@@ -1,3 +1,6 @@
+# 项目文档（用户裁决 2026-11-05：docs/ 仅本地保留，不上传 GitHub）
+docs/
+
 # 环境变量与密钥（.env / .env.test 不入库；*.example 模板入库）
 .env
 .env.test
