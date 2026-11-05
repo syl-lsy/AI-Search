@@ -60,6 +60,11 @@
 - unit 层 LLM 全 mock（结构化输出用 fixture）；integration 断言结构不断言文案；回答质量走评测线（M4 四套基线，eval-engineer），与确定性测试互不充当证据。
 - 全量 `make test` + `make typecheck` 绿才算完成；不接受只跑增量或 `--last-failed`。
 
+## Git 提交分工（2026-11-05 用户裁决，硬规范）
+
+- **AI 不执行任何 git 写操作**（commit / push / stash / 历史重写 / branch 管理等）：任务完成后停在工作区改动状态，向用户报告改动文件清单与内容摘要，提交由用户自行 add/commit/push。
+- git 仅做只读诊断（status / log / diff 等，且仅在用户问起 git 问题时）；唯一例外 = 用户当次明确指派执行某个具体 git 操作。
+
 ## 关键约束与已知坑
 
 - **密钥只进 `.env`**（Nacos 拒收疑似密钥字段）；禁止把密钥/凭据内容读入上下文、展示或写入任何对外产物；全部 host 端口绑 127.0.0.1。端口：backend 8300、frontend 5173、postgres **15432**（规避本机 5432）、minio 9000/9001、nacos 8848、litellm 4000、langfuse 3000、sandbox 8801（M4）、crawl4ai **11235**（MCP 备源，compose 常驻）。

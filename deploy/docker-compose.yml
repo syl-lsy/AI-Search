@@ -2,13 +2,19 @@
 # AI Search 基础设施 compose —— 占位文件（批次 1 实装）
 #
 # 拓扑与端口（服务清单/镜像/host 端口/容器端口）：docs/ARCHITECTURE.md §5 部署拓扑表
-#   postgres(pgvector) 15432 / minio 9000+9001 / nacos 8848（HTTP API）+ 8080（v3 控制台）+
+#   postgres(pgvector) 15432（三库：ai_search/langfuse/litellm） / minio 9000+9001 / nacos 8848（HTTP API）+ 8080（v3 控制台）+
 #   9848（gRPC）/ litellm 4000 /
 #   langfuse-web 3000 / langfuse-worker(不暴露) / clickhouse(不暴露) / redis(不暴露) /
 #   sandbox(compose profile: m4，8801) / crawl4ai 11235（随基础 compose 常驻）
 #   backend 8300 / frontend 5173 为本机进程（make dev / make dev-frontend），不在本文件内。
 # 变量清单：docs/ARCHITECTURE.md §7；compose 消费型变量（注入对应容器、后端不读取）：
-#   OLLAMA_API_BASE、NACOS_AUTH_* 四变量、LITELLM_MASTER_KEY、Langfuse S3_* 组。
+#   OLLAMA_API_BASE、NACOS_AUTH_* 四变量、LITELLM_MASTER_KEY + DB 模式四变量
+#   （LITELLM_SALT_KEY/UI_USERNAME/UI_PASSWORD/DB_PASSWORD）、Langfuse S3_* 组。
+# 基建镜像版本基准（v1.22，ADR-014）= 课程参考实现 dev-edu/ai-infrastructure docker-compose.yml：
+#   litellm/litellm-database:v1.101.0（DB 模式——postgres 第三库 litellm + 共享 redis REDIS_DB=1，
+#   不建专用 litellm_postgres/litellm_redis）、cgr.dev/chainguard/minio（digest 锁定，批次 1 实装
+#   锁当时 latest 的 digest）、docker.langfuse.com 源（Docker Hub 备源）、
+#   opensandbox/server:release-1.1.0（M4，端口维持 8801）；课程升级时对齐走增量 diff。
 # nacos v3 口径（v1.22，ARCHITECTURE §5 nacos 行 / ADR-013）：镜像 nacos/nacos-server:v3.2.4-slim
 #   （standalone，Derby 内嵌存储；MODE=standalone）；v3 起控制台独立端口 8080
 #   （http://127.0.0.1:8080/，无 /nacos 路径）；鉴权四件套同 v2.5 零变更；
