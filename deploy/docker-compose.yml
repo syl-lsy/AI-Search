@@ -1,0 +1,16 @@
+# =============================================================================
+# AI Search 基础设施 compose —— 占位文件（批次 1 实装）
+#
+# 拓扑与端口（服务清单/镜像/host 端口/容器端口）：docs/ARCHITECTURE.md §5 行492~512
+#   postgres(pgvector) 15432 / minio 9000+9001 / nacos 8848 / litellm 4000 /
+#   langfuse-web 3000 / langfuse-worker(不暴露) / clickhouse(不暴露) / redis(不暴露) /
+#   sandbox(compose profile: m4，8801) / crawl4ai 11235（随基础 compose 常驻）
+#   backend 8300 / frontend 5173 为本机进程（make dev / make dev-frontend），不在本文件内。
+# 变量清单：docs/ARCHITECTURE.md §7；compose 消费型变量（注入对应容器、后端不读取）：
+#   OLLAMA_API_BASE、NACOS_AUTH_* 四变量、LITELLM_MASTER_KEY、Langfuse S3_* 组。
+# 安全口径：全部 host 端口绑 127.0.0.1（PRD 5.3.7，不对公网暴露）。
+# 参考实现出处（§5 v1.14 注）：Gitee dev-edu/ai-infrastructure 教学仓库——
+#   教学实现，端口/口令勿照抄，以 §5 表与 §7 清单为准。
+# =============================================================================
+# 批次 1 实装前服务定义为空（services 为空映射——本文件不含任何可启动服务）。
+services: {}

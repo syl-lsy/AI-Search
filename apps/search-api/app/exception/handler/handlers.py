@@ -1,0 +1,117 @@
+"""FastAPI 全局异常处理器：请求-响应链路所有异常的最终出口。
+
+由 main.py 注册四处，覆盖四类异常：
+- RequestValidationError：请求参数校验失败（422001，message 拼 "loc: msg" 明细）；
+- starlette HTTPException：框架层协议错误（404/405/415 走 PROTOCOL_ERROR_MAP 友好消息，
+  其余状态码回退 exc.detail）；
+- BusinessException：领域异常（message 面向用户进响应体；detail/original_exception 只进日志）；
+- Exception：未知异常兜底（500001，message 用默认消息，不泄漏内部细节）。
+
+响应统一为 {"code": 业务错误码, "message": 面向用户的信息}——**本处理器只负责错误侧响应**；
+成功侧 /api/ 统一信封见 app/core/middleware/response.py（「统一响应与中间件」一节）。
+
+日志：**异常日志是「每请求恰一条」的异常侧出口**——优先经 `request.state.request_log`
+（logging 中间件挂上的 loguru 请求日志，带 request_id/method/path），补上状态码后按级落
+（协议/校验/业务异常 warning，未知异常 error 带栈）；request_log 缺失（不在中间件链内
+直调处理器）时回退标准库 logger，severity/message 口径保持一致。
+"""
+import logging
+
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
+
+from app.exception.base import BusinessException
+from app.exception.handler.errors import ERROR_MAP, PROTOCOL_ERROR_MAP
+
+logger = logging.getLogger(__name__)
+
+
+def _lookup(exc: Exception) -> tuple[str, int, str]:
+    """按 MRO 查找异常对应的错误码配置，找不到则回退到 Exception"""
+    for exc_type in type(exc).__mro__:
+        if exc_type in ERROR_MAP:
+            return ERROR_MAP[exc_type]
+    return ERROR_MAP[Exception]
+
+
+def _format_validation_error(err: dict) -> str:
+    loc = ".".join(str(p) for p in err["loc"])
+    return f"{loc}: {err['msg']}"
+
+
+def _log_exception(
+    request: Request, exc: Exception, http_status: int, body_msg: str
+) -> None:
+    """异常日志唯一出口：优先走 request_log（loguru 单管线），缺失时回退标准库 logger。
+
+    分级口径（与 service_logger、Logger 中间件一致）：
+    - BusinessException：业务异常=预期控制流走 warning；detail 追加进 message（只进日志），
+      仅包装了原始异常（original_exception，基础设施故障）时才带栈；
+    - 其他 500：未处理异常走 error 带栈（供根因排查）；
+    - 其余（协议错误/校验失败）：请求异常走 warning 不带栈。
+    """
+    log = getattr(request.state, "request_log", None)
+    if log is not None:
+        # 有 request_log：走 loguru——与「请求完成/业务日志」同一条管线、同一 request_id
+        log.status_code = http_status
+        if isinstance(exc, BusinessException):
+            log.message = f"业务异常: {exc.message}"
+            if exc.detail:
+                log.message += f" | detail={exc.detail}"
+            log.warning(exc=exc.original_exception)
+        elif http_status == 500:
+            log.message = f"未处理异常: {exc}"
+            log.error(exc=exc)
+        else:
+            log.message = f"请求异常: {body_msg}"
+            log.warning()
+        return
+
+    # 兜底：request_log 不存在（直调处理器等不在中间件链内的场景）→ 标准库 logger，
+    # 消息口径与上面一致（detail 仅在非空时追加），保证异常永不静默
+    if isinstance(exc, BusinessException):
+        if exc.detail:
+            logger.warning(
+                "业务异常: %s | detail=%s",
+                exc.message,
+                exc.detail,
+                exc_info=exc.original_exception,
+            )
+        else:
+            logger.warning(
+                "业务异常: %s", exc.message, exc_info=exc.original_exception
+            )
+    elif http_status == 500:
+        logger.error("未处理异常: %s", exc, exc_info=exc)
+    else:
+        logger.warning("请求异常: %s", body_msg)
+
+
+async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # 标记错误响应已终态（{code, message}）：统一信封中间件据此跳过，
+    # 保证错误响应不被成功信封二次包装（两个中间件共享同一 scope 的 state）。
+    request.state.exception_handled = True
+
+    if isinstance(exc, HTTPException):
+        code = str(exc.status_code)
+        http_status = exc.status_code
+        # 协议表未收录的状态码回退 detail；裸抛 HTTPException(429) 时 detail 可能为 None，归一为空串
+        body_msg = PROTOCOL_ERROR_MAP.get(exc.status_code) or (
+            exc.detail if isinstance(exc.detail, str) and exc.detail else ""
+        )
+    else:
+        code, http_status, default_msg = _lookup(exc)
+        if isinstance(exc, RequestValidationError):
+            body_msg = "\n".join(_format_validation_error(e) for e in exc.errors())
+        elif isinstance(exc, BusinessException):
+            body_msg = exc.message
+        else:
+            body_msg = default_msg
+
+    _log_exception(request, exc, http_status, body_msg)
+
+    return JSONResponse(
+        status_code=http_status, content={"code": code, "message": body_msg}
+    )

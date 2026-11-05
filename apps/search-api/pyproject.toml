@@ -1,0 +1,51 @@
+[project]
+name = "search-api"
+version = "0.1.0"
+description = "ai-search 后端服务（类 Perplexity AI 搜索引擎；导入包名 app）"
+requires-python = ">=3.12"
+dependencies = [
+    # ── Web/数据运行栈：核心依赖 == 锁定，沿用 python-backend-base 基座锁定值
+    #    （ARCH v1.21 §2 依赖策略：FastAPI==0.136.3、SQLAlchemy==2.0.50、asyncpg==0.31.0、loguru==0.7.3 等）；
+    #    uvicorn/alembic 为基座模板未直接声明的项，取 2026-11-04 PyPI 当日稳定版锁定
+    "fastapi[standard]==0.136.3",
+    "uvicorn[standard]==0.54.0",
+    "sqlalchemy[asyncio]==2.0.50",
+    "asyncpg==0.31.0",
+    "alembic==1.20.1",
+    "pydantic",                # 版本随 fastapi[standard]/pydantic-settings 由解析器约束，uv.lock 快照定版
+    "pydantic-settings==2.16.0",
+    "loguru==0.7.3",
+    # ── AI 栈：== 锁定（ARCH v1.21 依赖策略「AI 依赖取当日稳定版锁定」；锁定值 = 2026-11-04 uv.lock 定版快照）
+    "langgraph>=1.1",          # ARCH 版本下限例外（deep 流式 subgraphs=True + StreamPart v2，§6.1）
+    "langchain==1.4.9",        # 2026-11-04 当日稳定版锁定
+    "langchain-openai==1.7.4", # R8：ReasoningChatModel 覆写私有 API——锁版本 + 单测护栏（护栏单测 B1 落，ARCH §6.7）
+    "langchain-mcp-adapters==0.3.2",
+    "deepagents>=0.5.3",       # ARCH 版本下限例外（子代理 response_format=SummarySchema，ARCH S15）
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# 把 app/ 打包进服务，使 `uv run --package search-api python -c "import app.xxx"` 与跨服务 import 可用
+[tool.hatch.build.targets.wheel]
+packages = ["app/"]
+
+# 开发/测试依赖（不随生产安装）：三层测试（unit/integration/e2e）与调试
+# httpx = integration ASGITransport / e2e 轮询（ARCH dev 组锚点项；骨架期 app 代码不引用）
+# debugpy = 断点调试器（ARCH dev 组锚点项；派单口径写作 "debuggy"，实为基座模板的 debugpy——
+#   PyPI "debuggy" 是无关的 StackOverflow 检索工具，非调试器）
+# conftest 的 load_dotenv 所需 python-dotenv 经 pydantic-settings 传递依赖可用（其硬依赖），
+# 按 ARCH dev 组锚点（pytest 家族/httpx/debuggy/psycopg2-binary）不显式声明
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "httpx==0.28.1",
+    "debugpy==1.8.22",
+    "psycopg2-binary==2.9.13",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -1,0 +1,13 @@
+# ai-search — uv workspace 虚拟根（不声明 [project]）
+#
+# 不声明 [project] 时 uv 的默认成员 = 全部 workspace 成员：`uv sync` / 裸 `uv run pytest`
+# 在仓库根开箱可用（单 venv 装齐所有成员服务，含各自 dev 组）。
+# 若根声明 [project]，uv 的默认成员只剩根项目本身，成员依赖不会被安装——
+# 届时所有命令都必须显式 `uv run --package <service-name> ...`（基座踩坑结论）。
+[tool.uv.workspace]
+members = ["apps/*"]
+
+# `make test-changed`（scripts/run_changed_tests.py）扫描的测试目录清单：
+# 变更文件落在这些目录内且命名是测试文件（test_*.py / *_test.py）才会被逐个串行执行
+[tool.test-runner]
+test_dirs = ["apps/*/test"]

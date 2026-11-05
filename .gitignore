@@ -1,0 +1,42 @@
+# 环境变量与密钥（.env / .env.test 不入库；*.example 模板入库）
+.env
+.env.test
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Node / 前端
+node_modules/
+dist/
+coverage/
+
+# 构建产物
+build/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# 运行期本地数据（ARCH §3.1：data/ 运行期本地数据；logs/ 错误日志轮转目录）
+data/
+logs/
+
+# ZCode 工作区（忽略所有层级的 .zcode；例外：根 .zcode/plans/ 计划文档入库）
+**/.zcode/*
+!.zcode/plans/
+
+# Mimosa 安全扫描产物
+.mimosa/
+
+# 临时产物
+tmp/
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store

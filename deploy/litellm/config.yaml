@@ -1,0 +1,14 @@
+# =============================================================================
+# LiteLLM 网关配置 —— 占位文件（批次 1 实装）
+#
+# 模型别名→上游映射（上游 key 以 ${ENV} 引用 .env：ZHIPU_API_KEY / DEEPSEEK_API_KEY /
+#   DASHSCOPE_API_KEY；本地 Ollama 上游地址 OLLAMA_API_BASE）：
+#   - 6 个 chat 别名（chat-standard / chat-standard-glm / chat-standard-deepseek +
+#     chat-speed / chat-speed-glm / chat-speed-deepseek）各配三节 fallback 链
+#     （docs/ARCHITECTURE.md §5 行501 / §6.2 / §6.7，v1.11 起）；
+#   - v1.19 起 + light 链（qwen3.5-4b-ollama → chat-speed 单节，§6.7/S14）；
+#   - num_retries 重试去重（v1.3）+ 静态 config.yaml 配 Router 熔断
+#     allowed_fails/cooldown_time（v1.5）。
+# 拓扑与端口：docs/ARCHITECTURE.md §5 行492~512（litellm host 端口 4000）；变量见 §7。
+# =============================================================================
+# 批次 1 实装前配置为空：本文件当前不含任何 model_list / router_settings。
