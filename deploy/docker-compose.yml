@@ -1,13 +1,20 @@
 # =============================================================================
 # AI Search 基础设施 compose —— 占位文件（批次 1 实装）
 #
-# 拓扑与端口（服务清单/镜像/host 端口/容器端口）：docs/ARCHITECTURE.md §5 行492~512
-#   postgres(pgvector) 15432 / minio 9000+9001 / nacos 8848 / litellm 4000 /
+# 拓扑与端口（服务清单/镜像/host 端口/容器端口）：docs/ARCHITECTURE.md §5 部署拓扑表
+#   postgres(pgvector) 15432 / minio 9000+9001 / nacos 8848（HTTP API）+ 8080（v3 控制台）+
+#   9848（gRPC）/ litellm 4000 /
 #   langfuse-web 3000 / langfuse-worker(不暴露) / clickhouse(不暴露) / redis(不暴露) /
 #   sandbox(compose profile: m4，8801) / crawl4ai 11235（随基础 compose 常驻）
 #   backend 8300 / frontend 5173 为本机进程（make dev / make dev-frontend），不在本文件内。
 # 变量清单：docs/ARCHITECTURE.md §7；compose 消费型变量（注入对应容器、后端不读取）：
 #   OLLAMA_API_BASE、NACOS_AUTH_* 四变量、LITELLM_MASTER_KEY、Langfuse S3_* 组。
+# nacos v3 口径（v1.22，ARCHITECTURE §5 nacos 行 / ADR-013）：镜像 nacos/nacos-server:v3.2.4-slim
+#   （standalone，Derby 内嵌存储；MODE=standalone）；v3 起控制台独立端口 8080
+#   （http://127.0.0.1:8080/，无 /nacos 路径）；鉴权四件套同 v2.5 零变更；
+#   bind 挂载 ./nacos/plugin-states.json → /home/nacos/data/plugin/plugin-states.json
+#   （预置 {"visibility:nacos": false} 禁 visibility 插件——AI 资产 PUBLIC/PRIVATE 过滤关闭；
+#   create_host_path: false 防漏提交；修改后重启 Nacos 生效）。
 # 安全口径：全部 host 端口绑 127.0.0.1（PRD 5.3.7，不对公网暴露）。
 # 参考实现出处（§5 v1.14 注）：Gitee dev-edu/ai-infrastructure 教学仓库——
 #   教学实现，端口/口令勿照抄，以 §5 表与 §7 清单为准。
