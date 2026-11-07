@@ -9,8 +9,8 @@
 | 文档 | 管什么 |
 |---|---|
 | `docs/PRD.md`（v1.11） | 做什么：REQ-001~047、验收 A1~A30、里程碑 M1~M6（实验/可选功能 REQ-046/047 带 P2 降级口径；fast 答案 ≤3000 字硬上限、P50 ≤30s） |
-| `docs/ARCHITECTURE.md`（v1.23） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15 |
-| `docs/DEVELOPMENT-PROCESS.md`（v1.16） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
+| `docs/ARCHITECTURE.md`（v1.26） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口 + 宿主重映射，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15（§10 已落 S0 六项结论） |
+| `docs/DEVELOPMENT-PROCESS.md`（v1.17） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
 | `docs/PROGRESS.md` | 进度总览活文档：M1 完成流程图、批次状态表、每环节文档巡检记录。**每闭环一个环节必须更新**（巡检规则见 DEV §10.1） |
 | `docs/contract/api.md`、`data-model.md`、`nacos-config.md`、`frontend-api.md`、`memory-api.md`、`memory-data-model.md` | 冻结契约：REST+SSE 协议、DDL 与迁移、Nacos 五 dataId、前端映射。**字段/事件/表结构以此为准，禁止私改** |
 | `docs/design/`（4 个 HTML + `tokens.css` + `设计说明.md` + `reference/` 对照截图） | 已确认的视觉基准，前端样式必须用 tokens |
@@ -21,7 +21,7 @@
 ## 计划中的仓库布局与命令（开工时按此脚手架，勿自创）
 
 - 双 workspace：根 `pyproject.toml` **仅 workspace 定义**（`members=["apps/*"]`，虚拟根不声明 `[project]`——声明后 `uv sync` 不装成员依赖）+ `pnpm-workspace.yaml`（`packages=["frontend"]`）。后端服务 `apps/search-api/`（导入名 `search_api`），前端 `frontend/`。
-- 全部命令从仓库根跑（`env_file` 相对运行时 cwd 解析，禁止换目录裸跑）：`make dev`（后端 :8300）/ `make dev-frontend`（:5173）/ `make test` / `make test-unit` / `make test-integration` / `make test-e2e` / `make test-frontend*` / `make typecheck` / `make db-migrate|db-upgrade|db-downgrade`。
+- 全部命令从仓库根跑（`env_file` 相对运行时 cwd 解析，禁止换目录裸跑）：`make dev`（后端 :8300）/ `make dev-frontend`（:5173）/ `make test` / `make test-unit` / `make test-integration` / `make test-e2e` / `make test-frontend*` / `make typecheck`（前端 vue-tsc + 后端/脚本 compileall）/ `make db-migrate|db-upgrade|db-downgrade`；基建族（S0 已闭环）：`make infra-up|infra-down|infra-ps|infra-logs` / `make preflight`（起栈前端口预检）/ `make smoke-infra`（七组件 smoke）/ `make nacos-init`（五 dataId 发布，管理员凭据 inline 注入；已存在且内容不同默认跳过，覆盖加 `NACOS_INIT_FORCE=1`）。**compose 必须从仓库根跑**（`make infra-*` 已封装 `--project-directory .`；裸调 docker compose 漏该参数会在 deploy/ 目录找 .env，配置校验必败——S0 P0 坑）。
 - 分层铁律：`api/` 只做路由与校验，业务在 `services/`，**API 层不直接调 LangGraph**；`schemas/`（DTO）≠ `db/models/`（ORM）；service 只 flush 不 commit（事务边界在 `get_db`；TurnRunner/KB worker 为短事务例外）；图节点保持纯函数，持久化由 TurnRunner 消费事件流完成。
 - 依赖方向：`api/ → services/ → agent/ → config_center/`；agent 永不 import api；core/ 横切。
 
@@ -75,8 +75,8 @@
 - **安全铁律**：外部内容进上下文一律 `<external_content>` 包裹（提示注入隔离）；前端 markdown 过 DOMPurify、协议白名单 http/https；上传类型白名单 + 20MB 上限。
 - **版本锁定例外**：`deepagents>=0.5.3`、`langgraph>=1.1`、`langchain-openai` 须**锁版本 + 单测护栏**（ReasoningChatModel 覆写私有 API，升级前必须先跑护栏，R8）。
 - **模型映射现行值**：`model.mapping.light` = 本地 `qwen3.5-4b-ollama`（宿主 Ollama 为**默认运行时依赖**，litellm 静态 fallback→`chat-speed`）。备源降级链：搜索三级兜底 AnySearch（`fallback_search`）+ 自部署 Crawl4AI（`url_reader_backup`，`/mcp/sse`），备位**条件装载**（语言门控后主位全断才临时顶替，R12）。
-- **M1 开工前接入性验证六项（DEV §3.3）**：R1（BoCha stdio MCP，官方仓库 `github.com/BoChaAI/bocha-search-mcp`）、R7（本地 qwen3.5:4b 结构化输出，20 条合法率 ≥90%）、R9（LiteLLM 会话粘黏）、R11（智谱 Coding Plan 适配）、R12（AnySearch 配额 + crawl4ai 端点形态）、R15（nacos-sdk-python × Nacos v3.2.4 三链路，不通过=改自封装 httpx v3 client）——结论落档后才开 S1。
-- **S0 基建 UI 初始化 checklist（DEV §3.2）**：compose 起栈后、S1 开工前执行，顺序 **Nacos→MinIO→Langfuse→LiteLLM**（Nacos 先鉴权后操作：管理员改密、建只读账号 `ai-search-ro`、发布 403 实证，再初始化五 dataId）。课程仓库（ai-infrastructure / ai-eval）只是教学参考：**提示词走 Nacos，不用 Langfuse Prompt Management；M4 评测以 A' 契约为准**，教学端口/口令勿照抄。
+- **接入性验证六项（DEV §3.3）——✅ S0 已全部出结论并落档（ARCH §10，2026-11-06/07）**：R1 BoCha stdio ✅（实装工具名 snake_case `bocha_web_search`/`bocha_ai_search`）；R7 本地 qwen3.5:4b 结构化输出 ✅（19/20=95%，坑：max_tokens ≥8192 + 冷启动单条 149s）；R9 粘黏/fallback 整链 ✅（坑：fallbacks 必须在 litellm_settings 下）；R11 智谱 ①✅②灰区③❌条款禁产品化——**裁决：开发期 Coding Plan、上线前切按量**（零改码换凭证）；R12 AnySearch ✅（配额不可见→429 触发式；延迟 6~8s→读超时 ≥10s）+ crawl4ai 部署面 ✅；R15 nacos-sdk 3.2.0 三链路 ✅（五坑落档：`v2.nacos` 全 asyncio/锁版本/快照双坑/热更 ≥5s/INFO 日志打 accessToken）。B1/B3 派单前置输入见 `docs/s0-batch1-handoff.md` 续 10/11。
+- **S0 基建 UI 初始化 checklist（DEV §3.2）——✅ 已执行完毕（2026-11-06，顺序 Nacos→MinIO→Langfuse→LiteLLM）**：管理员改密/只读账号/403 实证/五 dataId 发布均已落地。课程仓库（ai-infrastructure / ai-eval）只是教学参考：**提示词走 Nacos，不用 Langfuse Prompt Management；M4 评测以 A' 契约为准**，教学端口/口令勿照抄。
 - 提示词/模型映射/Agent Spec 全部走 Nacos 热更（五 dataId，键位见 nacos-config.md），改提示词先补 fixture 测试与评测对比。
 - 收尾三底线：测试证据、安全敏感改动过 security-auditor、契约变更同步受影响方并更新 `docs/contract/*` 并升版本。
 - **环节闭环文档巡检（2026-11-05 用户裁决，DEV §10.1）**：每闭环一个环节（批次/阶段/工单）必做——盘点受影响文档 → 逐份判定需不需要更新（实质语义变更当批更新升版并同步引用方；无变更记「无需更新」+理由，**禁止机械 bump 版本**）→ 需更新者当批更新完、不留待办到下一环节 → 留痕（交付说明 + `docs/PROGRESS.md` 巡检记录与状态推进）。**巡检未做不算环节收尾完成**；巡检更新 ≠ 私改契约（契约变更仍走增量 diff）。
