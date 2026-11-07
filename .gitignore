@@ -1,9 +1,11 @@
 # 项目文档（用户裁决 2026-11-05：docs/ 仅本地保留，不上传 GitHub）
-docs/
+docs/*
 
-# 环境变量与密钥（.env / .env.test 不入库；*.example 模板入库）
-.env
-.env.test
+# 环境变量与密钥（.env 家族全部不入库——含 gen_env.py 的 .env.tmp 中转文件，防进程中断残留明文密钥
+#   被 git add -A 误提交；仅两个模板入库。安全终审 2026-11-07 低危修复项）
+.env*
+!.env.example
+!.env.test.example
 *.pem
 
 # Python

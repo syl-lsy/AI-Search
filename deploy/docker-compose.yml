@@ -1,29 +1,404 @@
 # =============================================================================
-# AI Search 基础设施 compose —— 占位文件（批次 1 实装）
+# AI Search 基础设施 compose —— 批次 1 S0 实装（docs/ARCHITECTURE.md §5 部署拓扑表）
 #
-# 拓扑与端口（服务清单/镜像/host 端口/容器端口）：docs/ARCHITECTURE.md §5 部署拓扑表
-#   postgres(pgvector) 15432（三库：ai_search/langfuse/litellm） / minio 9000+9001 / nacos 8848（HTTP API）+ 8080（v3 控制台）+
-#   9848（gRPC）/ litellm 4000 /
-#   langfuse-web 3000 / langfuse-worker(不暴露) / clickhouse(不暴露) / redis(不暴露) /
-#   sandbox(compose profile: m4，8801) / crawl4ai 11235（随基础 compose 常驻）
+# 拓扑与端口（host 端口全部绑 127.0.0.1，PRD 5.3.7 不对公网暴露；2026-11-06 用户裁决宿主侧
+#   端口重映射：nacos 8080→8081 / 8848→8849 / 9848→9849、langfuse-web 3000→3100、litellm
+#   4000→4100、minio 9000→9100 / 9001→9101——容器内端口一律不变）：
+#   postgres(pgvector) 15432（三库 ai_search/langfuse/litellm，deploy/postgres/init.sh）
+#   minio 9100+9101 / nacos 8081(v3 控制台)+8849(HTTP OpenAPI)+9849(gRPC) / litellm 4100 /
+#   langfuse-web 3100 / langfuse-worker(不暴露) / clickhouse(不暴露) / redis 16379 /
+#   crawl4ai 11235（随基础 compose 常驻——备胎必须已在跑，2026-11-03 用户裁决）/
+#   opensandbox 8801（**不挂 profile**——OpenSandbox 提前部署为本批用户裁决增补，
+#   DEV §3.1 第 9 行「仅 M4 开工前验」由本裁决改写，文档巡检同步待办）
 #   backend 8300 / frontend 5173 为本机进程（make dev / make dev-frontend），不在本文件内。
-# 变量清单：docs/ARCHITECTURE.md §7；compose 消费型变量（注入对应容器、后端不读取）：
-#   OLLAMA_API_BASE、NACOS_AUTH_* 四变量、LITELLM_MASTER_KEY + DB 模式四变量
-#   （LITELLM_SALT_KEY/UI_USERNAME/UI_PASSWORD/DB_PASSWORD）、Langfuse S3_* 组。
-# 基建镜像版本基准（v1.22，ADR-014）= 课程参考实现 dev-edu/ai-infrastructure docker-compose.yml：
-#   litellm/litellm-database:v1.101.0（DB 模式——postgres 第三库 litellm + 共享 redis REDIS_DB=1，
-#   不建专用 litellm_postgres/litellm_redis）、cgr.dev/chainguard/minio（digest 锁定，批次 1 实装
-#   锁当时 latest 的 digest）、docker.langfuse.com 源（Docker Hub 备源）、
-#   opensandbox/server:release-1.1.0（M4，端口维持 8801）；课程升级时对齐走增量 diff。
-# nacos v3 口径（v1.22，ARCHITECTURE §5 nacos 行 / ADR-013）：镜像 nacos/nacos-server:v3.2.4-slim
-#   （standalone，Derby 内嵌存储；MODE=standalone）；v3 起控制台独立端口 8080
-#   （http://127.0.0.1:8080/，无 /nacos 路径）；鉴权四件套同 v2.5 零变更；
-#   bind 挂载 ./nacos/plugin-states.json → /home/nacos/data/plugin/plugin-states.json
-#   （预置 {"visibility:nacos": false} 禁 visibility 插件——AI 资产 PUBLIC/PRIVATE 过滤关闭；
-#   create_host_path: false 防漏提交；修改后重启 Nacos 生效）。
-# 安全口径：全部 host 端口绑 127.0.0.1（PRD 5.3.7，不对公网暴露）。
-# 参考实现出处（§5 v1.14 注）：Gitee dev-edu/ai-infrastructure 教学仓库——
-#   教学实现，端口/口令勿照抄，以 §5 表与 §7 清单为准。
+#
+# 变量注入边界（变量清单 = docs/ARCHITECTURE.md §7）：
+#   上游 7 家厂商密钥（DASHSCOPE_TOKEN_PLAN_API_KEY / DASHSCOPE_API_KEY / ZHIPU_CODING_PLAN_API_KEY /
+#   ZHIPU_API_KEY / DEEPSEEK_API_KEY / TAVILY_API_KEY / BOCHA_API_KEY / FIRECRAWL_API_KEY /
+#   ANYSEARCH_API_KEY——本 compose 仅 litellm 消费其中 chat/embedding 相关五组）与 LANGSMITH_API_KEY
+#   用 ${VAR:-}（可空不阻塞起栈，调用时才需要真值）；其余基建密钥一律 ${VAR:?}（缺失即失败，fail fast）。
+#
+# 镜像版本基准（ADR-014 + 批次 1 留档）：
+#   litellm/litellm-database:v1.101.0（DB 模式——postgres 第三库 litellm + 共享 redis REDIS_DB=1）；
+#   cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+#   （digest 锁定留档——chainguard 免费档仅发布 latest，2026-11-05 经 cgr.dev 匿名 manifest 核对当时
+#   latest 多架构索引 digest；升级走增量 diff）；
+#   docker.langfuse.com 源（Docker Hub 为备源）；opensandbox/server:release-1.1.0（端口 8801）；
+#   unclecode/crawl4ai:0.9.5（2026-11-05 核对：Docker Hub 0.9.5 tag + GitHub release v0.9.5 同日发布
+#   = 当时 0.9.x 最新稳定，锁 tag 不落 latest，R12 部署面留档）。
+#
+# 调用纪律：一律从仓库根 `docker compose --project-directory . -f deploy/docker-compose.yml ...`
+#   （compose 相对路径按 --project-directory 解析——本文件内 bind 源均带 deploy/ 前缀、面向仓库根；
+#   .env 也从项目目录加载，--project-directory . 指回仓库根。Makefile infra-* 族已封装）。
 # =============================================================================
-# 批次 1 实装前服务定义为空（services 为空映射——本文件不含任何可启动服务）。
-services: {}
+
+name: ai-search
+
+# ═══════════════════ Langfuse web/worker 共享环境（顶层 x- 锚点）═══════════════════
+# 2026-11-07 Halo 接入时自 langfuse-worker 内联锚点（原 environment: &langfuse-common-env）上提为
+# 独立顶层块——Halo 引入 web/worker 各自专属变量（worker 专属 LANGFUSE_MCP_BASE_URL、web 专属
+# LANGFUSE_MCP_ALLOWED_HOSTS，见两服务各自 environment 注），不能进共享块互串，故拆分上提。
+x-langfuse-common-env: &langfuse-common-env
+  PORT: "3030"                                  # 容器端口（host 3100 映射，ARCH §5）
+  # v4 迁移模式置空=关闭 events_only 硬模式：LiteLLM 旧式 langfuse callback（/api/public/ingestion）
+  # 需要它才能写入 trace/generation（2026-11-06 实测：v4.56 默认 events_only 时旧式写入 400）。
+  # v4 原生消费（SDK 5.2.0 OTLP 通路）不受此变量影响。空串在真值判断下=禁用该模式。
+  LANGFUSE_MIGRATION_V4_WRITE_MODE: "dual"      # dual=旧式 ingestion 与 v4 事件表双写（枚举：dual/events_only/legacy，worker dist 实证）；events_only 为 v4.56 默认，会 400 拒掉 LiteLLM 旧式 langfuse callback
+  NEXTAUTH_URL: http://127.0.0.1:3100
+  DATABASE_URL: "postgresql://langfuse:${LANGFUSE_DB_PASSWORD:?Set LANGFUSE_DB_PASSWORD in .env}@postgres:5432/langfuse"
+  # 加密盐与主密钥：首启生成后固定不变，丢失/更换致已存 API Key 与数据不可解（.env LANGFUSE_SALT/ENCRYPTION_KEY）
+  SALT: "${LANGFUSE_SALT:?Set LANGFUSE_SALT in .env}"
+  ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY:?Set LANGFUSE_ENCRYPTION_KEY in .env}"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: root
+  CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:?Set CLICKHOUSE_PASSWORD in .env}"
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  # S3（实名组注释与 ARCH §7 映射见 .env.example；凭据复用 MINIO Service Account 对——同值不双写）。
+  # 桶名必须 = minio 三桶之一 langfuse，错配 trace 上传静默 403（DEV §3.2 ④ 警示）
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${MINIO_ACCESS_KEY:?Set MINIO_ACCESS_KEY in .env}"
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${MINIO_SECRET_KEY:?Set MINIO_SECRET_KEY in .env}"
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "${MINIO_ACCESS_KEY:?Set MINIO_ACCESS_KEY in .env}"
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "${MINIO_SECRET_KEY:?Set MINIO_SECRET_KEY in .env}"
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "true"
+  LANGFUSE_S3_BATCH_EXPORT_BUCKET: langfuse
+  LANGFUSE_S3_BATCH_EXPORT_REGION: auto
+  LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: http://127.0.0.1:9100
+  LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: "${MINIO_ACCESS_KEY:?Set MINIO_ACCESS_KEY in .env}"
+  LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${MINIO_SECRET_KEY:?Set MINIO_SECRET_KEY in .env}"
+  LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+  # ↓ Halo（Langfuse 内置对话式 AI 助手「问 AI 筛 trace」；v1.27 增，2026-11-07 用户裁决接入；ARCH §5/§7）——
+  #   官方要求 ≥ v4.28（现行 4.56）；模型须支持 OpenAI 风格 tool calling；改 LANGFUSE_AI_MODEL 须同步
+  #   虚拟 key 的模型白名单（litellm UI Virtual Keys）；配置不全 = UI 显示未启用、不影响起栈
+  #   （官方语义），故 API key 为可空注入、非 fail-fast。
+  LANGFUSE_IN_APP_AGENT_ENABLED: "true"
+  LANGFUSE_AI_PROVIDER: openai                      # OpenAI 兼容适配器——指向本项目 LiteLLM 网关
+  LANGFUSE_AI_MODEL: chat-speed                     # 主力问询模型（litellm 别名，Token Plan 抵扣）
+  LANGFUSE_AI_SMALL_MODEL: qwen3.5-4b-ollama        # 辅助杂活（会话标题等）走本地 Ollama，零边际成本
+  LANGFUSE_AI_API_KEY: "${LANGFUSE_AI_API_KEY:-}"   # LiteLLM 虚拟 key（别名 langfuse-halo，模型白名单
+                                                    #   [chat-speed, qwen3.5-4b-ollama]）；.env 提供，
+                                                    #   空值 = Halo 未启用
+  LANGFUSE_AI_BASE_URL: http://litellm:4000/v1      # 容器网内直连——注意用 litellm **容器内端口 4000**
+                                                    #   （宿主 4100 仅供宿主进程，2026-11-07 实测 4100 自容器内
+                                                    #   ECONNREFUSED）；Halo 自有 client，不受 LLM Connections
+                                                    #   的 SSRF 白名单变量约束
+
+services:
+  # ═══════════════════ 存储面 · PostgreSQL + pgvector ═══════════════════
+  # 一实例三库：ai_search（业务+pgvector）/ langfuse（观测元数据）/ litellm（网关 DB 模式，ADR-014）
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: always
+    ports:
+      - "127.0.0.1:15432:5432"
+    environment:
+      # 超级用户（postgres）引导密码复用 DB_PASSWORD（不新增契约变量；本机 127.0.0.1 绑定——
+      # 独立超级用户凭据如需拆分走增量 diff）；业务三角色密码由 init.sh 从容器 env 取，零写死，
+      # 故 init.sh 消费的三个密码变量同样经容器 env 注入（容器读不到宿主 .env，缺失即起栈失败）
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?Set DB_PASSWORD in .env}"
+      DB_PASSWORD: "${DB_PASSWORD:?Set DB_PASSWORD in .env}"
+      LANGFUSE_DB_PASSWORD: "${LANGFUSE_DB_PASSWORD:?Set LANGFUSE_DB_PASSWORD in .env}"
+      LITELLM_DB_PASSWORD: "${LITELLM_DB_PASSWORD:?Set LITELLM_DB_PASSWORD in .env}"
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # 首次初始化（entrypoint-initdb.d 仅空数据目录时执行）：建三库三角色 + ai_search 装 vector 扩展
+      - ./deploy/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ═══════════════════ 存储面 · MinIO（单实例三桶）═══════════════════
+  # 桶：ai-search-snapshots / ai-search-kb（.env MINIO_BUCKET_* 同名）/ langfuse（Langfuse S3）
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+    restart: always
+    # chainguard 镜像 entrypoint 口径（ARCH §5 minio 行：照课程写法）
+    entrypoint: sh
+    command: -c 'minio server --address ":9000" --console-address ":9001" /data'
+    ports:
+      - "127.0.0.1:9100:9000"    # S3 API（宿主 9100 ← 容器 9000，容器端口不变）
+      - "127.0.0.1:9101:9001"    # console（宿主 9101 ← 容器 9001）
+    environment:
+      # root 只用于 mc 管理；应用与 Langfuse 用 Service Account 子账号（DEV §3.2 ④，应用不用 root）
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}"
+    volumes:
+      - minio_data:/data
+      # Service Account 收窄 policy（仅三桶）——§3.2 ④ 建 Service Account 时容器内取用
+      # （mc admin policy create/attach local deploy/minio/policy.json 口径）
+      - ./deploy/minio/policy.json:/opt/minio-policy/policy.json:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # ═══════════════════ 配置面 · Nacos v3.2.4（standalone + Derby）═══════════════════
+  nacos:
+    image: nacos/nacos-server:v3.2.4-slim
+    restart: always
+    networks:
+      default:
+        # 固定 IP：v3 内嵌 JRaft 将节点地址持久化在卷中，容器重建换 IP 会让 raft 初始化失败循环重启
+        # （2026-11-06 实证：旧 IP 残留 → Fail to init node）；钉死 IP 根治
+        ipv4_address: 172.31.0.10
+    ports:
+      - "127.0.0.1:8081:8080"    # v3 控制台（URL http://127.0.0.1:8081/ 无 /nacos 路径，ADR-013）
+      - "127.0.0.1:8849:8848"    # HTTP OpenAPI（SDK / scripts/nacos_init.py）
+      - "127.0.0.1:9849:9848"    # gRPC 客户端通信
+    environment:
+      MODE: standalone           # 单机 Derby 内嵌存储（配置量小免另装 MySQL，ARCH §5 nacos 行）
+      # JVM 降堆（2026-11-07 实证）：镜像默认 Xms1g/Xmx1g 启动即 commit 1GB 堆，与同机 ai-eval 课程栈
+      # （langfuse×2 + clickhouse×2 等，两栈合计 ~6.3GB / Docker Desktop VM 7.75GB）并存时逼近内存悬崖，
+      # nacos 每轮启动峰值最大 → 被 VM 层 SIGKILL（exitCode 137 / OOMKilled=false / 死亡前零异常日志），
+      # 「活 ~20-35s 被杀 → 重启」循环。单机五 dataId 数据量 512m 上限绰绰有余，256m 起步削启动峰值
+      JVM_XMS: "256m"
+      JVM_XMX: "512m"
+      # 鉴权四件套（值经 .env 注入——鉴权未开启则匿名可读写，只读授权无意义，ARCH §7 v1.13）
+      NACOS_AUTH_ENABLE: "${NACOS_AUTH_ENABLE:?Set NACOS_AUTH_ENABLE in .env}"
+      NACOS_AUTH_TOKEN: "${NACOS_AUTH_TOKEN:?Set NACOS_AUTH_TOKEN in .env}"              # base64，解码后 ≥32 字符
+      NACOS_AUTH_IDENTITY_KEY: "${NACOS_AUTH_IDENTITY_KEY:?Set NACOS_AUTH_IDENTITY_KEY in .env}"
+      NACOS_AUTH_IDENTITY_VALUE: "${NACOS_AUTH_IDENTITY_VALUE:?Set NACOS_AUTH_IDENTITY_VALUE in .env}"
+    volumes:
+      - type: volume
+        source: nacos_data
+        target: /home/nacos/data
+        volume:
+          nocopy: true
+      - nacos_logs:/home/nacos/logs
+      # 预置禁 visibility 插件（{"visibility:nacos": false}）；create_host_path: false 防漏提交；
+      # 修改后重启 Nacos 生效（ADR-013）
+      - type: bind
+        source: ./deploy/nacos/plugin-states.json
+        target: /home/nacos/data/plugin/plugin-states.json
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      # 8848 探活（ask 口径）：优先 HTTP 健康端点，镜像无 curl 或路径形态不符时退化 bash TCP
+      # （nacos 镜像含 bash——startup.sh 依赖 bash）
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8848/nacos/v1/console/health/liveness || bash -c 'exec 3<>/dev/tcp/127.0.0.1/8848' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ═══════════════════ 观测面 · Langfuse v4（web + worker + clickhouse + redis）═══════════════════
+  # redis 与 LiteLLM 共享实例（LiteLLM 走 REDIS_DB=1 索引隔离，redis 服务见下方；Langfuse 用默认 DB 0）
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    restart: always
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy    # langfuse 桶先于 Langfuse 存在（DEV §3.2 顺序纪律的容器侧前提）
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-common-env
+      # ↓ Halo MCP 链路（worker 专属，v1.27 增；官方文档「MCP configuration」节）——
+      #   worker 消费 Halo 运行队列后经 MCP 回连 web 取项目工具；NEXTAUTH_URL=http://127.0.0.1:3100
+      #   自容器内不可达（宿主环回地址），必须显式指 web 服务名
+      LANGFUSE_MCP_BASE_URL: http://langfuse-web:3030
+    healthcheck:
+      # worker 容器内探针（2026-11-06 起栈实测裁定）：镜像无 curl；worker 侧健康端点为
+      # /api/health（/api/public/health 与 /health 均 404，与 web 不同——两容器各配探针）。
+      # 3030 仅绑容器 IP（Next standalone 绑容器 hostname 所致），环回 127.0.0.1 恒
+      # ECONNREFUSED——探针经 os.networkInterfaces 自发现非内部 IPv4、逐个尝试命中即过
+      # （exec 实测退出码 0；多网络挂载时遍历全部候选，不写死地址）
+      test: ["CMD", "node", "-e", "const os=require('os');const ips=Object.values(os.networkInterfaces()).flat().filter(i=>!i.internal&&i.family==='IPv4').map(i=>i.address);(async()=>{for(const ip of ips){try{const r=await fetch('http://'+ip+':3030/api/health');process.exit(r.ok?0:1)}catch(e){}}process.exit(1)})()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    restart: always
+    depends_on: *langfuse-depends-on
+    ports:
+      - "127.0.0.1:3100:3030"
+    environment:
+      <<: *langfuse-common-env
+      NEXTAUTH_SECRET: "${LANGFUSE_NEXTAUTH_SECRET:?Set LANGFUSE_NEXTAUTH_SECRET in .env}"
+      # media 双地址：浏览器走宿主 9100、容器内部走 minio:9000（ai-agent-infra-base 技能同款）
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://127.0.0.1:9100
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+      # ↓ Halo MCP 链路（web 专属，v1.27 增）：worker 回连时的 Host 为 langfuse-web:3030，与
+      #   NEXTAUTH_URL 不同源——Next host 校验需显式放行（缺配置 = MCP 调用报 403 Invalid Host header）
+      LANGFUSE_MCP_ALLOWED_HOSTS: langfuse-web
+    healthcheck:
+      # web 容器内探针（2026-11-06 起栈实测裁定）：镜像无 curl；web 侧健康端点为
+      # /api/public/health（宿主经 :3100 实测 200；/api/health 404）。CMD 数组直跑 node fetch、
+      # 不走 CMD-SHELL（原兜底链 node 段 `Promise || Promise` 恒取前式，只测 /api/health 且
+      # 404 恒失败）。3030 仅绑容器 IP（Next standalone 绑容器 hostname 所致），环回
+      # 127.0.0.1 恒 ECONNREFUSED（exec 实测）——经 os.networkInterfaces 自发现非内部 IPv4
+      test: ["CMD", "node", "-e", "const os=require('os');const ips=Object.values(os.networkInterfaces()).flat().filter(i=>!i.internal&&i.family==='IPv4').map(i=>i.address);(async()=>{for(const ip of ips){try{const r=await fetch('http://'+ip+':3030/api/public/health');process.exit(r.ok?0:1)}catch(e){}}process.exit(1)})()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    restart: always
+    user: "101:101"              # 官方建议：Linux 用户组 101
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: root
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:?Set CLICKHOUSE_PASSWORD in .env}"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7
+    restart: always
+    ports:
+      # 宿主 16379 = 6379+10000（对齐 postgres 15432 惯例）；宿主 6379 已被本机原生
+      # redis-server 占用（2026-11-06 实测），不可复用；仍绑 127.0.0.1 不对公网暴露
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  # ═══════════════════ 模型面 · LiteLLM 网关（DB 模式，ADR-014）═══════════════════
+  litellm:
+    image: litellm/litellm-database:v1.101.0
+    restart: always
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:4100:4000"
+    volumes:
+      - ./deploy/litellm/config.yaml:/app/config.yaml:ro    # 熔断/fallback 唯一落地处（§6.7 不进 UI）；改后重启生效
+    environment:
+      # DB 模式：postgres 第三库 litellm（库名/角色名 = deploy/postgres/init.sh 建的 litellm/litellm）
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in .env}"   # 运行态凭据=Master Key（.env LITELLM_API_KEY 同值，不建虚拟 key）
+      LITELLM_SALT_KEY: "${LITELLM_SALT_KEY:?Set LITELLM_SALT_KEY in .env}"         # 虚拟 key 加密盐——首启后固定不变
+      UI_USERNAME: "${LITELLM_UI_USERNAME:?Set LITELLM_UI_USERNAME in .env}"
+      UI_PASSWORD: "${LITELLM_UI_PASSWORD:?Set LITELLM_UI_PASSWORD in .env}"
+      DATABASE_URL: "postgresql://litellm:${LITELLM_DB_PASSWORD:?Set LITELLM_DB_PASSWORD in .env}@postgres:5432/litellm"
+      STORE_MODEL_IN_DB: "True"                      # DB 模式实证：Models 页可见 config.yaml 别名
+      # 【旧 langfuse callback 消费变量，已弃用】v4 ingestion schema 拒绝旧式 callback 已实证
+      #   （2026-11-06）——现走下方 OTEL_EXPORTER_OTLP_*；三变量保留供 B 组切回对照，勿删
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      # OTel callback → Langfuse OTLP（v4 原生通路；langfuse 旧式 callback 在 v4 events/dual schema 下被拒已实证）
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+      OTEL_EXPORTER_OTLP_HEADERS: "${OTEL_EXPORTER_OTLP_HEADERS:-}"
+      STORE_PROMPTS_IN_SPEND_LOGS: "True"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "1"                                  # 与 Langfuse 队列共享实例，索引隔离（ADR-014）
+      # 上游 key/base（config.yaml 以 os.environ/<VAR> 引用；可空不阻塞起栈，调用时才需要真值）
+      DASHSCOPE_TOKEN_PLAN_API_KEY: "${DASHSCOPE_TOKEN_PLAN_API_KEY:-}"
+      DASHSCOPE_TOKEN_PLAN_BASE_URL: "${DASHSCOPE_TOKEN_PLAN_BASE_URL:-}"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:-}"
+      DASHSCOPE_BASE_URL: "${DASHSCOPE_BASE_URL:-}"
+      ZHIPU_CODING_PLAN_API_KEY: "${ZHIPU_CODING_PLAN_API_KEY:-}"
+      ZHIPU_CODING_PLAN_BASE_URL: "${ZHIPU_CODING_PLAN_BASE_URL:-}"
+      ZHIPU_API_KEY: "${ZHIPU_API_KEY:-}"
+      ZHIPU_BASE_URL: "${ZHIPU_BASE_URL:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      OLLAMA_API_BASE: "${OLLAMA_API_BASE:-http://host.docker.internal:11434}"
+      # 网关侧 trace 环境标签（配置 Langfuse callback 后与 Agent 侧区分）
+      LANGFUSE_TRACING_ENVIRONMENT: gateway
+      OTEL_ENVIRONMENT_NAME: gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /health/liveliness（curl 优先；镜像为 python 基底——curl 缺失退化 python urllib）
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:4000/health/liveliness || python3 -c \"import urllib.request as u;u.urlopen('http://127.0.0.1:4000/health/liveliness',timeout=5)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ═══════════════════ 备源 · crawl4ai（Firecrawl 降级备胎，随基础 compose 常驻）═══════════════════
+  crawl4ai:
+    image: unclecode/crawl4ai:0.9.5
+    restart: always
+    shm_size: "1g"
+    ports:
+      - "127.0.0.1:11235:11235"
+    environment:
+      CRAWL4AI_API_TOKEN: "${CRAWL4AI_API_TOKEN:?Set CRAWL4AI_API_TOKEN in .env}"   # Bearer 鉴权（无 token 请求被拒）
+    # 无 depends_on——与主链并行起（备胎就位不阻塞主栈）
+    healthcheck:
+      # python 基底镜像（urllib 必在）；/health 端点
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request as u;u.urlopen('http://127.0.0.1:11235/health',timeout=5)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ═══════════════════ 执行面 · OpenSandbox（本批用户裁决提前部署，不挂 profile）═══════════════════
+  # 应用侧仍 SANDBOX_ENABLED=false（不启用），仅验基建面（M4 深验顺延）
+  opensandbox:
+    image: docker.io/opensandbox/server:release-1.1.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8801:8801"    # 沙箱 API（能创建容器=半个 root 入口，务必 127.0.0.1）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # 动态沙箱容器内回连宿主（Ollama/MinIO 等）
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      # 缺失即启动失败（fail fast）——无鉴权沙箱 API 不上线
+      OPENSANDBOX_SERVER_API_KEY: "${OPEN_SANDBOX_API_KEY:?Set OPEN_SANDBOX_API_KEY in .env}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock          # runtime=docker：由宿主 daemon 创建沙箱容器
+      - ./deploy/sandbox/opensandbox_config.toml:/etc/opensandbox/config.toml:ro
+      - opensandbox_server_data:/root/.opensandbox         # server 元数据（SQLite 等）
+      - ./data/sandbox:/root/.opensandbox/artifacts        # 产物卷：宿主 ./data/sandbox ↔ 容器产物根
+                                                           # （.env SANDBOX_ARTIFACTS_DIR 同路径；M4 直传 MinIO 为主通道，本卷兜底留存）
+    # 无 healthcheck：opensandbox server 镜像为 Go 静态二进制、无 curl/wget 可保证——探测留宿主侧
+    # （scripts/infra_smoke/sandbox_smoke.py 直探 127.0.0.1:8801）
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24      # 固定子网配合 nacos 钉 IP（2026-11-06 raft IP 漂移实证后增补）
+
+volumes:
+  postgres_data:
+  minio_data:
+  nacos_data:
+  nacos_logs:
+  clickhouse_data:
+  clickhouse_logs:
+  redis_data:
+  opensandbox_server_data:

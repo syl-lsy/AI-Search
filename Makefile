@@ -3,7 +3,57 @@
 
 .PHONY: dev dev-frontend test test-frontend test-frontend-unit test-frontend-integration \
         test-frontend-component test-unit test-integration test-e2e test-changed typecheck \
-        db-migrate db-upgrade db-downgrade
+        db-migrate db-upgrade db-downgrade \
+        preflight infra-up infra-down infra-ps infra-logs nacos-init smoke-infra
+
+# ── S0 基础设施（deploy/docker-compose.yml）────────────────────────────
+# compose 相对路径与 .env 都按 --project-directory 解析：必须从仓库根跑并显式指回仓库根
+# （compose 默认从 compose 文件所在目录 deploy/ 找 .env 与解析相对路径，会错位）。
+COMPOSE := docker compose --project-directory . -f deploy/docker-compose.yml
+
+# 起栈前置检查（端口空闲等）——独立目标，仅起栈前手动使用；不属 smoke 套件
+# （preflight 查「端口应空闲」，起栈后跑必假阳性，严禁混入 smoke-infra 循环）
+preflight:
+	python3 scripts/infra_smoke/preflight.py
+
+# 起 S0 基建栈（10 服务后台拉起；前置：make preflight 端口空闲 +
+# python3 scripts/infra_smoke/gen_env.py 生成 .env 容器侧密钥 + 上游密钥人工填好）
+infra-up:
+	$(COMPOSE) up -d
+
+# 停栈（保留数据卷——删卷=删库，须显式自行 `$(COMPOSE) down -v` 自担）
+infra-down:
+	$(COMPOSE) down
+
+infra-ps:
+	$(COMPOSE) ps
+
+infra-logs:
+	$(COMPOSE) logs -f --tail=100
+
+# Nacos 五 dataId 初始化（写操作，管理员凭据经环境变量注入，AI 不经手——nacos-config.md §8）：
+#   NACOS_INIT_USER=<管理员用户名> NACOS_INIT_PASS=<管理员密码> make nacos-init
+#   或：make NACOS_INIT_USER=... NACOS_INIT_PASS=...
+#   两种形态均正确透传——recipe 内 export 直取 make 变量（env 注入与命令行注入都成立），
+#   值不再经 shell 双引号重解释（密码含 $、反引号等特殊字符也安全）。
+# 前置：nacos 容器 healthy + 管理员改密 + namespace（名=ID=ai-search-dev）已建。
+# 覆写保护：已存在且与初值不同的 dataId 默认跳过（防线上热更值回滚）；确认覆盖加 NACOS_INIT_FORCE=1
+nacos-init:
+	export NACOS_INIT_USER NACOS_INIT_PASS; \
+		python3 scripts/nacos_init.py
+
+# S0 smoke 套件：起栈后七组件逐一跑并汇总 PASS/FAIL（任一 FAIL 整体非零退出；判定只基于七件）。
+# preflight.py（查端口空闲，起栈后跑必假阳性）与 gen_env.py 都是起栈前工具、不是 smoke——
+# 不进本循环：起栈前单独跑 make preflight + python3 scripts/infra_smoke/gen_env.py
+smoke-infra:
+	@overall=0; \
+	for s in postgres nacos minio langfuse litellm sandbox crawl4ai; do \
+		printf '== %s ==\n' "$$s"; \
+		if python3 scripts/infra_smoke/$${s}_smoke.py; then printf '%s: PASS\n' "$$s"; \
+		else printf '%s: FAIL\n' "$$s"; overall=1; fi; \
+	done; \
+	if [ $$overall -eq 0 ]; then printf 'smoke-infra: ALL PASS\n'; else printf 'smoke-infra: HAS FAIL\n'; fi; \
+	exit $$overall
 
 # ── 开发 ─────────────────────────────────────────────────────────────
 
@@ -57,11 +107,13 @@ test-changed:
 # ── 类型检查 ─────────────────────────────────────────────────────────
 
 # 前端：vue-tsc --noEmit 全量静态检查（含 .vue 模板表达式）
-# 后端段：骨架期先以 compileall 做语法级检查（真实命令形态，零新增依赖）；
+# 后端段：骨架期先以 compileall 做语法级检查（真实命令形态，零新增依赖），覆盖
+#   apps/search-api/app + scripts/（运维/烟测脚本同为 Python 交付物，一并入语法门禁；
+#   顶层 shebang 与 __main__ 块均为合法 Python，compileall 直接处理，无需排除）；
 #   lint/类型检查工具随 B1 钉死后替换为正式命令
 typecheck:
 	pnpm --filter frontend exec vue-tsc --noEmit
-	uv run --package search-api python -m compileall -q apps/search-api/app
+	uv run --package search-api python -m compileall -q apps/search-api/app scripts
 
 # ── 数据库迁移 ───────────────────────────────────────────────────────
 # alembic 服务自管：apps/search-api/alembic.ini（script_location = %(here)s/migrations）

@@ -1,14 +1,151 @@
 # =============================================================================
-# LiteLLM 网关配置 —— 占位文件（批次 1 实装）
+# LiteLLM 网关静态配置 —— 批次 1 S0 实装
 #
-# 模型别名→上游映射（上游 key 以 ${ENV} 引用 .env：ZHIPU_API_KEY / DEEPSEEK_API_KEY /
-#   DASHSCOPE_API_KEY；本地 Ollama 上游地址 OLLAMA_API_BASE）：
-#   - 6 个 chat 别名（chat-standard / chat-standard-glm / chat-standard-deepseek +
-#     chat-speed / chat-speed-glm / chat-speed-deepseek）各配三节 fallback 链
-#     （docs/ARCHITECTURE.md §5 部署拓扑表 litellm 行 / §6.2 / §6.7，v1.11 起）；
-#   - v1.19 起 + light 链（qwen3.5-4b-ollama → chat-speed 单节，§6.7/S14）；
-#   - num_retries 重试去重（v1.3）+ 静态 config.yaml 配 Router 熔断
-#     allowed_fails/cooldown_time（v1.5）。
-# 拓扑与端口：docs/ARCHITECTURE.md §5 部署拓扑表（litellm host 端口 4000）；变量见 §7。
+# 定位（docs/ARCHITECTURE.md §6.7 / docs/DEVELOPMENT-PROCESS.md §3.2 ②）：
+#   本文件 = 熔断（allowed_fails/cooldown_time）与 fallbacks 的【唯一】落地处——只在静态 config
+#   配，不在 UI 配；DB 模式 UI 的 Router/模型管理页同样不用。改本文件需重启 litellm 容器
+#   （make infra-up 或 docker compose --project-directory . -f deploy/docker-compose.yml up -d litellm），
+#   不是热更通道——运行时热更走 Nacos model.mapping（切换别名，nacos-config.md §5），与本文件解耦：
+#   别名是稳定契约面，上游真实 model id 是可变值。
+# 别名契约面（9 个）：chat-standard / chat-standard-glm / chat-standard-deepseek +
+#   chat-speed / chat-speed-glm / chat-speed-deepseek + qwen3.5-4b-ollama（light）+
+#   text-embedding-v4 + qwen3-rerank。
+# 上游引用纪律：api_key 一律 os.environ/<VAR>（值来自 .env 经 compose 注入 litellm 容器，可空占位
+#   不阻塞起栈）；api_base 同理（DeepSeek 单一官方地址除外——.env 不设该变量，见下注）。
+#   上游真实 model id 为「当前已知值」，S0-B 组逐字核对后更新（以各家控制台为准，尤其 DeepSeek
+#   flash 档位名——DEV §3.3；核对完成删除对应 TODO 注）。
+# 熔断参数初值：allowed_fails: 3 / cooldown_time: 60（对齐 nacos-config.md §2 MCP 熔断默认；
+#   链序与数值 M1 实测定）。embedding/rerank 单上游不配回退（ARCH §6.2/R3——降级路径见契约，
+#   不在此配 fallback，故也不配熔断参数）。
+# 供应商优先序：百炼 → 智谱 → DeepSeek（nacos-config.md §5 v1.7）。glm 主力两行的 fallback 接续序
+#   （[chat-*-deepseek, chat-*]，deepseek 在前）与契约「qwen→glm→deepseek 固定全序」的措辞差异
+#   为【2026-11-07 用户裁决：维持现状，链序 M1 建图实测（延迟/KV 缓存命中）后定】——契约本就预留
+#   「链序 M1 实测定」口子（nacos-config.md §5），实测后二选一收敛（改本文件或改契约措辞），零改码。
+# 百炼 chat 走 Token Plan 专属
+#   端点、智谱 chat 走 Coding Plan 专属端点（v1.23 凭证形态裁决），embedding/rerank 走百炼通用
+#   按量端点 + 标准 Key（Token Plan 不含向量/排序模型，官方文档定案）。
 # =============================================================================
-# 批次 1 实装前配置为空：本文件当前不含任何 model_list / router_settings。
+
+model_list:
+  # ── Standard 档（chat.options 三键消费：qwen / glm / deepseek）──
+  - model_name: chat-standard
+    litellm_params:
+      model: openai/qwen3.7-plus                    # TODO(S0-B组-逐字核对)：百炼控制台 chat 主力 id
+      api_base: os.environ/DASHSCOPE_TOKEN_PLAN_BASE_URL
+      api_key: os.environ/DASHSCOPE_TOKEN_PLAN_API_KEY
+      allowed_fails: 3                              # Router 熔断（§6.7 v1.5；数值 M1 实测定）
+      cooldown_time: 60
+    model_info:
+      mode: chat
+      input_cost_per_token: 2.82e-07       # ¥2/M 输入·¥8/M 输出（0-256K 非思考标准档 @7.1，2026-11-06 百炼价页；思考档输入 ¥8/M）
+      output_cost_per_token: 1.127e-06
+  - model_name: chat-standard-glm
+    litellm_params:
+      model: openai/GLM-5.3                         # TODO(S0-B组-逐字核对)：智谱控制台 chat 主力 id
+      api_base: os.environ/ZHIPU_CODING_PLAN_BASE_URL
+      api_key: os.environ/ZHIPU_CODING_PLAN_API_KEY
+      allowed_fails: 3
+      cooldown_time: 60
+    model_info:
+      mode: chat
+      input_cost_per_token: 1.127e-06       # ¥8/M 输入·¥28/M 输出 刊例 @7.1（2026-11-06 智谱定价页）
+      output_cost_per_token: 3.944e-06
+  - model_name: chat-standard-deepseek
+    litellm_params:
+      model: openai/deepseek-v4-pro                 # TODO(S0-B组-逐字核对)：DeepSeek 控制台 id
+      api_base: https://api.deepseek.com/v1         # DeepSeek 官方 OpenAI 兼容端点——单一官方地址，.env 不设变量（非密钥/端口类配置项）
+      api_key: os.environ/DEEPSEEK_API_KEY
+      allowed_fails: 3
+      cooldown_time: 60
+    model_info:
+      mode: chat
+      input_cost_per_token: 1.268e-06       # ¥9/M 输入(高峰·缓存未命中)·¥27/M 输出 @7.1（2026-11-06 DeepSeek 定价页：空闲减半；缓存命中 ¥0.30/M）
+      output_cost_per_token: 3.803e-06
+      cache_read_input_token_cost: 4.225e-08
+
+  # ── Speed 档（轻量 flash；chat-speed 为 model.mapping.memory 键 + light 链兜底别名）──
+  - model_name: chat-speed
+    litellm_params:
+      model: openai/qwen3.6-flash                   # ✅ 用户指定 Speed 档主力（2026-11-06）；Token Plan 套餐端点实测可用（双端点探针双过，套餐抵扣优先于按量）
+      api_base: os.environ/DASHSCOPE_TOKEN_PLAN_BASE_URL
+      api_key: os.environ/DASHSCOPE_TOKEN_PLAN_API_KEY
+      allowed_fails: 3
+      cooldown_time: 60
+    model_info:
+      mode: chat
+      input_cost_per_token: 1.690e-07       # ¥1.2/M 按量参考价 输入·¥7.2/M 输出 @7.1（2026-11-06 百炼价页；实际走 Token Plan 套餐抵扣，观测口径=按量机会成本）
+      output_cost_per_token: 1.014e-06
+  - model_name: chat-speed-glm
+    litellm_params:
+      model: openai/GLM-5.3-flash                   # TODO(S0-B组-逐字核对)：智谱 flash 档 id
+      api_base: os.environ/ZHIPU_CODING_PLAN_BASE_URL
+      api_key: os.environ/ZHIPU_CODING_PLAN_API_KEY
+      allowed_fails: 3
+      cooldown_time: 60
+    model_info:
+      mode: chat
+      input_cost_per_token: 5.634e-08       # ¥0.4/M 输入·¥1.4/M 输出 @7.1（2026-11-06 智谱定价页）
+      output_cost_per_token: 1.972e-07
+  - model_name: chat-speed-deepseek
+    litellm_params:
+      model: openai/deepseek-flash                  # TODO(S0-B组-逐字核对)：flash 档位名以控制台逐字核对为准
+      api_base: https://api.deepseek.com/v1
+      api_key: os.environ/DEEPSEEK_API_KEY
+      allowed_fails: 3
+      cooldown_time: 60
+    model_info:
+      mode: chat
+      input_cost_per_token: 2.82e-07       # ¥2/M 输入(高峰·缓存未命中)·¥8/M 输出 @7.1（2026-11-06 DeepSeek 定价页：空闲减半；缓存命中 ¥0.04/M）
+      output_cost_per_token: 1.127e-06
+      cache_read_input_token_cost: 5.634e-09
+
+  # ── light（本地 Ollama；v1.12 回退本地默认——ADR-008；宿主不可用时 fallback 链切 chat-speed 云端兜底）──
+  - model_name: qwen3.5-4b-ollama
+    litellm_params:
+      model: ollama/qwen3.5:4b                      # 宿主 Ollama 模型 tag（R7 结构化输出验证对象）
+      api_base: os.environ/OLLAMA_API_BASE          # http://host.docker.internal:11434（.env OLLAMA_API_BASE）
+      allowed_fails: 3
+      cooldown_time: 60
+
+  # ── embedding / rerank（百炼通用按量端点 + 标准 Key；单上游不配回退与熔断，见头注）──
+  - model_name: text-embedding-v4
+    litellm_params:
+      model: openai/text-embedding-v4               # 维度 1024 = KB_EMBEDDING_DIM（.env）；TODO(S0-B组-逐字核对)
+      api_base: os.environ/DASHSCOPE_BASE_URL
+      api_key: os.environ/DASHSCOPE_API_KEY
+    model_info:
+      mode: embedding
+      input_cost_per_token: 7.042e-08       # ¥0.5/M 仅输入计费 @7.1（2026-11-06 百炼价页）
+      output_cost_per_token: 0
+  - model_name: qwen3-rerank
+    litellm_params:
+      model: cohere/qwen3-rerank                    # ✅ Cohere 兼容通道直连百炼 compatible-api/v1/reranks（2026-11-06 实测 200 降序正确，用户指路）；openai/dashscope 前缀均不可走 rerank（源码+实测双证）
+      api_base: https://dashscope.aliyuncs.com/compatible-api/v1/reranks?via=/v1/rerank  # litellm cohere 路由强制以 /v1/rerank 结尾否则改写为单数路径（404）；?via= 为无害查询参数满足结尾校验、实际命复数端点（带参实测 200 不受影响）
+      api_key: os.environ/DASHSCOPE_API_KEY
+    model_info:
+      mode: rerank
+      input_cost_per_token: 7.042e-08       # ¥0.5/M 仅输入计费 @7.1（2026-11-06 百炼价页）
+      output_cost_per_token: 0
+
+router_settings:
+  num_retries: 0                                    # v1.3：网关重试去重——重试归 guards 代码层（Agent Spec retry），网关不重复重试
+  optional_pre_call_checks:
+    - session_affinity                              # 会话粘黏（§6.7/R9：x-litellm-session-id 原生支持性 S0 实测——
+                                                    #   不支持则降级为纯观测项，不作 TTFT 依赖手段）
+
+litellm_settings:
+  success_callback: ["otel"]                        # 网关侧 trace → Langfuse OTLP（B 组双 trace 网关侧；langfuse 旧式 callback 事件被 v4 ingestion schema 拒绝已实证，2026-11-06 改走 OTel）
+  fallbacks:
+    # 每档三节链（nacos-config.md §5：所选主力在前，其余两家按 qwen→glm→deepseek 固定全序接续）
+    - chat-standard: [chat-standard-glm, chat-standard-deepseek]
+    - chat-standard-glm: [chat-standard-deepseek, chat-standard]
+    - chat-standard-deepseek: [chat-standard, chat-standard-glm]
+    - chat-speed: [chat-speed-glm, chat-speed-deepseek]
+    - chat-speed-glm: [chat-speed-deepseek, chat-speed]
+    - chat-speed-deepseek: [chat-speed, chat-speed-glm]
+    # light 链（v1.12：本地主力 + 云端兜底单节——本地失败/冷却 → chat-speed）
+    - qwen3.5-4b-ollama: [chat-speed]
+  drop_params: true                                 # 上游不识别的 OpenAI 附加参数静默丢弃
+  set_verbose: false
+  request_timeout: 120                              # 网关兜底超时（图内超时以 Agent Spec 为准，先熔于此防悬挂）
+  telemetry: false                                  # 匿名遥测关闭——数据不出本机（与观测走自托管 Langfuse 同口径）
