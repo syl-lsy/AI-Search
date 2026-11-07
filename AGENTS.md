@@ -8,9 +8,9 @@
 
 | 文档 | 管什么 |
 |---|---|
-| `docs/PRD.md`（v1.11） | 做什么：REQ-001~047、验收 A1~A30、里程碑 M1~M6（实验/可选功能 REQ-046/047 带 P2 降级口径；fast 答案 ≤3000 字硬上限、P50 ≤30s） |
-| `docs/ARCHITECTURE.md`（v1.26） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口 + 宿主重映射，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15（§10 已落 S0 六项结论） |
-| `docs/DEVELOPMENT-PROCESS.md`（v1.17） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
+| `docs/PRD.md`（v1.13） | 做什么：REQ-001~047、验收 A1~A32（A31 评测维度集 / A32 评测数据集增量与治理）、里程碑 M1~M6（实验/可选功能 REQ-046/047 带 P2 降级口径；fast 答案 ≤3000 字硬上限、P50 ≤30s） |
+| `docs/ARCHITECTURE.md`（v1.30） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口 + 宿主重映射，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15（§10 已落 S0 六项结论） |
+| `docs/DEVELOPMENT-PROCESS.md`（v1.20） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
 | `docs/PROGRESS.md` | 进度总览活文档：M1 完成流程图、批次状态表、每环节文档巡检记录。**每闭环一个环节必须更新**（巡检规则见 DEV §10.1） |
 | `docs/contract/api.md`、`data-model.md`、`nacos-config.md`、`frontend-api.md`、`memory-api.md`、`memory-data-model.md` | 冻结契约：REST+SSE 协议、DDL 与迁移、Nacos 五 dataId、前端映射。**字段/事件/表结构以此为准，禁止私改** |
 | `docs/design/`（4 个 HTML + `tokens.css` + `设计说明.md` + `reference/` 对照截图） | 已确认的视觉基准，前端样式必须用 tokens |
@@ -21,7 +21,7 @@
 ## 计划中的仓库布局与命令（开工时按此脚手架，勿自创）
 
 - 双 workspace：根 `pyproject.toml` **仅 workspace 定义**（`members=["apps/*"]`，虚拟根不声明 `[project]`——声明后 `uv sync` 不装成员依赖）+ `pnpm-workspace.yaml`（`packages=["frontend"]`）。后端服务 `apps/search-api/`（导入名 `search_api`），前端 `frontend/`。
-- 全部命令从仓库根跑（`env_file` 相对运行时 cwd 解析，禁止换目录裸跑）：`make dev`（后端 :8300）/ `make dev-frontend`（:5173）/ `make test` / `make test-unit` / `make test-integration` / `make test-e2e` / `make test-frontend*` / `make typecheck`（前端 vue-tsc + 后端/脚本 compileall）/ `make db-migrate|db-upgrade|db-downgrade`；基建族（S0 已闭环）：`make infra-up|infra-down|infra-ps|infra-logs` / `make preflight`（起栈前端口预检）/ `make smoke-infra`（七组件 smoke）/ `make nacos-init`（五 dataId 发布，管理员凭据 inline 注入；已存在且内容不同默认跳过，覆盖加 `NACOS_INIT_FORCE=1`）。**compose 必须从仓库根跑**（`make infra-*` 已封装 `--project-directory .`；裸调 docker compose 漏该参数会在 deploy/ 目录找 .env，配置校验必败——S0 P0 坑）。
+- 全部命令从仓库根跑（`env_file` 相对运行时 cwd 解析，禁止换目录裸跑）：`make dev`（后端 :8300）/ `make dev-frontend`（:5173）/ `make test` / `make test-unit` / `make test-integration` / `make test-e2e` / `make test-frontend*` / `make typecheck`（前端 vue-tsc + 后端/脚本 compileall）/ `make db-migrate|db-upgrade|db-downgrade`；基建族（S0 已闭环）：`make infra-up|infra-down|infra-ps|infra-logs` / `make preflight`（起栈前端口预检）/ `make smoke-infra`（七组件 smoke）/ `make nacos-init`（五 dataId 发布，管理员凭据 inline 注入；已存在且内容不同默认跳过，覆盖加 `NACOS_INIT_FORCE=1`）。**compose 必须从仓库根跑**（`make infra-*` 已封装 `--project-directory .`；裸调 docker compose 漏该参数会在 deploy/ 目录找 .env，配置校验必败——S0 P0 坑）。**改单文件 bind 挂载的配置（litellm config.yaml / sandbox toml / nacos plugin-states.json）后必须 `up -d --force-recreate <服务>`**：macOS Docker 下编辑器 rename 替换 inode 会使容器内旧文件解链（进程 open 报 FileNotFoundError，restart 无效）——2026-11-07 litellm UI Models 页 500 实证。
 - 分层铁律：`api/` 只做路由与校验，业务在 `services/`，**API 层不直接调 LangGraph**；`schemas/`（DTO）≠ `db/models/`（ORM）；service 只 flush 不 commit（事务边界在 `get_db`；TurnRunner/KB worker 为短事务例外）；图节点保持纯函数，持久化由 TurnRunner 消费事件流完成。
 - 依赖方向：`api/ → services/ → agent/ → config_center/`；agent 永不 import api；core/ 横切。
 

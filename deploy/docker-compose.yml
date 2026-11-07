@@ -91,8 +91,14 @@ x-langfuse-common-env: &langfuse-common-env
                                                     #   空值 = Halo 未启用
   LANGFUSE_AI_BASE_URL: http://litellm:4000/v1      # 容器网内直连——注意用 litellm **容器内端口 4000**
                                                     #   （宿主 4100 仅供宿主进程，2026-11-07 实测 4100 自容器内
-                                                    #   ECONNREFUSED）；Halo 自有 client，不受 LLM Connections
-                                                    #   的 SSRF 白名单变量约束
+                                                    #   ECONNREFUSED）
+  # ↓ SSRF 白名单（v1.28 修复，2026-11-07 实证）：Halo（Ask AI）调用 baseURL 时同样过 LLM Connections
+  #   的 SSRF 内网 IP 检查——litellm 解析为 172.31.x.x 触发 "Blocked IP address detected"（v1.27 注
+  #   「Halo 自有 client 不受此约束」被实证否定），请求发出前即被拦、litellm 侧零到达。hostname 命中
+  #   白名单即跳过 IP 检查（bundle 取证：whitelist.hosts.includes(hostname) 短路；官方文档 §LLM
+  #   Connections / §Hardening）。web+worker 共享本块，双容器生效（官方 compose 漏传该变量已知 bug
+  #   langfuse#16012，故必须显式自配）
+  LANGFUSE_LLM_CONNECTION_WHITELISTED_HOST: litellm
 
 services:
   # ═══════════════════ 存储面 · PostgreSQL + pgvector ═══════════════════
@@ -299,7 +305,11 @@ services:
     ports:
       - "127.0.0.1:4100:4000"
     volumes:
-      - ./deploy/litellm/config.yaml:/app/config.yaml:ro    # 熔断/fallback 唯一落地处（§6.7 不进 UI）；改后重启生效
+      # 熔断/fallback 唯一落地处（§6.7 不进 UI）；改后 **必须 recreate**（up -d --force-recreate litellm）：
+      # 单文件 bind mount 在 macOS Docker 下，宿主编辑器以 rename 替换 inode 后容器内旧 inode 解链——
+      # 进程 open() 报 FileNotFoundError（2026-11-07 实证 837 次，UI Models 页 500「Internal server
+      # error」、docker restart 无效须 recreate 重新 bind；restart: always 自愈不了此坑）
+      - ./deploy/litellm/config.yaml:/app/config.yaml:ro
     environment:
       # DB 模式：postgres 第三库 litellm（库名/角色名 = deploy/postgres/init.sh 建的 litellm/litellm）
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in .env}"   # 运行态凭据=Master Key（.env LITELLM_API_KEY 同值，不建虚拟 key）
