@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -7,11 +8,14 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy import select
 from starlette.exceptions import HTTPException
 
-from app.core.config import common_settings, web_settings
-from app.core.logger import setup_logging
+from app.api.v1.health import router as health_router
+from app.core.config import common_settings
+from app.core.logger import CronLog, setup_logging
 from app.core.middleware import register_middleware
 from app.core.openapi import setup_openapi
-from app.db.session import get_engine
+from app.crons import CRON_TASKS, CronTask
+from app.db.models import Turn
+from app.db.session import get_session_factory
 from app.exception import BusinessException
 from app.exception.handler import exception_handler, generate_error_docs
 
@@ -34,6 +38,78 @@ _silence_uvicorn_loggers()
 setup_logging()
 
 
+# ---- 启动钩子：孤儿轮清理（data-model.md §4 / api.md §7.3 第 4 条 / ARCH §3.1）----
+
+# 孤儿判定状态集：running；v1.5 起 queued 同口径（ThreadScheduler 队列是进程内存态、
+# 重启即失）。pending 为「创建→启动」毫秒级瞬时态，不进清理集（api.md §0 409001 行注）。
+_ORPHAN_TURN_STATUSES: tuple[str, ...] = ("running", "queued")
+
+# 孤儿轮 error 载荷（turns.error 契约形态 {code,message,stage_key}，data-model.md §1.3）：
+# code 取错误码表兜底 500001——api.md §0 冻结表无「进程重启」专属码，不为非 HTTP 面
+# 私增错误码；message 用户可读、指向重问（api.md §7.3 第 4 条）；stage_key=startup——
+# 失败裁定发生在任何图节点之前，时间线上无节点可指，以启动清理上下文标注。
+_ORPHAN_TURN_ERROR: dict[str, str] = {
+    "code": "500001",
+    "message": "服务重启导致本轮中断，请重新提问",
+    "stage_key": "startup",
+}
+
+
+async def _cleanup_orphan_turns() -> int:
+    """孤儿轮清理（启动钩子一次性）：running/queued → failed（error=进程重启）。
+
+    进程重启时进行中轮的执行体（TurnRunner 的进程内 asyncio 任务 / ThreadScheduler
+    的内存队列）已随进程消失，这些轮永远等不到终态——启动期一次性置 failed，用户可
+    重新提问（api.md §7.3 第 4 条）；幂等可重入：清理后不再有 running/queued 轮，
+    重复启动零副作用。返回影响行数（0 = 无孤儿）。
+
+    事务自管（lifespan 无请求级 get_db，短事务模式）：独立 AsyncSession 一次 commit；
+    turns ORM 实体级变更（select 表达式全参数绑定，session.scalars() 取实体行），
+    失败由 lifespan 捕获记日志、不阻塞启动（恢复型 best-effort，就绪探针如实反映
+    db 状态）。
+    """
+    async with get_session_factory()() as session:
+        orphans = (
+            await session.scalars(
+                select(Turn).where(Turn.status.in_(_ORPHAN_TURN_STATUSES))
+            )
+        ).all()
+        for turn in orphans:
+            turn.status = "failed"
+            turn.error = _ORPHAN_TURN_ERROR
+        await session.commit()
+        return len(orphans)
+
+
+# ---- 周期任务注册（app/crons/ 注册表 → 进程内 asyncio 周期任务，ADR-001/010）----
+
+
+async def _cron_loop(task: CronTask) -> None:
+    """单任务常驻循环（crons/__init__.py 调度口径）：立即执行首轮 → sleep(interval) 循环。
+
+    任务异常不中断循环——记 CronLog.error 后进入下个周期重试（trace_cleanup 的
+    「查询失败本周期放弃、下周期重试」语义即按此消费）；CancelledError 是
+    BaseException、不落入 except，原样上抛交由停机优雅取消收口。
+    """
+    while True:
+        try:
+            await task.coroutine_factory()
+        except Exception as exc:
+            CronLog(
+                message=f"周期任务 {task.name} 执行失败——本周期放弃，下个周期重试",
+                task=task.name,
+            ).error(exc)
+        await asyncio.sleep(task.interval_seconds)
+
+
+def _register_cron_tasks() -> list[asyncio.Task[None]]:
+    """遍历 CRON_TASKS 注册表，为每项建常驻周期任务（Task name 供运行期排查）。"""
+    return [
+        asyncio.create_task(_cron_loop(task), name=f"cron:{task.name}")
+        for task in CRON_TASKS
+    ]
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """启动钩子：再关一次 uvicorn 标准库 logger（幂等，理由见下）。
@@ -44,20 +120,55 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     此后含访问日志在内的 uvicorn 输出都走 loguru 单管线（只剩 uvicorn 起跑前
     的 Started server process / Waiting for application startup 两行由 CLI 打出）。
 
-    ai-search（B1 工单待补，骨架阶段不提前实现）：
-    - 启动钩子（一次性）：默认用户 seed / KB 队列恢复 / 孤儿轮清理（running/queued 置 failed）；
-    - 周期任务注册：app/crons/ 任务注册表 → 进程内 asyncio 周期任务（ADR-001/010）。
+    启动钩子（一次性，先于周期任务——应用先恢复一致状态再开始后台工作）：
+    - 孤儿轮清理：running/queued 置 failed（error=进程重启），见 _cleanup_orphan_turns；
+      失败记日志不阻塞启动（恢复型 best-effort，幂等可重入、下次重启补做）；
+    - 默认用户 seed：不在钩子做——迁移 0001 幂等 seed 承担（app/db/seed.py，
+      data-model.md §1.1/§4；钩子不重复承担 seed 职责）；
+    - KB 队列恢复（M3/B5 落地锚点，data-model.md §4）：进程启动时将
+      status IN (pending,parsing,embedding) 的 kb_documents 重新入队（进程内队列
+      无持久化，重启即恢复处理）——随 0003 迁移与 kb_service 队列一并接线。
+
+    周期任务注册：CRON_TASKS → 进程内 asyncio 周期任务（非 LangGraph Agent Server
+    cron，本项目无 Agent Server，ADR-001/010）；停机逐个 cancel + gather 收口，
+    CancelledError 不外泄。
     """
     _silence_uvicorn_loggers()
-    yield
+
+    try:
+        cleaned = await _cleanup_orphan_turns()
+    except Exception as exc:
+        # task 字段复用为启动钩子标识：与 crons 同为无请求上下文的后台任务，同口径落 CronLog
+        CronLog(
+            message="启动钩子孤儿轮清理失败——本次跳过，下次重启补做",
+            task="startup_hook",
+        ).error(exc)
+    else:
+        if cleaned:
+            CronLog(
+                message=f"启动钩子孤儿轮清理完成：{cleaned} 条进行中轮置 failed",
+                task="startup_hook",
+                total=cleaned,
+            ).info()
+
+    # KB 队列恢复（M3/B5 落地，锚点见 docstring）：kb_documents 过期态重新入队。
+
+    cron_handles = _register_cron_tasks()
+    try:
+        yield
+    finally:
+        for handle in cron_handles:
+            handle.cancel()
+        await asyncio.gather(*cron_handles, return_exceptions=True)
 
 
 # 生产环境隐藏文档入口（/docs、/redoc、/openapi.json 全部关闭）
-_hide_docs = common_settings.environment == "production"
+_hide_docs = common_settings.app_env == "production"
 
 app = FastAPI(
     lifespan=lifespan,
-    title=web_settings.app_name,
+    # 应用名是纯代码常量（配置三分法：ARCH §7 通用组无 APP_NAME 变量），不入 .env
+    title="AI Search API",
     # /docs 的「错误码说明」由 ERROR_MAP 自动生成
     description=generate_error_docs(),
     docs_url=None if _hide_docs else "/docs",
@@ -85,36 +196,10 @@ app.add_exception_handler(HTTPException, exception_handler)
 app.add_exception_handler(BusinessException, exception_handler)
 app.add_exception_handler(Exception, exception_handler)
 
+# 双健康探针（api.md §1，不走信封故挂根路径而非 /api/ 前缀）：/health 存活 +
+# /health/ready 就绪（四组件并行探活，实现在 app/api/v1/health.py）。
+app.include_router(health_router)
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    """存活探针（Liveness Probe）：只证明进程能响应请求，不依赖外部服务。
-
-    K8s 每 30 秒调用一次，连续失败 3 次判定 Pod 死亡并重启；
-    因此这里绝不能加数据库/外部服务检查——依赖抖动会误杀健康的 Pod。
-    """
-    return {"status": "ok"}
-
-
-@app.get("/health/ready")
-async def health_ready() -> dict[str, str]:
-    """就绪探针（Readiness Probe）：检查数据库连通性（SELECT 1），不抛异常。
-
-    K8s 每 10 秒调用一次，连续失败 3 次将该 Pod 从 Service 转发列表摘除
-    （不重启，仅不接收新流量），待恢复后自动重新加入。
-    探测失败用 200 + 状态字段表达（而非 5xx）：探针语义是「答「未就绪」」，
-    不是「接口出错」，避免把编排系统与监控系统引入误判。
-    """
-    try:
-        engine = get_engine()
-        async with engine.connect() as conn:
-            # 表达式层构造等价 "SELECT 1"（非原始 SQL 字符串）；scalar 取首列执行即完成探活
-            await conn.scalar(select(1))
-        return {"status": "ok", "database": "connected"}
-    except Exception:
-        return {"status": "not ready", "database": "disconnected"}
-
-
-# 路由在 app/api/v1/ 中以 APIRouter 定义，统一在这里挂载（B1/B2 工单）：
+# 其余路由在 app/api/v1/ 中以 APIRouter 定义，统一在这里挂载（B2 工单）：
 # from app.api.v1 import threads
 # app.include_router(threads.router)

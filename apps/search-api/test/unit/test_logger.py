@@ -26,6 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 from loguru import logger
 
+from app import main
 from app.core.config import common_settings, log_settings
 from app.core.logger import (
     DBLog,
@@ -46,7 +47,7 @@ def test_setup_logging_production_uses_single_json_sink(monkeypatch):
     """production：清默认 sink → 只挂 stdout、serialize=True（单行 JSON）、级别走 LOG_LEVEL。"""
     mock_logger = MagicMock()
     monkeypatch.setattr("app.core.logger.log_record.logger", mock_logger)
-    monkeypatch.setattr(common_settings, "environment", "production")
+    monkeypatch.setattr(common_settings, "app_env", "production")
     monkeypatch.setattr(log_settings, "level", "WARNING")
 
     setup_logging()
@@ -67,7 +68,7 @@ def test_setup_logging_development_adds_console_and_error_file_sink(monkeypatch,
     """development：彩色控制台 + ERROR 文件 sink（目录自动创建、轮转与保留策略齐备）。"""
     mock_logger = MagicMock()
     monkeypatch.setattr("app.core.logger.log_record.logger", mock_logger)
-    monkeypatch.setattr(common_settings, "environment", "development")
+    monkeypatch.setattr(common_settings, "app_env", "dev")
     monkeypatch.setattr(log_settings, "file_dir", str(tmp_path / "logs"))
 
     setup_logging()
@@ -263,12 +264,20 @@ async def test_service_logger_failure_path_swallows_id_extractor_errors(log_reco
 
 # ---- uvicorn 标准库日志关闭（日志单管线）----
 
-def test_lifespan_re_silences_uvicorn_loggers():
+def test_lifespan_re_silences_uvicorn_loggers(monkeypatch: pytest.MonkeyPatch):
     """启动钩子再关一次 uvicorn logger：uvicorn 每次启动都会用 dictConfig 重置 disabled。
 
     回归守卫：仅在模块级关一次是不够的（`fastapi dev` 先导入应用再配置 uvicorn 日志），
     进入 lifespan 后访问日志/错误日志必须保持关闭，请求日志只由 logging 中间件出。
+    本用例只验日志语义——启动钩子（孤儿轮清理）与周期任务注册表换 mock（B1 起
+    lifespan 会真连库/真调度，unit 层零网络零库，见 test_main.py 的钩子专项测试）。
     """
+
+    async def _noop_cleanup() -> int:
+        return 0
+
+    monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+    monkeypatch.setattr(main, "CRON_TASKS", [])
     logging.getLogger("uvicorn.error").disabled = False  # 模拟被 uvicorn 配置重置
     logging.getLogger("uvicorn.access").disabled = False
 

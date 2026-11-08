@@ -15,12 +15,19 @@ dependencies = [
     "pydantic",                # 版本随 fastapi[standard]/pydantic-settings 由解析器约束，uv.lock 快照定版
     "pydantic-settings==2.16.0",
     "loguru==0.7.3",
+    # B1 双健康探针出站探活（MinIO /minio/health/live + LiteLLM 轻量探活，api.md §1.2）：
+    # httpx 升为运行依赖（== 锁定，与 dev 组同版）——原「骨架期 app 代码不引用」口径随探针落地解除
+    "httpx==0.28.1",
     # ── AI 栈：== 锁定（ARCH v1.21 依赖策略「AI 依赖取当日稳定版锁定」；锁定值 = 2026-11-04 uv.lock 定版快照）
     "langgraph>=1.1",          # ARCH 版本下限例外（deep 流式 subgraphs=True + StreamPart v2，§6.1）
     "langchain==1.4.9",        # 2026-11-04 当日稳定版锁定
     "langchain-openai==1.7.4", # R8：ReasoningChatModel 覆写私有 API——锁版本 + 单测护栏（护栏单测 B1 落，ARCH §6.7）
     "langchain-mcp-adapters==0.3.2",
     "deepagents>=0.5.3",       # ARCH 版本下限例外（子代理 response_format=SummarySchema，ARCH S15）
+    # R15：nacos-sdk-python 3.2.0 × Nacos server v3.2.4 三链路已验证（s0-batch1-handoff.md 续 10）。
+    # 锁版本 + 单测护栏（登录硬编码 v1 兼容端点 /nacos/v1/auth/users/login——上游收掉 v1 auth 即断，
+    # R8 同口径）；导入名 v2.nacos、方法全 asyncio 协程
+    "nacos-sdk-python==3.2.0",
 ]
 
 [build-system]
@@ -32,11 +39,12 @@ build-backend = "hatchling.build"
 packages = ["app/"]
 
 # 开发/测试依赖（不随生产安装）：三层测试（unit/integration/e2e）与调试
-# httpx = integration ASGITransport / e2e 轮询（ARCH dev 组锚点项；骨架期 app 代码不引用）
+# httpx = integration ASGITransport / e2e 轮询（ARCH dev 组锚点项；运行依赖侧已按
+#   B1 探针出站需要显式声明，两侧同版本 ==0.28.1）
 # debugpy = 断点调试器（ARCH dev 组锚点项；派单口径写作 "debuggy"，实为基座模板的 debugpy——
 #   PyPI "debuggy" 是无关的 StackOverflow 检索工具，非调试器）
-# conftest 的 load_dotenv 所需 python-dotenv 经 pydantic-settings 传递依赖可用（其硬依赖），
-# 按 ARCH dev 组锚点（pytest 家族/httpx/debuggy/psycopg2-binary）不显式声明
+# conftest 的 load_dotenv 所需 python-dotenv：B1 工具链钉版起显式声明（== 锁定；
+# 与 pydantic-settings 传递引入版本一致），不再依赖传递依赖的隐式可用性
 [dependency-groups]
 dev = [
     "pytest==9.1.1",
@@ -45,7 +53,18 @@ dev = [
     "httpx==0.28.1",
     "debugpy==1.8.22",
     "psycopg2-binary==2.9.13",
+    # B1 工具链钉版（2026-11-07 PyPI 当日稳定版）：pyright（basic 类型检查）+
+    # ruff（lint），范围与配置见仓库根 pyproject [tool.pyright]/[tool.ruff]，
+    # 命令入口 make typecheck-backend（替换骨架期 compileall 段）
+    "pyright==1.1.414",
+    "ruff==0.17.4",
+    "python-dotenv==1.2.4",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "requires_db: 需要真实 PostgreSQL（读仓库根 .env.test 的 DB_ 组；缺凭证/库不可达时 skip）",
+    "requires_nacos: 需要 Nacos 运行（读 .env.test NACOS_ 组；缺凭证时 skip）",
+    "requires_langfuse: 需要 Langfuse 运行（读 .env.test LANGFUSE_ 组；缺凭证时 skip）",
+]

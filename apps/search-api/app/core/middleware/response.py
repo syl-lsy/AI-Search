@@ -41,8 +41,11 @@ async def unified_response(
     ):
         return response
 
+    # call_next 的静态注解是 Response，运行期恒为 BaseHTTPMiddleware 的私有
+    # _StreamingResponse（直接继承 Response、自带 body_iterator）——经 getattr 取
+    # 流式体（属性边界收敛；缺失时与原实现同样 AttributeError，行为不变）
     body = b""
-    async for chunk in response.body_iterator:
+    async for chunk in getattr(response, "body_iterator"):
         body += chunk
 
     data = json.loads(body) if body else None

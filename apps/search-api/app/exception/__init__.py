@@ -5,7 +5,8 @@
 错误码文档（/docs 的「错误码说明」）会随之自动更新。
 """
 from app.exception.base import BusinessException
+from app.exception.config_center import ConfigCenterException
 from app.exception.database import DatabaseException
 from app.exception.not_found import NotFoundException
 
-__all__ = ["BusinessException", "DatabaseException", "NotFoundException"]
+__all__ = ["BusinessException", "ConfigCenterException", "DatabaseException", "NotFoundException"]
