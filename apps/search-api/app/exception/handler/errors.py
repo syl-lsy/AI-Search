@@ -6,6 +6,7 @@
 """
 from fastapi.exceptions import RequestValidationError
 
+from app.exception.config_center import ConfigCenterException
 from app.exception.database import DatabaseException
 from app.exception.not_found import NotFoundException
 
@@ -13,6 +14,7 @@ ERROR_MAP: dict[type, tuple[str, int, str]] = {
     RequestValidationError: ("422001", 422, "数据验证错误"),
     DatabaseException: ("422001", 422, "数据验证错误"),
     NotFoundException: ("404001", 404, "资源不存在"),
+    ConfigCenterException: ("503001", 503, "配置中心不可达且无缓存"),
     Exception: ("500001", 500, "服务器内部错误"),
 }
 

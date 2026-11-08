@@ -7,7 +7,7 @@
 - `is_stream` 标志 / 204 / HEAD 请求跳过包装；
 - 包装后保留原状态码与响应头（含多值头：双 Set-Cookie 逐条保留），
   且每个响应都带 `X-Process-Time`（毫秒数字）；
-- 注册表顺序（process_time → logging → response）与类式中间件挂载；
+- 注册表顺序（process_time → logging → response → cors）与类式中间件挂载；
 - **请求日志「每请求恰一条」**：成功请求产出 SUCCESS 记录（带 uuid4 request_id、
   真实状态码、method/path）；异常请求不出 SUCCESS 记录（由全局处理器按级落）。
 
@@ -182,13 +182,17 @@ def test_wrapped_body_is_valid_json_of_original():
 # ---- 注册表对类式中间件的行为 ----
 
 def test_middleware_registry_order_includes_logging():
-    """注册表三项且顺序固定：process_time → logging → response（越靠后越靠外）。
+    """注册表四项且顺序固定：process_time → logging → response → cors（越靠后越靠外）。
 
-    response（统一信封）必须最靠外：最后拿到响应才能读到 process_time 写的响应头；
-    logging（请求日志）在它里面、process_time 外面：call_next 返回后立即记，
-    且不越过信封层改动响应体。
+    cors（CORS）必须最靠外：预检 OPTIONS 在此短路（不进信封/日志内层），
+    业务错误响应也带 CORS 头（前端才能读到错误体）；
+    response（统一信封）在 cors 之内：最靠外的「业务中间件」，最后拿到响应
+    才能读到 process_time 写的响应头并对响应体做信封包装；
+    logging（请求日志）在 response 里面、process_time 外面：call_next 返回后
+    立即记（含真实状态码），且不越过信封层改动响应体。
     """
     from app.core.middleware import MIDDLEWARES
+    from app.core.middleware import cors
     from app.core.middleware import logging as logging_middleware
     from app.core.middleware import process_time, response
 
@@ -196,7 +200,43 @@ def test_middleware_registry_order_includes_logging():
         process_time.MIDDLEWARE,
         logging_middleware.MIDDLEWARE,
         response.MIDDLEWARE,
+        cors.MIDDLEWARE,
     ]
+
+
+# ---- CORS 中间件：读通用组 cors_origins，注册表最外层 ----
+
+def test_cors_allows_whitelisted_origin():
+    """白名单源（通用组默认 localhost:5173 双源）响应带 Access-Control-Allow-Origin。"""
+    resp = TestClient(app).get("/health", headers={"Origin": "http://localhost:5173"})
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_cors_rejects_unknown_origin():
+    """非白名单源不带 CORS 头（由浏览器侧拦截——CORS 协议语义，服务端照常应答）。"""
+    resp = TestClient(app).get("/health", headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 200
+    assert "access-control-allow-origin" not in resp.headers
+
+
+def test_cors_preflight_short_circuits_before_envelope():
+    """预检 OPTIONS 在 CORS 层短路：不进 /api/ 信封（PlainText "OK" 不得被包成 JSON）。
+
+    若 cors 被挪到信封内层，/api/ 路径的预检响应会被统一信封改写
+    （json.loads("OK") 失败兜底成 500001）——按原生预检响应形态守住注册表顺序。
+    """
+    resp = TestClient(app).options(
+        "/api/_test_echo",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.text == "OK"
 
 
 def test_register_middleware_supports_class_middleware(monkeypatch):

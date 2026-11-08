@@ -9,9 +9,12 @@
 新增中间件 = 新建文件 + 把它加进下面的 MIDDLEWARES 列表。
 
 注册顺序：starlette 每注册一个中间件都插到内部列表头部，因此 **MIDDLEWARES 里
-越靠后的中间件越靠外**——最先收到请求、最后拿到响应。两个位置约束：
-- response.MIDDLEWARE（统一信封）放最后：最外层才能最后拿到响应，读到内层
-  process_time 已写好的响应头，并对内层产出的响应体做信封包装；
+越靠后的中间件越靠外**——最先收到请求、最后拿到响应。三个位置约束：
+- cors.MIDDLEWARE（CORS）放最后（最外层）：预检 OPTIONS 在此短路返回（不进
+  信封/日志内层），且业务错误响应也带 CORS 头；
+- response.MIDDLEWARE（统一信封）放 cors 之内：最靠外的「业务中间件」才能
+  最后拿到响应，读到内层 process_time 已写好的响应头，并对内层产出的响应体
+  做信封包装；
 - logging.MIDDLEWARE（请求日志）放它里面、process_time 外面：`call_next` 返回后
   立即记请求日志（含真实状态码），且不越过信封层改动响应体。
 函数式与类式中间件按列表顺序统一处理，不区分先后规则。
@@ -21,12 +24,13 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from app.core.middleware import logging, process_time, response
+from app.core.middleware import cors, logging, process_time, response
 
 MIDDLEWARES: list[tuple[Any, dict[str, Any]]] = [
     process_time.MIDDLEWARE,
     logging.MIDDLEWARE,
     response.MIDDLEWARE,
+    cors.MIDDLEWARE,
 ]
 
 

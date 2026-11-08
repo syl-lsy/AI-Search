@@ -2,15 +2,15 @@
 
 类 Perplexity 的自建 AI 搜索引擎：快速模式（多源搜索 → ≤3000 字上限内带引用综合回答，篇幅按题型软引导，P50 ≤30s）+ 深度模式（deepagents 子代理并行研究 → 分节带引用报告）+ 个人知识库融合，全程引用可溯源、成本可观测。
 
-**当前阶段（2026-11-07）**：M1 实施计划 v4 **已获批**（`.zcode/plans/plan-m1-v4-20261104.md`），**批次 0 工程骨架已闭环 + 批次 1 S0 基础设施已闭环（2026-11-07：五件套全部闭环、§3.2 初始化、B 组验证面清零——五类 smoke 5/5、R1/R7/R9/R12①/R15 通过、R11 回退路径定档【开发期 Coding Plan、上线前切按量】、双 trace、评测能力 6/6；code-reviewer/security-auditor 终审过、§10.1 巡检落档）**。下一批 = **批次 2 B1 底座**（config.py 分组/settings 单例/核心骨架，按 DEV §4；前置输入：R15 SDK 3.2.0 五坑、R7 max_tokens 8192 与冷启动、R12 超时 ≥10s——详见 `docs/s0-batch1-handoff.md` 续 10/11）。**每环节闭环后执行文档巡检并更新 `docs/PROGRESS.md`（DEV §10.1）**。进度实况见 `docs/PROGRESS.md`。
+**当前阶段（2026-11-07）**：M1 实施计划 v4 **已获批**（`.zcode/plans/plan-m1-v4-20261104.md`），**批次 0 + 批次 1 S0 + 批次 2 B1 底座均已闭环**（批次 2 于 2026-11-07：config 分组/settings 单例、CORS、db 会话、五表 ORM+迁移 0001（含默认用户 seed）、config_center 三层、EventBus（线程级 seq）、双探针（ready 四组件 503 口径）、crons+trace_cleanup、ReasoningChatModel 护栏（R8）、pyright+ruff 钉版（Makefile `typecheck-backend`）；门禁绿：unit 320 passed + integration 4 passed/5 skipped（NACOS_/LANGFUSE_ 凭证门控）+ 后端覆盖率 97.78%（≥80%）+ typecheck-backend 零告警；§10.1 巡检落档）。下一批 = **批次 3 B2 线程轮次（桩主图）**（threads/turns REST + TurnRunner 骨架——桩主图走完整事件管线、TurnRunner 自此统一 invoke 主图单例 + ThreadScheduler 四策略（409001）+ 迁移 0008；B1 遗留接线项随 B2 同批：main.py lifespan 接 config_center/EventBus、/health/ready 加 nacos degraded 位）。**每环节闭环后执行文档巡检并更新 `docs/PROGRESS.md`（DEV §10.1）**。进度实况见 `docs/PROGRESS.md`。
 
 ## 文档地图（改任何东西前先读对应文档）
 
 | 文档 | 管什么 |
 |---|---|
-| `docs/PRD.md`（v1.13） | 做什么：REQ-001~047、验收 A1~A32（A31 评测维度集 / A32 评测数据集增量与治理）、里程碑 M1~M6（实验/可选功能 REQ-046/047 带 P2 降级口径；fast 答案 ≤3000 字硬上限、P50 ≤30s） |
-| `docs/ARCHITECTURE.md`（v1.30） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口 + 宿主重映射，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15（§10 已落 S0 六项结论） |
-| `docs/DEVELOPMENT-PROCESS.md`（v1.20） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
+| `docs/PRD.md`（v1.15） | 做什么：REQ-001~047、验收 A1~A33、里程碑 M1~M6（实验/可选功能 REQ-046/047 带 P2 降级口径；fast 答案 ≤3000 字硬上限、P50 ≤30s；评测面三层扩展——A31 维度集 / A32 数据集增量 / A33 第三增量） |
+| `docs/ARCHITECTURE.md`（v1.33） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15 |
+| `docs/DEVELOPMENT-PROCESS.md`（v1.21） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
 | `docs/PROGRESS.md` | 进度总览活文档：M1 完成流程图、批次状态表、每环节文档巡检记录。**每闭环一个环节必须更新**（巡检规则见 DEV §10.1） |
 | `docs/contract/api.md`、`data-model.md`、`nacos-config.md`、`frontend-api.md`、`memory-api.md`、`memory-data-model.md` | 冻结契约：REST+SSE 协议、DDL 与迁移、Nacos 五 dataId、前端映射。**字段/事件/表结构以此为准，禁止私改** |
 | `docs/design/`（4 个 HTML + `tokens.css` + `设计说明.md` + `reference/` 对照截图） | 已确认的视觉基准，前端样式必须用 tokens |
@@ -68,15 +68,15 @@
 
 ## 关键约束与已知坑
 
-- **密钥只进 `.env`**（Nacos 拒收疑似密钥字段）；禁止把密钥/凭据内容读入上下文、展示或写入任何对外产物；全部 host 端口绑 127.0.0.1。端口：backend 8300、frontend 5173、postgres **15432**（规避本机 5432）、minio 9100/9101、nacos 8081/8849/9849、litellm 4100、langfuse 3100、redis **16379**（6379+10000 惯例；本机 6379 被原生 redis 占用）、sandbox 8801（M4；2026-11-06 宿主端口重映射，与同机 deal-pilot 栈并存，ARCH v1.24）、crawl4ai **11235**（MCP 备源，compose 常驻）。
+- **密钥只进 `.env`**（Nacos 拒收疑似密钥字段）；禁止把密钥/凭据内容读入上下文、展示或写入任何对外产物；全部 host 端口绑 127.0.0.1。端口：backend 8300、frontend 5173、postgres **15432**（规避本机 5432）、minio 9100/9101、nacos 8081/8849/9849、litellm 4100、langfuse 3100、redis **16379**（6379+10000 惯例；本机 6379 被原生 redis 占用）、sandbox 8801（M4；2026-11-06 宿主端口重映射，与同机 deal-pilot 栈并存，ARCH v1.24）、crawl4ai **11235**（MCP 备源，compose 常驻）、searxng **18080**（搜索兜底链首，B3 compose 落地）。
 - **SSE 协议**：POST 建轮 + GET 订阅两段式（原生 EventSource 自动重连带 Last-Event-ID）；事件带线程级单调 `seq`；token 增量不落库；前端流式渲染遵守 streaming-buffer 规范。
 - **图编排（ADR-012）**：fast/deep 是**子图**；外层主图壳 `graphs/main.py` + `registry.py` 启动时一次编译三图注册 `GRAPH_REGISTRY`，TurnRunner 统一 `astream(subgraphs=True)`，`route_by_mode` 按 `state.mode` 读 Agent Spec `routing` ∩ registry 分发（亚毫秒/零 SSE 事件/无 LLM·IO）；扩展=新子图注册 + `spec.routing` 热更两步，主图拓扑零改动；前端点模式仅为本地状态（REQ-007）。子图边界三风险（state 投影映射/interrupt·cancel 传播/事件冒泡过滤）见 R14——B3 第 0 步主图壳先行 + 路由单测四条先闭环。
 - **图外功能不进节点五步闭环**：followups（REQ-046）与首页推荐池（REQ-047）按 §4 普通 TDD 交付；实验功能硬口径=默认关闭/失败静默/不计入 P50/评测验证后定转正或下线。crons：`trace_cleanup.py` 随 B1 落地，`memory_ttl_sweeper.py` 归 M5。
 - **安全铁律**：外部内容进上下文一律 `<external_content>` 包裹（提示注入隔离）；前端 markdown 过 DOMPurify、协议白名单 http/https；上传类型白名单 + 20MB 上限。
 - **版本锁定例外**：`deepagents>=0.5.3`、`langgraph>=1.1`、`langchain-openai` 须**锁版本 + 单测护栏**（ReasoningChatModel 覆写私有 API，升级前必须先跑护栏，R8）。
-- **模型映射现行值**：`model.mapping.light` = 本地 `qwen3.5-4b-ollama`（宿主 Ollama 为**默认运行时依赖**，litellm 静态 fallback→`chat-speed`）。备源降级链：搜索三级兜底 AnySearch（`fallback_search`）+ 自部署 Crawl4AI（`url_reader_backup`，`/mcp/sse`），备位**条件装载**（语言门控后主位全断才临时顶替，R12）。
-- **接入性验证六项（DEV §3.3）——✅ S0 已全部出结论并落档（ARCH §10，2026-11-06/07）**：R1 BoCha stdio ✅（实装工具名 snake_case `bocha_web_search`/`bocha_ai_search`）；R7 本地 qwen3.5:4b 结构化输出 ✅（19/20=95%，坑：max_tokens ≥8192 + 冷启动单条 149s）；R9 粘黏/fallback 整链 ✅（坑：fallbacks 必须在 litellm_settings 下）；R11 智谱 ①✅②灰区③❌条款禁产品化——**裁决：开发期 Coding Plan、上线前切按量**（零改码换凭证）；R12 AnySearch ✅（配额不可见→429 触发式；延迟 6~8s→读超时 ≥10s）+ crawl4ai 部署面 ✅；R15 nacos-sdk 3.2.0 三链路 ✅（五坑落档：`v2.nacos` 全 asyncio/锁版本/快照双坑/热更 ≥5s/INFO 日志打 accessToken）。B1/B3 派单前置输入见 `docs/s0-batch1-handoff.md` 续 10/11。
-- **S0 基建 UI 初始化 checklist（DEV §3.2）——✅ 已执行完毕（2026-11-06，顺序 Nacos→MinIO→Langfuse→LiteLLM）**：管理员改密/只读账号/403 实证/五 dataId 发布均已落地。课程仓库（ai-infrastructure / ai-eval）只是教学参考：**提示词走 Nacos，不用 Langfuse Prompt Management；M4 评测以 A' 契约为准**，教学端口/口令勿照抄。
+- **模型映射现行值**：`model.mapping.light` = 本地 `qwen3.5-4b-ollama`（宿主 Ollama 为**默认运行时依赖**，litellm 静态 fallback→`chat-speed`）。备源降级链（v1.32 两级链）：搜索兜底 = SearXNG（自部署，`fallback_search` 链首）→ AnySearch（`fallback_search_secondary` 次级）+ 读取备胎 = 自部署 Crawl4AI（`url_reader_backup`，`/mcp/sse`），备位**条件装载**（语言门控后主位全断才按链序临时顶替，R12；SearXNG compose 与接入性验证归 B3 第 0 步，验证不过回退 AnySearch 独担）。
+- **M1 开工前接入性验证六项（DEV §3.3）**：R1（BoCha stdio MCP，官方仓库 `github.com/BoChaAI/bocha-search-mcp`）、R7（本地 qwen3.5:4b 结构化输出，20 条合法率 ≥90%）、R9（LiteLLM 会话粘黏）、R11（智谱 Coding Plan 适配）、R12（AnySearch 配额 + crawl4ai 端点形态）、R15（nacos-sdk-python × Nacos v3.2.4 三链路，不通过=改自封装 httpx v3 client）——结论落档后才开 S1。
+- **S0 基建 UI 初始化 checklist（DEV §3.2）**：compose 起栈后、S1 开工前执行，顺序 **Nacos→MinIO→Langfuse→LiteLLM**（Nacos 先鉴权后操作：管理员改密、建只读账号 `ai-search-ro`、发布 403 实证，再初始化五 dataId）。课程仓库（ai-infrastructure / ai-eval）只是教学参考：**提示词走 Nacos，不用 Langfuse Prompt Management；M4 评测以 A' 契约为准**，教学端口/口令勿照抄。
 - 提示词/模型映射/Agent Spec 全部走 Nacos 热更（五 dataId，键位见 nacos-config.md），改提示词先补 fixture 测试与评测对比。
 - 收尾三底线：测试证据、安全敏感改动过 security-auditor、契约变更同步受影响方并更新 `docs/contract/*` 并升版本。
 - **环节闭环文档巡检（2026-11-05 用户裁决，DEV §10.1）**：每闭环一个环节（批次/阶段/工单）必做——盘点受影响文档 → 逐份判定需不需要更新（实质语义变更当批更新升版并同步引用方；无变更记「无需更新」+理由，**禁止机械 bump 版本**）→ 需更新者当批更新完、不留待办到下一环节 → 留痕（交付说明 + `docs/PROGRESS.md` 巡检记录与状态推进）。**巡检未做不算环节收尾完成**；巡检更新 ≠ 私改契约（契约变更仍走增量 diff）。**盘点基线（DEV v1.18）显式含仓库根 `README.md`**（面向使用者、入库 GitHub 可见——批次 1 曾漏盘致其停留旧状态，2026-11-07 用户指令强化后堵口）；每阶段闭环及时更新文档是硬规范，不是可选动作。

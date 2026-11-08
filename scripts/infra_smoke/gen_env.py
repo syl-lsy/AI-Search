@@ -140,8 +140,8 @@ def main() -> int:
     out_lines: list[str] = []
     # 预读 LITELLM_API_KEY 现值：MASTER 回填时若 API 侧已有真实值则镜像同值、不独立随机
     # （2b 同值契约；不依赖两键在文件中的先后顺序）
-    api_pre = next((_clean(m.group("value")) for l in lines
-                    if (m := _LINE_RE.match(l)) and m.group("key") == "LITELLM_API_KEY"), None)
+    api_pre = next((_clean(m.group("value")) for line in lines
+                    if (m := _LINE_RE.match(line)) and m.group("key") == "LITELLM_API_KEY"), None)
     for line in lines:
         m = _LINE_RE.match(line)
         if not m:
@@ -171,15 +171,15 @@ def main() -> int:
         out_lines.append(line)
 
     # LANGSMITH_TRACING 行缺失则追加
-    if not any(l.strip().startswith("LANGSMITH_TRACING=") for l in out_lines):
+    if not any(line.strip().startswith("LANGSMITH_TRACING=") for line in out_lines):
         out_lines.append("LANGSMITH_TRACING=false")
         tracing_fixed = True
 
     # LITELLM_MASTER_KEY ↔ LITELLM_API_KEY 同值镜像（见 docstring 2b）：任一侧经本次回填或已有
     # 真实值、另一侧仍为空/占位 → 镜像过去；双侧均为真实值但不一致 → pending 提醒、不覆盖
     def _read_val(key: str) -> str | None:
-        for l in out_lines:
-            m = _LINE_RE.match(l)
+        for line in out_lines:
+            m = _LINE_RE.match(line)
             if m and m.group("key") == key:
                 return m.group("value")
         return None
@@ -192,13 +192,13 @@ def main() -> int:
         api_real = bool(api_c) and not _is_fillable(api_c)
         if master_real and not api_real:
             out_lines = [f"LITELLM_API_KEY={master_c}"
-                         if (mm := _LINE_RE.match(l)) and mm.group("key") == "LITELLM_API_KEY" else l
-                         for l in out_lines]
+                         if (mm := _LINE_RE.match(line)) and mm.group("key") == "LITELLM_API_KEY" else line
+                         for line in out_lines]
             filled.append("LITELLM_API_KEY")
         elif api_real and not master_real:
             out_lines = [f"LITELLM_MASTER_KEY={api_c}"
-                         if (mm := _LINE_RE.match(l)) and mm.group("key") == "LITELLM_MASTER_KEY" else l
-                         for l in out_lines]
+                         if (mm := _LINE_RE.match(line)) and mm.group("key") == "LITELLM_MASTER_KEY" else line
+                         for line in out_lines]
             filled.append("LITELLM_MASTER_KEY")
         elif master_real and api_real and master_c != api_c:
             pending.append("LITELLM_MASTER_KEY 与 LITELLM_API_KEY 均为真实值但不一致——"

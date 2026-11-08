@@ -40,13 +40,16 @@ request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
-def _ensure_extras(record: dict[str, Any]) -> None:
+def _ensure_extras(record: Any) -> None:
     """patcher：给每条记录的 extra 补默认键，防格式串取键失败丢日志。
 
     两个 sink 的格式串都引用了 `{extra[request_id]}` 与 `{extra[duration_ms]}`——
     经 LogRecord._emit 走的日志天然带这两个键，但业务代码直接 `logger.info(...)` 时
     没有，loguru 会因格式化失败丢弃整条记录。用 setdefault 补默认值：不影响显式
     bind 的值，只兜底缺省场景。
+
+    形参收敛为 Any：logger.configure 的 patcher 契约是 loguru 内部 Record TypedDict，
+    非 dict 视图注解可比——patcher 边界按 loguru 契约放行（运行期即 dict）。
     """
     record["extra"].setdefault("request_id", "-")
     record["extra"].setdefault("duration_ms", "-")
@@ -67,7 +70,7 @@ def setup_logging() -> None:
     """
     logger.remove()  # 清掉 loguru 默认 stderr sink：输出口径完全由本函数决定
     logger.configure(patcher=_ensure_extras)
-    if common_settings.environment == "production":
+    if common_settings.app_env == "production":
         # 使用json；diagnose=False 防局部变量值随异常现场外发（见 docstring）
         logger.add(
             sys.stdout, level=log_settings.level, serialize=True, diagnose=False

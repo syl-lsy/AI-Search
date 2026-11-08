@@ -3,6 +3,7 @@
 
 .PHONY: dev dev-frontend test test-frontend test-frontend-unit test-frontend-integration \
         test-frontend-component test-unit test-integration test-e2e test-changed typecheck \
+        typecheck-backend \
         db-migrate db-upgrade db-downgrade \
         preflight infra-up infra-down infra-ps infra-logs nacos-init smoke-infra
 
@@ -93,8 +94,10 @@ test-frontend-component:
 test-unit:
 	uv run pytest apps/search-api/test/unit/ -q
 
+# -rP：passed 用例的捕获输出随报告显示——trace_cleanup 删除滞后观察数据（[lag] 行）得以可见
+# （langfuse#8834 删除异步收敛口径，ARCH §7 滞后观察）
 test-integration:
-	uv run pytest apps/search-api/test/integration/ -q
+	uv run pytest apps/search-api/test/integration/ -q -rP
 
 test-e2e:
 	uv run pytest apps/search-api/test/e2e/ -q
@@ -106,21 +109,26 @@ test-changed:
 
 # ── 类型检查 ─────────────────────────────────────────────────────────
 
-# 前端：vue-tsc --noEmit 全量静态检查（含 .vue 模板表达式）
-# 后端段：骨架期先以 compileall 做语法级检查（真实命令形态，零新增依赖），覆盖
-#   apps/search-api/app + scripts/（运维/烟测脚本同为 Python 交付物，一并入语法门禁；
-#   顶层 shebang 与 __main__ 块均为合法 Python，compileall 直接处理，无需排除）；
-#   lint/类型检查工具随 B1 钉死后替换为正式命令
+# 后端正式门禁（B1 工具链钉版，替换骨架期 compileall 语法级检查）：pyright basic
+# （类型）+ ruff（lint）；范围 apps/search-api/app + scripts/（运维/烟测脚本同为
+# Python 交付物，一并入门禁）；规则与范围配置在仓库根 pyproject
+# [tool.pyright]/[tool.ruff]，工具本体在 apps/search-api dev 组 == 钉版
+typecheck-backend:
+	uv run --package search-api pyright apps/search-api/app scripts
+	uv run --package search-api ruff check apps/search-api/app scripts
+
+# 前端：vue-tsc --noEmit 全量静态检查（含 .vue 模板表达式）；后端段调 typecheck-backend
 typecheck:
 	pnpm --filter frontend exec vue-tsc --noEmit
-	uv run --package search-api python -m compileall -q apps/search-api/app scripts
+	$(MAKE) typecheck-backend
 
 # ── 数据库迁移 ───────────────────────────────────────────────────────
 # alembic 服务自管：apps/search-api/alembic.ini（script_location = %(here)s/migrations）
 
-# 生成迁移：make db-migrate message="add user table"
+# 生成迁移：make db-migrate message="add user table"（autogenerate 对比 Base.metadata 与库；
+# 产物须人工核对契约 DDL——DESC/部分索引、seed、扩展等 metadata 外语义手补）
 db-migrate:
-	uv run --package search-api alembic -c apps/search-api/alembic.ini revision -m "$(message)"
+	uv run --package search-api alembic -c apps/search-api/alembic.ini revision --autogenerate -m "$(message)"
 
 db-upgrade:
 	uv run --package search-api alembic -c apps/search-api/alembic.ini upgrade head

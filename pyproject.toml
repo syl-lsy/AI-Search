@@ -11,3 +11,22 @@ members = ["apps/*"]
 # 变更文件落在这些目录内且命名是测试文件（test_*.py / *_test.py）才会被逐个串行执行
 [tool.test-runner]
 test_dirs = ["apps/*/test"]
+
+# ── 后端静态检查工具链（B1 钉版；命令入口 make typecheck-backend，替换骨架期 compileall）──
+# 范围口径：apps/search-api/app（后端应用代码）+ scripts（运维/烟测脚本同为 Python
+# 交付物）。工具本体在 apps/search-api dev 组 == 钉版（pyright==1.1.414 / ruff==0.17.4）。
+
+# pyright：basic 模式（生产级最小类型门禁；strict 留待批次推进按需评估）
+[tool.pyright]
+typeCheckingMode = "basic"
+include = ["apps/search-api/app", "scripts"]
+pythonVersion = "3.12"
+
+# ruff：lint 范围与 pyright 同口径；规则集显式钉 ruff 经典默认（E4/E7/E9/F =
+# pycodestyle 错误子集 + pyflakes）——0.17 起默认规则集大幅扩宽（SIM/PLW/RUF 等
+# 风格族），显式 select 锁定语义防随版本漂移；扩集随批次推进按需增补，不做对
+# 既有代码无增量收益的大面积风格改写
+[tool.ruff]
+target-version = "py312"
+include = ["apps/search-api/app/**/*.py", "scripts/**/*.py"]
+lint.select = ["E4", "E7", "E9", "F"]
