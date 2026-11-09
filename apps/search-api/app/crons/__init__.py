@@ -4,9 +4,9 @@
 Agent Server，ADR-001/010）。main.py lifespan 启动时遍历 CRON_TASKS：为每项建
 常驻周期循环（调用 coroutine_factory() → await → sleep(interval_seconds) 循环），
 停机时对句柄 cancel() 并 await gather(..., return_exceptions=True) 优雅取消
-（CancelledError 不外泄）。本批次只收敛注册表结构与任务实现，main.py 接线随
-B1 后续工单落地（main.py lifespan 注释「周期任务注册：app/crons/ 任务注册表」
-即指此处）。
+（CancelledError 不外泄）。main.py 接线已于 B1 完成（注册 + 停机 gather 收口）；
+B2 起 lifespan 启动序在此之上前置资产中心/EventBus/ThreadScheduler/seq 种入，
+停机在 cron 取消之后逆序关停 EventBus 与资产中心（main.py lifespan docstring）。
 
 CronTask = (name, interval_seconds, coroutine_factory)：
 - name：任务名（日志与排查用，注册表内唯一）；

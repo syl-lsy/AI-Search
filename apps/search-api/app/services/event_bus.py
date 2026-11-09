@@ -29,7 +29,7 @@ StreamingResponse 断连自动关闭生成器）——finally 注销订阅者，
 """
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -89,6 +89,7 @@ class _TurnChannel:
     subscribers: set[_Subscriber]
     appended: int = 0  # 累计写入数（订阅游标基准——淘汰使 deque 下标漂移，不能按下标跟随）
     terminal: bool = False  # done 事件后置位（ADR-003 v1.7 增注 1 清扫判据）
+    closed: bool = False  # close_channel 显式关闭置位（订阅流结束信号；done 不置它）
     last_activity: float = 0.0  # 滑动 TTL 基准（clock() 每写入刷新）
 
 
@@ -162,7 +163,7 @@ class EventBus:
 
     async def subscribe(
         self, turn_id: str, last_seq: int = 0
-    ) -> AsyncIterator[SseEvent]:
+    ) -> AsyncGenerator[SseEvent, None]:
         """订阅轮事件流：重放缓冲中 seq > last_seq 者 → 实时跟随，直至消费方停止。
 
         - 惰性启动：首次 __anext__ 才登记订阅者并取重放快照（登记与快照间无 await，
@@ -170,7 +171,8 @@ class EventBus:
         - last_seq 早于现存缓冲最早事件时缺口静默跳过（ADR-003 v1.7 增注 2）；
         - 各订阅者独立游标互不干扰；断开/停止迭代即从订阅者集合移除自身；
         - 不因 done 自动结束——done 后保活窗口（followups，ADR-003 v1.16）与
-          流关闭时机归 SSE 端点（B2）裁决，消费方自行 break/aclose。
+          流关闭时机归 SSE 端点（B2）裁决，消费方自行 break/aclose（async 生成器，
+          注解即 AsyncGenerator——aclose 是消费方关闭协议的一部分）。
         """
         channel = self._channels.get(turn_id)
         if channel is None:  # 订阅先行：先建空通道（thread 待首个 publish 绑定）
@@ -195,8 +197,10 @@ class EventBus:
                 yield event
             while True:
                 async with channel.cond:
-                    while sub.cursor >= channel.appended:
+                    while sub.cursor >= channel.appended and not channel.closed:
                         await channel.cond.wait()
+                    if channel.closed and sub.cursor >= channel.appended:
+                        break  # 通道显式关闭（close_channel）→ 正常结束（finally 注销）
                     batch = self._drain(channel, sub)  # 出锁前取段（同步无 await）
                 for event in batch:
                     yield event
@@ -243,6 +247,43 @@ class EventBus:
 
         current = self._thread_last_seq.get(thread_id, 0)
         self._thread_last_seq[thread_id] = max(current, last_seq)
+
+    def terminal_seq(self, turn_id: str) -> int | None:
+        """该轮终态事件（done）的 seq；通道不存在或未终态返回 None。
+
+        SSE 端点（B2 最小版）的「客户端已持有 done」判定依据：重连 Last-Event-ID
+        ≥ 本值时不重发 done、直接关闭（api.md §7.1 512-514 行的重放对偶分支——
+        done 在缓冲中只发一次）。close_channel 关闭的通道（error 路径）缓冲无
+        done 事件 → 返回 None（订阅流随 closed 自然结束，不依赖本判定）。
+        """
+        channel = self._channels.get(turn_id)
+        if channel is None or not channel.terminal:
+            return None
+        for event in reversed(channel.buffer):
+            if event.event_type == TERMINAL_EVENT_TYPE and event.seq is not None:
+                return event.seq
+        return None
+
+    async def close_channel(self, turn_id: str) -> bool:
+        """显式关闭轮通道并唤醒订阅者结束（B2：TurnRunner 失败路径调用）。
+
+        - **不发事件、不落库**——api.md §7.2 error 条目「error 后……或直接关闭
+          （无内容时）」的进程内实现；订阅者消费完既有缓冲后收到结束信号，
+          async for 正常退出（不悬挂）；
+        - 同时置 terminal：failed 轮无 done 事件、terminal 永不置位 → 缓冲永不清收
+          的泄漏由此修复（cleanup_expired 判据恢复可回收）；
+        - **done 路径不走本方法**：done 后保活窗口（followups，ADR-003 v1.16）依赖
+          「terminal 不结束订阅流」契约——关闭时机归 SSE 端点裁决（172 行 docstring）；
+        - 幂等：重复关闭无副作用；通道不存在（该轮从未发布/订阅）no-op 返回 False。
+        """
+        channel = self._channels.get(turn_id)
+        if channel is None:
+            return False
+        channel.closed = True
+        channel.terminal = True
+        async with channel.cond:  # 持锁唤醒挂起的订阅者
+            channel.cond.notify_all()
+        return True
 
     # ---- 生命周期（后台周期清扫）----
 

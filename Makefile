@@ -4,7 +4,7 @@
 .PHONY: dev dev-frontend test test-frontend test-frontend-unit test-frontend-integration \
         test-frontend-component test-unit test-integration test-e2e test-changed typecheck \
         typecheck-backend \
-        db-migrate db-upgrade db-downgrade \
+        db-migrate db-current db-upgrade db-downgrade \
         preflight infra-up infra-down infra-ps infra-logs nacos-init smoke-infra
 
 # ── S0 基础设施（deploy/docker-compose.yml）────────────────────────────
@@ -129,6 +129,11 @@ typecheck:
 # 产物须人工核对契约 DDL——DESC/部分索引、seed、扩展等 metadata 外语义手补）
 db-migrate:
 	uv run --package search-api alembic -c apps/search-api/alembic.ini revision --autogenerate -m "$(message)"
+
+# 查看当前库所处 revision（data-model.md §4：增补迁移开工前「以 make db-current
+# 核实链尾」——0008/0009 行均引用此口径）
+db-current:
+	uv run --package search-api alembic -c apps/search-api/alembic.ini current
 
 db-upgrade:
 	uv run --package search-api alembic -c apps/search-api/alembic.ini upgrade head

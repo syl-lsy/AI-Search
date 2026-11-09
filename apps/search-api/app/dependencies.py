@@ -12,16 +12,32 @@
 - get_event_bus：轮次事件总线消费出口（services/event_bus.py，ADR-003）——SSE
   端点订阅（Last-Event-ID 重放源）唯一入口；持有者由 lifespan 调
   start_event_bus() 注册（B2 接线），未启动即取 fail-fast（同 get_asset_center）。
-
-后续阶段锚点（占位注释，不提前实现——依赖注入含业务语义，随所属工单按
-节点五步闭环纪律落地）：
-- get_current_user：MVP 默认用户（启动幂等 seed，REQ 契约见 api.md）——B2。
+- get_model_mapping：model.mapping 快照 payload 消费出口（threads 建轮模型解析 +
+  GET /models 切换器共用同源快照）。
+- get_current_user：MVP 默认用户（REQ-011：user_id 隐式——服务端从请求上下文取，
+  请求体不含 user_id；与启动幂等 seed 同源，api.md「user_id」行）。
 """
+from collections.abc import Mapping
+from typing import Any
+
 from app.config_center import AssetSnapshot, get_asset_center
+from app.core.config import common_settings
 from app.db.session import get_db
+from app.exception import ConfigCenterException
 from app.services.event_bus import get_event_bus
 
-__all__ = ["get_asset_center", "get_asset_snapshot", "get_db", "get_event_bus"]
+__all__ = [
+    "get_asset_center",
+    "get_asset_snapshot",
+    "get_current_user",
+    "get_db",
+    "get_event_bus",
+    "get_model_mapping",
+]
+
+# model.mapping dataId（nacos-config.md §5：五 dataId 之一；与 turn_service 的
+# 轮次捕获同源——此处的出口面向 API 请求路径，快照缺失转 503001）
+_MAPPING_DATA_ID = "ai_search.model.mapping.json"
 
 
 def get_asset_snapshot(data_id: str) -> AssetSnapshot | None:
@@ -32,3 +48,35 @@ def get_asset_snapshot(data_id: str) -> AssetSnapshot | None:
     B2 在轮次启动时一次性取引用实现，同走 get_asset_center()。
     """
     return get_asset_center().snapshot(data_id)
+
+
+def get_model_mapping() -> Mapping[str, Any]:
+    """model.mapping 当前快照 payload（threads 建轮模型解析 + GET /models 共用同源）。
+
+    配置面不可用在 API 请求路径上一律按可预期运行态呈现：资产中心未启动
+    （get_asset_center 的 RuntimeError fail-fast）与快照缺失（None——启动后 dataId
+    未装载，正常不发生，start_asset_center 对五 dataId 全量装内置默认）均转
+    ConfigCenterException（503001）自然冒泡，经全局业务异常处理器出 503，路由层
+    零捕获（api.md §0；不落 500001——配置面不可用非未知异常，也不泄漏内部栈）。
+    """
+    try:
+        snapshot = get_asset_snapshot(_MAPPING_DATA_ID)
+    except RuntimeError as exc:
+        raise ConfigCenterException(
+            "配置中心不可达且无缓存", detail=f"model.mapping 快照不可用：{exc}"
+        ) from exc
+    if snapshot is None:
+        raise ConfigCenterException(
+            "配置中心不可达且无缓存", detail=f"{_MAPPING_DATA_ID} 快照缺失"
+        )
+    return snapshot.payload
+
+
+def get_current_user() -> str:
+    """MVP 默认用户：读 common_settings.default_user_id（.env DEFAULT_USER_ID）。
+
+    api.md「user_id」行口径：隐式默认用户，请求体不含 user_id（REQ-011）；与启动
+    幂等 seed（db/seed.py）同源。auth 二期换登录态（token→user 解析）时仅替换本
+    函数实现——返回类型（user_id 字符串）与表结构不动。
+    """
+    return common_settings.default_user_id

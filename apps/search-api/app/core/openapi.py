@@ -29,7 +29,7 @@ def _build_envelope_properties(data_schema: dict[str, Any]) -> dict[str, Any]:
         "message": {
             "type": "string",
             "description": "提示信息",
-            "example": "success",
+            "example": "ok",
         },
     }
 

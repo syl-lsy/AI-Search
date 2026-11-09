@@ -5,8 +5,9 @@ models/ 未落地或列漂移时本文件先红（TDD 红绿循环的契约锚�
 断言粒度 = DDL 逐条：列/类型/可空/服务端默认/主键/FK（含 ON DELETE CASCADE）/
 索引（唯一/DESC/部分索引 WHERE）/identity。
 
-0001 范围护栏：后续迁移的增列（turns.cancel_reason/incognito/memory_hits/followups、
-sources.snapshot_id/kb_doc_id/kb_chunk_ids）在 0001 不得提前出现。
+0001 范围护栏：后续迁移的增列（turns.incognito/memory_hits/followups、
+sources.snapshot_id/kb_doc_id/kb_chunk_ids）在 0001 不得提前出现（turns.cancel_reason
+已随 0008 落地，移出护栏、纳入 §1.3 逐列断言）。
 """
 import uuid
 
@@ -177,6 +178,7 @@ def test_turns_columns():
         "usage",
         "langfuse_trace_id",
         "degraded_reason",
+        "cancel_reason",
         "started_at",
         "finished_at",
         "duration_ms",
@@ -242,6 +244,12 @@ def test_turns_columns():
     assert isinstance(degraded_reason.type, String) and degraded_reason.type.length == 16
     assert degraded_reason.nullable is True  # 0002 起启用写入语义，列已在 0001
 
+    # cancel_reason：0008（REQ-042）——user|superseded|rolled_back，仅 status=canceled
+    # 时非空（§1.3 104 行）；无默认、取消不是 error（不复用 error 列语义）
+    cancel_reason = _col(turns, "cancel_reason")
+    assert isinstance(cancel_reason.type, String) and cancel_reason.type.length == 16
+    assert cancel_reason.nullable is True and cancel_reason.server_default is None
+
     for name in ("started_at", "finished_at"):
         col = _col(turns, name)
         assert isinstance(col.type, DateTime) and col.type.timezone is True
@@ -254,10 +262,11 @@ def test_turns_columns():
 
 
 def test_turns_excludes_later_migration_columns():
-    """0005/0006/0008/0009 的增列不得提前出现在 0001（防 autogenerate 过度生成）。"""
+    """0005/0006/0009 的增列不得提前出现（防 autogenerate 过度生成）；
+    cancel_reason 已随 0008（REQ-042）落地，不再属护栏清单。"""
     turns = _table("turns")
-    for name in ("cancel_reason", "incognito", "memory_hits", "followups"):
-        assert name not in turns.columns, f"{name} 属后续迁移增列，0001 不应包含"
+    for name in ("incognito", "memory_hits", "followups"):
+        assert name not in turns.columns, f"{name} 属后续迁移增列，不应提前包含"
 
 
 def test_turns_indexes():
@@ -270,11 +279,12 @@ def test_turns_indexes():
         "created_at",
     ]
 
-    # 部分索引（0001 形态：条件不含 queued——扩 queued 属 0008 的 drop+recreate）
+    # 部分索引（0008 形态，REQ-042）：条件含 queued——enqueue 排队轮同入 409001
+    # 裁决与孤儿轮清理口径（§1.3 146 行；drop+recreate 属 0008）
     ix_running = _index(turns, "idx_turns_running")
     assert ix_running.unique is False
     where = str(ix_running.dialect_options["postgresql"]["where"])
-    assert "pending" in where and "running" in where and "queued" not in where
+    assert "pending" in where and "running" in where and "queued" in where
 
 
 # ---- §1.4 turn_events ----

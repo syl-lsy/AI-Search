@@ -269,13 +269,31 @@ def test_lifespan_re_silences_uvicorn_loggers(monkeypatch: pytest.MonkeyPatch):
 
     回归守卫：仅在模块级关一次是不够的（`fastapi dev` 先导入应用再配置 uvicorn 日志），
     进入 lifespan 后访问日志/错误日志必须保持关闭，请求日志只由 logging 中间件出。
-    本用例只验日志语义——启动钩子（孤儿轮清理）与周期任务注册表换 mock（B1 起
-    lifespan 会真连库/真调度，unit 层零网络零库，见 test_main.py 的钩子专项测试）。
+    本用例只验日志语义——B2 起 lifespan 会真连 Nacos/建 EventBus/建调度器/按库种入
+    seq（真连库会以 unit 空环境默认值毒化 _engine 单例——test_engine.py 2026-11-07
+    同型事故），基础设施四件套在此全部换假体（零网络零库，专项测试见 test_main.py）。
     """
+
+    class _FakeCloseable:
+        async def close(self) -> None:  # 停机收口假体（bus / asset center 共用形状）
+            return None
+
+    async def _fake_start_asset_center(**_kwargs: object) -> _FakeCloseable:
+        return _FakeCloseable()
+
+    async def _fake_start_event_bus(**_kwargs: object) -> _FakeCloseable:
+        return _FakeCloseable()
+
+    async def _fake_seed_seq_from_db() -> None:
+        return None
 
     async def _noop_cleanup() -> int:
         return 0
 
+    monkeypatch.setattr(main, "start_asset_center", _fake_start_asset_center)
+    monkeypatch.setattr(main, "start_event_bus", _fake_start_event_bus)
+    monkeypatch.setattr(main, "start_thread_scheduler", lambda: _FakeCloseable())
+    monkeypatch.setattr(main, "seed_seq_from_db", _fake_seed_seq_from_db)
     monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
     monkeypatch.setattr(main, "CRON_TASKS", [])
     logging.getLogger("uvicorn.error").disabled = False  # 模拟被 uvicorn 配置重置

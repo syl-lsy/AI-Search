@@ -51,7 +51,8 @@ async def unified_response(
     data = json.loads(body) if body else None
 
     new_response = JSONResponse(
-        content={"code": "0", "data": data, "message": "success"},
+        # api.md §0 成功信封：message 固定 "ok"（与 core/openapi.py 的信封同步一起改）
+        content={"code": "0", "data": data, "message": "ok"},
         status_code=response.status_code,
     )
     # 逐条搬运原响应头（保留重复头，如多个 Set-Cookie）；content-length 剔除后

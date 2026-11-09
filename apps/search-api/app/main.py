@@ -8,8 +8,10 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy import select
 from starlette.exceptions import HTTPException
 
+from app.api.v1 import models, threads, turns
 from app.api.v1.health import router as health_router
-from app.core.config import common_settings
+from app.config_center import start_asset_center
+from app.core.config import common_settings, nacos_settings
 from app.core.logger import CronLog, setup_logging
 from app.core.middleware import register_middleware
 from app.core.openapi import setup_openapi
@@ -18,6 +20,8 @@ from app.db.models import Turn
 from app.db.session import get_session_factory
 from app.exception import BusinessException
 from app.exception.handler import exception_handler, generate_error_docs
+from app.services.event_bus import start_event_bus
+from app.services.turn_service import seed_seq_from_db, start_thread_scheduler
 
 
 def _silence_uvicorn_loggers() -> None:
@@ -120,7 +124,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     此后含访问日志在内的 uvicorn 输出都走 loguru 单管线（只剩 uvicorn 起跑前
     的 Started server process / Waiting for application startup 两行由 CLI 打出）。
 
-    启动钩子（一次性，先于周期任务——应用先恢复一致状态再开始后台工作）：
+    启动序（B2 接线，一次性，先于周期任务——应用先具备依赖与一致状态再开始后台工作）：
+    - 资产中心（start_asset_center，NACOS_ 组参 + common_settings.app_env）——
+      production L4（不可达且无缓存）抛 ConfigCenterException 503001 拒启动；
+    - EventBus（start_event_bus，SSE_ 组单例）→ ThreadScheduler（start_thread_
+      scheduler，四策略调度 + TurnRunner；无常驻任务、停机零收口）；
+    - seq 种入（seed_seq_from_db）：按 turn_events 库内 max(seq) per thread 种入
+      EventBus 计数器——不种入则新轮 seq 与持久化历史撞 uq(thread_id, seq)；
     - 孤儿轮清理：running/queued 置 failed（error=进程重启），见 _cleanup_orphan_turns；
       失败记日志不阻塞启动（恢复型 best-effort，幂等可重入、下次重启补做）；
     - 默认用户 seed：不在钩子做——迁移 0001 幂等 seed 承担（app/db/seed.py，
@@ -129,37 +139,52 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
       status IN (pending,parsing,embedding) 的 kb_documents 重新入队（进程内队列
       无持久化，重启即恢复处理）——随 0003 迁移与 kb_service 队列一并接线。
 
-    周期任务注册：CRON_TASKS → 进程内 asyncio 周期任务（非 LangGraph Agent Server
-    cron，本项目无 Agent Server，ADR-001/010）；停机逐个 cancel + gather 收口，
-    CancelledError 不外泄。
+    基础设施启动失败（资产中心/EventBus/调度器/seq 种入）不静默吞掉：原样上抛
+    令应用启动失败退出（503001 拒启动语义保持；部分启动的组件由嵌套 finally
+    逆序收口，不泄漏客户端）。周期任务注册：CRON_TASKS → 进程内 asyncio 周期
+    任务（非 LangGraph Agent Server cron，本项目无 Agent Server，ADR-001/010）。
+    停机逆序：cron 逐个 cancel + gather 收口 → EventBus.close → 资产中心.close。
     """
     _silence_uvicorn_loggers()
 
+    center = await start_asset_center(
+        settings=nacos_settings, app_env=common_settings.app_env
+    )
     try:
-        cleaned = await _cleanup_orphan_turns()
-    except Exception as exc:
-        # task 字段复用为启动钩子标识：与 crons 同为无请求上下文的后台任务，同口径落 CronLog
-        CronLog(
-            message="启动钩子孤儿轮清理失败——本次跳过，下次重启补做",
-            task="startup_hook",
-        ).error(exc)
-    else:
-        if cleaned:
-            CronLog(
-                message=f"启动钩子孤儿轮清理完成：{cleaned} 条进行中轮置 failed",
-                task="startup_hook",
-                total=cleaned,
-            ).info()
+        bus = await start_event_bus()
+        try:
+            start_thread_scheduler()
+            await seed_seq_from_db()
 
-    # KB 队列恢复（M3/B5 落地，锚点见 docstring）：kb_documents 过期态重新入队。
+            try:
+                cleaned = await _cleanup_orphan_turns()
+            except Exception as exc:
+                # task 字段复用为启动钩子标识：与 crons 同为无请求上下文的后台任务，同口径落 CronLog
+                CronLog(
+                    message="启动钩子孤儿轮清理失败——本次跳过，下次重启补做",
+                    task="startup_hook",
+                ).error(exc)
+            else:
+                if cleaned:
+                    CronLog(
+                        message=f"启动钩子孤儿轮清理完成：{cleaned} 条进行中轮置 failed",
+                        task="startup_hook",
+                        total=cleaned,
+                    ).info()
 
-    cron_handles = _register_cron_tasks()
-    try:
-        yield
+            # KB 队列恢复（M3/B5 落地，锚点见 docstring）：kb_documents 过期态重新入队。
+
+            cron_handles = _register_cron_tasks()
+            try:
+                yield
+            finally:
+                for handle in cron_handles:
+                    handle.cancel()
+                await asyncio.gather(*cron_handles, return_exceptions=True)
+        finally:
+            await bus.close()
     finally:
-        for handle in cron_handles:
-            handle.cancel()
-        await asyncio.gather(*cron_handles, return_exceptions=True)
+        await center.close()
 
 
 # 生产环境隐藏文档入口（/docs、/redoc、/openapi.json 全部关闭）
@@ -200,6 +225,8 @@ app.add_exception_handler(Exception, exception_handler)
 # /health/ready 就绪（四组件并行探活，实现在 app/api/v1/health.py）。
 app.include_router(health_router)
 
-# 其余路由在 app/api/v1/ 中以 APIRouter 定义，统一在这里挂载（B2 工单）：
-# from app.api.v1 import threads
-# app.include_router(threads.router)
+# REST 路由（api.md §2/§3，B2 工单）：threads / turns / models——prefix=/api/v1
+# 在各 router 模块内声明（/api/ 前缀触发成功信封包装，core/middleware/response.py）。
+app.include_router(threads.router)
+app.include_router(turns.router)
+app.include_router(models.router)

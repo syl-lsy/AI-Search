@@ -1,7 +1,7 @@
 """unit 层：统一成功信封中间件 + 请求日志中间件（app/core/middleware/）。
 
 覆盖点：
-- `/api/` 路径的成功响应包装为 `{"code": "0", "data": ..., "message": "success"}`；
+- `/api/` 路径的成功响应包装为 `{"code": "0", "data": ..., "message": "ok"}`；
 - 非 `/api/` 路径（/health）不包装；
 - 错误响应（异常处理器置 `exception_handled` 标志）不被二次包装，顶层即 `{code, message}`；
 - `is_stream` 标志 / 204 / HEAD 请求跳过包装；
@@ -102,7 +102,7 @@ def test_api_success_response_is_wrapped():
     assert resp.json() == {
         "code": "0",
         "data": {"hello": "world"},
-        "message": "success",
+        "message": "ok",  # api.md §0 成功信封：message 固定 "ok"
     }
 
 
