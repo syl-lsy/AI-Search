@@ -2,14 +2,14 @@
 
 类 Perplexity 的自建 AI 搜索引擎：快速模式（多源搜索 → ≤3000 字上限内带引用综合回答，篇幅按题型软引导，P50 ≤30s）+ 深度模式（deepagents 子代理并行研究 → 分节带引用报告）+ 个人知识库融合，全程引用可溯源、成本可观测。
 
-**当前阶段（2026-11-07）**：M1 实施计划 v4 **已获批**（`.zcode/plans/plan-m1-v4-20261104.md`），**批次 0 + 批次 1 S0 + 批次 2 B1 底座均已闭环**（批次 2 于 2026-11-07：config 分组/settings 单例、CORS、db 会话、五表 ORM+迁移 0001（含默认用户 seed）、config_center 三层、EventBus（线程级 seq）、双探针（ready 四组件 503 口径）、crons+trace_cleanup、ReasoningChatModel 护栏（R8）、pyright+ruff 钉版（Makefile `typecheck-backend`）；门禁绿：unit 320 passed + integration 4 passed/5 skipped（NACOS_/LANGFUSE_ 凭证门控）+ 后端覆盖率 97.78%（≥80%）+ typecheck-backend 零告警；§10.1 巡检落档）。下一批 = **批次 3 B2 线程轮次（桩主图）**（threads/turns REST + TurnRunner 骨架——桩主图走完整事件管线、TurnRunner 自此统一 invoke 主图单例 + ThreadScheduler 四策略（409001）+ 迁移 0008；B1 遗留接线项随 B2 同批：main.py lifespan 接 config_center/EventBus、/health/ready 加 nacos degraded 位）。**每环节闭环后执行文档巡检并更新 `docs/PROGRESS.md`（DEV §10.1）**。进度实况见 `docs/PROGRESS.md`。
+**当前阶段（2026-11-08）**：M1 实施计划 v4 **已获批**（`.zcode/plans/plan-m1-v4-20261104.md`），**批次 0 + 批次 1 S0 + 批次 2 B1 底座 + 批次 3 B2 线程轮次（桩主图）均已闭环**（批次 3 于 2026-11-08：迁移 0008（turns.cancel_reason + idx_turns_running 扩 queued）、12 组 DTO（分期口径 incognito/followups/has_artifacts 固定值）、thread/turn_service（四策略 16 分支决策矩阵 + TurnRunner 短事务管线 + EventBus close_channel）、桩主图（router 条件边 + fast/deep 桩 + 四条路由单测）、REST 7 端点 + SSE 最小端点（重放/心跳/404001 归属）、lifespan 接线收口 B1 遗留（start_asset_center/start_event_bus/seed_thread_seq）、错误码对齐（400001/409001/409002、成功信封 message=ok）；门禁绿：unit+integration **505 passed/1 skipped**（既有 NACOS_ 凭证门控）+ 后端覆盖率 **97.95%**（≥80%）+ typecheck-backend 零告警；双评审 19 条两轮修复闭环；§10.1 巡检落档）。下一批 = **批次 4 B3 主图壳 + fast 五节点**（第 0 步：registry 迭代化 + route_by_mode 读 spec.routing——B2 已落桩版主图壳与四条路由单测，接真后按 DEV §5.1 复验勿重复；searxng compose/wrapper/接入性验证同批第 0 步；rewrite 起逐节点 §5.4 五步闭环）。**每环节闭环后执行文档巡检并更新 `docs/PROGRESS.md`（DEV §10.1）**。进度实况见 `docs/PROGRESS.md`。
 
 ## 文档地图（改任何东西前先读对应文档）
 
 | 文档 | 管什么 |
 |---|---|
 | `docs/PRD.md`（v1.15） | 做什么：REQ-001~047、验收 A1~A33、里程碑 M1~M6（实验/可选功能 REQ-046/047 带 P2 降级口径；fast 答案 ≤3000 字硬上限、P50 ≤30s；评测面三层扩展——A31 维度集 / A32 数据集增量 / A33 第三增量） |
-| `docs/ARCHITECTURE.md`（v1.33） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15 |
+| `docs/ARCHITECTURE.md`（v1.36） | 怎么实现：图编排=主图路由+两张模式子图（§4.0/ADR-012）、目录结构、端口（Nacos v3.2.4 三端口，ADR-013）、工单 B1~B8/F1、ADR-001~014、风险 R1~R15 |
 | `docs/DEVELOPMENT-PROCESS.md`（v1.21） | 按什么顺序做：S0~S5 流程、TDD 规范、节点五步闭环、门禁与 DoD、环节闭环文档巡检（§10.1）。**开发会话开工前必读全文 + §11 checklist** |
 | `docs/PROGRESS.md` | 进度总览活文档：M1 完成流程图、批次状态表、每环节文档巡检记录。**每闭环一个环节必须更新**（巡检规则见 DEV §10.1） |
 | `docs/contract/api.md`、`data-model.md`、`nacos-config.md`、`frontend-api.md`、`memory-api.md`、`memory-data-model.md` | 冻结契约：REST+SSE 协议、DDL 与迁移、Nacos 五 dataId、前端映射。**字段/事件/表结构以此为准，禁止私改** |

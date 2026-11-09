@@ -1,7 +1,7 @@
 """FastAPI 全局异常处理器：请求-响应链路所有异常的最终出口。
 
 由 main.py 注册四处，覆盖四类异常：
-- RequestValidationError：请求参数校验失败（422001，message 拼 "loc: msg" 明细）；
+- RequestValidationError：请求参数校验失败（400001，message 拼 "loc: msg" 明细）；
 - starlette HTTPException：框架层协议错误（404/405/415 走 PROTOCOL_ERROR_MAP 友好消息，
   其余状态码回退 exc.detail）；
 - BusinessException：领域异常（message 面向用户进响应体；detail/original_exception 只进日志）；

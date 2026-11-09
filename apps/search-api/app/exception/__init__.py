@@ -4,9 +4,19 @@
 在 app/exception/handler/errors.py 的 ERROR_MAP 注册（业务错误码, HTTP 状态码, 默认消息）；
 错误码文档（/docs 的「错误码说明」）会随之自动更新。
 """
+from app.exception.bad_request import BadRequestException
 from app.exception.base import BusinessException
 from app.exception.config_center import ConfigCenterException
+from app.exception.conflict import ConflictException, TurnTerminalException
 from app.exception.database import DatabaseException
 from app.exception.not_found import NotFoundException
 
-__all__ = ["BusinessException", "ConfigCenterException", "DatabaseException", "NotFoundException"]
+__all__ = [
+    "BadRequestException",
+    "BusinessException",
+    "ConfigCenterException",
+    "ConflictException",
+    "DatabaseException",
+    "NotFoundException",
+    "TurnTerminalException",
+]

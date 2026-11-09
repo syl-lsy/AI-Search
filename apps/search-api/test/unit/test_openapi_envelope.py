@@ -116,6 +116,8 @@ def test_ref_response_wrapped_as_api_envelope_component():
     assert wrapper["properties"]["data"] == {"$ref": "#/components/schemas/ItemOut"}
     assert wrapper["properties"]["code"]["type"] == "string"
     assert wrapper["properties"]["message"]["type"] == "string"
+    # 信封 message 示例与运行时一致（api.md §0：成功固定 "ok"）——两侧契约一起动
+    assert wrapper["properties"]["message"]["example"] == "ok"
 
 
 def test_second_reference_reuses_existing_wrapper_component():

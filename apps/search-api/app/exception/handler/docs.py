@@ -21,7 +21,7 @@ def generate_error_docs() -> str:
     for exc_type, (code, http_status, message) in ERROR_MAP.items():
         if exc_type is Exception:  # 兜底码不面向客户端文档（客户端无需区分内部错误成因）
             continue
-        if code in seen_codes:  # 多个异常映射同一业务码（如校验错误与数据库错误同为 422001）只列一次
+        if code in seen_codes:  # 多个异常映射同一业务码时只列一次（同码去重）
             continue
         seen_codes.add(code)
         lines.append(f"| {code} | {http_status} | {message} |")

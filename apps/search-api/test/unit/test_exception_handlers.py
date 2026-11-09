@@ -8,7 +8,7 @@
   status_code 再按级落（协议/校验/业务 warning，未知异常 error 带栈），业务异常 detail
   进 message、仅 original_exception 存在时带栈；request_log 缺失时回退标准库 logger，
   severity/message 口径一致；
-- TestClient 走真实注册链路：`/nonexistent` 404、非法参数 422001、未捕获异常 500001、
+- TestClient 走真实注册链路：`/nonexistent` 404、非法参数 400001、未捕获异常 500001、
   BusinessException 在默认 TestClient 下内联返回统一 JSON（不冒泡）；
   **404/422/500 各恰好一条对应级别日志、都没有 SUCCESS**（请求日志由中间件/处理器二选一）；
 - `generate_error_docs()` 与 `app.description`（错误码表自动进文档）；
@@ -27,7 +27,13 @@ from starlette.exceptions import HTTPException
 
 import app.exception as exception_pkg
 from app.core.logger import RequestLog
-from app.exception import BusinessException, DatabaseException, NotFoundException
+from app.exception import (
+    BusinessException,
+    ConflictException,
+    DatabaseException,
+    NotFoundException,
+    TurnTerminalException,
+)
 from app.exception.handler import exception_handler, generate_error_docs
 from app.exception.handler.errors import ERROR_MAP
 from app.exception.handler.handlers import _lookup
@@ -59,9 +65,28 @@ def test_lookup_hits_registered_type_exactly():
     assert _lookup(NotFoundException(message="x")) == ("404001", 404, "资源不存在")
 
 
-def test_lookup_database_exception_shares_validation_code():
-    expected = ("422001", 422, "数据验证错误")
-    assert _lookup(DatabaseException(message="unique violation")) == expected
+def test_lookup_conflict_exceptions_use_409_codes():
+    """REQ-042 同线程并发策略的 409 码：ConflictException=409001、TurnTerminalException=409002。"""
+    assert _lookup(ConflictException(message="线程已有进行中轮次")) == (
+        "409001",
+        409,
+        "线程已有进行中轮次",
+    )
+    assert _lookup(TurnTerminalException(message="轮次已处于终态，不可取消")) == (
+        "409002",
+        409,
+        "轮次已处于终态，不可取消",
+    )
+
+
+def test_lookup_database_exception_maps_to_internal_error():
+    """DatabaseException → 500001/500（api.md §0 错误码表「内部错误」；
+    422001 让位给 api.md 46 行「URL 非法」M3 口径，本批不实现 KB）。"""
+    assert _lookup(DatabaseException(message="unique violation")) == (
+        "500001",
+        500,
+        "内部错误",
+    )
 
 
 def test_lookup_falls_back_to_nearest_registered_parent():
@@ -138,10 +163,28 @@ async def test_handler_validation_error_formats_locations():
         "type": "int_parsing",
     }
     resp = await exception_handler(_request_with_log(), RequestValidationError([error]))
-    assert resp.status_code == 422
+    assert resp.status_code == 400
     body = json.loads(resp.body)
-    assert body["code"] == "422001"
+    assert body["code"] == "400001"
     assert body["message"] == "query.n: Input should be a valid integer"
+
+
+async def test_handler_conflict_exceptions_return_409():
+    """REQ-042 新 409 领域异常经统一处理器出 {code, message}（409001/409002）。"""
+    resp = await exception_handler(
+        _request_with_log(), ConflictException(message="线程已有进行中轮次")
+    )
+    assert resp.status_code == 409
+    assert json.loads(resp.body) == {"code": "409001", "message": "线程已有进行中轮次"}
+
+    resp = await exception_handler(
+        _request_with_log(), TurnTerminalException(message="轮次已处于终态，不可取消")
+    )
+    assert resp.status_code == 409
+    assert json.loads(resp.body) == {
+        "code": "409002",
+        "message": "轮次已处于终态，不可取消",
+    }
 
 
 async def test_handler_unknown_exception_does_not_leak_internals():
@@ -169,7 +212,7 @@ async def test_handler_protocol_error_logs_warning_via_request_log(log_records):
 
 
 async def test_handler_validation_error_logs_warning_via_request_log(log_records):
-    """新行为：校验失败（422）此前不记日志，现经 request_log 落一条 warning。"""
+    """新行为：校验失败（400001）此前不记日志，现经 request_log 落一条 warning。"""
     error = {
         "loc": ("query", "n"),
         "msg": "Input should be a valid integer",
@@ -180,11 +223,11 @@ async def test_handler_validation_error_logs_warning_via_request_log(log_records
         _request_with_log(log), RequestValidationError([error])
     )
 
-    assert resp.status_code == 422
+    assert resp.status_code == 400
     record = log_records[-1]
     assert record["level"].name == "WARNING"
     assert record["message"] == "请求异常: query.n: Input should be a valid integer"
-    assert record["extra"]["status_code"] == 422
+    assert record["extra"]["status_code"] == 400
     assert record["exception"] is None
 
 
@@ -202,7 +245,8 @@ async def test_handler_business_exception_logs_detail_via_request_log(log_record
         == "业务异常: 数据保存失败 | detail=psycopg: unique_violation on orders_pkey"
     )
     assert record["exception"] is None  # 预期控制流不带栈，避免应用日志层再造噪音
-    assert json.loads(resp.body) == {"code": "422001", "message": "数据保存失败"}
+    # DatabaseException → 500001/500（api.md「内部错误」；message 仍用异常自身面向用户的消息）
+    assert json.loads(resp.body) == {"code": "500001", "message": "数据保存失败"}
     assert "unique_violation" not in resp.body.decode()
 
 
@@ -333,16 +377,16 @@ def test_invalid_query_returns_validation_error_code():
     client = TestClient(app, raise_server_exceptions=False)
     try:
         resp = client.get("/_test_validate", params={"n": "not-an-int"})
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.json()
-        assert body["code"] == "422001"
+        assert body["code"] == "400001"
         assert "query.n" in body["message"]
         assert client.get("/_test_validate", params={"n": 3}).json() == {"n": 3}
     finally:
         _remove_test_route("/_test_validate")
 
 
-def test_client_422_logs_exactly_one_warning(log_records):
+def test_client_400_logs_exactly_one_warning(log_records):
     @app.get("/_test_validate_log")
     async def _validate_log(n: int):
         return {"n": n}
@@ -351,15 +395,31 @@ def test_client_422_logs_exactly_one_warning(log_records):
         resp = TestClient(app, raise_server_exceptions=False).get(
             "/_test_validate_log", params={"n": "not-an-int"}
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
         warnings = _records_at(log_records, "WARNING")
         assert len(warnings) == 1
         assert warnings[0]["message"].startswith("请求异常: query.n")
-        assert warnings[0]["extra"]["status_code"] == 422
+        assert warnings[0]["extra"]["status_code"] == 400
         assert _records_at(log_records, "SUCCESS") == []
     finally:
         _remove_test_route("/_test_validate_log")
+
+
+def test_conflict_exception_route_returns_409001():
+    """ConflictException 经真实注册链路返回 409001（REQ-042 同线程并发拒绝）。"""
+
+    @app.get("/_test_conflict")
+    async def _conflict():
+        raise ConflictException(message="线程已有进行中轮次")
+
+    client = TestClient(app)
+    try:
+        resp = client.get("/_test_conflict")
+        assert resp.status_code == 409
+        assert resp.json() == {"code": "409001", "message": "线程已有进行中轮次"}
+    finally:
+        _remove_test_route("/_test_conflict")
 
 
 def test_business_exception_route_works_with_default_test_client():
@@ -426,11 +486,15 @@ def test_generate_error_docs_contains_both_tables():
     assert "| 404 | 404 | 路径不存在 |" in docs
 
 
-def test_generate_error_docs_dedupes_shared_code_and_hides_fallback():
+def test_generate_error_docs_lists_contract_codes_and_hides_fallback():
     docs = generate_error_docs()
-    # RequestValidationError 与 DatabaseException 同码，只列一次
-    assert docs.count("422001") == 1
-    assert "500001" not in docs  # Exception 兜底行不进文档
+    # 契约错误码表（api.md §0）：校验 400001、并发 409001/409002、数据库 500001 各列一次
+    assert "| 400001 | 400 | 请求参数错误 |" in docs
+    assert "| 409001 | 409 | 线程已有进行中轮次 |" in docs
+    assert "| 409002 | 409 | 轮次已处于终态，不可取消 |" in docs
+    assert "| 500001 | 500 | 内部错误 |" in docs  # DatabaseException 注册 500001 后进文档
+    assert "422001" not in docs  # 422001 让位给「URL 非法」（api.md 46 行，M3 口径，本批不实现）
+    assert "服务器内部错误" not in docs  # Exception 兜底行仍不进文档（客户端无需区分内部成因）
 
 
 def test_app_description_includes_error_docs():

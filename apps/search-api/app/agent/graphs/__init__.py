@@ -1,10 +1,7 @@
-"""图编排层出口：导出编译图（ARCH §3.1 / ADR-012，v1.20）。
+"""图编排层出口（ARCH §3.1 / ADR-012，v1.20；B2 桩已落地）。
 
-规划（B3 实装）：main = 主图壳（路由，亚毫秒/零 SSE 事件/无 LLM·IO）+ fast / deep
-两张模式子图；启动时由 registry.py 一次编译三图注册 GRAPH_REGISTRY；扩展 =
-新子图注册 + Agent Spec `spec.routing` 热更两步，主图拓扑零改动。
-
-占位阶段不导出任何符号（B3 定稿主图入口后，langgraph.json 的 graphs 指向本包
-main/fast/deep 暴露的编译图）。本包占位文件不 import langgraph——保证 AI 栈依赖
-就位前骨架模块引用一致。
+main = 主图壳（路由，亚毫秒/零 SSE 事件/无 LLM·IO）+ fast / deep 两张桩模式子图；
+registry.py 维护 GRAPH_REGISTRY，扩展 = 新子图注册 + Agent Spec `spec.routing`
+热更两步，主图拓扑零改动。langgraph.json 三入口（main/fast/deep）指向各模块的
+模块级 `graph` 编译产物；图内信号 schema 见 graphs/signals.py docstring。
 """

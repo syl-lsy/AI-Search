@@ -357,3 +357,58 @@ async def test_holder_fail_fast_then_start_and_close():
             event_bus_module.get_event_bus()  # close 清持有者（与 AssetCenter.close 同型）
     finally:
         event_bus_module._event_bus = original
+
+
+# ---- close_channel（B2：failed 轮无 done 的显式关闭，api.md §7.2 error 条目「直接关闭」口径）----
+
+
+async def test_close_channel_ends_subscriber_without_new_events():
+    """close_channel 唤醒订阅者正常结束：不发事件、async for 自然收尾（不悬挂）。"""
+    clock = FakeClock()
+    bus = _bus(clock)
+    await bus.publish("turn-a", _ev())
+    gen = bus.subscribe("turn-a")
+    assert (await _next(gen)).seq == 1
+
+    assert await bus.close_channel("turn-a") is True
+    # 无新事件投递——订阅流在关闭后自然退出（StopAsyncIteration），不悬挂
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+
+
+async def test_close_channel_marks_terminal_fixing_sweep_leak():
+    """failed 轮无 done 时 terminal 永不置位 → 缓冲永不清收；close_channel 置位修复泄漏。"""
+    clock = FakeClock()
+    bus = _bus(clock)
+    await bus.publish("turn-a", _ev())  # failed 轮：error 已入缓冲、无 done
+    clock.advance(31 * 60)
+    assert bus.cleanup_expired() == 0  # 未关闭：清扫判据（terminal ∨ 空缓冲）不满足
+
+    await bus.close_channel("turn-a")
+    clock.advance(1)  # 关闭后再静止一拍，越过 TTL
+    assert bus.cleanup_expired() == 1  # 泄漏修复：close 置 terminal 后可回收
+
+
+async def test_close_channel_is_idempotent_and_safe_on_missing_turn():
+    clock = FakeClock()
+    bus = _bus(clock)
+    assert await bus.close_channel("missing") is False  # 无通道 no-op（安全）
+
+    await bus.publish("turn-a", _ev())
+    assert await bus.close_channel("turn-a") is True
+    assert await bus.close_channel("turn-a") is True  # 幂等：重复关闭无异常
+
+
+async def test_terminal_done_does_not_end_subscription():
+    """done 置 terminal 但不结束订阅流（契约 172-173 行：关闭时机归 SSE 端点裁决，
+    done 后保活窗口——followups，ADR-003 v1.16——依赖此语义）。"""
+    clock = FakeClock()
+    bus = _bus(clock)
+    await bus.publish("turn-a", _ev(event_type="done"))
+    gen = bus.subscribe("turn-a")
+    assert (await _next(gen)).event_type == "done"
+
+    with pytest.raises(asyncio.TimeoutError):
+        await _next(gen, timeout=0.1)  # done 后订阅保持挂起（不自动结束）
+    await gen.aclose()
+

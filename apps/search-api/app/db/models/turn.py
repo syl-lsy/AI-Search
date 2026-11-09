@@ -1,7 +1,7 @@
-"""turns 表 ORM（data-model.md §1.3，0001 范围）。
+"""turns 表 ORM（data-model.md §1.3，0001 范围 + 0008 增补）。
 
-0005/0006/0008/0009 的增列（incognito/memory_hits/cancel_reason/followups）随对应
-迁移落地，本文件不得提前包含（护栏见 test_db_models.py）。
+0005/0006/0009 的增列（incognito/memory_hits/followups）随对应迁移落地，本文件
+不得提前包含（护栏见 test_db_models.py）；cancel_reason 已随 0008（REQ-042）落地。
 status/枚举列一律 varchar 无 CHECK（§4 规则：避开 PG enum 变更痛苦；取值校验在
 schema 层与 service 层）。
 """
@@ -26,17 +26,17 @@ from app.db.base import Base
 
 
 class Turn(Base):
-    """轮次（一次提问→回答的完整生命周期；时间线/成本/错误均为 jsonb 列）。"""
+    """轮次（一次提问→回答的完整生命周期；时间线/错误均为 jsonb 列）。"""
 
     __tablename__ = "turns"
     __table_args__ = (
         Index("idx_turns_thread_created", "thread_id", "created_at"),
-        # 部分索引（0001 形态）：进行中轮裁决（409001 检查/孤儿轮清理）；
-        # 扩 queued 的 drop+recreate 属 0008（REQ-042）
+        # 部分索引（0008 形态，REQ-042）：进行中/排队轮裁决（409001 检查/孤儿轮
+        # 清理，queued 随 running 同口径）；0001→0008 的 drop+recreate 见迁移文件
         Index(
             "idx_turns_running",
             "thread_id",
-            postgresql_where=text("status IN ('pending','running')"),
+            postgresql_where=text("status IN ('pending','running','queued')"),
         ),
     )
 
@@ -59,6 +59,9 @@ class Turn(Base):
     usage: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'"))
     langfuse_trace_id: Mapped[str | None] = mapped_column(String(64))  # session=thread_id
     degraded_reason: Mapped[str | None] = mapped_column(String(16))  # M2 起写入
+    # user|superseded|rolled_back（0008（REQ-042））；仅 status=canceled 时非空——
+    # 取消不是 error，不复用 error 列语义（§1.3 104 行）
+    cancel_reason: Mapped[str | None] = mapped_column(String(16))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     duration_ms: Mapped[int | None] = mapped_column(Integer)  # 提交→done

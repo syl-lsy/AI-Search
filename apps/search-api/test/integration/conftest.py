@@ -232,12 +232,36 @@ def _truncate_core_tables(info: TestDbInfo) -> None:
 
 @pytest.fixture
 def migrated_db(test_db) -> TestDbInfo:
-    """真库 + 已升级到 head（幂等）；用后截断。供需要已迁移 schema 的 integration 用例使用。"""
+    """真库 + 已升级到 head + 默认用户补种（幂等）；用后截断。
+
+    补种默认用户：_truncate_core_tables 会连 users 一起清空，而迁移 0001 的幂等
+    seed 只在首次 upgrade 执行——不补种则 threads/turns（user_id FK）全部写不进
+    （B2 契约测试实锤）。以 id 锚 ON CONFLICT DO NOTHING，与 app/db/seed.py 的
+    幂等 upsert 语义一致（值同源 common_settings DEFAULT_USER_ 组）。
+    """
     run_alembic(test_db, ["upgrade", "head"])
+    _seed_default_user(test_db)
     try:
         yield test_db
     finally:
         _truncate_core_tables(test_db)
+
+
+def _seed_default_user(info: TestDbInfo) -> None:
+    """幂等补种默认用户（管理面 psycopg2；INSERT 全参数绑定，值取自配置单例）。"""
+    from app.core.config import common_settings  # noqa: PLC0415 —— 延迟导入：在 DB_ 注入后读
+
+    conn = _pg_connect(info, info.name, user=info.user)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (id, name) VALUES (%s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (common_settings.default_user_id, common_settings.default_user_name),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @pytest.fixture
@@ -245,3 +269,182 @@ def db_truncate(test_db) -> TestDbInfo:
     """用后截断（迁移链用例自管 upgrade/downgrade，本 fixture 只负责清理数据行）。"""
     yield test_db
     _truncate_core_tables(test_db)
+
+
+# ---- B2 线程轮次基建（lifespan 等价启停：真库 + 桩图 + 真 EventBus，Nacos 走内置默认）----
+
+import asyncio  # noqa: E402
+import time as _time  # noqa: E402
+from collections.abc import Awaitable, Callable  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from typing import Any  # noqa: E402
+
+
+class _NoNacosClient:
+    """NacosAssetClient 假体：start/fetch 立即失败 → AssetCenter 按降级阶梯落 L4 内置默认。
+
+    内置默认（config_center/defaults.py）即 nacos-config.md 契约初值——spec.turn.
+    default_on_conflict="reject"、model.mapping.chat.options 三键——契约测试的消费
+    语义与生产 L1 快照完全一致，integration 不依赖 Nacos 存活（同 test_health.py
+    「非库探针假体」口径）。
+    """
+
+    async def start(self) -> None:
+        raise RuntimeError("integration 基建 fixture 不连 Nacos（落 L4 内置默认）")
+
+    async def fetch(self, data_id: str) -> str:
+        raise RuntimeError(f"integration 基建 fixture 不连 Nacos：{data_id}")
+
+    async def close(self) -> None:
+        return None
+
+
+@dataclass
+class B2Runtime:
+    """B2 基建句柄（lifespan 等价产物）：资产中心 / EventBus / ThreadScheduler。"""
+
+    center: Any  # AssetCenter（L4 内置默认，快照目录隔离在 tmp_path）
+    bus: Any  # EventBus（进程级持有者已注册，SSE 端点经 get_event_bus 解析）
+    scheduler: Any  # ThreadScheduler（TurnRunner 短事务，路由经 get_thread_scheduler 解析）
+
+
+@pytest.fixture(autouse=True)
+async def _recycle_engine_pool_between_tests():
+    """每测试后清空引擎连接池（integration 层 loop 卫生）。
+
+    asyncpg 连接绑定创建它的 asyncio loop，pytest-asyncio 默认每测试新 loop——
+    池内跨 loop 残留连接在下测 pre_ping 处炸「Future attached to a different
+    loop」（B2 契约测试实锤，setup ERROR 形态）。dispose 于当前 loop 内收口本测
+    全部连接，下测 checkout 全新连接；引擎对象本身为模块级单例，dispose 只清池
+    不换实例（get_session_factory 无感）。
+    """
+    yield
+    from app.db.session import _engine  # noqa: PLC0415 —— 模块级单例的池清理仅测试设施使用
+
+    if _engine is not None:
+        await _engine.dispose()
+
+
+@pytest.fixture
+async def b2_runtime(migrated_db, tmp_path):
+    """lifespan 等价基建启停：资产中心 → EventBus → ThreadScheduler → seq 种入。
+
+    启动顺序对齐 main.py lifespan（start_asset_center → start_event_bus →
+    start_thread_scheduler → seed_seq_from_db）；快照目录隔离到 tmp_path（不写真实
+    data/nacos_snapshot），app_env="test" 绕开 production L4 拒启动语义。用后逆序
+    收口：ThreadScheduler 无常驻任务（ARCH §6.1），复位全局持有者后 bus/center
+    依次 close（各自清持有者，与 lifespan finally 同序）。
+
+    每测试新启一整套（非会话级）：EventBus 的 Condition/Event 与清扫任务均绑定
+    运行 loop，pytest-asyncio 默认每测试新 loop——会话级单例会跨 loop 复用原语。
+    """
+    from app.config_center import start_asset_center
+    from app.core.config import NacosSettings
+    from app.services import turn_service
+    from app.services.event_bus import start_event_bus
+
+    center = await start_asset_center(
+        settings=NacosSettings(
+            snapshot_dir=str(tmp_path / "nacos-snapshot"), startup_timeout_s=1
+        ),
+        app_env="test",
+        client=_NoNacosClient(),
+    )
+    try:
+        bus = await start_event_bus()
+        try:
+            # start_thread_scheduler 幂等不复写全局——复位上测残留，保证本测的
+            # scheduler 绑定本测的 bus（无 close API，复位即 lifespan 逆序收口的等价物）
+            turn_service._thread_scheduler = None
+            scheduler = turn_service.start_thread_scheduler(bus=bus)
+            await turn_service.seed_seq_from_db()
+            yield B2Runtime(center=center, bus=bus, scheduler=scheduler)
+        finally:
+            turn_service._thread_scheduler = None
+            await bus.close()
+    finally:
+        await center.close()
+
+
+async def await_until(
+    predicate: Callable[[], Awaitable[bool] | bool],
+    *,
+    timeout_s: float = 30.0,
+    interval_s: float = 0.05,
+    description: str = "条件成立",
+) -> None:
+    """轮询等待谓词成立（桩图运行窗口/终态到达的通用等待；超时 AssertionError）。"""
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        result = predicate()
+        if isinstance(result, Awaitable):
+            result = await result
+        if result:
+            return
+        if _time.monotonic() > deadline:
+            raise AssertionError(f"等待超时（{timeout_s}s）：{description}")
+        await asyncio.sleep(interval_s)
+
+
+class B2Rest:
+    """B2 契约测试的 REST 轮询辅助（绑定进程内 ASGI 客户端）。
+
+    BackgroundTask（schedule_turn→图运行）在 POST 响应返回前执行（ASGITransport
+    整链路驱动）——需要在运行窗口内并发交互的用例（cancel/排队/打断）以
+    asyncio.create_task 提交 POST，再经本类轮询「行已提交可见」的线程/轮次：
+    建轮路由的 get_db 为 scope="function"（threads.py，teardown commit 先于
+    响应发送与 BackgroundTask），行提交即可从列表/详情端点拿到 thread_id/turn_id。
+    """
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    async def wait_first_thread(self) -> tuple[str, str]:
+        """等待首个线程/轮次行提交可见，返回 (thread_id, turn_id)（用前表已截断）。"""
+
+        async def _visible() -> bool:
+            resp = await self.client.get("/api/v1/threads")
+            return resp.status_code == 200 and bool(resp.json()["data"]["items"])
+
+        await await_until(_visible, description="首个线程行提交可见")
+        resp = await self.client.get("/api/v1/threads")
+        thread_id = resp.json()["data"]["items"][0]["thread_id"]
+        detail = await self.client.get(f"/api/v1/threads/{thread_id}")
+        return thread_id, detail.json()["data"]["turns"][0]["turn_id"]
+
+    async def turn_payload(self, turn_id: str) -> dict[str, Any] | None:
+        """GET /turns/{id} data；未提交可见（404）时返回 None（轮询容错）。"""
+        resp = await self.client.get(f"/api/v1/turns/{turn_id}")
+        if resp.status_code != 200:
+            return None
+        return resp.json()["data"]
+
+    async def wait_turn_status(
+        self, turn_id: str, statuses: set[str], *, timeout_s: float = 30.0
+    ) -> dict[str, Any]:
+        """轮询至轮次到达给定状态集，返回最终 §2.5 详情 data。"""
+
+        async def _reached() -> bool:
+            payload = await self.turn_payload(turn_id)
+            return payload is not None and payload["status"] in statuses
+
+        await await_until(
+            _reached,
+            timeout_s=timeout_s,
+            description=f"轮次 {turn_id} 到达 {sorted(statuses)}",
+        )
+        payload = await self.turn_payload(turn_id)
+        assert payload is not None
+        return payload
+
+
+@pytest.fixture
+def b2_rest(async_client) -> B2Rest:
+    """B2 REST 轮询辅助（绑定 async_client）。"""
+    return B2Rest(async_client)
+
+
+@pytest.fixture
+def wait_for():
+    """await_until 的 fixture 形态（测试模块经此轮询任意条件）。"""
+    return await_until
