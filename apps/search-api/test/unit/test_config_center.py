@@ -10,6 +10,7 @@
 """
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -299,6 +300,34 @@ class TestBuiltinDefaultsSerializable:
         assert json.loads(text) == BUILTIN_DEFAULTS[data_id], (
             f"{data_id} 内置默认 json 往返不等价（含不可序列化常量或语义漂移）"
         )
+
+
+class TestNacosInitScriptParity:
+    """scripts/nacos_init.py 五份初值 ≡ defaults.py BUILTIN_DEFAULTS（同一契约 §1~§5 的双投影）。
+
+    两处均声称【逐字】取自契约——投影一旦单侧漂移（某批次只改 defaults 或只改脚本），
+    FORCE=1 重跑 nacos-init 会把旧结构初值覆盖发布（线上热更值被回滚为过时结构）。
+    本测试锁死双投影一致：契约增量必须两处同步后才算闭环。
+    """
+
+    @staticmethod
+    def _load_script_module():
+        import importlib.util
+
+        script_path = Path(__file__).resolve().parents[4] / "scripts" / "nacos_init.py"
+        spec = importlib.util.spec_from_file_location("nacos_init_parity", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # 脚本有 __main__ 守卫，导入不触发发布
+        return module
+
+    def test_all_five_payloads_identical_to_defaults(self):
+        module = self._load_script_module()
+        script_payloads = dict(module.DATA_IDS)
+        for data_id, defaults_payload in BUILTIN_DEFAULTS.items():
+            assert script_payloads.get(data_id) == defaults_payload, (
+                f"{data_id}：nacos_init.py 初值与 defaults.py 内置默认漂移——"
+                "契约变更须两处同步（逐字投影），先修齐再发布"
+            )
 
 
 class TestProductionFloor:

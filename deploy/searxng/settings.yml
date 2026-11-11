@@ -1,0 +1,34 @@
+# =============================================================================
+# SearXNG settings —— ai-search 自部署搜索兜底链首（B3 第 0 步）
+# 契约溯源：docs/ARCHITECTURE.md §5 searxng 行 + nacos-config.md §2 searxng 条目注记（v1.18）
+#   + docs/research/search-source-selfhost-20261107.md（部署形态）
+# 约束（本文件与 compose searxng 服务成对维护）：
+#   - search.formats 白名单必含 json——JSON API 前提（缺省 GET /search?format=json 403）；
+#   - limiter 关闭 + 不配 Redis——纯内网 API 场景（limiter 依赖 Redis，关闭即零依赖，
+#     research 报告 §五：官方单容器 ~500-600MB RAM）；
+#   - 其余键走上游默认（use_default_settings: true，官方推荐叠加式最小配置）；
+#   - 改本文件后必须 up -d --force-recreate searxng（单文件 bind 挂载 macOS inode 坑，
+#     同 deploy/docker-compose.yml litellm 注，restart 无效）。
+# =============================================================================
+
+use_default_settings: true
+
+general:
+  instance_name: "ai-search-searxng"
+  debug: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+server:
+  limiter: false          # 纯内网 API 场景关闭（开启需 Redis）
+  image_proxy: false      # 不经实例代理图片（聚合层只供 JSON API）
+  # secret_key 省略不写本文件（密钥纪律：secret 不落仓库）。2026-11-09 实证：该版本镜像对
+  # 默认值 ultrasecretkey 硬拒绝启动（worker "server.secret_key is not changed" 即退出），
+  # 且 entrypoint 仅在 settings.yml 不存在时才生成随机值（bind mount 存在则跳过）——
+  # 正解 = 容器环境变量 SEARXNG_SECRET 覆写（searx/settings_defaults.py:218 SettingsValue
+  # environ_name='SEARXNG_SECRET'，镜像内默认 settings 自注 "Is overwritten by
+  # ${SEARXNG_SECRET}"），值经 compose ${SEARXNG_SECRET:?} 从 .env 注入（fail fast）

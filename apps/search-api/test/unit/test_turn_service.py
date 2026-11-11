@@ -29,14 +29,19 @@ from app.exception import (
     NotFoundException,
     TurnTerminalException,
 )
+from app.agent.nodes.synthesis import SynthesisError
+from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry
 from app.services import turn_service
 from app.services.event_bus import EventBus, SseEvent
 from app.services.turn_service import (
     FINAL_STATUSES,
+    HISTORY_WINDOW_TURNS,
     QUEUE_DEPTH_LIMIT,
     SubmitDecision,
     ThreadScheduler,
     decide_on_submit,
+    detect_query_lang,
+    history_statement,
     resolve_chat_model,
     seed_seq_from_db,
 )
@@ -116,13 +121,17 @@ class _TurnRow:
 
     def __init__(self, *, status: str = "running", mode: str = "fast",
                  thread_id: str = "0b1f3a2e-0000-4000-8000-000000000001",
-                 user_id: str = "00000000-0000-4000-8000-000000000001") -> None:
+                 user_id: str = "00000000-0000-4000-8000-000000000001",
+                 query: str = "桩问题", chat_model_key: str = "qwen") -> None:
         self.id = uuid.uuid4()
         self.thread_id = thread_id
         self.user_id = user_id
         self.status = status
         self.mode = mode
-        self.query = "桩问题"
+        self.query = query
+        self.chat_model_key = chat_model_key
+        self.query_lang: str | None = None  # TurnRunner 运行时写入（§2.5 事实源）
+        self.rewritten_queries: list[Any] = []
         self.created_at = datetime.now(UTC)
         self.started_at: datetime | None = None
         self.finished_at: datetime | None = None
@@ -135,14 +144,21 @@ class _TurnRow:
 
 
 class _FakeGraph:
-    """假主图：astream 按脚本产出 (namespace, stream_mode, chunk) 三元组；步间可插 delay。"""
+    """假主图：astream 按脚本产出 (namespace, stream_mode, chunk) 三元组；步间可插 delay。
+
+    记录每次收到的初始 state payload（B3 第 0 步注入断言用）。
+    """
 
     def __init__(self, steps: list[tuple[str, Any]], *, delay: float = 0.0) -> None:
         self._steps = steps
         self._delay = delay
+        self.payloads: list[Any] = []
+        self.configs: list[Any] = []
 
     def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
                 subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
         steps = self._steps
         delay = self._delay
 
@@ -150,8 +166,14 @@ class _FakeGraph:
             for stream, chunk in steps:
                 if delay:
                     await asyncio.sleep(delay)
-                # updates 一律产顶层 ns（=()）——TurnRunner 仅吸收顶层 updates 最终 state
-                namespace = () if stream == "updates" else (("fast:run",),)
+                # updates 一律产顶层 ns（=()）——TurnRunner 仅吸收顶层 updates 最终 state；
+                # messages 帧 namespace 带 synthesis 节点段（R14③ 过滤判定面，§6.1）
+                if stream == "updates":
+                    namespace = ()
+                elif stream == "messages":
+                    namespace = ("fast:run", "synthesis")
+                else:
+                    namespace = ("fast:run",)
                 yield (namespace, stream, chunk)
 
         return gen()
@@ -166,7 +188,6 @@ class _BoomGraph(_FakeGraph):
     def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
                 subgraphs: bool = False) -> Any:
         async def gen():
-            yield (("fast:run",), "custom", {"type": "stage", "stage_key": "rewrite", "status": "running"})
             raise RuntimeError("图运行爆炸")
 
         return gen()
@@ -226,6 +247,7 @@ def _scheduler(bus: EventBus, factory: _FakeSessionFactory, graph: Any = None,
         graph=graph or _FakeGraph([]),
         spec_snapshot=_snapshot(spec or _SPEC_PAYLOAD),
         mapping_snapshot=_snapshot(_MAPPING_PAYLOAD),
+        tools_registry=ToolRegistry(),  # 裸 registry：单测 mcp 快照缺省→空链（假图不触网）
     )
 
 
@@ -496,12 +518,11 @@ async def test_execute_turn_translates_and_persists_with_same_seq() -> None:
     session = _FakeSession(turn=turn)
     factory = _FakeSessionFactory(session)
     graph = _FakeGraph([
-        _custom({"type": "stage", "stage_key": "rewrite", "status": "running"}),
         _custom({"type": "stage", "stage_key": "rewrite", "status": "done"}),
         _custom({"type": "stage", "stage_key": "search", "status": "running"}),
         _custom({"type": "stage", "stage_key": "search", "status": "done"}),
         _custom({"type": "sources", "batch": [_SRC], "total": 1}),
-        _custom({"type": "token", "delta": "答案"}),
+        _message("答案"),  # token 经 messages 流（§6.1——custom 流无 token 域）
         _updates({"write": {"answer_md": "答案", "sources": [_SRC]}}),
     ])
     scheduler = _scheduler(bus, factory, graph)
@@ -572,11 +593,11 @@ async def test_execute_turn_messages_chunks_to_token_and_thinking() -> None:
     # 帧内顺序：reasoning 先于 content（思维链在前）；帧 2 text 块先于 thinking 块；
     # 全部只发布不落库 + 正常完成仍发 done
     assert [e.event_type for e in published] == [
-        "thinking", "token", "token", "thinking", "done",
-    ]
+        "stage", "thinking", "token", "token", "thinking", "done",
+    ]  # 首个 stage=图前发布（§4.3）
     # token/thinking 不落库（done 恒落库——终态不变式）
     persisted_types = [obj.event_type for obj in session.added if isinstance(obj, TurnEvent)]
-    assert persisted_types == ["done"]
+    assert persisted_types == ["stage", "done"]  # 首个 stage 图前发布且落库（§4.3/§7.2 落库子集）
     assert turn.status == "completed"
     assert turn.answer_md is None  # 无顶层 updates answer_md → 不写
     done = published[-1]
@@ -621,7 +642,6 @@ async def test_cancel_running_before_start_finishes_canceled_immediately() -> No
     turn = _TurnRow(status="running")
     session = _FakeSession(turn=turn)
     graph = _FakeGraph([
-        _custom({"type": "stage", "stage_key": "rewrite", "status": "running"}),
         _custom({"type": "stage", "stage_key": "rewrite", "status": "done"}),
     ])
     scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
@@ -644,7 +664,6 @@ async def test_cancel_running_midflight_senses_at_event_boundary() -> None:
     turn = _TurnRow(status="running")
     session = _FakeSession(turn=turn)
     graph = _FakeGraph([
-        _custom({"type": "stage", "stage_key": "rewrite", "status": "running"}),
         _custom({"type": "stage", "stage_key": "rewrite", "status": "done"}),
         _custom({"type": "stage", "stage_key": "search", "status": "running"}),
     ], delay=0.03)
@@ -711,7 +730,6 @@ async def test_terminal_race_loser_skips_done_and_keeps_canceled() -> None:
     turn = _TurnRow(status="canceled")
     session = _FakeSession(turn=turn)
     graph = _FakeGraph([
-        _custom({"type": "stage", "stage_key": "rewrite", "status": "running"}),
         _custom({"type": "stage", "stage_key": "rewrite", "status": "done"}),
     ])
     scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
@@ -768,6 +786,60 @@ async def test_execute_turn_exception_fails_with_500001_and_closes_channel() -> 
     assert channel is not None and channel.terminal is True and channel.closed is True
 
 
+class _SearchBoomGraph(_FakeGraph):
+    """搜索链全断假图：astream 抛 SearchChainUnavailable（500201 短路路径）。"""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+        # 同步直抛（astream 求值处抛出——try 块内，SearchChainUnavailable 捕获路径）
+        raise SearchChainUnavailable("主位与备位链全部不可用")
+
+
+async def test_search_chain_unavailable_short_circuits_500201() -> None:
+    """全源失败短路（ARCH §4.1 A1 情形 3）：SearchChainUnavailable → error 500201 +
+    failed + close_channel（事件由 TurnRunner 出、图不发 error；synthesis 前短路）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _SearchBoomGraph())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["stage", "error"]  # 首个 stage=图前发布
+    error_event = published[1]
+    assert error_event.data["code"] == "500201"  # 全部搜索源不可用（§7.2 SSE 专属码）
+    assert turn.status == "failed"
+    assert turn.error is not None and turn.error["code"] == "500201"
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True and channel.closed is True
+
+
+async def test_done_degraded_from_state_with_source_failure_reason() -> None:
+    """图内降级接线（§6.2）：FastState.degraded=True → done.degraded=True +
+    degraded_reason=source_failure + turns.degraded_reason 列同步。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({"write": {"answer_md": "降级答案", "degraded": True}}),
+    ])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = next(e for e in published if e.event_type == "done")
+    assert done.data["degraded"] is True
+    assert done.data["degraded_reason"] == "source_failure"
+    assert turn.status == "completed" and turn.degraded_reason == "source_failure"
+
+
 async def test_execute_turn_timeout_guard_fails_with_500301() -> None:
     """spec.turn_timeout_s 包 astream：超时 → error(500301 硬超时熔断) + failed + close_channel。"""
     bus = _bus()
@@ -782,10 +854,99 @@ async def test_execute_turn_timeout_guard_fails_with_500301() -> None:
     await scheduler._execute_turn(turn)
 
     published = await _drain_all(bus, str(turn.id))
-    assert [e.event_type for e in published] == ["error"]
-    assert published[0].data["code"] == "500301"
+    assert [e.event_type for e in published] == ["stage", "error"]  # 首个 stage=图前发布
+    assert published[1].data["code"] == "500301"
     assert turn.status == "failed"
     assert turn.error is not None and turn.error["code"] == "500301"
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True
+
+
+
+
+# ---- R14③ messages 过滤 + SynthesisError 降级收束（B3 节点 5/5）----
+
+
+class _FakeAstream3:
+    """产出完整三元组 (namespace, stream_mode, chunk) 的假图（messages 过滤用例）。"""
+
+    def __init__(self, frames: list[tuple[tuple[str, ...], str, Any]]) -> None:
+        self._frames = frames
+        self.payloads: list[Any] = []
+        self.configs: list[Any] = []
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+        frames = list(self._frames)
+
+        async def gen():
+            for ns, stream, chunk in frames:
+                yield (ns, stream, chunk)
+
+        return gen()
+
+
+async def test_messages_filter_only_fast_synthesis_yields_tokens() -> None:
+    """R14③（§6.1，实测形态）：仅 synthesis 节点 metadata 增量映射 token/thinking——
+    rewrite/writer 帧不放行；custom 流无 token 域（sources 照常翻译）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    frames = [
+        ((), "messages", (_MessageChunk("改写增量"), {"langgraph_node": "rewrite"})),
+        ((), "messages", (_MessageChunk("综合增量", reasoning="思"), {"langgraph_node": "synthesis"})),
+        ((), "messages", (_MessageChunk("深度增量"), {"langgraph_node": "writer"})),
+        (("fast:r1",), "custom", {"type": "sources", "batch": [], "total": 0}),
+        ((), "updates", {"synthesis": {"answer_md": "答案"}}),
+    ]
+    graph = _FakeAstream3(frames)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    tokens = [(e.event_type, e.data.get("delta")) for e in published if e.event_type in ("token", "thinking")]
+    assert tokens == [("thinking", "思"), ("token", "综合增量")]
+    assert turn.status == "completed" and turn.answer_md == "答案"
+
+
+class _SynthesisBoomGraph(_FakeGraph):
+    """综合失败假图：先产 sources（部分内容）再抛 SynthesisError（500101 收束路径）。"""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+
+        async def gen():
+            yield (("fast:r1",), "custom", {"type": "sources", "batch": [], "total": 0})
+            raise SynthesisError("LLM 调用重试耗尽")
+
+        return gen()
+
+
+async def test_synthesis_error_degraded_finish_with_error_and_done() -> None:
+    """api.md §7.2 收束（v1.10 ⑥「有部分内容」形态）：SynthesisError → error(500101) +
+    done(finish=degraded) + turns.status=degraded——已收集 sources 保留。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _SynthesisBoomGraph())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["stage", "sources", "error", "done"]  # 首个 stage=图前发布
+    error_event = next(e for e in published if e.event_type == "error")
+    assert error_event.data["code"] == "500101"  # LLM 调用重试耗尽（§7.2 SSE 专属码）
+    done = published[-1]
+    assert done.data["finish"] == "degraded" and done.data["degraded"] is True
+    assert turn.status == "degraded" and turn.error["code"] == "500101"
     channel = bus._channels.get(str(turn.id))
     assert channel is not None and channel.terminal is True
 
@@ -835,6 +996,183 @@ def test_resolve_chat_model_validates_against_options() -> None:
     assert resolve_chat_model("glm", _MAPPING_PAYLOAD) == ("glm", "glm-4.7")
     with pytest.raises(BadRequestException):
         resolve_chat_model("llama", _MAPPING_PAYLOAD)
+
+
+# ---- B3 第 0 步：OQ-11 轮快照冻结 + FastState 全量输入注入（ARCH §4.0/§4.1/§6.1）----
+
+
+class _FakeAssetCenter:
+    """AssetCenter 假体：按 dataId 计数 snapshot 调用次数，逐次返回编排的 payload 序列。"""
+
+    def __init__(self, payloads: dict[str, list[dict[str, Any]]]) -> None:
+        self._payloads = payloads  # data_id → 逐次返回的 payload 序列（末次复用）
+        self.calls: dict[str, int] = {}
+
+    def snapshot(self, data_id: str) -> AssetSnapshot:
+        seq = self.calls.get(data_id, 0)
+        self.calls[data_id] = seq + 1
+        series = self._payloads[data_id]
+        payload = series[min(seq, len(series) - 1)]
+        return AssetSnapshot(
+            data_id=data_id, version=seq + 1, md5="m", updated_at="t", payload=payload
+        )
+
+
+async def test_execute_turn_injects_full_fast_state_input() -> None:
+    """astream 初始 state 注入 FastState 全量输入（ARCH §4.1）：OQ-11 spec 快照随 state
+    进图 + history（最近 6 轮 {q, a_head≤200}，时间正序）+ query_lang 前置纯代码判定
+    + chat_model_key 复用 resolve_chat_model；images 恒空（M4）。"""
+    bus = _bus()
+    turn = _TurnRow(
+        status="running",
+        mode="fast",
+        query="今天的天气怎么样？最新消息",
+        chat_model_key="qwen",
+    )
+    session = _FakeSession(
+        turn=turn,
+        execute_rows=[  # 历史查询返回（created_at desc 形态：新→旧）
+            ("上一问二", "答" * 250),
+            ("上一问一", "更早答案"),
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert set(payload) == {
+        "turn_id",
+        "thread_id",
+        "user_id",
+        "mode",
+        "query",
+        "chat_model_key",
+        "history",
+        "query_lang",
+        "spec",
+        "images",
+    }
+    assert payload["turn_id"] == str(turn.id)
+    assert payload["thread_id"] == turn.thread_id
+    assert payload["user_id"] == turn.user_id
+    assert payload["mode"] == "fast"
+    assert payload["query"] == "今天的天气怎么样？最新消息"
+    assert payload["chat_model_key"] == "qwen"  # resolve_chat_model(turn.chat_model_key, mapping)
+    assert payload["query_lang"] == "zh"  # CJK 占比 ≥30%（OQ-2，实现层常量不进 Nacos）
+    assert payload["images"] == []
+    assert payload["history"] == [  # 时间正序（旧→新）；a_head 截 200
+        {"q": "上一问一", "a_head": "更早答案"},
+        {"q": "上一问二", "a_head": "答" * 200},
+    ]
+    assert payload["spec"] == _SPEC_PAYLOAD  # 轮内快照（dict 化）随 state 进图
+    # configurable 注入：模型映射快照（rewrite/light 消费，OQ-11 同源）
+    config = graph.configs[0]
+    assert config["configurable"]["thread_id"] == turn.thread_id
+    assert config["configurable"]["turn_id"] == str(turn.id)
+    assert config["configurable"]["model_mapping"] == _MAPPING_PAYLOAD
+    # 观测注入随 LANGFUSE_ 配置形态（有键 → 1 个 handler；无键 → 空表）
+    from app.core.config import langfuse_settings as _lf
+
+    _lf_configured = bool(
+        _lf.public_key and _lf.secret_key.get_secret_value()
+    )
+    callbacks = config.get("callbacks", [])
+    assert (len(callbacks) == 1) if _lf_configured else (callbacks == [])
+    assert config["metadata"]["langfuse_session_id"] == turn.thread_id
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("今天的天气怎么样", "zh"),  # 全 CJK
+        ("langgraph 是什么框架", "zh"),  # CJK 5/14 ≈ 35.7% ≥30%
+        ("What is the latest news about langgraph?", "en"),
+        ("hello world 今天", "en"),  # CJK 2/12 ≈ 16.7% <30%
+        ("!!!???", "en"),  # 零 CJK（纯标点）
+        ("", "en"),  # 空串
+        ("   ", "en"),  # 纯空白
+    ],
+)
+def test_detect_query_lang_cjk_ratio_threshold(
+    query: str, expected: str
+) -> None:
+    """OQ-2：CJK 字符占比 ≥30% 判 zh（分母=非空白字符）；空/零有效字符回落 en。"""
+    assert detect_query_lang(query) == expected
+
+
+async def test_execute_turn_freezes_spec_and_mapping_snapshots_oq11(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OQ-11：运行开始一次性捕获 spec/mapping 快照——轮内全部读取走该快照，
+    热更不串轮（修生产路径每次实时读快照、未真正冻结的问题）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    spec_v1 = {**_SPEC_PAYLOAD, "fast": {"turn_timeout_s": 5.0}}
+    spec_v2 = {**_SPEC_PAYLOAD, "fast": {"turn_timeout_s": 999.0}}
+    center = _FakeAssetCenter({
+        turn_service._SPEC_DATA_ID: [spec_v1, spec_v2],  # 第二次读取（若有）将拿到换版 v2
+        turn_service._MAPPING_DATA_ID: [_MAPPING_PAYLOAD],
+    })
+    monkeypatch.setattr(turn_service, "get_asset_center", lambda: center)
+    # 无 ctor 快照注入 = 生产路径（start_thread_scheduler 缺省装配形态）
+    scheduler = ThreadScheduler(
+        bus=bus,
+        session_factory=_FakeSessionFactory(session),
+        graph=graph,
+        tools_registry=ToolRegistry(),
+    )
+
+    await scheduler._execute_turn(turn)
+
+    assert center.calls[turn_service._SPEC_DATA_ID] == 1  # 一次性捕获，不反复实时读
+    assert center.calls[turn_service._MAPPING_DATA_ID] == 1
+    assert graph.payloads[0]["spec"] == spec_v1  # 冻结 v1，热更 v2 不串轮
+
+
+async def test_resolve_captures_spec_snapshot_once_from_asset_center(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """提交裁决路径同口径：缺省策略读一次性捕获的快照（进程内捕获为执行依据）。"""
+    spec = {**_SPEC_PAYLOAD, "turn": {"default_on_conflict": "enqueue"}}
+    center = _FakeAssetCenter(
+        {
+            turn_service._SPEC_DATA_ID: [spec],
+            turn_service._MAPPING_DATA_ID: [_MAPPING_PAYLOAD],
+        }
+    )
+    monkeypatch.setattr(turn_service, "get_asset_center", lambda: center)
+    bus = _bus()
+    running = _TurnRow(status="running")
+    turn = _TurnRow(status="pending")
+    session = _FakeSession(turn=turn, rows=[running])
+    scheduler = ThreadScheduler(bus=bus, session_factory=_FakeSessionFactory(session))
+
+    decision = await scheduler.resolve_conflict_on_submit(
+        session, thread_id=turn.thread_id, turn_id=str(turn.id), on_conflict=None
+    )
+
+    assert decision is SubmitDecision.ENQUEUE  # 缺省策略来自资产中心快照 enqueue
+    assert center.calls[turn_service._SPEC_DATA_ID] == 1
+
+
+def test_history_statement_filters_and_binds_params() -> None:
+    """历史装配查询口径：状态窗口/回退排除/无答案排除 + 参数绑定（无字符串拼接）+ LIMIT 6。"""
+    stmt = history_statement(str(uuid.uuid4()), str(uuid.uuid4()))
+    compiled = stmt.compile()
+    sql = str(compiled)
+    bound_values = [str(v) for v in compiled.params.values()]
+
+    assert "IS NOT NULL" in sql  # 无答案轮不产 a_head，自然排除
+    assert any("rolled_back" in v for v in bound_values)  # 回退轮排除（内容回退语义）
+    assert "'rolled_back'" not in sql  # 绑定参数承载，无字符串拼接
+    assert any("completed" in v for v in bound_values)
+    assert any("degraded" in v for v in bound_values)
+    assert any("canceled" in v for v in bound_values)
+    assert str(HISTORY_WINDOW_TURNS) in [v for v in bound_values]  # LIMIT 6
 
 
 # ---- 辅助 ----

@@ -24,7 +24,7 @@ test_rollback_strategy。
 并发交互口径：BackgroundTask（schedule_turn→图运行）在 POST 响应返回前由 ASGI 链路
 驱动完成——需要运行窗口的用例以 asyncio.create_task 提交 POST，再轮询已提交可见的
 行（get_db teardown commit 先于 BackgroundTask，FastAPI 0.106+ 时序）拿 id 后并发
-操作；桩图运行窗口经 monkeypatch fast_graph.SEARCH_DELAY_S 制造（ask 指定口径）。
+操作；桩图运行窗口经 monkeypatch 搜索假体延时（stub_flow.FAKE_DELAY_S，B3 节点接真后由桩流假图承担）制造。
 
 source_id 三面同源（评审 P2 修复后）：stub 的固定测试 uuid（fast.py）仅是图侧占位
 ——翻译层先建 sources 行定 id、以行 id 回写事件 batch 后再发布，§7.2 sources 事件 /
@@ -40,7 +40,8 @@ import pytest
 from sqlalchemy import select
 
 from app.agent.graphs import deep as deep_graph
-from app.agent.graphs import fast as fast_graph
+from test.integration import stub_flow
+from app.agent.tools import registry as _tools_registry_module
 from app.db.models import Source, Turn, TurnEvent
 from app.db.session import get_session_factory
 
@@ -125,18 +126,21 @@ _STAGE_KEYS = {
 _USAGE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"}
 
 # §7.4 快速主干（桩期序列）：rewrite(r,d) → search(r,d) → sources → write(r,d) → done
+# §7.4 主干（B3 五节点接真形态）：首个 stage=图前发布（§4.3）、rewrite 仅 done 帧、
+# search running→done(progress) 一对、sources 由 fuse_rerank 发最终集、write running→done；
+# token/thinking 走 messages 流不入 turn_events（ADR-003 第 4 条）
 _STUB_FAST_EVENT_SEQUENCE = [
-    "stage",
-    "stage",
-    "stage",
-    "stage",
-    "sources",
-    "stage",
-    "stage",
+    "stage",   # rewrite running（TurnRunner 图前发布）
+    "stage",   # rewrite done
+    "stage",   # search running
+    "stage",   # search done (progress)
+    "sources",  # fuse_rerank 发最终集
+    "stage",   # write running (label=综合中)
+    "stage",   # write done
     "done",
 ]
 
-_FAST_QUERY = "LangGraph 的 Send API 和 Router 的区别？"
+_FAST_QUERY = "LangGraph 的 Send 和条件边有什么区别？"  # 中文占比 ≥30%（OQ-2 判 zh——测试数据与判据对齐）
 
 
 # ---- DB 直读辅助（闭环② turn_events 落库对账）----
@@ -238,14 +242,14 @@ async def test_post_threads_success_and_turn_events_reconciliation(
     assert detail["mode"] == "fast"
     assert detail["status"] == "completed"
     assert detail["query"] == _FAST_QUERY
-    assert detail["query_lang"] is None  # B2 桩期不判定（M1 简化记录）
-    assert detail["rewritten_queries"] == []
+    assert detail["query_lang"] == "zh"  # B3：TurnRunner 前置纯代码判定（OQ-2）
+    assert detail["rewritten_queries"] == ["桩改写检索 query"]  # rewrite 假体 fixture
     assert detail["parent_turn_id"] is None
     # 桩答案经 token 流→updates 合并→终态落库→REST 读回全链一致
-    assert detail["answer_md"] == fast_graph.STUB_FAST_ANSWER_MD
+    assert detail["answer_md"] == stub_flow.FAKE_ANSWER_MD
     # sources[]：§2.5 形状 + 桩值；分期口径 snapshot_available=false / kb_doc_id=null
-    assert len(detail["sources"]) == 2
-    assert [s["ref_no"] for s in detail["sources"]] == [1, 2]
+    assert len(detail["sources"]) == 1  # 搜索假体每 query 恒 1 候选（conftest 桩流假体）
+    assert [s["ref_no"] for s in detail["sources"]] == [1]
     for src in detail["sources"]:
         assert set(src) == _SOURCE_KEYS
         assert src["source_type"] == "web"
@@ -253,7 +257,7 @@ async def test_post_threads_success_and_turn_events_reconciliation(
         assert src["title"] and src["snippet"]
         assert src["snapshot_available"] is False  # M2（snapshot_id 列）起真实值
         assert src["kb_doc_id"] is None  # M3 起真实值
-    assert [s["score"] for s in detail["sources"]] == [0.91, 0.87]
+    assert [s["score"] for s in detail["sources"]] == [0.9]  # 搜索假体固定分值
     assert detail["images"] == []  # B2 桩不发 images 事件（M4 定回放口径）
     # stages[]：§2.5 形状 + running/done 配对聚合结果
     assert [s["stage_key"] for s in detail["stages"]] == ["rewrite", "search", "write"]
@@ -290,7 +294,7 @@ async def test_post_threads_success_and_turn_events_reconciliation(
     assert turn_row.started_at is not None  # PROCEED 裁决同事务盖章（图运行开始）
     assert turn_row.finished_at is not None
     assert turn_row.started_at < turn_row.finished_at  # 非终态防御分支补盖（评审 P2）
-    assert turn_row.answer_md == fast_graph.STUB_FAST_ANSWER_MD
+    assert turn_row.answer_md == stub_flow.FAKE_ANSWER_MD
     assert turn_row.duration_ms == detail["duration_ms"]
     assert turn_row.usage == {}
     assert [s["stage_key"] for s in turn_row.timing["stages"]] == [
@@ -304,6 +308,7 @@ async def test_post_threads_success_and_turn_events_reconciliation(
     # ---- 闭环②：turn_events 落库逐条对账 ----
     events = await _db_turn_events(turn_id)
     types = [e.event_type for e in events]
+    print("[actual types]", types)
     # §7.4 快速主干 + token/thinking 不落库（ADR-003 第 4 条）
     assert types == _STUB_FAST_EVENT_SEQUENCE
     assert "token" not in types and "thinking" not in types
@@ -325,9 +330,9 @@ async def test_post_threads_success_and_turn_events_reconciliation(
     assert write_running.payload["label"] == "综合中"
     # sources 事件 payload 与 REST sources / sources 表三方一致
     sources_event = next(e for e in events if e.event_type == "sources")
-    assert sources_event.payload["total"] == 2
+    assert sources_event.payload["total"] == 1
     batch = sources_event.payload["batch"]
-    assert [b["ref_no"] for b in batch] == [1, 2]
+    assert [b["ref_no"] for b in batch] == [1]
     for brief, item in zip(detail["sources"], batch):
         assert (item["ref_no"], item["source_type"], item["title"], item["url"]) == (
             brief["ref_no"],
@@ -339,24 +344,21 @@ async def test_post_threads_success_and_turn_events_reconciliation(
     db_rows = await _db_sources(turn_id)
     assert [(r.ref_no, r.source_type, r.title) for r in db_rows] == [
         (1, "web", batch[0]["title"]),
-        (2, "web", batch[1]["title"]),
     ]
-    assert float(db_rows[0].score) == 0.91 and float(db_rows[1].score) == 0.87
+    assert float(db_rows[0].score) == 0.9  # 搜索假体固定分值
     # source_id 四面同源（评审 P2 修复）：§7.2 事件 batch / turn_events payload /
     # sources 表行 id / §2.5 sources[] 一致（data-model.md §1.5「id 即 api.md 的
     # source_id」）；stub 固定测试 uuid 仅图侧占位，已被行 id 回写覆写
     for brief, item, row in zip(detail["sources"], batch, db_rows):
         assert item["source_id"] == brief["source_id"] == str(row.id)
         uuid.UUID(brief["source_id"])  # 合法 UUID v4（api.md §0）
-        assert brief["source_id"] != fast_graph.STUB_FAST_SOURCES[0]["source_id"]
-        assert brief["source_id"] != fast_graph.STUB_FAST_SOURCES[1]["source_id"]
     # done 事件 payload 与 REST 终态一致（先落库后发布——「事件到达时 2.5 已可对账」）
     done = events[-1]
     assert done.payload["finish"] == "completed"
     assert done.payload["degraded"] is False
     assert done.payload["degraded_reason"] is None
     assert done.payload["duration_ms"] == detail["duration_ms"]
-    assert done.payload["source_count"] == 2
+    assert done.payload["source_count"] == 1
     assert done.payload["usage"] == {}
 
 
@@ -475,7 +477,7 @@ async def test_get_thread_detail_contract_and_404(async_client, b2_rest, b2_runt
     assert skeleton["mode"] == "fast"
     assert skeleton["has_report"] is False
     assert skeleton["degraded"] is False
-    assert skeleton["query_lang"] is None  # B2 桩期
+    assert skeleton["query_lang"] == "zh"  # B3 TurnRunner 前置判定
     assert isinstance(skeleton["duration_ms"], int)
 
     # 404001：不存在与非法 UUID 同码不泄漏存在性
@@ -560,7 +562,7 @@ async def test_post_turn_followup_contract(async_client, b2_rest, b2_runtime):
     assert followup["thread_id"] == thread_id
     assert followup["status"] == "running"  # 空闲线程追问 PROCEED
     detail = await b2_rest.wait_turn_status(followup["turn_id"], {"completed"})
-    assert detail["answer_md"] == fast_graph.STUB_FAST_ANSWER_MD
+    assert detail["answer_md"] == stub_flow.FAKE_ANSWER_MD
     assert detail["thread_id"] == thread_id
     assert detail["parent_turn_id"] is None  # 无深度轮可挂（REQ-017 仅 deep completed/degraded）
 
@@ -604,7 +606,7 @@ async def test_get_turn_detail_404(async_client, migrated_db):
 
 @pytest.mark.requires_db
 async def test_get_turn_detail_while_running(async_client, b2_rest, b2_runtime, monkeypatch):
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 1.5)
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 1.5)
     post_task = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": _FAST_QUERY, "mode": "fast"})
     )
@@ -627,7 +629,7 @@ async def test_get_turn_detail_while_running(async_client, b2_rest, b2_runtime, 
 
 @pytest.mark.requires_db
 async def test_cancel_running_turn(async_client, b2_rest, b2_runtime, monkeypatch):
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 2.0)
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 2.0)
     post_task = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": "会被取消的问题", "mode": "fast"})
     )
@@ -649,6 +651,7 @@ async def test_cancel_running_turn(async_client, b2_rest, b2_runtime, monkeypatc
     # turn_events：无 error 事件；done(finish=canceled, cancel_reason=user)
     events = await _db_turn_events(turn_id)
     types = [e.event_type for e in events]
+    print("[actual types]", types)
     assert "error" not in types
     done = next(e for e in events if e.event_type == "done")
     assert done.payload["finish"] == "canceled"
@@ -660,7 +663,7 @@ async def test_cancel_running_turn(async_client, b2_rest, b2_runtime, monkeypatc
 
 @pytest.mark.requires_db
 async def test_cancel_queued_turn(async_client, b2_rest, b2_runtime, wait_for, monkeypatch):
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 2.0)
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 2.0)
     post1 = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": "占住运行位", "mode": "fast"})
     )
@@ -719,7 +722,7 @@ async def test_cancel_queued_turn(async_client, b2_rest, b2_runtime, wait_for, m
 
 @pytest.mark.requires_db
 async def test_reject_strategy_409001(async_client, b2_rest, b2_runtime, monkeypatch):
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 2.0)
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 2.0)
     post1 = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": "进行中", "mode": "fast"})
     )
@@ -761,7 +764,8 @@ async def test_reject_strategy_409001(async_client, b2_rest, b2_runtime, monkeyp
 
 @pytest.mark.requires_db
 async def test_enqueue_strategy_fifo(async_client, b2_rest, b2_runtime, wait_for, monkeypatch):
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 1.0)
+    from app.agent.tools import registry as _tools_registry_module
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 1.0)  # 桩流延时改由搜索假体承担（B3 节点接真）
     post1 = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": "第一轮", "mode": "fast"})
     )
@@ -845,7 +849,7 @@ async def _assert_break_strategy(
 ) -> None:
     """interrupt/rollback 共用断言：旧轮 canceled+cancel_reason 落库、无 error 事件、
     新轮在旧轮终态后启动并完成。"""
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 2.0)
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 2.0)
     post1 = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": "被打断的问题", "mode": "fast"})
     )
@@ -909,7 +913,7 @@ async def test_interrupt_with_queued_new_turn_preempts_queue(
     """裁决 A（2026-11-08，评审 P2 次序澄清）：running+queued 时 interrupt——
     被打断轮 canceled 后执行槽归 interrupt 新轮（「不经排队」），既有 queued 轮
     顺延到抢占轮终态之后。started_at 实证次序：抢占轮先于既有 queued 启动。"""
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 2.0)
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 2.0)
 
     async def _turn_at(thread_id: str, index: int) -> str | None:
         detail = await async_client.get(f"/api/v1/threads/{thread_id}")
@@ -941,7 +945,7 @@ async def test_interrupt_with_queued_new_turn_preempts_queue(
             assert turn2 is not None
             await b2_rest.wait_turn_status(turn2, {"queued"})
             # interrupt 新轮（抢占轮；打断 turn1，插队启动）——须在 turn1 运行
-            # 窗口内提交（SEARCH_DELAY_S=2.0 的运行窗口足够轮询完成）
+            # 窗口内提交（FAKE_DELAY_S=2.0 的运行窗口足够轮询完成）
             post3 = asyncio.create_task(
                 async_client.post(
                     f"/api/v1/threads/{thread_id}/turns",

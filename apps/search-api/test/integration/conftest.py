@@ -325,6 +325,79 @@ async def _recycle_engine_pool_between_tests():
         await _engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B3 节点接真后（rewrite/web_search/merge_dedupe）：走真桩图的 REST/SSE 流测试不依赖
+    真 LLM 与真搜索源——fixture 假体直注（零网络、确定性、不受本地 ollama/凭证存活影响）。
+
+    requires_llm / requires_search 标记的用例（真依赖冒烟）豁免本假体。"""
+    if request.node.get_closest_marker("requires_llm") or request.node.get_closest_marker(
+        "requires_search"
+    ):
+        return
+
+    # 假图注入（B3 节点 5/5 synthesis 接真后）：桩流 REST/SSE 测试整体换脚本化假图——
+    # 零 LLM/零真源/零网络，事件序列按 §7.4 主干（token 走 messages 流）。
+    from test.integration import stub_flow
+
+    from app.services import turn_service  # noqa: PLC0415 —— fixture 局部导入（同 b2_runtime 口径）
+
+    real_main_graph = turn_service.main_graph  # deep 桩分流回真图（fast 才走脚本假图）
+    monkeypatch.setattr(
+        "app.services.turn_service.main_graph",
+        stub_flow.ModeRoutingFakeGraph(real_main_graph),
+    )
+
+    # 搜索链假体：registry.resolve 恒 [tavily]、search 恒确定性候选（TurnRunner 轮启动
+    # resolve 面兜底——假图下节点不执行，此处保 resolve 不抛）
+
+    # 搜索链假体：registry.resolve 恒 [tavily]、search 恒确定性候选（桩流面零真源调用）
+    from app.agent.tools import registry as registry_module
+    from app.agent.tools.registry import SearchChain
+
+    class _FakeSearchRegistry:
+        def __init__(self) -> None:
+            self.breakers: dict[str, Any] = {}
+
+        def bind(self, payload: Any) -> None:
+            return None
+
+        def resolve(self, payload: Any, query_lang: str) -> SearchChain:
+            return SearchChain(
+                sources=["tavily"], backup=None, degraded=False, detail="tavily（假体）"
+            )
+
+        def credential_ready(self, server: str) -> bool:
+            return True
+
+        async def search(
+            self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+        ) -> list[dict[str, Any]]:
+            import asyncio as _asyncio
+
+            delay = getattr(registry_module, "STUB_SEARCH_DELAY_S", 0.0)
+            if delay:
+                await _asyncio.sleep(delay)  # 桩流运行窗口（心跳/取消语义测试）
+            return [
+                {
+                    "url": f"https://stub.example/{abs(hash(query)) % 1000}",
+                    "title": f"桩结果：{query[:30]}",
+                    "snippet": "桩搜索结果（integration 假体）",
+                    "score": 0.9,
+                    "origin": source,
+                }
+            ]
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        registry_module, "get_tools_registry", lambda: _FakeSearchRegistry()
+    )
+    monkeypatch.setattr(
+        "app.services.turn_service.get_tools_registry", lambda: _FakeSearchRegistry()
+    )
+
 @pytest.fixture
 async def b2_runtime(migrated_db, tmp_path):
     """lifespan 等价基建启停：资产中心 → EventBus → ThreadScheduler → seq 种入。

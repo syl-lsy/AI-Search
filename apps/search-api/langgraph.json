@@ -1,4 +1,5 @@
 {
+  "dependencies": ["."],
   "graphs": {
     "main": "./app/agent/graphs/main.py:graph",
     "fast": "./app/agent/graphs/fast.py:graph",

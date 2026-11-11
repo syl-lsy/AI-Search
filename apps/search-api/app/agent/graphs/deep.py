@@ -17,7 +17,7 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.graphs.signals import emit_stage, emit_token
-from app.agent.state import MainState
+from app.agent.state import DeepState
 
 #: 固定 token 增量 2 段；答案 = 增量拼接，保证一致性
 STUB_DEEP_TOKEN_DELTAS: list[str] = [
@@ -28,14 +28,14 @@ STUB_DEEP_TOKEN_DELTAS: list[str] = [
 STUB_DEEP_ANSWER_MD: str = "".join(STUB_DEEP_TOKEN_DELTAS)
 
 
-def plan(state: MainState) -> dict[str, Any]:
+def plan(state: DeepState) -> dict[str, Any]:
     """研究规划桩：stage(plan, running→done)，无 LLM、无子代理（B4 实装）。"""
     emit_stage("plan", "running")
     emit_stage("plan", "done")
     return {}
 
 
-def write(state: MainState) -> dict[str, Any]:
+def write(state: DeepState) -> dict[str, Any]:
     """撰写桩：stage(write, running→done) 夹 token 流；终态 answer_md 固定 Markdown。"""
     emit_stage("write", "running", label="撰写报告")
     for delta in STUB_DEEP_TOKEN_DELTAS:
@@ -46,7 +46,7 @@ def write(state: MainState) -> dict[str, Any]:
 
 def build_deep_graph() -> Any:
     """编译 deep 桩子图（B4 起替换为 planner→research→reflect→writer 真拓扑）。"""
-    builder = StateGraph(MainState)
+    builder = StateGraph(DeepState)
     builder.add_node("plan", plan)
     builder.add_node("write", write)
     builder.add_edge(START, "plan")

@@ -126,6 +126,7 @@ McpRole = Literal[
     "primary_search",
     "chinese_search",
     "fallback_search",
+    "fallback_search_secondary",  # §2 v1.18：anysearch 降为搜索备位链次级（searxng 链首）
     "url_reader",
     "url_reader_backup",
 ]

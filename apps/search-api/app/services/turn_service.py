@@ -45,12 +45,15 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, cast
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.graphs.main import graph as main_graph
+from app.agent.nodes.synthesis import SynthesisError
+from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
+from app.core.observability import build_turn_callbacks
 from app.db.models import Source, Thread, Turn, TurnEvent
 from app.db.session import get_session_factory
 from app.exception import BadRequestException, ConflictException, NotFoundException, TurnTerminalException
@@ -72,13 +75,16 @@ from app.services.event_bus import EventBus, SseEvent, get_event_bus
 __all__ = [
     "ACTIVE_STATUSES",
     "FINAL_STATUSES",
+    "HISTORY_WINDOW_TURNS",
     "QUEUE_DEPTH_LIMIT",
     "SubmitDecision",
     "ThreadScheduler",
     "decide_on_submit",
+    "detect_query_lang",
     "ensure_turn_owner",
     "get_thread_scheduler",
     "get_turn_detail",
+    "history_statement",
     "resolve_chat_model",
     "seed_seq_from_db",
     "start_thread_scheduler",
@@ -95,10 +101,25 @@ QUEUE_DEPTH_LIMIT = 1
 # Nacos dataId（nacos-config.md：五 dataId 键名；TurnRunner 轮快照捕获）
 _SPEC_DATA_ID = "ai_search.agent.spec.json"
 _MAPPING_DATA_ID = "ai_search.model.mapping.json"
+_MCP_DATA_ID = "ai_search.agent.mcp.json"
 
 # spec 缺省兜底（TurnSpec 节缺失时组装层回落 reject 的同款内置口径）
 _DEFAULT_POLICY = "reject"
 _DEFAULT_TURN_TIMEOUT_S = 60.0
+
+# 历史装配窗口（ARCH §4.1/§6.5：最近 6 轮 {q, a_head≤200 chars}）。nacos spec `history`
+# 节为弃用迁移口径（memory.short_term 于 M5 接管，nacos-config.md §3），B3 以实现常量
+# 执行，M5 记忆重构时随 MB2 工单替换。
+HISTORY_WINDOW_TURNS = 6
+HISTORY_ANSWER_HEAD_CHARS = 200
+
+# 历史纳入状态口径：completed/degraded 正常纳入；canceled 纳入（打断轮已产出内容
+# 进历史装配，ARCH §6.1）；rolled_back 整体排除（内容回退语义，ARCH §6.1——由
+# cancel_reason 过滤承担）；failed/无答案轮不产 a_head，由 answer_md IS NOT NULL 排除。
+_HISTORY_STATUSES = ("completed", "degraded", "canceled")
+
+# 中文判定阈值（PRD OQ-2：CJK 字符占比 ≥30% 判 zh——实现层常量，不进 Nacos）
+CJK_RATIO_THRESHOLD = 0.30
 
 
 class SubmitDecision(str, Enum):
@@ -157,6 +178,61 @@ def resolve_chat_model(
             detail=f"model 键 {key!r} 不在 model.mapping.chat.options 键域",
         )
     return str(key), str(options[key])
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """CJK 表意文字区段（统一表意 + 扩展 A/B——OQ-2「CJK 字符」的代码口径）。"""
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF  # CJK 统一表意文字
+        or 0x3400 <= code <= 0x4DBF  # 扩展 A
+        or 0x20000 <= code <= 0x2A6DF  # 扩展 B
+    )
+
+
+def detect_query_lang(query: str) -> str:
+    """图启动前纯代码语言判定（ARCH §4.1 前置口径；PRD OQ-2）：CJK 字符占比 ≥30% → zh。
+
+    分母为非空白字符（空白不稀释占比）；空串/零有效字符回落 en。改写不改判——
+    rewrite 节点不再判语言，直接消费注入值。
+    """
+    chars = [c for c in query if not c.isspace()]
+    if not chars:
+        return "en"
+    cjk_count = sum(1 for c in chars if _is_cjk_char(c))
+    return "zh" if cjk_count / len(chars) >= CJK_RATIO_THRESHOLD else "en"
+
+
+def _is_fast_synthesis_messages(namespace: Any, chunk_pair: Any) -> bool:
+    """R14③ messages 过滤（§6.1）：仅 synthesis 节点增量放行（token/thinking 映射面）。
+
+    实测运行形态（2026-11-10 探针）：subgraphs=True 下 messages 帧 namespace 为空、
+    节点标识在 chunk metadata `langgraph_node`——按 metadata 判定。fast/deep 侧跨子图
+    区分（namespace 路径面）实测归批次 5（R14③——deep writer 不产 messages，deepagents
+    实装时收敛）。
+    """
+    meta = chunk_pair[1] if isinstance(chunk_pair, tuple) and len(chunk_pair) > 1 else None
+    return isinstance(meta, Mapping) and meta.get("langgraph_node") == "synthesis"
+
+
+def history_statement(thread_id: str, turn_id: str) -> Any:
+    """历史装配查询（ARCH §6.5）：最近 N 轮 {q, answer_md}，created_at 倒序取窗。
+
+    纳入/排除口径见 _HISTORY_STATUSES 注；全部条件参数绑定（无字符串拼接）。
+    返回按 created_at 倒序的行集（调用方反转为时间正序装配）。
+    """
+    return (
+        select(Turn.query, Turn.answer_md)
+        .where(
+            Turn.thread_id == uuid.UUID(thread_id),
+            Turn.id != uuid.UUID(turn_id),
+            Turn.status.in_(_HISTORY_STATUSES),
+            Turn.answer_md.is_not(None),
+            or_(Turn.cancel_reason.is_(None), Turn.cancel_reason != "rolled_back"),
+        )
+        .order_by(Turn.created_at.desc(), Turn.id.desc())
+        .limit(HISTORY_WINDOW_TURNS)
+    )
 
 
 async def get_turn_detail(
@@ -328,11 +404,18 @@ def get_thread_scheduler() -> ThreadScheduler:
 
 @dataclass
 class _RunContext:
-    """单轮运行的内存聚合：stage 时间线配对、sources 计数（进程内，随轮消亡）。"""
+    """单轮运行的内存聚合：stage 时间线配对、sources 计数（进程内，随轮消亡）。
+
+    `spec_payload` / `mapping_payload`：运行开始时一次性捕获的资产快照 payload
+    （OQ-11——轮内全部读取走该快照，热更仅对后续轮生效；ARCH §4.0/§6.1）。
+    """
 
     turn_id: str
     thread_id: str
     user_id: Any = None
+    spec_payload: Mapping[str, Any] = field(default_factory=dict)
+    mapping_payload: Mapping[str, Any] = field(default_factory=dict)
+    mcp_payload: Mapping[str, Any] = field(default_factory=dict)
     stages: list[dict[str, Any]] = field(default_factory=list)
     stage_started: dict[str, datetime] = field(default_factory=dict)
     stage_label: dict[str, str] = field(default_factory=dict)
@@ -356,6 +439,7 @@ class ThreadScheduler:
         graph: Any = None,
         spec_snapshot: AssetSnapshot | None = None,
         mapping_snapshot: AssetSnapshot | None = None,
+        tools_registry: ToolRegistry | None = None,
     ) -> None:
         self._bus = bus
         self._session_factory = (
@@ -364,6 +448,7 @@ class ThreadScheduler:
         self._graph: Any = graph if graph is not None else main_graph
         self._spec_snapshot = spec_snapshot
         self._mapping_snapshot = mapping_snapshot
+        self._tools_registry = tools_registry
         # 进程内取消标志：turn_id → cancel_reason（user|superseded|rolled_back）；
         # 图循环在每个事件边界 pop 感知（B2 桩图节点间即边界；B3 guards 同语义实装）
         self._cancel_flags: dict[str, str] = {}
@@ -413,9 +498,10 @@ class ThreadScheduler:
             for other in rows
         )
 
-    # ---- 轮快照（OQ-11：轮次发起时一次性捕获，整轮沿用）----
+    # ---- 轮快照（OQ-11：运行周期开始时一次性捕获 AssetSnapshot，轮内全部读取走该快照）----
 
-    def _spec_payload(self) -> Mapping[str, Any]:
+    def _capture_spec_payload(self) -> Mapping[str, Any]:
+        """一次性捕获 Agent Spec 快照 payload（OQ-11）——调用方每运行周期至多一次。"""
         snap = self._spec_snapshot
         if snap is None:
             snap = get_asset_center().snapshot(_SPEC_DATA_ID)
@@ -423,7 +509,8 @@ class ThreadScheduler:
             raise RuntimeError(f"Agent Spec 快照不可用（{_SPEC_DATA_ID} 未装载）")
         return snap.payload
 
-    def _mapping_payload(self) -> Mapping[str, Any]:
+    def _capture_mapping_payload(self) -> Mapping[str, Any]:
+        """一次性捕获模型映射快照 payload（OQ-11）——调用方每运行周期至多一次。"""
         snap = self._mapping_snapshot
         if snap is None:
             snap = get_asset_center().snapshot(_MAPPING_DATA_ID)
@@ -431,12 +518,43 @@ class ThreadScheduler:
             raise RuntimeError(f"模型映射快照不可用（{_MAPPING_DATA_ID} 未装载）")
         return snap.payload
 
-    def _default_policy(self) -> str:
-        turn = self._spec_payload().get("turn") or {}
+    def _capture_mcp_payload(self) -> Mapping[str, Any]:
+        """一次性捕获 MCP 清单快照 payload（OQ-11 同源——搜索链解析的配置面）。
+
+        资产中心未启动（单测/Studio 直跑）→ 空表（链解析回落全不可用——假体注入面）。
+        """
+        try:
+            snap = get_asset_center().snapshot(_MCP_DATA_ID)
+        except Exception as exc:  # noqa: BLE001 —— 回落属预期运行形态（组装层未启动）
+            AgentLog(
+                message=f"mcp 快照捕获异常（回落空表）：{type(exc).__name__}: {exc}",
+                graph="turn_runner",
+            ).warning()
+            return {}
+        if snap is None:
+            AgentLog(
+                message="mcp 快照缺失（store 无该 dataId）",
+                graph="turn_runner",
+            ).warning()
+            return {}
+        if not snap.payload:
+            AgentLog(
+                message=(
+                    f"mcp 快照为空 payload（version={snap.version} md5={snap.md5} "
+                    f"data_id={snap.data_id} updated_at={snap.updated_at}）"
+                ),
+                graph="turn_runner",
+            ).warning()
+        return snap.payload
+
+    def _default_policy(self, spec_payload: Mapping[str, Any]) -> str:
+        """缺省并发策略（入参=已捕获快照，不再实时读）。"""
+        turn = spec_payload.get("turn") or {}
         return str(turn.get("default_on_conflict", _DEFAULT_POLICY))
 
-    def _turn_timeout_s(self, mode: str) -> float:
-        spec = self._spec_payload().get(mode) or {}
+    def _turn_timeout_s(self, spec_payload: Mapping[str, Any], mode: str) -> float:
+        """轮级硬超时（入参=已捕获快照，不再实时读；500301 熔断依据）。"""
+        spec = spec_payload.get(mode) or {}
         return float(spec.get("turn_timeout_s", _DEFAULT_TURN_TIMEOUT_S))
 
     # ---- 提交裁决（请求事务内；路由层在建轮后、响应前调用）----
@@ -463,7 +581,10 @@ class ThreadScheduler:
           （新轮行消失），标记由消费侧自愈清除（_can_start 校验失配 /
           schedule_turn 读不到行），不会永久阻塞该线程既有 queued 轮（评审 P2）。
         """
-        policy = on_conflict if on_conflict is not None else self._default_policy()
+        # OQ-11：请求周期一次性捕获 spec 快照为执行依据（缺省策略读快照，不实时反复读；
+        # 热更仅对新提交生效——api.md §0 / nacos-config.md §3 turn 节生效边界）
+        spec_payload = self._capture_spec_payload()
+        policy = on_conflict if on_conflict is not None else self._default_policy(spec_payload)
         # 裁决串行化（评审 P2）：先 FOR UPDATE 锁线程行再查活动轮——READ COMMITTED
         # 下两个并发 POST 互相看不到对方未提交轮，双双 PROCEED 会击穿「每线程同时
         # 一轮」；线程行锁把两笔裁决串成先后事务，后者读到前者已提交的 running。
@@ -563,6 +684,8 @@ class ThreadScheduler:
         error: dict[str, Any] | None = None,
         cancel_reason: str | None = None,
         stages: list[dict[str, Any]] | None = None,
+        degraded_reason: str | None = None,
+        rewritten_queries: list[str] | None = None,
     ) -> tuple[datetime, int] | None:
         """终态落 turns（条件收口：行锁 + 终态重查，终态绝不被覆写）。
 
@@ -600,6 +723,10 @@ class ThreadScheduler:
                 row.error = error
             if cancel_reason is not None:
                 row.cancel_reason = cancel_reason
+            if degraded_reason is not None:
+                row.degraded_reason = degraded_reason
+            if rewritten_queries is not None:
+                row.rewritten_queries = rewritten_queries
             await session.commit()
             return now, int(row.duration_ms or 0)
 
@@ -671,11 +798,22 @@ class ThreadScheduler:
 
     async def _finish_completed(self, ctx: _RunContext, final_state: dict[str, Any]) -> None:
         answer_md = final_state.get("answer_md")
+        # 图内降级留痕接线（§6.2）：search 单源失败/备位装载 → FastState.degraded=True
+        # → done.degraded=True + degraded_reason=source_failure（turns.degraded_reason 列同步）
+        degraded = bool(final_state.get("degraded"))
+        raw_queries = final_state.get("rewritten_queries")
+        rewritten = (
+            [str(q) for q in raw_queries]
+            if isinstance(raw_queries, list)
+            else None
+        )
         outcome = await self._persist_terminal(
             ctx.turn_id,
             status="completed",
             answer_md=answer_md if isinstance(answer_md, str) else None,
             stages=ctx.stages,
+            degraded_reason="source_failure" if degraded else None,
+            rewritten_queries=rewritten,
         )
         if outcome is None:
             return  # 终态竞态落败（并发取消已收口）：跳过 done 发布，防双终态
@@ -685,8 +823,8 @@ class ThreadScheduler:
             "done",
             {
                 "finish": "completed",
-                "degraded": False,
-                "degraded_reason": None,
+                "degraded": degraded,
+                "degraded_reason": "source_failure" if degraded else None,
                 "duration_ms": duration_ms,
                 "source_count": ctx.sources_count,
                 "usage": {},
@@ -726,6 +864,51 @@ class ThreadScheduler:
             },
         )
 
+    async def _finish_degraded_with_error(
+        self,
+        ctx: _RunContext,
+        *,
+        code: str,
+        message: str,
+        exc: Exception | None = None,
+        degraded_reason: str | None = None,
+    ) -> None:
+        """部分内容降级收束：error 事件 + turns.status=degraded + done(finish=degraded)。
+
+        api.md §7.2 error 收束括注（v1.10 ⑥）：有部分内容（已收集 sources/部分答案）时
+        error 后跟 done(finish=degraded)；终态条件落库先行（竞态落败方零事件退出）。
+        """
+        AgentLog(message=f"轮次降级收束：{message}", graph="turn_runner").error(exc)
+        error_payload: dict[str, Any] = {
+            "code": code,
+            "message": message,
+            "stage_key": None,
+        }
+        outcome = await self._persist_terminal(
+            ctx.turn_id,
+            status="degraded",
+            error=error_payload,
+            stages=ctx.stages,
+            degraded_reason=degraded_reason,
+        )
+        if outcome is None:
+            return
+        _, duration_ms = outcome
+        await self._publish_and_persist(ctx, "error", error_payload)
+        await self._publish_and_persist(
+            ctx,
+            "done",
+            {
+                "finish": "degraded",
+                "degraded": True,
+                "degraded_reason": degraded_reason,
+                "duration_ms": duration_ms,
+                "source_count": ctx.sources_count,
+                "usage": {},
+            },
+        )
+        self._nudge_thread(ctx.thread_id)
+
     # ---- 调度循环（BackgroundTask 入口：commit 后触发；DB 为事实源 + event 加速）----
 
     async def schedule_turn(self, turn_id: str) -> None:
@@ -764,6 +947,30 @@ class ThreadScheduler:
     async def _load_turn(self, turn_id: str) -> Any:
         async with self._session_factory() as session:
             return await session.get(Turn, uuid.UUID(turn_id))
+
+    async def _persist_query_lang(self, turn_id: str, query_lang: str) -> None:
+        """query_lang 落 turns 列（图启动前短事务；§2.5 事实源——列注释「TurnRunner 注入」）。"""
+        async with self._session_factory() as session:
+            row = await session.get(Turn, uuid.UUID(turn_id))
+            if row is not None and row.query_lang != query_lang:
+                row.query_lang = query_lang
+                await session.commit()
+
+    async def _load_history(self, thread_id: str, turn_id: str) -> list[dict[str, str]]:
+        """最近 N 轮历史装配（ARCH §6.5：{q, a_head≤HISTORY_ANSWER_HEAD_CHARS}）。
+
+        短事务只读，图启动前完成；纳入/排除口径见 history_statement。返回时间正序
+        （旧→新，提示词装配自然读序）。
+        """
+        async with self._session_factory() as session:
+            rows = (await session.execute(history_statement(thread_id, turn_id))).all()
+        return [
+            {
+                "q": str(query),
+                "a_head": str(answer_md or "")[:HISTORY_ANSWER_HEAD_CHARS],
+            }
+            for query, answer_md in reversed(rows)
+        ]
 
     async def _can_start(self, row: Any) -> bool:
         """启动条件（每线程同时一轮）：无其他 ACTIVE 轮 + 抢占/FIFO 次序约束。
@@ -839,25 +1046,100 @@ class ThreadScheduler:
     async def _execute_turn(self, turn: Any) -> None:
         """执行单轮：astream 三流消费 → 翻译 → publish/落库 → 终态收尾。
 
-        取消感知在每个事件边界（含启动前）——pop 标志即收尾 canceled；
-        timeout 守卫 = asyncio.timeout(spec.<mode>.turn_timeout_s) 包整个 astream。
+        - OQ-11：运行开始一次性捕获 spec/mapping 快照存入 _RunContext——轮内全部
+          读取（timeout/注入 state 的 spec/chat 模型解析）一律走该快照，热更不串轮；
+        - 初始 state 注入 FastState 全量输入（ARCH §4.1）：历史装配（DB 短事务）+
+          query_lang 前置纯代码判定（OQ-2）+ chat_model_key 复用 resolve_chat_model；
+          images 恒空（M4 视觉轮预留）；
+        - 取消感知在每个事件边界（含启动前）——pop 标志即收尾 canceled；
+          timeout 守卫 = asyncio.timeout(spec.<mode>.turn_timeout_s) 包整个 astream。
         """
         turn_id = str(turn.id)
         thread_id = str(turn.thread_id)
-        ctx = _RunContext(turn_id=turn_id, thread_id=thread_id, user_id=turn.user_id)
-        timeout_s = self._turn_timeout_s(str(turn.mode))
+        ctx = _RunContext(
+            turn_id=turn_id,
+            thread_id=thread_id,
+            user_id=turn.user_id,
+            spec_payload=self._capture_spec_payload(),
+            mapping_payload=self._capture_mapping_payload(),
+            mcp_payload=self._capture_mcp_payload(),
+        )
+        timeout_s = self._turn_timeout_s(ctx.spec_payload, str(turn.mode))
         cancel_reason = self._cancel_flags.pop(turn_id, None)
         if cancel_reason is not None:  # 启动前已被取消/打断：零业务事件直接收尾
             await self._finish_canceled(turn_id, thread_id, reason=cancel_reason)
             self._nudge_thread(thread_id)
             return
+        query_lang = detect_query_lang(str(turn.query))
+        await self._persist_query_lang(turn_id, query_lang)
+        # 搜索链轮启动冻结（nacos-config §2：装载决策读熔断实时态一次，轮内中途熔断不切换）
+        tools_registry = (
+            self._tools_registry
+            if self._tools_registry is not None
+            else get_tools_registry()
+        )
+        tools_registry.bind(ctx.mcp_payload)  # 连接条目+熔断参数按本轮快照刷新（指纹缓存复用）
+        search_chain = tools_registry.resolve(ctx.mcp_payload, query_lang)
+        if search_chain.degraded or not search_chain.sources:
+            servers = ctx.mcp_payload.get("servers") if isinstance(ctx.mcp_payload, Mapping) else None
+            server_summary = (
+                {name: entry.get("enabled") for name, entry in servers.items()}
+                if isinstance(servers, Mapping)
+                else f"payload-type={type(ctx.mcp_payload).__name__} keys={list(ctx.mcp_payload)[:5] if isinstance(ctx.mcp_payload, Mapping) else 'N/A'}"
+            )
+            creds = {name: tools_registry.credential_ready(name) for name in ("tavily", "bocha", "searxng", "anysearch")}
+            AgentLog(
+                message=f"搜索链降级/不可用：{search_chain.detail}（sources={search_chain.sources}，servers-enabled={server_summary}，creds={creds}）",
+                graph="turn_runner",
+            ).warning()
+        chat_model_key, _ = resolve_chat_model(
+            str(turn.chat_model_key), ctx.mapping_payload
+        )
+        initial_state: dict[str, Any] = {
+            "turn_id": turn_id,
+            "thread_id": thread_id,
+            "user_id": str(turn.user_id),
+            "mode": str(turn.mode),
+            "query": str(turn.query),
+            "chat_model_key": chat_model_key,
+            "history": await self._load_history(thread_id, turn_id),
+            "query_lang": query_lang,
+            "spec": dict(ctx.spec_payload),  # MappingProxyType → 可序列化 dict 随 state 进图
+            "images": [],  # M4 视觉轮预留（REQ 视觉面），本批恒空
+        }
+        # 首 stage 图前同步发布（ARCH §4.3「首个 stage ≤1s」的结构性保证：不等 LLM/
+        # 图首帧——rewrite 节点内不再发 running，避免重复 seq）
+        first_stage: dict[str, Any] = {"stage_key": "rewrite", "status": "running"}
+        await self._publish_and_persist(ctx, "stage", first_stage)
+        self._absorb_stage(ctx, first_stage)  # timing.stages 配对开档（done 帧到达时合档）
         final_state: dict[str, Any] = {}
         try:
             async with asyncio.timeout(timeout_s):
                 async for namespace, stream_mode, chunk in self._graph.astream(
-                    {"mode": str(turn.mode), "query": str(turn.query)},
+                    initial_state,
                     config={
-                        "configurable": {"thread_id": thread_id, "turn_id": turn_id}
+                        "configurable": {
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "model_mapping": dict(ctx.mapping_payload),
+                            "search_chain": search_chain,
+                            "tools_registry": tools_registry,
+                        },
+                        # Langfuse trace root=轮（ARCH §6.6）：trace_id=turn_id 对账、
+                        # session=thread_id 经 langfuse_* metadata 键承载（v3 契约键）
+                        "callbacks": build_turn_callbacks(
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            user_id=str(turn.user_id),
+                            mode=str(turn.mode),
+                        ),
+                        "metadata": {
+                            "langfuse_session_id": thread_id,
+                            "langfuse_user_id": str(turn.user_id),
+                            "langfuse_tags": [f"mode:{turn.mode}"],
+                            "turn_id": turn_id,
+                            "mode": str(turn.mode),
+                        },
                     },
                     stream_mode=["messages", "updates", "custom"],
                     subgraphs=True,
@@ -867,15 +1149,34 @@ class ThreadScheduler:
                         break
                     if stream_mode == "custom":
                         await self._translate_custom(ctx, chunk)
-                    elif stream_mode == "messages":
+                    elif stream_mode == "messages" and _is_fast_synthesis_messages(
+                        namespace, chunk
+                    ):
+                        # R14③ messages 过滤（§6.1）：仅 fast 子图 synthesis 节点增量映射
+                        # token/thinking——rewrite 等其余节点与 deep 侧（批次 5 实测）不放行
                         await self._translate_message_chunk(ctx, chunk)
                     elif stream_mode == "updates" and not namespace:
                         # 顶层 updates 合并最终 state（answer_md/sources——子图投影回填）
                         for update in chunk.values():
                             final_state.update(update)
-        except TimeoutError:
+        except TimeoutError as exc:
+            # 500301：零内容 failed+close；有部分内容（sources 已发布）→ 降级收束（timeout）
             await self._fail_turn(
-                ctx, code="500301", message="轮次执行超时，请稍后重试"
+                ctx, code="500301", message="轮次执行超时，请稍后重试", exc=exc
+            )
+            return
+        except SearchChainUnavailable as exc:
+            # 全源失败短路（ARCH §4.1 A1 情形 3）：error 事件由 TurnRunner 出（500201）
+            await self._fail_turn(
+                ctx, code="500201", message="全部搜索源不可用，请稍后重试", exc=exc
+            )
+            return
+        except SynthesisError as exc:
+            # LLM 调用重试耗尽（§4.1 synthesis 行 / api.md §7.2 500101）：已收集 sources
+            # 保留——error 后跟 done(finish=degraded)（v1.10 error 收束括注「有部分内容」形态）
+            await self._finish_degraded_with_error(
+                ctx, code="500101", message="综合生成失败，已保留检索来源", exc=exc,
+                degraded_reason=None,  # 枚举（timeout/budget/source_failure）外不上报
             )
             return
         except Exception as exc:
@@ -895,11 +1196,12 @@ class ThreadScheduler:
         await self._finish_completed(ctx, final_state)
 
     async def _translate_custom(self, ctx: _RunContext, payload: dict[str, Any]) -> None:
-        """custom 信号 → SSE 事件（一对一翻译；token 不落库；未知类型告警忽略）。"""
+        """custom 信号 → SSE 事件（一对一翻译；未知类型告警忽略）。
+
+        token/thinking 不在 custom 域（§6.1：仅 messages 流映射——B3 节点 5/5 接真后
+        custom 流仅承载 stage/sources/images；桩期 custom-token 路径随桩清理移除）。
+        """
         ptype = payload.get("type")
-        if ptype == "token":
-            await self._publish_only(ctx, "token", {"delta": payload.get("delta", "")})
-            return
         business = {k: v for k, v in payload.items() if k != "type"}
         if ptype == "stage":
             self._absorb_stage(ctx, business)
@@ -918,6 +1220,8 @@ class ThreadScheduler:
             ).warning()
 
     async def _translate_message_chunk(self, ctx: _RunContext, chunk_pair: Any) -> None:
+        """messages 帧翻译（调用面已经 _is_fast_synthesis_messages 过滤）。"""
+
         """messages 帧 → token/thinking（按帧读 .content——R8：禁止聚合后再过 blocks）。"""
         message = chunk_pair[0] if isinstance(chunk_pair, tuple) else chunk_pair
         for kind, delta in self._extract_deltas(message):
@@ -989,13 +1293,22 @@ class ThreadScheduler:
         message: str,
         exc: Exception | None = None,
     ) -> None:
-        """失败路径：error 事件 + turns.status=failed + close_channel（「直接关闭」口径）。
+        """失败路径（api.md §7.2 v1.10 error 收束两句）：
 
-        done(finish=degraded) 归 M2 降级路径（turns.status=degraded）——B2 失败轮
-        status=failed、不发 done，订阅流由 close_channel 收口（保留缓冲供重放）。
+        - **有部分内容**（sources 已发布）→ error + done(finish=degraded) +
+          turns.status=degraded（§7.1 例外把 failed 终态限定为「失败且无部分内容」）；
+        - **零内容** → error + turns.status=failed + close_channel（「直接关闭」口径）。
+
         条件落库先行：终态竞态落败（并发取消已收口）→ 不发 error、不 close——
         winner 的 done 已把流收口，失败方零事件退出。
         """
+        if ctx.sources_count > 0:
+            # timeout/未知异常落在 sources 之后=有部分内容——降级收束（同 500101 形态）
+            degraded_reason = "timeout" if code == "500301" else None  # 枚举内才上报
+            await self._finish_degraded_with_error(
+                ctx, code=code, message=message, exc=exc, degraded_reason=degraded_reason
+            )
+            return
         AgentLog(message=f"轮次执行失败：{message}", graph="turn_runner").error(exc)
         error_payload: dict[str, Any] = {
             "code": code,

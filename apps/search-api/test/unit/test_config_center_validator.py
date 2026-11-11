@@ -153,6 +153,51 @@ class TestMcpRules:
             validate_asset(MCP_DATA_ID, payload)
 
 
+class TestMcpSearxngChain:
+    """§2 v1.18：搜索兜底链式化——searxng（fallback_search 链首）→ anysearch
+    （fallback_search_secondary 次级）。客户端（validator/defaults）必须先于 v1.18
+    mcp.json 发布同步，否则发布时整份配置被校验拒收（契约 §8 init 顺序红线）。"""
+
+    def test_defaults_full_mcp_list_passes_validator(self):
+        """L4 内置默认 mcp 清单（v1.18 六源）全量过校验——发布前置条件。"""
+        payload = BUILTIN_DEFAULTS[MCP_DATA_ID]
+        assert validate_asset(MCP_DATA_ID, payload) == payload
+
+    def test_searxng_entry_matches_contract(self):
+        """§2 v1.18 searxng 条目逐字对齐：stdio 指针 + timeout 5 + 无 auth
+        （自部署环回无密钥——auth 指针不得出现）。"""
+        entry = BUILTIN_DEFAULTS[MCP_DATA_ID]["servers"].get("searxng")
+        assert entry is not None, "searxng 条目缺失"
+        assert entry["enabled"] is True
+        assert entry["role"] == "fallback_search"
+        assert entry["transport"] == "stdio"
+        assert entry["command_env"] == "SEARXNG_MCP_COMMAND"
+        assert entry["args_env"] == "SEARXNG_MCP_ARGS"
+        assert entry["timeout_s"] == 5
+        assert entry["circuit"] == {"failure_threshold": 3, "cooldown_s": 60}
+        assert "auth" not in entry, "自部署环回无密钥——searxng 条目不得带 auth 字段"
+
+    def test_searxng_precedes_anysearch_in_chain_order(self):
+        """链序锁死：searxng（fallback_search 链首）在 anysearch（次级）之前。"""
+        order = list(BUILTIN_DEFAULTS[MCP_DATA_ID]["servers"])
+        assert "searxng" in order and "anysearch" in order
+        assert order.index("searxng") < order.index("anysearch")
+
+    def test_anysearch_role_is_fallback_search_secondary(self):
+        """§2 v1.18：anysearch 降为链上次级——role=fallback_search_secondary，
+        其余字段不动（链序 searxng→anysearch）。"""
+        entry = BUILTIN_DEFAULTS[MCP_DATA_ID]["servers"]["anysearch"]
+        assert entry["role"] == "fallback_search_secondary"
+
+    def test_fallback_search_secondary_role_accepted(self):
+        """validator 枚举已扩 fallback_search_secondary——v1.18 mcp.json 可发布的前提。"""
+        payload = _mutated(
+            MCP_DATA_ID,
+            lambda p: p["servers"]["tavily"].update({"role": "fallback_search_secondary"}),
+        )
+        assert validate_asset(MCP_DATA_ID, payload) == payload
+
+
 class TestPromptsRules:
     def test_prompt_value_must_be_string(self):
         payload = _mutated(

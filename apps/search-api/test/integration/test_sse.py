@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from app.agent.graphs import fast as fast_graph
+from test.integration import stub_flow
 from app.core.config import sse_settings
 from app.db.models import TurnEvent
 from app.db.session import get_session_factory
@@ -122,7 +122,7 @@ async def test_sse_first_connect_full_replay(async_client, b2_rest, b2_runtime, 
 
     # token 增量拼接 = 桩答案（与 REST answer_md 同源）
     token_concat = "".join(f["data"]["delta"] for f in frames if f["event"] == "token")
-    assert token_concat == fast_graph.STUB_FAST_ANSWER_MD
+    assert token_concat == stub_flow.FAKE_ANSWER_MD
 
     # done 帧 payload 与 REST 终态对账
     detail = (await async_client.get(f"/api/v1/turns/{turn_id}")).json()["data"]
@@ -130,7 +130,7 @@ async def test_sse_first_connect_full_replay(async_client, b2_rest, b2_runtime, 
     assert done_data["finish"] == "completed"
     assert done_data["degraded"] is False
     assert done_data["duration_ms"] == detail["duration_ms"]
-    assert done_data["source_count"] == 2
+    assert done_data["source_count"] == 1
     assert done_data["usage"] == {}
 
     # 流 ⊇ turn_events 落库子集；流多出的帧恰为只发布不落库的 token（ADR-003 第 4 条）
@@ -213,7 +213,8 @@ async def test_sse_heartbeat_during_running_turn(
 ):
     """运行中轮订阅：心跳织入业务事件之间（心跳间隔配置调小至 1s，桩图 delay 制造窗口）。"""
     monkeypatch.setattr(sse_settings, "heartbeat_seconds", 1)
-    monkeypatch.setattr(fast_graph, "SEARCH_DELAY_S", 2.5)
+    # 桩流延时旋钮（B3 节点接真后由桩流假图承担）
+    monkeypatch.setattr(stub_flow, "FAKE_DELAY_S", 2.5)
 
     post_task = asyncio.create_task(
         async_client.post("/api/v1/threads", json={"query": _FAST_QUERY, "mode": "fast"})

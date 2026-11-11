@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy import select
 from starlette.exceptions import HTTPException
 
+from app.agent.tools.registry import get_tools_registry, start_tools_registry
 from app.api.v1 import models, threads, turns
 from app.api.v1.health import router as health_router
 from app.config_center import start_asset_center
@@ -153,6 +154,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         bus = await start_event_bus()
         try:
+            start_tools_registry()  # 进程级工具注册表（熔断状态/连接缓存，B3 web_search）
             start_thread_scheduler()
             await seed_seq_from_db()
 
@@ -184,6 +186,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         finally:
             await bus.close()
     finally:
+        try:
+            await get_tools_registry().aclose()
+        except RuntimeError:
+            pass  # 注册表未及启动（资产中心失败早退）——无可收口
         await center.close()
 
 

@@ -24,11 +24,30 @@ SOURCES = "sources"
 TOKEN = "token"
 
 
-def emit_stage(stage_key: str, status: str, *, label: str | None = None) -> None:
-    """发射 stage 信号（stage_key：rewrite|search|read|reflect|plan|write|code_exec）。"""
+def emit_stage(
+    stage_key: str,
+    status: str,
+    *,
+    label: str | None = None,
+    progress: dict[str, Any] | None = None,
+    detail: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """发射 stage 信号（stage_key：rewrite|search|read|reflect|plan|write|code_exec）。
+
+    label/progress/detail/extra 为 §7.2 stage 可选业务字段（B3 rewrite 起 extra 用于
+    兜底留痕与 memory_directive 留档）；TurnRunner 吸收 progress/detail/extra 进
+    turns.timing.stages 并透传 §2.5（B2 _absorb_stage 已支持）。
+    """
     payload: dict[str, Any] = {"type": STAGE, "stage_key": stage_key, "status": status}
     if label is not None:
         payload["label"] = label
+    if progress is not None:
+        payload["progress"] = progress
+    if detail is not None:
+        payload["detail"] = detail
+    if extra is not None:
+        payload["extra"] = extra
     get_stream_writer()(payload)
 
 

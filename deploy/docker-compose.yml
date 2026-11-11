@@ -375,6 +375,38 @@ services:
       retries: 12
       start_period: 30s
 
+  # ═══════════════════ 搜索备源 · SearXNG（搜索兜底链首 fallback_search，B3 第 0 步，v1.32/ADR-002）═══════════════════
+  # 自托管元搜索/聚合层（上游仍为第三方引擎，CAPTCHA/上游改版残余依赖随链传递——ARCH §10 R12，
+  # 验证不过经 Nacos searxng.enabled=false 回退 AnySearch 独担，零改码）。接入面 = 自研薄 stdio
+  # MCP wrapper（apps/search-api/app/agent/tools/searxng_mcp.py，进程环境读 SEARXNG_URL），
+  # 本容器只提供原生 JSON API（deploy/searxng/settings.yml：formats 白名单含 json、limiter 关闭、
+  # 不配 Redis——nacos-config.md §2 searxng 条目注记）。
+  searxng:
+    image: searxng/searxng:2026.9.8-3fdc6d753   # 2026-11-09 选定当时最新稳定 tag（经 1panel 镜像源
+                                                #   核对 tags 全量后按日期+commit 取最新；amd64+arm64
+                                                #   双架构 manifest 核实；锁 tag 不落 latest，ADR-014）
+    restart: always
+    ports:
+      - "127.0.0.1:18080:8080"   # 宿主 18080 = 8080+10000（对齐 postgres 15432 / redis 16379 惯例，ARCH §5）
+    environment:
+      # Flask 会话签名 secret——镜像对默认值 ultrasecretkey 硬拒绝启动（2026-11-09 实证），
+      # settings.yml 不落仓库（密钥纪律），经 SettingsValue environ_name=SEARXNG_SECRET 覆写
+      # （searx/settings_defaults.py:218，镜像内默认 settings 自注）；值在 .env，缺失即失败
+      SEARXNG_SECRET: "${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}"
+    volumes:
+      # settings.yml 必含 search.formats: [html, json]（缺 json → JSON API 恒 403）；改后必须
+      # up -d --force-recreate searxng（单文件 bind 挂载 macOS inode 坑，同上方 litellm 注，
+      # restart 无法重新 bind）
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    # 无 depends_on——与主链并行起（备源就位不阻塞主栈，同 crawl4ai 口径）
+    healthcheck:
+      # python 基底镜像（urllib 必在）；/healthz 端点返回 200 OK
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request as u;u.urlopen('http://127.0.0.1:8080/healthz',timeout=5)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
   # ═══════════════════ 执行面 · OpenSandbox（本批用户裁决提前部署，不挂 profile）═══════════════════
   # 应用侧仍 SANDBOX_ENABLED=false（不启用），仅验基建面（M4 深验顺延）
   opensandbox:

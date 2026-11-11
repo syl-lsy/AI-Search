@@ -106,6 +106,14 @@ model_list:
       api_base: os.environ/OLLAMA_API_BASE          # http://host.docker.internal:11434（.env OLLAMA_API_BASE）
       allowed_fails: 3
       cooldown_time: 60
+      # 思考模型上下文窗（B3 rewrite 实证）：ollama 默认 num_ctx=4096——qwen3.5 思维链
+      # + rewrite 提示词（type_rules 全文 ≈1.7k tok）合计即触顶，输出预算被吃光 →
+      # 「空文本+零工具调用」（R7 空输出病理的上下文面根因）。8192 = R7 max_tokens 口径
+      # 同源（思考 + 结构化输出 JSON 共存的最小裕量；M4 评测后再调）。
+      # 注：关思维链的 think=false 走不到 ollama（litellm_params 不透传该键，实测）——
+      # 由 S15 调用方经 extra_body 逐请求注入（app/agent/nodes/fast_rewrite.py
+      # build_light_model），网关侧不重复声明。
+      num_ctx: 8192
 
   # ── embedding / rerank（百炼通用按量端点 + 标准 Key；单上游不配回退与熔断，见头注）──
   - model_name: text-embedding-v4
