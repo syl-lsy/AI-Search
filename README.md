@@ -2,7 +2,7 @@
 
 类 Perplexity 的自建 AI 搜索引擎：快速模式（多源搜索 → ≤3000 字上限内带引用综合回答，篇幅按题型软引导，P50 ≤30s）+ 深度模式（deepagents 子代理并行研究 → 分节带引用报告），全程引用可溯源、成本可观测。
 
-> 当前阶段（2026-11-10）：**批次 0（工程骨架）+ 批次 1（S0 基础设施）+ 批次 2（B1 底座）+ 批次 3（B2 线程轮次·桩主图）+ 批次 4（B3 主图壳+fast 五节点）已闭环**，下一批 = 批次 5（S2 SSE 联调）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
+> 当前阶段（2026-11-11）：**批次 0（工程骨架）+ 批次 1（S0 基础设施）+ 批次 2（B1 底座）+ 批次 3（B2 线程轮次·桩主图）+ 批次 4（B3 主图壳+fast 五节点）+ 批次 5（S2 SSE 联调）已闭环**，下一批 = 批次 6（后端综合验证）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
 
 ## 快速开始
 
@@ -15,7 +15,7 @@ pnpm install                    # 前端依赖（pnpm workspace；前端批次 7
 
 ## S0 基础设施栈（批次 1 已闭环）
 
-`deploy/docker-compose.yml`，10 服务全部绑 127.0.0.1：
+`deploy/docker-compose.yml`，11 个服务（含 searxng，见下方备源组件）全部绑 127.0.0.1：
 
 | 组件 | 宿主端口 | 说明 |
 |---|---|---|
@@ -28,7 +28,7 @@ pnpm install                    # 前端依赖（pnpm workspace；前端批次 7
 | crawl4ai | 11235 | 自部署读取备胎（`url_reader_backup`，MCP `/mcp/sse`） |
 | opensandbox | 8801 | 代码沙箱（M4 启用） |
 
-备源组件（批次 4 已落地）：SearXNG :18080（镜像锁 tag `2026.9.8-3fdc6d753`；`make infra-up` 起栈自启，需 .env `SEARXNG_SECRET`——该版本镜像对默认 secret_key 硬拒绝启动）；接入性验证 PASS（延迟 P50 1.32s / P95 3.02s，显著优于 AnySearch 实测 5.9~7.9s；上游引擎 CAPTCHA/限流残余风险与回退门 `searxng.enabled=false` 见 ARCHITECTURE §10 R12）。
+备源组件（批次 4 已落地）：SearXNG :18080（镜像锁 tag `2026.9.8-3fdc6d753`；`make infra-up` 起栈自启，需 .env `SEARXNG_SECRET`——该版本镜像对默认 secret_key 硬拒绝启动）；接入性验证 PASS（延迟 P50 1.32s / P95 3.02s，显著优于 AnySearch 实测 5.9~7.9s；上游引擎 CAPTCHA/限流残余风险与回退门 `searxng.enabled=false` 见 ARCHITECTURE §10 R12）。批次 5（2026-11-11）起标准 `make dev` 形态下链首**真装载**（`.env` 的 `SEARXNG_*` 经 `McpCredentialSettings` 生效——此前后端未声明三字段导致 `.env` 有值但 wrapper 装不上，降级链退化为 AnySearch 独担；缺口已修），且 Nacos 运行时 mcp.json 已发布 v1.18（六源含 searxng、anysearch 降为次级）。
 
 ### 起栈流程（顺序执行，全部从仓库根跑）
 
@@ -63,4 +63,4 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 
 ## 里程碑路线（M1，状态见 `docs/PROGRESS.md`）
 
-批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 → 批次 6 后端综合验证 → 批次 7 前端 F1 → 批次 8 M1 综合测试与退出；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。
+批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 → 批次 7 前端 F1 → 批次 8 M1 综合测试与退出；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。

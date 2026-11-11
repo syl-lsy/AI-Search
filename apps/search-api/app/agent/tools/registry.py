@@ -28,7 +28,7 @@ from pydantic import SecretStr
 from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 __all__ = [
     "SEARCH_SOURCE_NAMES",
@@ -178,10 +178,20 @@ def resolve_search_chain(
 
 
 class _SearchArgs(BaseModel):
-    """搜索调用入参边界（本节点构造的编程面——extra 容忍各源扩展参数）。"""
+    """搜索调用入参边界（本节点构造的编程面——extra 容忍各源扩展参数）。
+
+    查询文本跨源两种参数名：通用 `query` / searxng wrapper 扁平 `q`——二选一非空。
+    """
 
     model_config = {"extra": "allow"}
-    query: str
+    query: str | None = None
+    q: str | None = None
+
+    @model_validator(mode="after")
+    def _query_text_present(self) -> "_SearchArgs":
+        if not (self.query or "").strip() and not (self.q or "").strip():
+            raise ValueError("query/q 至少一项非空（查询文本在场）")
+        return self
 
 
 _BOCHA_ENTRY_RE = re.compile(
@@ -308,7 +318,11 @@ def _search_args(source: str, query: str, time_range: str | None, top_k: int) ->
         return args
     if source == "bocha":
         return {"query": query, "count": top_k, "summary": True}
-    return {"query": query}  # searxng / anysearch：最小面
+    if source == "searxng":
+        # wrapper 扁平签名 `q`（SearxngSearchInput extra="forbid"，工具名 searxng_search；
+        # B3 冒烟证伪嵌套 params 形态后钉死）。top_k 不透传——SearXNG JSON API 无对应参数
+        return {"q": query}
+    return {"query": query}  # anysearch：最小面
 
 
 def guarded_source_call(
@@ -361,7 +375,12 @@ class ToolRegistry:
     # ---- 凭证在场性（源可用性三条件之一；测试假体覆写本方法）----
 
     def credential_ready(self, server: str) -> bool:
-        """*_env 指针指向的凭证/连接值在场（空值=缺失=该源不可用）。值绝不外泄。"""
+        """*_env 指针指向的凭证/连接值在场（空值=缺失=该源不可用）。值绝不外泄。
+
+        有意设计（装载门窄于解析面，安全方向）：searxng 等连接指针类走
+        _resolve_pointer 双渠道（settings 空值回落 os.environ）；tavily/bocha/
+        anysearch 等 API-key 密钥类只信 settings 单例——密钥语义不进进程环境。
+        """
         from app.core.config import mcp_settings
 
         if server == "tavily":
@@ -371,8 +390,11 @@ class ToolRegistry:
         if server == "anysearch":
             return bool(mcp_settings.anysearch_api_key.get_secret_value())
         if server == "searxng":
+            # wrapper 三件套走统一指针渠道（settings 单例优先 → 空值/未声明回落进程
+            # 环境）：.env + make dev 形态值在 settings 单例（B3 R12 注遗留②修复——
+            # 原实现只查 os.environ，该形态下恒 False、备位链首不可装载）
             return all(
-                bool(os.environ.get(name, "").strip())
+                bool(self._resolve_pointer(name).strip())
                 for name in _SOURCE_ENV_POINTERS[server]
             )
         return False
@@ -432,19 +454,20 @@ class ToolRegistry:
 
     @staticmethod
     def _resolve_pointer(name: str) -> str:
-        """*_env 指针解析：settings 字段（大小写不敏感同名）优先，回落进程环境。
+        """*_env 指针解析：settings 字段（大小写不敏感同名）非空优先，空值/未声明回落进程环境。
 
-        .env 值经 pydantic-settings 进 settings 单例（不在 os.environ）；compose 消费型
-        变量（如 SEARXNG_* 子进程三件套）只在进程环境——两渠道统一在此收口。值绝不外泄。
+        .env 值经 pydantic-settings 进 settings 单例（不在 os.environ）——标准
+        「.env + make dev」形态走单例渠道；部署/compose 注入或测试 setenv 晚于单例
+        实例化时，字段空值穿透回落进程环境（两渠道统一收口）。值绝不外泄。
         """
         from app.core.config import mcp_settings
 
         field_name = name.lower()
         if hasattr(mcp_settings, field_name):
             value = getattr(mcp_settings, field_name)
-            if isinstance(value, SecretStr):
-                return value.get_secret_value()
-            return str(value)
+            resolved = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+            if resolved.strip():
+                return resolved
         return os.environ.get(name, "")
 
     async def aclose(self) -> None:
@@ -500,7 +523,6 @@ class ToolRegistry:
                 if secret:
                     connection["headers"] = {"Authorization": f"Bearer {secret}"}
         # Connection 为 adapters 的 TypedDict 形态（运行期即 dict）——构造边界按库契约放行
-        # Connection 为 adapters TypedDict 形态（运行期即 dict）——构造边界按库契约放行
         client = MultiServerMCPClient({source: connection})  # type: ignore[arg-type]
         tools = await client.get_tools()
         by_name = {tool.name: tool for tool in tools}

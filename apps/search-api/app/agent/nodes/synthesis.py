@@ -32,7 +32,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import SecretStr
 
-from app.agent.guards import TurnDeadline, default_retry_on, retry_policy_from_spec
+from app.agent.guards import TurnDeadline, default_retry_on, ensure_not_canceled, retry_policy_from_spec
 from app.agent.graphs.signals import emit_stage
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.agent.tools.registry import SearchChainUnavailable
@@ -141,6 +141,7 @@ def _text_of(chunk: Any) -> str:
 
 async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """综合回答节点：stage(write) 夹流式生成；answer_md 兜底截断 + 引用越界剔除。"""
+    ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
     emit_stage("write", "running", label="综合中")
     query = str(state.get("query") or "")
     fused = state.get("fused") or []

@@ -28,6 +28,7 @@ import httpx
 from langchain_core.runnables import RunnableConfig
 
 from app.agent.graphs.signals import emit_sources, emit_stage
+from app.agent.guards import ensure_not_canceled
 from app.agent.state import Candidate
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
@@ -142,6 +143,7 @@ def _source_item(candidate: Candidate, ref_no: int) -> dict[str, Any]:
 
 async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """融合重排节点：topN 截断 + KB 命中 rerank + 兜底 + sources 事件（最终集）。"""
+    ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
     fused_input = state.get("fused") or []
     query = str(state.get("query") or "")
     spec = state.get("spec")

@@ -327,7 +327,7 @@ def test_litellm_base_url_rejects_non_http_scheme(monkeypatch):
 
 
 def test_mcp_group_reads_exact_field_names(monkeypatch):
-    """MCP 凭据组不设 env_prefix：十三个字段名=变量名，逐一精确命中。"""
+    """MCP 凭据组不设 env_prefix：十六个字段名=变量名，逐一精确命中。"""
     env = {
         "mcp_tavily_url": "https://mcp.tavily.test/mcp",
         "tavily_api_key": "tvly-dummy",
@@ -342,6 +342,9 @@ def test_mcp_group_reads_exact_field_names(monkeypatch):
         "anysearch_api_key": "as_sk-dummy",
         "mcp_crawl4ai_url": "http://127.0.0.1:11235/mcp/sse",
         "crawl4ai_api_token": "crawl4ai-dummy",
+        "searxng_url": "http://127.0.0.1:18080",
+        "searxng_mcp_command": "uv",
+        "searxng_mcp_args": "run --package search-api python -m app.agent.tools.searxng_mcp",
     }
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -359,6 +362,9 @@ def test_mcp_group_reads_exact_field_names(monkeypatch):
     assert settings.anysearch_api_key.get_secret_value() == "as_sk-dummy"
     assert settings.mcp_crawl4ai_url == "http://127.0.0.1:11235/mcp/sse"
     assert settings.crawl4ai_api_token.get_secret_value() == "crawl4ai-dummy"
+    assert settings.searxng_url == "http://127.0.0.1:18080"
+    assert settings.searxng_mcp_command == "uv"
+    assert settings.searxng_mcp_args == "run --package search-api python -m app.agent.tools.searxng_mcp"
 
 
 def test_mcp_group_without_prefix_stays_untouched_by_wrong_names(monkeypatch):
@@ -407,6 +413,50 @@ def test_mcp_group_defaults(monkeypatch):
     assert settings.mcp_crawl4ai_url == "http://127.0.0.1:11235/mcp/sse"
     assert settings.tavily_api_key.get_secret_value() == ""
     assert settings.crawl4ai_api_token.get_secret_value() == ""
+
+
+# ---- searxng 三件套（v1.18 备位链首；R12 B3 注遗留②接线缺口修复）----
+
+
+def test_mcp_group_searxng_reads_exact_env_names(monkeypatch):
+    """searxng 三件套大写变量名精确命中（注入形态与 .env 一致，pydantic 大小写不敏感）。
+
+    接线缺口红测：.env + make dev 形态下 .env 值经本组声明进 settings 单例，
+    成为 registry `_resolve_pointer`/`credential_ready` 的第一渠道（R12 B3 注遗留②）。
+    测试值为占位假值：环回端点/wrapper 命令是设计常量，非密钥。
+    """
+    monkeypatch.setenv("SEARXNG_URL", "http://127.0.0.1:18080")
+    monkeypatch.setenv("SEARXNG_MCP_COMMAND", "uv")
+    monkeypatch.setenv(
+        "SEARXNG_MCP_ARGS", "run --package search-api python -m app.agent.tools.searxng_mcp"
+    )
+    settings = McpCredentialSettings(_env_file=None)
+    assert settings.searxng_url == "http://127.0.0.1:18080"
+    assert settings.searxng_mcp_command == "uv"
+    assert settings.searxng_mcp_args == (
+        "run --package search-api python -m app.agent.tools.searxng_mcp"
+    )
+
+
+def test_mcp_group_searxng_defaults_empty(monkeypatch):
+    """searxng 三件套默认空=未配置态（三件套本身即 readiness 门，区别于 bocha 命令的
+    R1 代码锚定默认）：缺 .env 键时凭证门 false → 备位链不预装载——integration
+    降级链演练「searxng 凭证缺失 → skip」依赖本语义。"""
+    for name in ("SEARXNG_URL", "SEARXNG_MCP_COMMAND", "SEARXNG_MCP_ARGS"):
+        # 大小写一并清（pydantic-settings 大小写不敏感，外层 shell 导出算数）
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    settings = McpCredentialSettings(_env_file=None)
+    assert settings.searxng_url == ""
+    assert settings.searxng_mcp_command == ""
+    assert settings.searxng_mcp_args == ""
+
+
+def test_mcp_group_searxng_url_requires_http_scheme_when_set(monkeypatch):
+    """searxng_url 配置层 scheme 闸口（出站 URL 唯一来源；空值放行、非空必过 http/https）。"""
+    monkeypatch.setenv("SEARXNG_URL", "127.0.0.1:18080")  # 无 scheme
+    with pytest.raises(ValidationError):
+        McpCredentialSettings(_env_file=None)
 
 
 # ---- LANGFUSE_ 组（容器侧五件套 + AI_API_KEY 为 compose 消费型，不声明）----
@@ -576,6 +626,7 @@ def test_kb_top_k_lower_bound(monkeypatch):
             ),
         ),
         (SandboxSettings, ("api_key",)),  # OPEN_SANDBOX_API_KEY：无 SANDBOX_ 前缀可命中
+        (McpCredentialSettings, ("searxng_secret",)),  # SEARXNG_SECRET：compose 消费型（注入 searxng 容器，应用不读取）
     ],
 )
 def test_compose_consumed_variables_not_declared(settings_cls, forbidden_fields, monkeypatch):

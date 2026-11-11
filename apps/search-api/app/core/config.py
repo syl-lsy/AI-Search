@@ -10,7 +10,9 @@ compose 消费型变量**不在此声明**（注入对应容器、应用不读�
   LITELLM_UI_PASSWORD/LITELLM_DB_PASSWORD（注入 litellm 容器，ADR-014）；
 - MINIO_ROOT_USER/MINIO_ROOT_PASSWORD（注入 minio 容器）、OPEN_SANDBOX_API_KEY、
   Langfuse 容器侧五件套与 AI_API_KEY（SALT/ENCRYPTION_KEY/NEXTAUTH_SECRET/
-  DB_PASSWORD/AI_API_KEY）、ZHIPU_*/DASHSCOPE_*/OTEL_*/LANGSMITH_* 等上游组。
+  DB_PASSWORD/AI_API_KEY）、ZHIPU_*/DASHSCOPE_*/OTEL_*/LANGSMITH_* 等上游组；
+- SEARXNG_SECRET（注入 searxng 容器 Flask secret_key，应用不读取；test_config.py
+  按反例断言其不入 McpCredentialSettings）。
 pydantic-settings 对未声明的环境变量按 extra="ignore" 忽略——勿按前缀全量声明进组
 （单测 test_config.py 按 §7 例外清单逐组兜住）。
 
@@ -66,6 +68,14 @@ def _validate_host_port(value: str) -> str:
 HttpUrlStr = Annotated[str, AfterValidator(_validate_http_url)]
 HostPortStr = Annotated[str, AfterValidator(_validate_host_port)]
 Port = Annotated[int, Field(ge=1, le=65535)]
+
+
+def _validate_optional_http_url(value: str) -> str:
+    """空值放行（=未配置态，凭证门 false → 源不装载），非空走 http/https 校验。"""
+    return _validate_http_url(value) if value else value
+
+
+OptionalHttpUrlStr = Annotated[str, AfterValidator(_validate_optional_http_url)]
 
 
 def _split_csv_list(value: object) -> object:
@@ -151,8 +161,9 @@ class LitellmSettings(BaseSettingsWithEnv):
 
 
 # 搜索/读取 MCP 凭据组（无统一前缀：字段名与环境变量名一一对应）。
-# 源清单/路由在 Nacos，凭证在此（§7 组头注）；五源 = 主位 tavily/bocha/firecrawl
-# + 备位 anysearch（fallback_search）/ crawl4ai（url_reader_backup，R12）
+# 源清单/路由在 Nacos，凭证在此（§7 组头注）；六源 = 主位 tavily/bocha/firecrawl
+# + 备位 searxng（fallback_search 链首，v1.18）/ anysearch（fallback_search_secondary，
+# R12）/ crawl4ai（url_reader_backup，R12）
 class McpCredentialSettings(BaseSettingsWithEnv):
     mcp_tavily_url: HttpUrlStr = "https://mcp.tavily.com/mcp"
     tavily_api_key: SecretStr = SecretStr("")
@@ -167,6 +178,16 @@ class McpCredentialSettings(BaseSettingsWithEnv):
     anysearch_api_key: SecretStr = SecretStr("")
     mcp_crawl4ai_url: HttpUrlStr = "http://127.0.0.1:11235/mcp/sse"
     crawl4ai_api_token: SecretStr = SecretStr("")
+    # searxng 三件套（wrapper 子进程连接指针，nacos-config §2 searxng 条目；B3 R12 注
+    # 遗留②接线缺口修复）：本组声明使 .env 值进 settings 单例，与子进程 env 指针注入
+    # 同经 registry._resolve_pointer 统一收口。空默认=未配置态——三件套本身即 readiness
+    # 门（区别于 bocha 命令的 R1 代码锚定：searxng 无独立 key，命令/参数在场即「凭证」），
+    # 缺 .env 键时 credential_ready false → 备位链不预装载（降级链演练语义）。
+    # SEARXNG_SECRET 为 compose 消费型（注入 searxng 容器 Flask secret_key，应用不读取，
+    # §7 例外清单/.env.example 注），不声明。
+    searxng_url: OptionalHttpUrlStr = ""  # 自部署环回（.env 定形 127.0.0.1:18080）；wrapper 经进程环境读取
+    searxng_mcp_command: str = ""  # wrapper 入口（.env 定形值 uv，同 BOCHA_MCP_COMMAND 模式）
+    searxng_mcp_args: str = ""  # wrapper 启动参数（registry stdio 分支按空白切分）
 
 
 # Langfuse 配置（LANGFUSE_）：本服务读六个——观测出口与 webhook 验签密钥（M4）；

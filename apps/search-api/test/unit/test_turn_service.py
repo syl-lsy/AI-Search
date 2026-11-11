@@ -820,6 +820,137 @@ async def test_search_chain_unavailable_short_circuits_500201() -> None:
     assert channel is not None and channel.terminal is True and channel.closed is True
 
 
+# ---- 组装段异常兜底（评审 P2：try 之外段任一异常不得永卡 running）----
+
+
+async def test_assembly_load_history_failure_fails_turn_closes_channel_nudges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组装段 _load_history DB 故障（此前位于 try 之外 → 异常外泄、turn 永卡 running：
+    无终态落库、无 SSE 终态、队头不被 nudge）：现须 failed 终态落库 + error 事件
+    （500001）+ close_channel（api.md §7.1 v1.10 零内容例外——error 后直接关闭、
+    无 done）+ thread 队列 nudge；异常不外泄（外泄即本用例在 await 行抛错变红）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session))
+    thread_id = str(turn.thread_id)
+    wake = scheduler._thread_events.setdefault(thread_id, asyncio.Event())
+
+    async def boom(thread_id: str, turn_id: str) -> list[dict[str, str]]:
+        raise RuntimeError("历史装配 DB 故障")
+
+    monkeypatch.setattr(scheduler, "_load_history", boom)
+
+    await scheduler._execute_turn(turn)  # 异常不得外泄为未处理栈
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["error"]  # first_stage 未发布：零业务事件
+    assert published[0].data["code"] == "500001"
+    assert turn.status == "failed"
+    assert turn.error is not None and turn.error["code"] == "500001"
+    assert turn.finished_at is not None and turn.duration_ms is not None
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True and channel.closed is True
+    assert wake.is_set()  # thread 队头被 nudge（0.2s 兜底轮询外的即时唤醒）
+
+
+async def test_assembly_tools_registry_resolve_failure_maps_500201(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组装段 tools_registry.resolve 抛 SearchChainUnavailable（连接指针缺失等装载
+    失败，此前 try 之外 → 异常外泄永卡 running）：与 astream 段异常处理同语义 →
+    error(500201) + failed + close_channel + nudge；异常不外泄。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    registry = ToolRegistry()
+
+    def boom(mcp_payload: Any, query_lang: str) -> Any:
+        raise SearchChainUnavailable("搜索链连接指针缺失")
+
+    monkeypatch.setattr(registry, "resolve", boom)
+    scheduler = ThreadScheduler(
+        bus=bus,
+        session_factory=_FakeSessionFactory(session),
+        graph=_FakeGraph([]),
+        spec_snapshot=_snapshot(_SPEC_PAYLOAD),
+        mapping_snapshot=_snapshot(_MAPPING_PAYLOAD),
+        tools_registry=registry,
+    )
+    thread_id = str(turn.thread_id)
+    wake = scheduler._thread_events.setdefault(thread_id, asyncio.Event())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["error"]  # first_stage 未发布
+    assert published[0].data["code"] == "500201"  # astream 段同码（§7.2 全部搜索源不可用）
+    assert turn.status == "failed"
+    assert turn.error is not None and turn.error["code"] == "500201"
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True and channel.closed is True
+    assert wake.is_set()
+
+
+async def test_assembly_spec_snapshot_failure_fails_turn_with_minimal_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组装段快照捕获阶段失败（ctx 尚未建成）：_fail_ctx 回落最小 ctx（零内容）→
+    error(500001) + failed + close_channel + nudge；异常不外泄。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session))
+    thread_id = str(turn.thread_id)
+    wake = scheduler._thread_events.setdefault(thread_id, asyncio.Event())
+
+    def boom() -> dict[str, Any]:
+        raise RuntimeError("Agent Spec 快照不可用")
+
+    monkeypatch.setattr(scheduler, "_capture_spec_payload", boom)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["error"]  # ctx 未建成：零业务事件
+    assert published[0].data["code"] == "500001"
+    assert turn.status == "failed"
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True and channel.closed is True
+    assert wake.is_set()
+
+
+async def test_assembly_failure_after_first_stage_stage_then_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """first_stage 已发布后组装段再失败（seq 已占号）：序列自洽 =
+    [stage(rewrite,running), error] 后直接关闭（api.md §7.2/§7.4）——无 done、
+    无重复 stage、异常不外泄。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session))
+
+    def boom(ctx: Any, business: dict[str, Any]) -> None:
+        raise RuntimeError("stage 合档爆炸")
+
+    monkeypatch.setattr(scheduler, "_absorb_stage", boom)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["stage", "error"]
+    assert (
+        published[0].data["stage_key"] == "rewrite"
+        and published[0].data["status"] == "running"
+    )
+    assert published[1].data["code"] == "500001"
+    assert turn.status == "failed"
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True and channel.closed is True
+
+
 async def test_done_degraded_from_state_with_source_failure_reason() -> None:
     """图内降级接线（§6.2）：FastState.degraded=True → done.degraded=True +
     degraded_reason=source_failure + turns.degraded_reason 列同步。"""

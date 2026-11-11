@@ -24,6 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 
 from app.agent.graphs.signals import emit_stage
+from app.agent.guards import ensure_not_canceled
 from app.agent.tools.registry import SearchChainUnavailable
 
 __all__ = ["WEB_SEARCH_TOP_K", "search_fanout", "web_search"]
@@ -55,6 +56,7 @@ def search_fanout(state: Any) -> list[Send] | str:
 
 async def web_search(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """单 query 搜索副本：冻结链逐源并行 → candidates（add reducer 合并）+ 降级留痕。"""
+    ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：Send 扇出副本同感知）
     configurable = (config or {}).get("configurable") or {}
     chain = configurable.get("search_chain")
     registry = configurable.get("tools_registry")

@@ -14,6 +14,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from app.agent.guards import ensure_not_canceled
 from app.agent.tools.registry import SearchChainUnavailable
 
 __all__ = ["merge_candidates", "merge_dedupe"]
@@ -50,6 +51,7 @@ def merge_dedupe(state: Any, config: RunnableConfig | None = None) -> dict[str, 
     sources 事件不在本节点发射（发射点=fuse_rerank——最终集经 topN/rerank 定序后
     ref_no 首现冻结，§7.2）。
     """
+    ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
     candidates = state.get("candidates") or []
     errors = state.get("errors") or []
     if not candidates and errors:

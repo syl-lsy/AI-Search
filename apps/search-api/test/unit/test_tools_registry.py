@@ -14,8 +14,10 @@
   一次失败（进熔断），不写入 state、不污染上下文。
 """
 
+import ast
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -329,3 +331,159 @@ def test_guard_input_violation_is_programming_error_not_circuit() -> None:
             clock=lambda: 0.0,
         ))
     assert breaker.consecutive_failures == 0
+
+
+# ---- 真注册表凭证渠道（settings 单例 → _resolve_pointer → credential_ready）----
+# R12 B3 注遗留②（SEARXNG_* 接线缺口）：.env + make dev 形态下 .env 值经 pydantic-settings
+# 进 settings 单例（不在 os.environ）——指针解析与凭证在场必须两渠道统一收口。
+# 测试值全部为占位假值：自部署环回端点与 wrapper 命令是设计常量，非密钥。
+
+_SEARXNG_TRIO: dict[str, str] = {
+    "SEARXNG_URL": "http://127.0.0.1:18080",
+    "SEARXNG_MCP_COMMAND": "uv",
+    "SEARXNG_MCP_ARGS": "run --package search-api python -m app.agent.tools.searxng_mcp",
+}
+
+
+def _patch_searxng_settings(monkeypatch: pytest.MonkeyPatch, *, declared: bool) -> None:
+    """换掉 mcp_settings 单例为受控实例（_env_file=None 跳过仓库根 .env）。
+
+    declared=True = 三字段已配置（占位假值）；False = 未配置（空默认）。两种形态都
+    先清进程环境三键（隔离外层 shell 泄漏），credential_ready/_resolve_pointer 经
+    方法内 `from app.core.config import mcp_settings` 延迟导入读到被替换的单例。
+    """
+    from app.core import config as config_module
+    from app.core.config import McpCredentialSettings
+
+    for name in _SEARXNG_TRIO:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        config_module,
+        "mcp_settings",
+        McpCredentialSettings(
+            _env_file=None, **{name.lower(): value for name, value in _SEARXNG_TRIO.items()}
+        ) if declared else McpCredentialSettings(_env_file=None),
+    )
+
+
+def test_resolve_pointer_searxng_from_settings_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """指针解析第一渠道：searxng 三键在 settings 单例（进程环境全空）→ 解析非空。
+
+    接线缺口红测（R12 B3 注遗留②）：修复前字段未声明 → hasattr False → 落
+    os.environ（本测已清空）→ 三键全解析为空 → wrapper 不可装载。
+    """
+    _patch_searxng_settings(monkeypatch, declared=True)
+    registry = ToolRegistry()
+    for env_name, expected in _SEARXNG_TRIO.items():
+        resolved = registry._resolve_pointer(env_name)
+        assert resolved == expected, f"{env_name} 应经 settings 单例渠道解析"
+        assert resolved.strip() != ""
+
+
+def test_credential_ready_searxng_true_when_settings_declared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """凭证就位（settings 单例渠道）→ credential_ready("searxng") 为 True。
+
+    接线缺口红测：修复前只查 os.environ——.env + make dev 形态下恒 False →
+    SearchChainUnavailable 自动落次级 anysearch（降级链演练「凭证缺失」的根因）。
+    """
+    _patch_searxng_settings(monkeypatch, declared=True)
+    assert ToolRegistry().credential_ready("searxng") is True
+
+
+def test_resolve_pointer_searxng_empty_settings_falls_through_to_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """settings 空值穿透：字段已声明但未配置（空默认）→ 回落进程环境（双渠道统一）。
+
+    钉死「部署/compose 注入或测试 setenv 晚于单例实例化」形态——字段空值不遮蔽
+    进程环境（test_review_fixes.py P1 修复的部署形态前提）。
+    """
+    _patch_searxng_settings(monkeypatch, declared=False)
+    for name, value in _SEARXNG_TRIO.items():
+        monkeypatch.setenv(name, value)
+    registry = ToolRegistry()
+    for env_name, expected in _SEARXNG_TRIO.items():
+        assert registry._resolve_pointer(env_name) == expected
+
+
+def test_credential_ready_searxng_false_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三件套全缺席（单例空默认 + 进程环境空）→ False（未配置态不预装载，
+    integration 降级链演练「searxng 凭证缺失 → skip」的语义锚）。"""
+    _patch_searxng_settings(monkeypatch, declared=False)
+    assert ToolRegistry().credential_ready("searxng") is False
+
+
+def test_search_args_searxng_uses_flat_q_param() -> None:
+    """searxng 调用参数 = wrapper 扁平签名 `q`（wrapper SearxngSearchInput extra="forbid"）。
+
+    接线缺口红测第二层：`{"query": …}` 形态被 wrapper 拒收 → 出参变错误文本 →
+    归一报「出参非 JSON」（装载真通后 integration 实证，B3 冒烟绕过装载链故未暴露）。
+    anysearch 最小面 `{"query": …}` 保持不变。
+    """
+    from app.agent.tools.registry import _search_args
+
+    assert _search_args("searxng", "LangGraph", None, 3) == {"q": "LangGraph"}
+    assert _search_args("anysearch", "q2", "day", 3) == {"query": "q2"}
+
+
+def test_search_args_boundary_accepts_searxng_q_form() -> None:
+    """入参边界容忍 searxng 扁平 `q` 形态（query/q 二选一非空；全空/空白仍拒收）。
+
+    guarded_source_call 入参校验=编程错误面：`{"q": …}` 过边界才算贯通到 wrapper
+    （integration 真源实证的第三层断点）。
+    """
+    from pydantic import ValidationError
+
+    from app.agent.tools.registry import _SearchArgs
+
+    _SearchArgs.model_validate({"q": "LangGraph"})  # 扁平形态不抛
+    _SearchArgs.model_validate({"query": "LangGraph"})  # 通用形态不抛
+    with pytest.raises(ValidationError):
+        _SearchArgs.model_validate({})  # 全空拒收（编程错误）
+    with pytest.raises(ValidationError):
+        _SearchArgs.model_validate({"query": "  "})  # 空白拒收
+
+
+# ---- 防回归哨兵（CR-1 修复轮 1）：本文件禁止空壳测试函数 ----
+
+
+def test_no_vacuous_test_functions_in_this_module() -> None:
+    """AST 哨兵：本文件每个顶层 test_* 必须含可执行直接语句（CR-1 防回归）。
+
+    钉死 CR-1 形态：重排缩进曾把断言块缩进进内层 `async def invoke` 体内
+    raise 之后（不可达死代码），单跑零断言假绿——「入参校验失败=编程错误、
+    熔断计数不动」语义失去唯一测试保护。凡直接语句仅 docstring/import/内层
+    def/裸 pass/裸 return 的顶层测试函数一律判空壳，哨兵红。
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    vacuous: list[str] = []
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            continue
+        body = list(node.body)
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]  # 剥 docstring
+        meaningful = [
+            s
+            for s in body
+            if not isinstance(
+                s,
+                (
+                    ast.Import,
+                    ast.ImportFrom,
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Pass,
+                    ast.Return,
+                ),
+            )
+        ]
+        if not meaningful:
+            vacuous.append(node.name)
+    assert vacuous == [], f"空壳测试函数（无可执行语句）: {vacuous}"

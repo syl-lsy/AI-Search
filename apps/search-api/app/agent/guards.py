@@ -33,8 +33,10 @@ import httpx
 
 __all__ = [
     "RetryPolicy",
+    "TurnCanceledSignal",
     "TurnDeadline",
     "default_retry_on",
+    "ensure_not_canceled",
     "llm_timeout_s",
     "pop_cancel_flag",
     "retry_policy_from_spec",
@@ -144,8 +146,9 @@ def pop_cancel_flag(config: Mapping[str, Any] | None) -> str | None:
 
     注入面：TurnRunner astream 的 `configurable["cancel_flags"]`（进程级 dict 引用）+
     `configurable["turn_id"]`。无注入面（Studio 直跑/单测/无 flags）时静默返回 None
-    ——节点不依赖 TurnRunner 运行时设施（DEV §5.3 边界）；跨子图透传实测归批次 5
-    （R14②）。取消收尾（canceled 落库 + done 事件）归 TurnRunner，图内只感知不落库。
+    ——节点不依赖 TurnRunner 运行时设施（DEV §5.3 边界）；跨子图透传实测批次 5 已闭
+    （R14②：test_r14_cross_subgraph 锁死注入身份与节点感知）。取消收尾（canceled
+    落库 + done 事件）归 TurnRunner，图内只感知不落库。
     """
     if not isinstance(config, Mapping):
         return None
@@ -157,6 +160,32 @@ def pop_cancel_flag(config: Mapping[str, Any] | None) -> str | None:
     if not isinstance(flags, dict) or not turn_id:
         return None
     return flags.pop(str(turn_id), None)
+
+
+class TurnCanceledSignal(Exception):
+    """节点边界感知到协作式取消的控制流信号（**取消非故障**，R14② 跨子图透传形态）。
+
+    guards `pop_cancel_flag` 在节点入口命中（进程级 `_cancel_flags` 经 configurable
+    引用注入，跨主图壳→子图边界可达）即上抛本信号——图内只感知、不落库，TurnRunner
+    捕获后走 `_finish_canceled`（done(finish=canceled, cancel_reason=reason)，
+    不产生 error 事件，api.md §7.2「打断非故障」口径）。reason ∈ user|superseded|
+    rolled_back（ThreadScheduler._cancel_flags 值域）。
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def ensure_not_canceled(config: Mapping[str, Any] | None) -> None:
+    """节点入口边界感知：pop 命中即抛 TurnCanceledSignal（未命中零开销直通）。
+
+    fast 五节点入口统一接线（R14②）：无注入面（Studio 直跑/单测/无 flags）静默
+    返回——节点不依赖 TurnRunner 运行时设施（DEV §5.3 边界不变）。
+    """
+    reason = pop_cancel_flag(config)
+    if reason is not None:
+        raise TurnCanceledSignal(reason)
 
 
 class TurnDeadline:

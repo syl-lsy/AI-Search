@@ -31,6 +31,7 @@ from app.agent.graphs.signals import emit_stage
 from app.agent.guards import (
     TurnDeadline,
     default_retry_on,
+    ensure_not_canceled,
     llm_timeout_s,
     retry_policy_from_spec,
 )
@@ -236,6 +237,7 @@ def _fallback_update(
 async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """rewrite 节点（fast 子图）：stage(rewrite, done) 收口（running 由 TurnRunner
     图前同步发布——ARCH §4.3 首 stage ≤1s 且无重复 seq）。"""
+    ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
 
     query = str(state.get("query") or "")
     spec = state.get("spec")
