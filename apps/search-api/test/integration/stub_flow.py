@@ -5,6 +5,9 @@ ThreadScheduler 已支持 graph 注入（B2 起）；本模块提供脚本化假
 收口后的真实承载形态），零 LLM/零真源/零网络依赖。
 
 - FAKE_DELAY_S：运行窗口旋钮（monkeypatch 之制造心跳/取消/超时窗口；默认 0）；
+- FAKE_IMAGES：images 事件旋钮（A6——None=不发（默认）；非空 list 时在 sources 之后、
+  write(running) 之前发射 `{"type": "images", "images": [...]}` custom 信号，
+  api.md §7.4 快速序列 images(可选) 位置）；
 - requires_llm / requires_search 标记用例豁免（走真节点链路，见 conftest autouse 夹具）。
 """
 
@@ -12,6 +15,10 @@ from typing import Any
 
 #: 运行窗口旋钮（秒）：假图 search 阶段在此处睡眠——心跳/取消/超时语义测试用
 FAKE_DELAY_S: float = 0.0
+
+#: images 事件旋钮（A6）：None=不发（默认——api.md §7.2「无图不发」现状基线）；
+#: 非 list|None 值非法（测试侧自律），list 非空时按 §7.4 位置发射
+FAKE_IMAGES: list[dict[str, Any]] | None = None
 
 #: 假答案（token 拼接一致——SSE token_concat 断言基准）
 FAKE_TOKEN_DELTAS: list[str] = [
@@ -72,6 +79,9 @@ class FakeScriptedGraph:
                 "progress": {"current": 1, "total": 1}, "detail": "tavily×1",
             })
             yield (("fast:stub",), "custom", {"type": "sources", "batch": [dict(FAKE_SOURCE)], "total": 1})
+            # images（可选——A6 旋钮开启时按 §7.4 位置发射：sources 之后、write(running) 之前）
+            if FAKE_IMAGES:
+                yield (("fast:stub",), "custom", {"type": "images", "images": list(FAKE_IMAGES)})
             # write（token 走 messages 流——§6.1）
             yield (("fast:stub",), "custom", {"type": "stage", "stage_key": "write", "status": "running", "label": "综合中"})
             for delta in FAKE_TOKEN_DELTAS:

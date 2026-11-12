@@ -2,7 +2,7 @@
 
 类 Perplexity 的自建 AI 搜索引擎：快速模式（多源搜索 → ≤3000 字上限内带引用综合回答，篇幅按题型软引导，P50 ≤30s）+ 深度模式（deepagents 子代理并行研究 → 分节带引用报告），全程引用可溯源、成本可观测。
 
-> 当前阶段（2026-11-11）：**批次 0（工程骨架）+ 批次 1（S0 基础设施）+ 批次 2（B1 底座）+ 批次 3（B2 线程轮次·桩主图）+ 批次 4（B3 主图壳+fast 五节点）+ 批次 5（S2 SSE 联调）已闭环**，下一批 = 批次 6（后端综合验证）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
+> 当前阶段（2026-11-12）：**批次 0（工程骨架）+ 批次 1（S0 基础设施）+ 批次 2（B1 底座）+ 批次 3（B2 线程轮次·桩主图）+ 批次 4（B3 主图壳+fast 五节点）+ 批次 5（S2 SSE 联调）+ 批次 6（后端综合验证）+ 批次 7（前端 F1，含 A6 images 前置小修）已闭环**，下一批 = 批次 8（M1 综合测试与退出）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
 
 ## 快速开始
 
@@ -10,8 +10,18 @@
 cp .env.example .env            # 配置见 .env.example；容器侧密钥由 gen_env 生成（见下），上游 API Key 自填
 cp .env.test.example .env.test  # integration/e2e 测试凭证（不入库，缺凭证用例按需 skip）
 uv sync                         # Python 依赖（uv workspace，Python 3.12）
-pnpm install                    # 前端依赖（pnpm workspace；前端批次 7 落位，当前可跳过）
+pnpm install                    # 前端依赖（pnpm workspace；前端批次 7 已落位，make dev-frontend 前必跑）
 ```
+
+## 前端（批次 7 已落位）
+
+```bash
+cp frontend/.env.example frontend/.env   # 可选：模板默认直连后端 http://127.0.0.1:8300（CORS 已放行 :5173 两个 origin）
+make dev-frontend                        # Vite :5173（/api 代理 → http://127.0.0.1:8300）
+```
+
+- `frontend/.env` 的 `VITE_API_BASE_URL`：未设/留空 = 同源相对路径走 Vite dev proxy（推荐 dev 形态，无需 CORS）；直连 = 填后端 origin，改端口须同步后端 `CORS_ORIGINS`。仅 `VITE_` 前缀变量暴露给客户端（唯一读取处 `frontend/src/api/client.ts`）。
+- 前端测试：`make test-frontend`（unit/integration/component 三层 + 80% 覆盖率门禁）；e2e（playwright，真服务）运行期间 `make dev` + `make dev-frontend` 双服务须在跑；流式用例当前因本机代理环境 skip 挂牌（摘牌复跑条件见 `docs/PROGRESS.md` §2 批次 7 行）。
 
 ## S0 基础设施栈（批次 1 已闭环）
 
@@ -48,7 +58,7 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 | 命令 | 作用 |
 |---|---|
 | `make dev` | 后端 uvicorn 热重载 :8300 |
-| `make dev-frontend` | 前端 Vite :5173（前端批次 7 落位） |
+| `make dev-frontend` | 前端 Vite :5173（批次 7 已落位；启动与环境变量说明见上方「前端」节） |
 | `make test` | 质量门禁：后端 unit+integration + 前端三层，双端各 80% 覆盖率（e2e 不计） |
 | `make test-unit` / `make test-integration` / `make test-e2e` | 后端分层单跑（读 `.env.test`，缺凭证用例按需 skip） |
 | `make test-frontend` | 前端三层一次跑全（unit/integration/component，含 80% 覆盖率门禁） |
@@ -63,4 +73,4 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 
 ## 里程碑路线（M1，状态见 `docs/PROGRESS.md`）
 
-批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 → 批次 7 前端 F1 → 批次 8 M1 综合测试与退出；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。
+批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 ✅ → 批次 7 前端 F1 ✅ → 批次 8 M1 综合测试与退出；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。

@@ -324,13 +324,15 @@ def main() -> int:
         servers = mcp.get("servers") or {}
         anysearch = servers.get("anysearch") or {}
         crawl4ai = servers.get("crawl4ai") or {}
+        searxng = servers.get("searxng") or {}
         spot_ok = (
-            anysearch.get("role") == "fallback_search"
+            searxng.get("role") == "fallback_search"
+            and anysearch.get("role") == "fallback_search_secondary"
             and crawl4ai.get("role") == "url_reader_backup"
             and crawl4ai.get("transport") == "sse"
         )
         checks.append({"name": "spot_mcp_backup", "pass": spot_ok,
-                       "detail": "anysearch(role=fallback_search)+crawl4ai(role=url_reader_backup,sse) 在位"
+                       "detail": "searxng(role=fallback_search)+anysearch(role=fallback_search_secondary)+crawl4ai(role=url_reader_backup,sse) 在位（v1.18 两级降级链）"
                        if spot_ok else "备源条目与契约不符"})
 
     # ro 只读实证：probe dataId 发布应 403（DEV §3.2 ①；200=授权配错=FAIL）

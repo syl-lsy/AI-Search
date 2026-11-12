@@ -18,11 +18,10 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from sqlalchemy import select
 
 from app.config_center.cache import AssetSnapshot
 from app.core.config import SseSettings
-from app.db.models import Source, Turn, TurnEvent
+from app.db.models import Source, TurnEvent
 from app.exception import (
     BadRequestException,
     ConflictException,
@@ -34,7 +33,6 @@ from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry
 from app.services import turn_service
 from app.services.event_bus import EventBus, SseEvent
 from app.services.turn_service import (
-    FINAL_STATUSES,
     HISTORY_WINDOW_TURNS,
     QUEUE_DEPTH_LIMIT,
     SubmitDecision,
@@ -43,7 +41,6 @@ from app.services.turn_service import (
     detect_query_lang,
     history_statement,
     resolve_chat_model,
-    seed_seq_from_db,
 )
 
 
@@ -147,6 +144,9 @@ class _FakeGraph:
     """假主图：astream 按脚本产出 (namespace, stream_mode, chunk) 三元组；步间可插 delay。
 
     记录每次收到的初始 state payload（B3 第 0 步注入断言用）。
+    VR-2 关闭追踪：生成器帧终结（aclose 注入 GeneratorExit / 耗尽 / 异常穿透）时
+    置 closed=True；streams 持生成器引用阻断 GC 终结器——closed 断言与 GC 时机无关
+    （现状无显式 aclose 时 closed 恒 False，即取消收口护栏的红点）。
     """
 
     def __init__(self, steps: list[tuple[str, Any]], *, delay: float = 0.0) -> None:
@@ -154,6 +154,8 @@ class _FakeGraph:
         self._delay = delay
         self.payloads: list[Any] = []
         self.configs: list[Any] = []
+        self.closed = False
+        self.streams: list[Any] = []
 
     def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
                 subgraphs: bool = False) -> Any:
@@ -163,20 +165,25 @@ class _FakeGraph:
         delay = self._delay
 
         async def gen():
-            for stream, chunk in steps:
-                if delay:
-                    await asyncio.sleep(delay)
-                # updates 一律产顶层 ns（=()）——TurnRunner 仅吸收顶层 updates 最终 state；
-                # messages 帧 namespace 带 synthesis 节点段（R14③ 过滤判定面，§6.1）
-                if stream == "updates":
-                    namespace = ()
-                elif stream == "messages":
-                    namespace = ("fast:run", "synthesis")
-                else:
-                    namespace = ("fast:run",)
-                yield (namespace, stream, chunk)
+            try:
+                for stream, chunk in steps:
+                    if delay:
+                        await asyncio.sleep(delay)
+                    # updates 一律产顶层 ns（=()）——TurnRunner 仅吸收顶层 updates 最终 state；
+                    # messages 帧 namespace 带 synthesis 节点段（R14③ 过滤判定面，§6.1）
+                    if stream == "updates":
+                        namespace = ()
+                    elif stream == "messages":
+                        namespace = ("fast:run", "synthesis")
+                    else:
+                        namespace = ("fast:run",)
+                    yield (namespace, stream, chunk)
+            finally:
+                self.closed = True
 
-        return gen()
+        gen_stream = gen()
+        self.streams.append(gen_stream)
+        return gen_stream
 
 
 class _BoomGraph(_FakeGraph):
@@ -686,6 +693,43 @@ async def test_cancel_running_midflight_senses_at_event_boundary() -> None:
     done = next(e for e in published if e.event_type == "done")
     assert done.data["finish"] == "canceled" and done.data["cancel_reason"] == "superseded"
     assert turn.status == "canceled" and turn.cancel_reason == "superseded"
+
+
+async def test_cancel_break_explicitly_closes_graph_stream() -> None:
+    """VR-2/批次 6 遗留④：取消 break 收尾必须显式 aclose 图生成器——
+    _execute_turn 返回时生成器帧已终结（aclose 在挂起点注入 GeneratorExit），
+    不得依赖 GC/asyncgen 终结器的异步调度时机（此前取消后底层图任务可能继续
+    跑满预算）。取消语义不变：已产出保留、后续帧零翻译、done(canceled) 收尾。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _custom({"type": "stage", "stage_key": "rewrite", "status": "done"}),
+        _custom({"type": "stage", "stage_key": "search", "status": "running"}),
+        # ↑ 帧 2 边界感知取消（不翻译）；帧 3 取消后不得再消费
+        _custom({"type": "sources", "batch": [_SRC]}),
+    ], delay=0.03)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    async def register_late() -> None:
+        # 同 test_cancel_running_midflight 时序：0.03s 间隔中点 0.045s 登记，
+        # 第 2 帧（0.06s）边界 pop 命中 → break（asyncio 单线程，15ms 裕量稳）
+        await asyncio.sleep(0.045)
+        scheduler._cancel_flags[str(turn.id)] = "superseded"
+
+    register_task = asyncio.create_task(register_late())
+    await scheduler._execute_turn(turn)
+    await register_task
+
+    # 取消语义不变（打断非故障）：图前 stage + 帧 1 保留，帧 2/3 不再翻译
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["stage", "stage", "done"]
+    done = published[-1]
+    assert done.data["finish"] == "canceled" and done.data["cancel_reason"] == "superseded"
+    assert turn.status == "canceled" and turn.error is None
+    # VR-2 红点：break 后生成器必须已显式收口——streams 持引用阻断 GC 终结器，
+    # 现状（无 aclose）生成器仍挂起，closed 恒 False
+    assert graph.closed is True
 
 
 async def test_cancel_queued_finishes_immediately_then_409002() -> None:

@@ -615,6 +615,64 @@ async def test_cancel_during_synthesis_streaming_partial_tokens_real_graph(
     ]
 
 
+async def test_cancel_break_closes_real_graph_stream_and_stops_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VR-2（批次 6 遗留④）真图护栏：取消 break 收尾必须显式 aclose 真主图
+    astream 生成器——aclose 在挂起点注入 GeneratorExit → AsyncPregelLoop.__aexit__
+    → AsyncBackgroundExecutor 取消 in-flight 节点任务（_runner.py 提交带
+    __cancel_on_exit__=True；__aexit__ 重抛时忽略 CancelledError 不外泄），
+    synthesis 残余片停止生成，底层图任务终止（不再跑满预算）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _r14_scheduler(bus, session)
+    scheduler._tools_registry = _R14FakeRegistry()  # noqa: SLF001
+    turn_id = str(turn.id)
+    chunks: list[int] = []
+
+    async def on_chunk() -> None:
+        await asyncio.sleep(0.03)  # 每片前暂停：消费侧排空先前帧（同注入点 3 交错口径）
+        chunks.append(1)
+        if len(chunks) == 2:  # 第 2 片产出前登记取消 → token2 帧边界感知 → break
+            scheduler._cancel_flags[turn_id] = "user"  # noqa: SLF001
+
+    _mock_llm(
+        monkeypatch,
+        synth_pieces=[(f"片段{i}。", "text") for i in range(1, 31)],
+        synth_on_chunk=on_chunk,
+    )
+    # 捕获真 astream 返回的生成器（captured 持引用防 GC 终结器——断言与 GC 时机无关）
+    captured: list[Any] = []
+    original_astream = main_graph.astream
+
+    def _capture_astream(payload: Any, config: Any = None, **kwargs: Any) -> Any:
+        gen = original_astream(payload, config, **kwargs)
+        captured.append(gen)
+        return gen
+
+    monkeypatch.setattr(main_graph, "astream", _capture_astream)
+
+    await scheduler._execute_turn(turn)
+
+    # VR-2 红点：break 后真图生成器必须已终结（挂起帧清除）——现状无 aclose 恒挂起
+    (gen,) = captured
+    assert gen.ag_frame is None
+    # 底层图任务终止：取消后残余片停止生成（有限时间内计数冻结）
+    count_at_return = len(chunks)
+    await asyncio.sleep(0.1)
+    assert len(chunks) == count_at_return
+    # 取消语义不变：首片增量已发布，后续帧零翻译，done(canceled) 收尾、零 error
+    published = await _drain_all(bus, str(turn.id))
+    types = [e.event_type for e in published]
+    assert types[0] == "stage" and types[-1] == "done"
+    assert types.count("token") == 1
+    assert not [e for e in published if e.event_type == "error"]
+    done = published[-1]
+    assert done.data["finish"] == "canceled" and done.data["cancel_reason"] == "user"
+    assert turn.status == "canceled" and turn.cancel_reason == "user"
+
+
 async def test_configurable_cancel_flags_cross_subgraph_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

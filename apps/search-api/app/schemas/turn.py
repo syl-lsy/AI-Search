@@ -14,7 +14,7 @@ SourceBrief/StageBrief 对齐 §2.5 sources[]/stages[] 形状。
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 from app.schemas.common import SearchMode, TurnStatus
 from app.schemas.thread import ThreadCreate
@@ -48,14 +48,33 @@ class SourceBrief(BaseModel):
     kb_doc_id: str | None
 
 
+#: ImageBrief 可选键集（缺值 None 时序列化省略——api.md §7.2 v1.12 键可省）
+_IMAGE_BRIEF_OPTIONAL_KEYS = frozenset({"source_url", "title", "width", "height"})
+
+
 class ImageBrief(BaseModel):
-    """答案图片引用（§2.5 images[]）。"""
+    """答案图片引用（§2.5 images[]，api.md §7.2 v1.12 键可省同口径）。
+
+    url 恒在（必填）；source_url/title/width/height 上游缺则**序列化时省略该键**
+    （不置 null、不伪造——v1.12 钉文字：键可省口径同 §7.2，前端缺键不渲染对应
+    元数据，frontend-api.md v1.13）。
+    """
 
     url: str
     source_url: str | None = None
     title: str | None = None
     width: int | None = None
     height: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_optional_keys(self, handler: Any) -> dict[str, Any]:
+        """缺值可选键出序列化面（url 恒在；None 键不落响应——api.md v1.12 不置 null）。"""
+        data = handler(self)
+        return {
+            key: value
+            for key, value in data.items()
+            if not (key in _IMAGE_BRIEF_OPTIONAL_KEYS and value is None)
+        }
 
 
 class StageBrief(BaseModel):

@@ -88,7 +88,7 @@ class FastState(TypedDict, total=False):
     rewritten_queries: list[str]
     # 检索产出（Send 扇出并行写入 → merge_dedupe 消费）
     candidates: Annotated[list[Candidate], add]
-    images_raw: list[dict[str, Any]]
+    images_raw: list[dict[str, Any]]  # A6：候选图片投影（merge_dedupe 填充——候选附带 img_src 保归并序在前、query_images 池殿后；fuse_rerank 选图消费，ARCH §4.1 images_raw 行）
     fused: list[Candidate]
     # 综合产出
     answer_md: str

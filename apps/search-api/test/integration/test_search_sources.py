@@ -75,15 +75,33 @@ async def _search_with_retry(registry: Any, query: str, source: str, *, top_k: i
 
 
 def _assert_candidates_structure(candidates: list[dict[str, Any]], source: str) -> None:
-    """结构断言（integration 口径：断 structure 不断言内容）。"""
+    """结构断言（integration 口径：断 structure 不断言内容）。
+
+    A6 适配（批次 7 前置小修——测试承认数据面可选键，非放宽）：候选键集由严格五键
+    相等改为「五键恒在 + 图片键可选增量」（api.md §7.2 v1.12：SearXNG img_src 主
+    通道逐条透传、Tavily query_images 池挂载首候选；五键之外其余键仍禁入）。
+    """
+    base_keys = {"url", "title", "snippet", "score", "origin"}
+    image_keys = {"img_src", "img_width", "img_height", "query_images"}
     assert isinstance(candidates, list) and candidates, f"{source} 应返回非空候选"
     for item in candidates:
-        assert set(item) == {"url", "title", "snippet", "score", "origin"}
+        assert base_keys <= set(item) and set(item) <= base_keys | image_keys
         assert isinstance(item["url"], str) and item["url"].startswith("http")
         assert isinstance(item["title"], str) and item["title"]
         assert isinstance(item["snippet"], str)
         assert isinstance(item["score"], (int, float))
         assert item["origin"] == source
+        # 图片键形态（可选键——上游带图才出现；畸形即回归红）
+        if "img_src" in item:
+            assert isinstance(item["img_src"], str) and item["img_src"]
+        for dim in ("img_width", "img_height"):
+            if dim in item:
+                assert isinstance(item[dim], (int, float)) and not isinstance(item[dim], bool)
+        if "query_images" in item:
+            assert isinstance(item["query_images"], list)
+            for entry in item["query_images"]:
+                assert isinstance(entry, dict)
+                assert isinstance(entry.get("url"), str) and entry["url"]
 
 
 async def test_tavily_real_search_structure() -> None:
@@ -120,4 +138,31 @@ async def test_searxng_real_search_structure_or_skip() -> None:
     if ready:
         pytest.skip(ready)
     candidates = await _search_with_retry(_registry(), _QUERY, "searxng")
+    _assert_candidates_structure(candidates, "searxng")
+
+
+# ---- A6 images 数据面（批次 7 前置小修）：真源图片字段透传（live 条件用例）----
+
+#: 带图倾向查询（视觉主体题——提高上游返回图片的概率；断言仍为结构面，不强求在场）
+_IMAGE_QUERY = "长城 航拍照片"
+
+
+async def test_tavily_live_accepts_include_images_and_pool_passthrough() -> None:
+    """Tavily 真调用（A6 次级通道）：include_images=true 参数被真工具接受（拒收→
+    guarded 失败→本测红=参数面回归）；出参图片键结构经 _assert_candidates_structure
+    键集白名单校验（带图与否属上游波动，不强求在场）。"""
+    ready = _source_ready("tavily")
+    if ready:
+        pytest.skip(ready)
+    candidates = await _search_with_retry(_registry(), _IMAGE_QUERY, "tavily")
+    _assert_candidates_structure(candidates, "tavily")  # 含 query_images/img_src 键形态校验
+
+
+async def test_searxng_live_img_src_passthrough_or_skip() -> None:
+    """SearXNG 真调用（A6 主通道）：逐条 img_src 透传为候选键（键形态白名单校验；
+    带图与否属上游引擎波动，不强求在场）。SEARXNG_* 三件套缺失 skip（套件惯例）。"""
+    ready = _source_ready("searxng")
+    if ready:
+        pytest.skip(ready)
+    candidates = await _search_with_retry(_registry(), _IMAGE_QUERY, "searxng")
     _assert_candidates_structure(candidates, "searxng")

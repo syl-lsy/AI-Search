@@ -59,9 +59,12 @@ from app.db.models import Source, Thread, Turn, TurnEvent
 from app.db.session import get_session_factory
 from app.exception import BadRequestException, ConflictException, NotFoundException, TurnTerminalException
 from app.schemas.common import SearchMode, TurnStatus
+from pydantic import ValidationError
+
 from app.schemas.turn import (
     CancelReason,
     DegradedReason,
+    ImageBrief,
     SourceBrief,
     StageBrief,
     StageKey,
@@ -237,6 +240,31 @@ def history_statement(thread_id: str, turn_id: str) -> Any:
     )
 
 
+def _rebuild_images_briefs(image_event_row: TurnEvent | None) -> list[ImageBrief]:
+    """turn_events images 行 → §2.5 images[]（api.md v1.12「自 turn_events 重建」）。
+
+    payload["images"] 条目键可省形态透传（url 恒在；source_url/title/width/height
+    缺值键由 ImageBrief 序列化省略——不置 null）；无行/无 payload/畸形条目（非 dict、
+    缺 url、字段非法）静默跳过不拖垮回看面（同「契约 snippet 必填；来源行为空按空串
+    呈现」的防御口径）。
+    """
+    if image_event_row is None:
+        return []
+    payload = image_event_row.payload if isinstance(image_event_row.payload, dict) else {}
+    items = payload.get("images")
+    if not isinstance(items, list):
+        return []
+    briefs: list[ImageBrief] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            briefs.append(ImageBrief.model_validate(entry))
+        except ValidationError:
+            continue  # 历史行畸形条目：跳过（重建不抛——回看面鲁棒性优先）
+    return briefs
+
+
 async def get_turn_detail(
     session: AsyncSession, turn_id: str, *, user_id: str
 ) -> TurnDetail:
@@ -250,9 +278,12 @@ async def get_turn_detail(
       export_available=mode=deep 且 answer_md 非空 且 status∈{completed,degraded}
       （api.md v1.10 §2.5——判据与 §2.3 has_report 同源化）；
     - 分期口径（用户裁决 2026-11-08）：incognito 恒 false（M5 列）、followups 恒 null
-      （0009+B7）、images 恒空（B2 桩不发 images 事件，M4 视觉轮起定回放口径）、
-      snapshot_available 恒 false / kb_doc_id 恒 null（M2/M3 增列后接真实值）；
+      （0009+B7）、snapshot_available 恒 false / kb_doc_id 恒 null（M2/M3 增列后接真实值）；
       memory_hits 不返回（api.md §2.5「M5 及之前无此字段」，M6 随迁移再增）。
+    - images：自该轮 turn_events 的 images 事件 payload 重建（api.md §2.5 v1.12——
+      A6 批次 7 前置小修起真实值；轮内至多一次，防御多行取 seq 首见；条目键可省形态
+      透传（缺值键不置 null，ImageBrief 序列化省略），历史畸形条目跳过不拖垮回看面；
+      零 images 行 → 空数组）。
     """
     try:
         turn_uuid = uuid.UUID(turn_id)
@@ -273,11 +304,19 @@ async def get_turn_detail(
             select(Source).where(Source.turn_id == turn_uuid).order_by(Source.ref_no.asc())
         )
     ).all()
+    image_event_row = (
+        await session.scalars(
+            select(TurnEvent)
+            .where(TurnEvent.turn_id == turn_uuid, TurnEvent.event_type == "images")
+            .order_by(TurnEvent.seq.asc())
+        )
+    ).first()  # 契约轮内至多一次（§7.2）；防御多行取 seq 首见
     status = cast(TurnStatus, turn.status)
     mode = cast(SearchMode, turn.mode)
     timing = turn.timing if isinstance(turn.timing, dict) else {}
     stages_raw = timing.get("stages") or []
     usage = turn.usage if isinstance(turn.usage, dict) else {}
+    images = _rebuild_images_briefs(image_event_row)
     return TurnDetail(
         turn_id=str(turn.id),
         thread_id=str(turn.thread_id),
@@ -304,7 +343,7 @@ async def get_turn_detail(
             )
             for row in source_rows
         ],
-        images=[],  # B2 桩不发 images 事件（翻译面预留）；M4 视觉轮起定回放口径
+        images=images,  # §2.5 v1.12：自 turn_events images 行重建（键可省透传；零行→空数组）
         stages=[
             StageBrief(
                 stage_key=cast(StageKey, entry.get("stage_key", "")),
@@ -1153,7 +1192,7 @@ class ThreadScheduler:
         final_state: dict[str, Any] = {}
         try:
             async with asyncio.timeout(timeout_s):
-                async for namespace, stream_mode, chunk in self._graph.astream(
+                graph_stream = self._graph.astream(
                     initial_state,
                     config={
                         "configurable": {
@@ -1184,9 +1223,25 @@ class ThreadScheduler:
                     },
                     stream_mode=["messages", "updates", "custom"],
                     subgraphs=True,
-                ):
+                )
+                async for namespace, stream_mode, chunk in graph_stream:
                     cancel_reason = self._cancel_flags.pop(turn_id, None)
                     if cancel_reason is not None:  # 节点边界感知（打断非故障）
+                        # VR-2 显式收口（批次 6 遗留④）：break 后生成器挂起不终结，
+                        # 此前靠 GC/asyncgen 终结器异步调度关闭——时机不可控，底层图
+                        # 任务（AsyncBackgroundExecutor 节点任务）可能继续跑满预算。
+                        # aclose 在挂起点注入 GeneratorExit → AsyncPregelLoop.__aexit__
+                        # 取消 in-flight 协程（langgraph 1.2.19 _runner.py 提交带
+                        # __cancel_on_exit__=True；executor __aexit__ 等待收尾且重抛时
+                        # 忽略 CancelledError 不外泄），取消即停成显式契约；关闭异常仅
+                        # 告警不吞取消语义（canceled 收尾非故障路径不受影响）。
+                        try:
+                            await graph_stream.aclose()
+                        except Exception as close_exc:
+                            AgentLog(
+                                message=f"取消收口 aclose 异常（忽略，canceled 收尾不受影响）：{close_exc!r}",
+                                graph="turn_runner",
+                            ).warning()
                         break
                     if stream_mode == "custom":
                         await self._translate_custom(ctx, chunk)

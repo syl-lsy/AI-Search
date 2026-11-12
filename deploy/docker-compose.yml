@@ -301,15 +301,18 @@ services:
   litellm:
     image: litellm/litellm-database:v1.101.0
     restart: always
-    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    command: ["--config", "/app/litellm-config/config.yaml", "--port", "4000"]
     ports:
       - "127.0.0.1:4100:4000"
     volumes:
-      # 熔断/fallback 唯一落地处（§6.7 不进 UI）；改后 **必须 recreate**（up -d --force-recreate litellm）：
-      # 单文件 bind mount 在 macOS Docker 下，宿主编辑器以 rename 替换 inode 后容器内旧 inode 解链——
-      # 进程 open() 报 FileNotFoundError（2026-11-07 实证 837 次，UI Models 页 500「Internal server
-      # error」、docker restart 无效须 recreate 重新 bind；restart: always 自愈不了此坑）
-      - ./deploy/litellm/config.yaml:/app/config.yaml:ro
+      # 熔断/fallback 唯一落地处（§6.7 不进 UI）。**目录级 bind mount（2026-11-12 根治）**：
+      # 旧口径挂单文件（./deploy/litellm/config.yaml:/app/config.yaml）在 macOS Docker 下，宿主
+      # 编辑器以 rename 替换 inode 后容器内旧 inode 解链——文件"物理消失"，进程 open() 报
+      # FileNotFoundError（2026-11-07 与 2026-11-12 两次实证，UI Models 页 /v2/model/info 500
+      # 「Internal server error」、restart 无效须 recreate）。目录挂载跟踪目录本身，宿主改/替换
+      # 目录内文件容器内立即可见——宿主直接改 config.yaml 即生效（预热期需 litellm 自身的
+      # 配置刷新节律，无需 recreate 容器）
+      - ./deploy/litellm:/app/litellm-config:ro
     environment:
       # DB 模式：postgres 第三库 litellm（库名/角色名 = deploy/postgres/init.sh 建的 litellm/litellm）
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in .env}"   # 运行态凭据=Master Key（.env LITELLM_API_KEY 同值，不建虚拟 key）

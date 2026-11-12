@@ -261,6 +261,11 @@ def _unwrap_mcp_content(raw: Any) -> Any:
 def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
     """各源 MCP 搜索出参 → candidates 归一（url 必备；content/snippet 兜底；score 数值化）。
 
+    图片字段增量透传（A6，REQ-004 / api.md §7.2 v1.12；现有键零改动）：
+    - SearXNG `img_src`（+ `img_width`/`img_height` 数值型）逐条附带——主通道，天然带相关性；
+    - 顶层 `images` 数组（Tavily）无逐条来源页绑定 → 归一为 `query_images` 池挂载到
+      首个候选（次级通道；**不伪造逐条绑定**），零候选时随空集丢弃；
+    - BoCha/AnySearch 文本形态无图字段 → 自然不产图（禁止硬造）。
     出参形态异常（无结果集/条目缺 url）→ ValueError（schema_guard 计该源一次失败）。
     """
     if source == "bocha":
@@ -286,6 +291,7 @@ def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
             items = json.loads(items)
         except json.JSONDecodeError as exc:
             raise ValueError(f"{source} 出参非 JSON") from exc
+    payload_map = items if isinstance(items, Mapping) else None
     if isinstance(items, Mapping):
         items = items.get("results") or items.get("data") or items.get("items")
     if not isinstance(items, list):
@@ -299,20 +305,45 @@ def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
             continue
         score_raw = item.get("score")
         snippet = item.get("content") or item.get("snippet") or item.get("description") or ""
-        out.append({
+        entry: dict[str, Any] = {
             "url": url,
             "title": str(item.get("title") or url),
             "snippet": str(snippet),
             "score": float(score_raw) if isinstance(score_raw, (int, float)) else 0.0,
             "origin": source,
-        })
+        }
+        img_src = item.get("img_src")  # A6 主通道：逐条附带图（str 才透传，畸形丢弃）
+        if isinstance(img_src, str) and img_src.strip():
+            entry["img_src"] = img_src
+        for dim in ("img_width", "img_height"):  # 尺寸上游可得才携带（数值型）
+            value = item.get(dim)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                entry[dim] = value
+        out.append(entry)
+    if payload_map is not None and out:  # A6 次级通道：顶层 images 池挂载到首个候选
+        pool: list[dict[str, Any]] = []
+        for image in payload_map.get("images") or []:
+            if isinstance(image, str) and image.strip():
+                pool.append({"url": image})
+            elif isinstance(image, Mapping) and isinstance(image.get("url"), str) and image["url"].strip():
+                pool_entry: dict[str, Any] = {"url": image["url"]}
+                description = image.get("description") or image.get("title")
+                if isinstance(description, str) and description.strip():
+                    pool_entry["title"] = description
+                pool.append(pool_entry)
+        if pool:
+            out[0]["query_images"] = pool
     return out
 
 
 def _search_args(source: str, query: str, time_range: str | None, top_k: int) -> dict[str, Any]:
-    """各源调用参数（time_range 仅透传 Tavily——ARCH §4.1；其余源不接收该参数）。"""
+    """各源调用参数（time_range 仅透传 Tavily——ARCH §4.1；其余源不接收该参数）。
+
+    Tavily 附带 `include_images: true`（A6 次级通道数据前提——顶层 images 数组，
+    无逐条排序作池透传）；其余源无该参数面。
+    """
     if source == "tavily":
-        args: dict[str, Any] = {"query": query, "max_results": top_k}
+        args: dict[str, Any] = {"query": query, "max_results": top_k, "include_images": True}
         if time_range:
             args["time_range"] = time_range
         return args

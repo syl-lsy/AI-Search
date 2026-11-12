@@ -14,8 +14,12 @@ kb.rerank_timeout_s（缺省 2s）；模型别名 = 轮内映射快照 model.map
 内置默认）。snippet 截断 ≤500 chars（§4.3 TTFT 手段，M1 冻结现值）。
 
 sources 事件发射点 = 本节点（最终集经 topN 截断/rerank 重排定序后 ref_no 首现冻结——
-§7.2「ref_no 首次出现即冻结」；merge_dedupe 产出的去重集是本节点输入）。节点纯函数：
-rerank 客户端可 mock，零 DB/EventBus。
+§7.2「ref_no 首次出现即冻结」；merge_dedupe 产出的去重集是本节点输入）。
+**images 事件发射点 = 本节点尾部（A6，REQ-004）**：选图沿 fused 序取前 ≤IMAGES_MAX_COUNT
+（ARCH:413「按相关度取 3（OQ-6）」——3 为语义化代码常量，不进 Nacos），协议白名单
+http/https + URL 去重 + 池殿后补位，过滤后为空则不发射（轮内零 images 事件合法）；
+发射紧邻 emit_sources 之后——§7.4 快速序列 images(可选) 位于 sources 与
+stage(write,running) 之间。节点纯函数：rerank 客户端可 mock，零 DB/EventBus。
 """
 
 import asyncio
@@ -23,21 +27,25 @@ import json
 import uuid
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from langchain_core.runnables import RunnableConfig
 
-from app.agent.graphs.signals import emit_sources, emit_stage
+from app.agent.graphs.signals import emit_images, emit_sources, emit_stage
 from app.agent.guards import ensure_not_canceled
+from app.agent.nodes.merge_dedupe import image_descriptor_from_candidate
 from app.agent.state import Candidate
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
 
 __all__ = [
+    "IMAGES_MAX_COUNT",
     "SNIPPET_MAX_CHARS",
     "fuse_rerank",
     "has_kb_hit",
     "rerank_via_gateway",
+    "select_images",
     "truncate_snippets",
 ]
 
@@ -49,6 +57,13 @@ _DEFAULT_RERANK_TIMEOUT_S = 2.0
 
 #: fuse_top_n 缺省（spec fast.fuse_top_n 缺失时回落，§3 初值 10）
 _DEFAULT_FUSE_TOP_N = 10
+
+#: images 事件条目上限（api.md §7.2「≤3 张（OQ-6）」；ARCH:413「按相关度取 3」——
+#: 语义化代码常量，口径已裁决不进 Nacos）
+IMAGES_MAX_COUNT = 3
+
+#: images 条目白名单键集（url 恒在；其余键上游缺则省略——api.md §7.2 v1.12）
+_IMAGE_ITEM_KEYS = ("source_url", "title", "width", "height")
 
 
 def has_kb_hit(candidates: Any) -> bool:
@@ -141,6 +156,72 @@ def _source_item(candidate: Candidate, ref_no: int) -> dict[str, Any]:
     }
 
 
+def _url_allowed(url: str) -> bool:
+    """URL 协议白名单（api.md §7.2 安全面）：http/https 且带主机（绝对 URL）。"""
+    parsed = urlparse(url)
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+
+
+def _image_item(entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    """images_raw 描述符 → §7.2 images 条目（url 恒在；白名单键缺失则省略——v1.12）。"""
+    url = entry.get("url")
+    if not isinstance(url, str) or not url or not _url_allowed(url):
+        return None
+    item: dict[str, Any] = {"url": url}
+    for key in _IMAGE_ITEM_KEYS:
+        value = entry.get(key)
+        if key == "title":
+            if isinstance(value, str) and value.strip():
+                item[key] = value
+            continue
+        if value is not None:
+            item[key] = value
+    return item
+
+
+def select_images(
+    fused: list[Candidate],
+    images_raw: list[dict[str, Any]] | None,
+    *,
+    limit: int = IMAGES_MAX_COUNT,
+) -> list[dict[str, Any]]:
+    """选图（ARCH:413「按相关度取 3（OQ-6）」落地）——沿 fused 序取前 ≤limit 张：
+
+    ① 主通道：直接读最终 fused 候选自带的 img_src（source_url=候选页，绑定真实）——
+       descriptor 塑形复用 merge_dedupe.image_descriptor_from_candidate（单一事实源）；
+    ② 次级池殿后补位：images_raw 余量（topN 截断外候选图 + Tavily query_images 池）按
+       投影序填充；
+    ③ 全程过滤：URL 协议白名单 http/https、URL 去重（首见保留）、payload 只含白名单键
+       （url 恒在，source_url/title/width/height 缺则省略——不置 null 不伪造）。
+    """
+    pool = [entry for entry in (images_raw or []) if isinstance(entry, Mapping)]
+    taken_urls: set[str] = set()
+    selected: list[dict[str, Any]] = []
+
+    def _consider(entry: Mapping[str, Any]) -> None:
+        if len(selected) >= limit:
+            return
+        item = _image_item(entry)
+        if item is None or item["url"] in taken_urls:
+            return
+        taken_urls.add(item["url"])
+        selected.append(item)
+
+    for candidate in fused:  # 主通道：沿最终 fused 序（topN 截断/rerank 重排后）
+        if len(selected) >= limit:
+            break
+        if not isinstance(candidate, Mapping):
+            continue
+        descriptor = image_descriptor_from_candidate(dict(candidate))
+        if descriptor is not None:
+            _consider(descriptor)
+    for entry in pool:  # 次级池殿后补位
+        if len(selected) >= limit:
+            break
+        _consider(entry)
+    return selected
+
+
 async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """融合重排节点：topN 截断 + KB 命中 rerank + 兜底 + sources 事件（最终集）。"""
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
@@ -191,6 +272,11 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
         batch=[_source_item(candidate, ref_no) for ref_no, candidate in enumerate(fused, start=1)],
         total=len(fused),
     )
+    # A6：images 事件（可选）紧邻 sources 之后发射——§7.4 快速序列 sources → images(可选)
+    # → stage(write,running)；无图不发（过滤后为空=轮内零 images 事件，合法）
+    images = select_images(fused, state.get("images_raw") or [])
+    if images:
+        emit_images(images)
     if extra is not None:
         emit_stage("search", "done", detail="rerank 失败降级：按源分排序兜底", extra=extra)
     update: dict[str, Any] = {"fused": fused, "degraded": degraded}

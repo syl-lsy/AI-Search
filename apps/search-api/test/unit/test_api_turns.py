@@ -9,7 +9,7 @@
   非 turns.status 枚举值）；404001 / 409002（已终态）；
 - 成功信封 {"code":"0","message":"ok"} 与错误体 {"code","message"}。
 
-DB 走最小 AsyncSession 假体（按 select 实体类型分流 Turn/Source——零网络）；
+DB 走最小 AsyncSession 假体（按 select 实体类型分流 Turn/Source/TurnEvent——零网络）；
 cancel 的调度器走 dependency_overrides 假体（排程/出队语义归 test_turn_service.py）。
 """
 
@@ -23,8 +23,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.api.v1 import turns
-from app.db.models import Source, Turn
+from app.db.models import Source, Turn, TurnEvent
 from app.dependencies import get_current_user, get_db
 from app.exception import NotFoundException, TurnTerminalException
 from app.main import app
@@ -50,7 +49,8 @@ class _FakeResult:
 
 
 class _FakeSession:
-    """按 select 实体类型分流：Turn 主行 / Source 来源行（get_turn_detail 的两段查询）。
+    """按 select 实体类型分流：Turn 主行 / Source 来源行 / TurnEvent images 行
+    （get_turn_detail 的三段查询——A6 P1 评审修复起含 §2.5 images[] 重建查询）。
 
     expect_user_id 模拟真实 SQL 的归属过滤（WHERE user_id = <当前用户>）——行为
     同语义：行 user_id 与期望不符即查无此行（越权 404001 的假体侧依据）。
@@ -61,10 +61,12 @@ class _FakeSession:
         turn: Any = None,
         sources: list[Any] | None = None,
         *,
+        images_events: list[Any] | None = None,
         expect_user_id: uuid.UUID | None = None,
     ) -> None:
         self._turn = turn
         self._sources = sources if sources is not None else []
+        self._images_events = images_events if images_events is not None else []
         self._expect_user_id = expect_user_id
 
     async def scalars(self, stmt: Any) -> _FakeResult:
@@ -80,6 +82,8 @@ class _FakeSession:
             return _FakeResult(rows)
         if entity is Source:
             return _FakeResult(list(self._sources))
+        if entity is TurnEvent:
+            return _FakeResult(list(self._images_events))
         raise AssertionError(f"未预期的查询实体：{entity}")
 
 
@@ -393,3 +397,72 @@ async def test_cancel_terminal_409002(overrides: dict) -> None:
     assert response.status_code == 409
     body = response.json()
     assert body["code"] == "409002" and body["message"] == "轮次已处于终态，不可取消"
+
+
+# ---- §2.5 images[] 自 turn_events 重建（api.md v1.12，A6 P1 评审修复）----
+
+
+async def test_get_turn_rebuilds_images_from_turn_events(overrides: dict) -> None:
+    """images 行在场 → §2.5 images[] 重建：条目键可省形态透传——全键条目带
+    source_url/title/width/height；仅 url 条目序列化**不含 null 键**（不置 null，
+    api.md §7.2 v1.12 同口径）；零 images 行 → 空数组（其余用例假体默认即零行）。"""
+    images_event = SimpleNamespace(
+        seq=8,
+        event_type="images",
+        payload={
+            "images": [
+                {
+                    "url": "https://example.com/a.png",
+                    "source_url": "https://example.com/page",
+                    "title": "架构图",
+                    "width": 1200,
+                    "height": 750,
+                },
+                {"url": "https://example.com/bare.png"},
+            ]
+        },
+    )
+    session = _FakeSession(turn=_turn_row(), images_events=[images_event])
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    async with _client() as client:
+        response = await client.get(f"/api/v1/turns/{_TURN_ID}")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["images"] == [
+        {
+            "url": "https://example.com/a.png",
+            "source_url": "https://example.com/page",
+            "title": "架构图",
+            "width": 1200,
+            "height": 750,
+        },
+        {"url": "https://example.com/bare.png"},
+    ]
+    assert "source_url" not in data["images"][1]
+    assert "title" not in data["images"][1]
+    assert "width" not in data["images"][1]
+    assert "height" not in data["images"][1]
+
+
+async def test_get_turn_skips_malformed_image_entries(overrides: dict) -> None:
+    """历史行畸形条目（非 dict/缺 url/字段非法）静默跳过——重建不拖垮回看面。"""
+    images_event = SimpleNamespace(
+        seq=8,
+        event_type="images",
+        payload={
+            "images": [
+                "junk",  # 非 dict
+                {"title": "缺 url"},  # 缺 url（url 恒在口径）
+                {"url": "https://example.com/ok.png", "width": "wide"},  # 字段非法
+                {"url": "https://example.com/good.png"},  # 合法
+            ]
+        },
+    )
+    session = _FakeSession(turn=_turn_row(), images_events=[images_event])
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    async with _client() as client:
+        response = await client.get(f"/api/v1/turns/{_TURN_ID}")
+    assert response.status_code == 200
+    assert response.json()["data"]["images"] == [{"url": "https://example.com/good.png"}]

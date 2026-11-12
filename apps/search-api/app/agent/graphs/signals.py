@@ -7,6 +7,8 @@ dict 信号；TurnRunner 统一 `main_graph.astream(stream_mode=["messages","upd
 
 - `stage`   → SSE `stage` 事件（api.md §7.2；stage_key/status 枚举同契约）；
 - `sources` → SSE `sources` 事件 + sources 表落库；
+- `images`  → SSE `images` 事件 + turn_events 落库（A6，REQ-004——轮内至多一次、
+  ≤3 张（OQ-6）、无图不发；条目 url 恒在、其余键可省——api.md v1.12）；
 - `token`   → SSE `token` 事件，**不落库**（ADR-003 第 4 条）。
 
 演进边界（B3/B4）：done 由 TurnRunner 落库终态后自发布（图不发 done）；
@@ -21,6 +23,7 @@ from langgraph.config import get_stream_writer
 
 STAGE = "stage"
 SOURCES = "sources"
+IMAGES = "images"
 TOKEN = "token"
 
 
@@ -54,6 +57,13 @@ def emit_stage(
 def emit_sources(batch: list[dict[str, Any]], total: int) -> None:
     """发射 sources 信号（batch 条目结构与 api.md §7.2 sources 事件一致）。"""
     get_stream_writer()({"type": SOURCES, "batch": batch, "total": total})
+
+
+def emit_images(images: list[dict[str, Any]]) -> None:
+    """发射 images 信号（A6，REQ-004：api.md §7.2 图片卡片行——条目 url 恒在、
+    source_url/title/width/height 键可省；调用方保证非空与 ≤3（OQ-6）——空集不发
+    事件由 fuse_rerank 选图面裁决，本函数不做过滤）。"""
+    get_stream_writer()({"type": IMAGES, "images": images})
 
 
 def emit_token(delta: str) -> None:

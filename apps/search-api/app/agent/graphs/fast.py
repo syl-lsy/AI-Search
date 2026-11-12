@@ -4,15 +4,17 @@
 （节点名 = api.md §7.2 stage_key），信号序列对齐 api.md §7.4 快速主干：
 
     stage(rewrite,r→d) → stage(search,r) → stage(search,d,progress)×N
-    → sources(归并终态集) → stage(write,running,label=综合中) → token…token（messages 流）
-    → stage(write,done)
+    → sources(归并终态集) → images(可选，≤3 张) → stage(write,running,label=综合中)
+    → token…token（messages 流） → stage(write,done)
 
 - rewrite（1/5）/merge_dedupe（2/5）/web_search（3/5 Send 扇出）/fuse_rerank（4/5 KB 命中
-  rerank+topN+snippet≤500+sources 发射点）/synthesis（5/5——chat 模型流式，token/thinking
+  rerank+topN+snippet≤500+sources 发射点+images 选图发射（A6——沿 fused 序 ≤3 张，
+  紧邻 sources 之后）/synthesis（5/5——chat 模型流式，token/thinking
   经 messages 流，节点只累积 answer_md）全部接真；
 - token/thinking 不走 custom 流（messages 流承载——§6.1 messages 过滤：仅 fast synthesis
   节点增量映射，R14③）；
-- done/images 不由图发射：done 归 TurnRunner 落库终态后自发布；
+- done 不由图发射：done 归 TurnRunner 落库终态后自发布（images 由 fuse_rerank 发射——
+  api.md §7.2 v1.12：轮内至多一次、≤3 张、无图不发）；
 - kb_search（B5/M3）插在 web_search 与 merge_dedupe 之间（§4.1 拓扑位）；
 - 最小检索分支（answerable=true）= rewrite 产出 + synthesis 提示词切分（节点内实现）。
 """

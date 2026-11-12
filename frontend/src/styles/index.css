@@ -1,0 +1,11 @@
+/*
+ * 全局样式入口。
+ * 顺序约定：tokens.css（docs/design/tokens.css 原文，frontend-api.md §6「直接复用原文进全局层，
+ * 不重复定义」）在 @tailwind 指令之前 import——Tailwind utilities 需要赢过 tokens 组件基类
+ * （同特异性后者胜）；tokens 的 :root 变量与基础层不受 preflight 实质影响。
+ */
+@import './tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -1,0 +1,3 @@
+# Playwright 产物（根 .gitignore 已覆盖 node_modules/dist/coverage/.env*，此处只补前端专属）
+test-results/
+playwright-report/
