@@ -135,5 +135,5 @@ class DeepState(TypedDict, total=False):
     # 横切
     usage_total: int
     degraded: bool
-    degraded_reason: str | None  # "timeout" | "budget" | "canceled"
+    degraded_reason: str | None  # "timeout" | "budget" | "source_failure"（api.md §7.2 枚举）
     errors: list[dict[str, Any]]

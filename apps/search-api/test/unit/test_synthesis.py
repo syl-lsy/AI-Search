@@ -182,6 +182,25 @@ async def test_synthesis_uses_chat_alias_from_mapping(monkeypatch: pytest.Monkey
     assert seen["alias"] == "chat-standard-glm"
 
 
+# ---- 模型工厂：关思维链（专项① synthesis 提速）----
+
+
+def test_chat_model_disables_thinking_via_enable_thinking_extra_body() -> None:
+    """专项①（2026-11-13，M1 后 synthesis 提速）锁面：build_chat_model 产物必须携带
+    extra_body={'enable_thinking': False}——chat-standard 通道（百炼 qwen3.7-plus 经
+    litellm openai/ 兼容透传）生效键形态经网关探针钉死：
+
+    - `enable_thinking: false` 生效：流式 delta 零 reasoning_content（两轮 0 帧/0 字，
+      1.0~1.7s）；`think: false`（rewrite 先例的 ollama 原生形态）被 DashScope 上游
+      忽略（58/66 帧、310/350 字思维链，4.3~5.1s ≈ 基线 4.5s）——不照抄 ollama 形态；
+    - synthesis 为流式消费面（token/thinking 事件经 messages 流），不注入
+      disable_streaming（该参数是 rewrite 结构化输出通道专属——batch 8 A 裁决）。
+    """
+    model = synthesis_module.build_chat_model("chat-standard")
+    assert model.extra_body == {"enable_thinking": False}
+    assert model.disable_streaming is False  # 流式消费面：禁流式不得外溢到 synthesis
+
+
 # ---- 硬上限 / 引用越界 ----
 
 

@@ -5,9 +5,12 @@
   命中时执行（保护 30s 轮预算；rerank 目标 ≤2s 不变）；
 - **KB 命中** → rerank（LiteLLM 网关 /rerank 透传 qwen3-rerank——S0 落档：cohere 兼容
   通道直连百炼 compatible-api/v1/reranks）→ relevance 降序取 topN；
-- **rerank 失败/超时** → 按 origin 得分降序排序兜底（不终止）+ degraded/errors + 复用
-  stage(search, done) detail 标注（fuse_rerank 无独立 stage_key——api.md §7.2 枚举约束，
-  不新增枚举值；§6.2「降级必须出现在 stage detail 与 done.degraded」）。
+- **rerank 失败/超时** → 按 origin 得分降序排序兜底（不终止）+ **不置 degraded**
+  （§6.2 v1.41 二分口径：机制兜底不属 api.md §7.2 degraded_reason 枚举
+  timeout/budget/source_failure 任一语义，置位会被 TurnRunner._finish_completed
+  一律派生为 source_failure 误标正常轮——update 语义对齐 fast_rewrite
+  ._fallback_update 先例）+ errors[]/stage(search, done) extra 留痕 + AgentLog
+  WARN 埋点（fuse_rerank 无独立 stage_key——api.md §7.2 枚举约束，不新增枚举值）。
 
 参数面（轮内 spec 快照，OQ-11 同源）：topN = fast.fuse_top_n（缺省 10）；rerank 超时 =
 kb.rerank_timeout_s（缺省 2s）；模型别名 = 轮内映射快照 model.mapping.rerank（缺省回落
@@ -38,6 +41,7 @@ from app.agent.nodes.merge_dedupe import image_descriptor_from_candidate
 from app.agent.state import Candidate
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
+from app.core.logger import AgentLog
 
 __all__ = [
     "IMAGES_MAX_COUNT",
@@ -249,7 +253,6 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
         else _DEFAULT_RERANK_TIMEOUT_S
     )
 
-    degraded = False
     errors: list[dict[str, Any]] = []
     extra: dict[str, Any] | None = None
     if has_kb_hit(fused_input):
@@ -265,12 +268,23 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
                 query, documents, model_alias=alias, timeout_s=rerank_timeout
             )
             fused = _rerank_order(scores, fused_input)[:top_n]
-        except Exception:
-            # 兜底：按 origin 得分降序（不终止）；降级留痕 stage detail + state（§6.2）
+        except Exception as exc:
+            # 兜底：按 origin 得分降序（不终止）；**不置 FastState.degraded**（§6.2 v1.41
+            # 二分口径：机制兜底不属 api.md §7.2 degraded_reason 枚举任一语义，置位会被
+            # TurnRunner._finish_completed 一律派生为 source_failure 误标正常轮——update
+            # 语义对齐 fast_rewrite._fallback_update 先例）；观测面 = stage(search, done)
+            # extra + state.errors[] + AgentLog WARN 埋点（留痕不丢、只记不吞）
             fused = _sort_by_score(fused_input)[:top_n]
-            degraded = True
             errors = [{"stage": "search", "reason": "rerank_fallback"}]
             extra = {"fallback": "rerank_fallback"}
+            AgentLog(
+                message=(
+                    f"fuse_rerank rerank 失败兜底（reason=rerank_fallback，按源分排序，"
+                    f"不置 degraded）：{type(exc).__name__}: {str(exc)[:200]}"
+                ),
+                graph="fast",
+                node="fuse_rerank",
+            ).warning()
     else:
         fused = fused_input[:top_n]  # 常态直通（B3 无 kb_search——零 rerank 调用）
 
@@ -285,8 +299,12 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
     if images:
         emit_images(images)
     if extra is not None:
-        emit_stage("search", "done", detail="rerank 失败降级：按源分排序兜底", extra=extra)
-    update: dict[str, Any] = {"fused": fused, "degraded": degraded}
+        # 措辞二分口径（§6.2 v1.41）：机制兜底 ≠ degraded 枚举内的「降级」，detail 不出现
+        # 「降级」字样，避免观测面把 done.degraded=false 的兜底读成降级。
+        emit_stage("search", "done", detail="rerank 失败兜底：按源分排序", extra=extra)
+    update: dict[str, Any] = {"fused": fused}
     if errors:
-        update["errors"] = errors
+        update["errors"] = errors  # 机制兜底：零 degraded 键（对齐 _fallback_update 先例）
+    else:
+        update["degraded"] = False
     return update

@@ -1,8 +1,8 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "main": "./app/agent/graphs/main.py:graph",
-    "fast": "./app/agent/graphs/fast.py:graph",
-    "deep": "./app/agent/graphs/deep.py:graph"
+    "main": "app.agent.graphs.main:graph",
+    "fast": "app.agent.graphs.fast:graph",
+    "deep": "app.agent.graphs.deep:graph"
   }
 }

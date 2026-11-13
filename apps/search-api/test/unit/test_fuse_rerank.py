@@ -4,9 +4,12 @@
 - `fused = kb 命中 ? rerank(candidates)[:topN] : candidates[:topN]`（ARCH §4.1）：
   无 KB 标记（B3 常态，kb_search 未接入）→ **零 rerank 调用**直通截断（保护 30s 预算，
   rerank 目标 ≤2s 不变）；KB 命中 → 按 relevance 降序取 topN；
-- rerank 失败（异常/超时）→ 按 origin 得分降序排序兜底 + degraded=True + errors 记录 +
-  stage(search, done) detail 标注（§6.2「降级必须出现在 stage 事件 detail 与
-  done.degraded」——fuse_rerank 无独立 stage_key，复用 search key 不新增枚举值）；
+- rerank 失败（异常/超时）→ 按 origin 得分降序排序兜底（不终止）+ **不置 degraded**
+  （ARCH §6.2 v1.41 二分口径：机制兜底不属 api.md §7.2 degraded_reason 枚举任一语义，
+  置位会被 TurnRunner._finish_completed 派生为 source_failure 误标正常轮——update
+  语义对齐 fast_rewrite._fallback_update 先例）+ errors 记录 + stage(search, done)
+  detail/extra 留痕 + AgentLog WARN 埋点（fuse_rerank 无独立 stage_key，复用 search
+  key 不新增枚举值）；
 - fuse_top_n=10（nacos-config §3 fast.fuse_top_n，spec 快照读取缺省回落 10）；
   rerank 超时 = spec kb.rerank_timeout_s（缺省 2s，§3）；模型别名 = 轮内映射快照
   model.mapping.rerank（OQ-11 同源，缺省回落内置默认）；
@@ -78,13 +81,19 @@ def _sources(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return batches
 
 
-def _mock_reranker(monkeypatch: pytest.MonkeyPatch, scores: list[float] | Exception) -> list[list[str]]:
-    """注入 rerank 客户端假体；记录每次收到的 documents。"""
+def _mock_reranker(
+    monkeypatch: pytest.MonkeyPatch, scores: list[float] | BaseException
+) -> list[list[str]]:
+    """注入 rerank 客户端假体；记录每次收到的 documents。
+
+    异常面收 BaseException（非 Exception）：`asyncio.CancelledError` 自 Python 3.8 起
+    直接继承 BaseException，取消信号护栏单测依赖它穿透 `except Exception` 兜底。
+    """
     seen: list[list[str]] = []
 
     async def _fake(query: str, documents: list[str], *, model_alias: str, timeout_s: float) -> list[float]:
         seen.append(list(documents))
-        if isinstance(scores, Exception):
+        if isinstance(scores, BaseException):
             raise scores
         return scores
 
@@ -149,13 +158,20 @@ async def test_kb_hit_reranks_and_sorts_by_relevance(monkeypatch: pytest.MonkeyP
     assert update["degraded"] is False
 
 
-# ---- rerank 失败：按 origin 得分排序兜底（不终止）----
+# ---- rerank 失败：按 origin 得分排序兜底（不终止；不置 degraded——§6.2 v1.41 二分口径）----
 
 
-async def test_rerank_failure_falls_back_to_score_sort_with_degradation(
+async def test_rerank_failure_falls_back_to_score_sort_without_degraded(
     monkeypatch: pytest.MonkeyPatch,
+    log_records: list[dict[str, Any]],
 ) -> None:
-    """rerank 异常 → 按 origin 得分降序兜底 + degraded/errors + stage(search,done) detail 标注。"""
+    """rerank 异常 → 按 origin 得分降序兜底 + errors/extra/AgentLog 留痕；不置 degraded。
+
+    2026-11-13 M1 后专项②（ARCH §6.2 v1.41 二分口径）：机制兜底不属 api.md §7.2
+    degraded_reason 枚举任一语义，update 不携带 degraded=True（对齐
+    fast_rewrite._fallback_update 先例）——置位会被 TurnRunner._finish_completed
+    一律派生为 source_failure，把答案完整的正常轮误标「研究未完成」。
+    """
     candidates = [
         _cand("https://a/1", origin=["kb", "tavily"], score=0.5),
         _cand("https://b/2", origin=["kb"], score=0.95),
@@ -163,7 +179,7 @@ async def test_rerank_failure_falls_back_to_score_sort_with_degradation(
     ]
     seen = _mock_reranker(monkeypatch, RuntimeError("rerank 网关挂了"))
     stages = _stages(monkeypatch)
-    batches = _sources(monkeypatch)
+    _sources(monkeypatch)
 
     update = await fuse_rerank(
         {"fused": candidates, "query": "q", "spec": _spec(top_n=2)}, _config()
@@ -171,15 +187,27 @@ async def test_rerank_failure_falls_back_to_score_sort_with_degradation(
 
     assert seen != []  # rerank 确实被调用过
     assert [c["url"] for c in update["fused"]] == ["https://b/2", "https://c/3"]  # score 降序 top2
-    assert update["degraded"] is True
-    assert update["errors"] == [{"stage": "search", "reason": "rerank_fallback"}]
+    assert "degraded" not in update  # state.degraded 不被置位（FastState.or_ reducer 缺键=不写）
+    assert update["errors"] == [{"stage": "search", "reason": "rerank_fallback"}]  # 留痕不丢
     done = [s for s in stages if s["status"] == "done"]
-    assert done and "rerank" in done[-1]["detail"] and "降级" in done[-1]["detail"]
+    assert done and "rerank" in done[-1]["detail"] and "兜底" in done[-1]["detail"]
+    # 措辞二分口径（§6.2 v1.41）：机制兜底（done.degraded=false）不得在 detail 里
+    # 写成「降级」，否则观测面会把正常轮读成降级轮。
+    assert "降级" not in done[-1]["detail"]
     assert done[-1]["stage_key"] == "search"  # 不新增 stage_key 枚举值
+    assert done[-1]["extra"] == {"fallback": "rerank_fallback"}  # stage extra 留痕
+    # AgentLog WARN 埋点（只记不吞）：reason=rerank_fallback + 异常摘要
+    rerank_warnings = [
+        r for r in log_records
+        if r["level"].name == "WARNING" and "rerank_fallback" in str(r["message"])
+    ]
+    assert rerank_warnings, "兜底路径须落 AgentLog WARNING（reason=rerank_fallback）"
+    assert "RuntimeError" in str(rerank_warnings[0]["message"])  # 异常摘要进消息
+    assert any(r["extra"].get("node") == "fuse_rerank" for r in rerank_warnings)
 
 
 async def test_rerank_timeout_falls_back_identically(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rerank 超时与异常同构兜底（分级超时包络 TimeoutError → 兜底路径）。"""
+    """rerank 超时与异常同构兜底（分级超时包络 TimeoutError → 兜底路径；同样不置 degraded）。"""
     candidates = [_cand(f"https://a/{i}", origin=["kb"], score=0.9 - i / 10) for i in range(3)]
     _mock_reranker(monkeypatch, asyncio.TimeoutError())
     _stages(monkeypatch)
@@ -190,7 +218,44 @@ async def test_rerank_timeout_falls_back_identically(monkeypatch: pytest.MonkeyP
     )
 
     assert [c["url"] for c in update["fused"]] == ["https://a/0", "https://a/1", "https://a/2"]
-    assert update["degraded"] is True
+    assert "degraded" not in update  # 超时兜底同口径（机制兜底 ≠ 枚举内降级）
+    assert update["errors"] == [{"stage": "search", "reason": "rerank_fallback"}]
+
+
+async def test_rerank_cancellation_propagates_without_fallback_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    log_records: list[dict[str, Any]],
+) -> None:
+    """rerank 调用期间的取消信号必须原样向外传播，**不得**被兜底路径吞成正常结果。
+
+    `asyncio.CancelledError` 自 Python 3.8 起直接继承 BaseException，`except Exception`
+    （fuse_rerank.py 兜底分支）结构上不会命中——本用例把它钉成回归护栏：一旦有人把兜底
+    改成 `except BaseException`/裸 `except`，取消会被转成 rerank_fallback 兜底并继续发
+    sources/stage，客户端取消语义即被破坏（R14② 跨子图取消透传面）。
+
+    断言面（取消后无返回 update，故以可观测副作用取证）：
+    - 异常类型原样（`asyncio.CancelledError`，非被包装）；
+    - 零 stage 事件（未走到 emit_stage(search, done)）；
+    - 零 sources 事件（未走到 emit_sources 最终集发射）；
+    - 零 rerank_fallback AgentLog WARNING（未进入兜底分支——等价于「零 errors 留痕」：
+      errors[] 只在兜底分支内构造，未进入即不存在）。
+    """
+    candidates = [_cand("https://a/1", origin=["kb"], score=0.9)]
+    _mock_reranker(monkeypatch, asyncio.CancelledError())
+    stages = _stages(monkeypatch)
+    sources = _sources(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await fuse_rerank(
+            {"fused": candidates, "query": "q", "spec": _spec()}, _config()
+        )
+
+    assert stages == []  # 零 stage 副作用（未落到兜底后的 stage(search, done)）
+    assert sources == []  # 零 sources 事件（最终集未发射）
+    assert not [
+        r for r in log_records
+        if r["level"].name == "WARNING" and "rerank_fallback" in str(r["message"])
+    ], "取消信号不得走 rerank_fallback 兜底分支（零 errors 留痕等价断言）"
 
 
 # ---- 空候选 / 截断 / 纯函数 ----

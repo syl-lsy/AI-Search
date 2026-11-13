@@ -4,15 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!--
-      CSP 最小集（评审留档 P3）：
+      CSP 最小集（评审留档 P3；2026-11-13 批次 9 专项③：img-src 放宽对齐契约——用户裁决）：
       - style-src 'unsafe-inline'：index.html 内联防白闪 <style> + Tailwind 内联样式（必需）；
-      - img-src https:：来源卡/回答内图片为外部 http(s) 直链（vite proxy 下同源外全是外域）；
+      - img-src 'self' http: https:：对齐现行 http/https 契约口径（PRD REQ-004「图片地址仅允许
+        http/https」docs/PRD.md:165 + PRD §5.3 第 4 条「引用与图片链接仅允许 http/https 协议」
+        docs/PRD.md:518）——来源卡/回答内图片为外部 http(s) 直链（vite proxy 下同源外全是外域）。
+        安全真实防线 = DOMPurify 白名单（renderer.ts SANITIZE_ALLOWED_TAGS）+ ^https?:// 协议
+        白名单 + rel="noopener noreferrer" hook（frontend-api.md §2），协议过滤职责在渲染层；
+        对齐后 http 外链图不再被浏览器静默拦截（原 img-src 'self' https: 与渲染层 ^https?://
+        白名单不一致，见 docs/security-audit-m1-batch8.md R1）；
       - connect-src 回落 default-src 'self'：dev 走 vite proxy（同源）；若以 VITE_API_BASE_URL
         直连后端 origin（跨源形态），须按部署形态在部署侧补 connect-src，此处不硬编码端口。
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; img-src 'self' https:; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'self'; form-action 'self'"
+      content="default-src 'self'; img-src 'self' http: https:; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'self'; form-action 'self'"
     />
     <!-- 暗色基座防白闪（值 = tokens.css --color-bg-primary） -->
     <style>html { background: #191a1a; }</style>

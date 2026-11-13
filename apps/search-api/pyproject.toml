@@ -68,7 +68,17 @@ dev = [
     "pyright==1.1.414",
     "ruff==0.17.4",
     "python-dotenv==1.2.4",
+    # R4 遗留承载（2026-11-13 批次 9 终审留档）：本行 inmem 额外依赖钉住
+    #   langgraph-api<0.6.0，而 0.5.x 全档反钉 cryptography<45.0 —— 两包修复线
+    #   （langgraph-api ≥0.15.0 / cryptography ≥50.0.0）在本行钉版下互锁不可达，
+    #   升级路径与接受理由见 docs/security-audit-m1-batch8.md §五.4（需同批抬
+    #   langgraph-cli ≥0.4.43 把 inmem 上界放宽到 <1.0.0）。
     "langgraph-cli[inmem]==0.4.9",
+    # R4 依赖 CVE 机扫通道（security-audit-m1-batch8.md）：pip-audit 环境审计模式
+    # （枚举本 venv 已装发行版比对 PyPI Advisory DB），命令入口 make audit。
+    # == 钉版（2026-11-13 PyPI 当日稳定版 2.10.1）；其传递依赖自带 pip（uv venv 默认无 pip，
+    #    环境枚举所需随装即用）
+    "pip-audit==2.10.1",
 ]
 
 [tool.pytest.ini_options]

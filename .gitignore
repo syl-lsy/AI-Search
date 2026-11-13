@@ -30,6 +30,8 @@ htmlcov/
 # 运行期本地数据（ARCH §3.1：data/ 运行期本地数据；logs/ 错误日志轮转目录）
 data/
 logs/
+# LangGraph Studio（make studio）本地运行产物
+.langgraph_api/
 
 # ZCode 工作区（忽略所有层级的 .zcode；例外：根 .zcode/plans/ 计划文档入库）
 **/.zcode/*

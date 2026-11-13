@@ -1047,6 +1047,34 @@ async def test_rewrite_mechanism_fallback_does_not_mark_degraded() -> None:
     assert getattr(turn, "degraded_reason", None) is None  # 列未被派生赋值
 
 
+async def test_rerank_fallback_does_not_mark_degraded() -> None:
+    """2026-11-13 M1 后专项②护栏（ARCH §6.2 v1.41 二分口径）：fuse_rerank rerank
+    机制兜底与 rewrite 同口径——不属 api.md §7.2 degraded_reason 枚举任一语义，
+    节点 update 不携带 degraded（errors[].reason=rerank_fallback 留痕保留）
+    → 正常完成轮 done.degraded=False + degraded_reason=null + status=completed。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    # fuse_rerank 兜底形态（专项②修复后 update 无 degraded 键——errors 留痕保留）
+    graph = _FakeGraph([
+        _updates({"fuse": {
+            "fused": [{"url": "https://b/2", "title": "t:b", "snippet": "s", "score": 0.95, "origin": ["kb"]}],
+            "errors": [{"stage": "search", "reason": "rerank_fallback"}],
+        }}),
+        _updates({"write": {"answer_md": "正常综合答案（rerank 兜底轮）"}}),
+    ])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = next(e for e in published if e.event_type == "done")
+    assert done.data["degraded"] is False
+    assert done.data["degraded_reason"] is None  # 不派生 source_failure
+    assert turn.status == "completed"
+    assert getattr(turn, "degraded_reason", None) is None  # 列未被派生赋值
+
+
 async def test_execute_turn_timeout_guard_fails_with_500301() -> None:
     """spec.turn_timeout_s 包 astream：超时 → error(500301 硬超时熔断) + failed + close_channel。"""
     bus = _bus()

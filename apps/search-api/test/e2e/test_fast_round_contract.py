@@ -22,15 +22,20 @@ Last-Event-ID 重放/落库逐字段）已在 integration 锁死——本层只�
 链路：POST /api/v1/threads 建轮 → GET /api/v1/turns/{id}/events 收 SSE 流
 （真链路实测 39~49s/轮，收流上限 90s/轮）→ done 后 GET /api/v1/turns/{id} 终态对账。
 
-【当前活跃面与挂牌状态（终审 P1，2026-11-13——M1 退出裁决须显式知情）】本文件
-3/3 契约用例（multifacet:279 / factoid:294 / en_language_follow:312）全部 skip 挂牌，
-整个 test/e2e/ 活跃面仅剩 test_health.py 1 条健康检查——`make test-e2e exit 0` 的
-字面结论**不代表**全链路验证事实。三条挂牌理由链一致且断言体/题面原样保留（非门禁
-放宽）：rewrite 流式劫持已修复实证（零兜底 WARNING、单调用 stream=False），残余=
-synthesis 慢侧 ~45-55s（波动跨线）撞满 fast.turn_timeout_s=60 → 500301 熔断
-answer_md=None。**复跑摘牌条件=M1 后调优专项（synthesis 提速）落地**——与 P50
-预算矛盾（前置挤占 + synthesis 慢侧，PRD「P50 ≤30s」验收与 AGENTS.md 遗留④）
-的调优排期绑定，摘牌随专项闭环逐条执行，不跨里程碑悬置。
+【摘牌完成态（2026-11-13，docs/m1-exit-batch8.md §5.3 口径执行）】本文件 3/3 契约用例
+（multifacet / factoid / en_language_follow）的 @pytest.mark.skip 已逐条删除——摘牌
+依据：M1 后专项①（synthesis 提速）落地，synthesis build_chat_model 注入
+extra_body={"enable_thinking": False} 关思维链（生效键形态经网关探针钉死：chat-standard
+通道 enable_thinking:false 零思维链 1.0~1.7s、rewrite 先例的 think:false 被上游忽略；
+真轮冒烟实证零 thinking 事件 + done(completed) duration_ms=26166），synthesis 慢侧
+撞满 fast.turn_timeout_s=60 → 500301 熔断的根因消除。断言体与题面一个字未动（四硬
+约束断言原样生效，非门禁放宽）；各用例 docstring 内历史挂牌/回挂记录原样保留（审计
+链不删改）。**复跑结论（2026-11-13 回填）：批次 9 e2e 门禁第 1 轮已实测三契约用例活跃
+全绿**——摘牌后 `make test-e2e` exit 0（4/4 passed = 本文件三契约用例 + `test_health.py`
+一条，零 skip、零 error；采集复核 4 tests collected / 0 errors）。执行时点晚于性能复测
+（`docs/perf-sampling-m15.md`：主口径 P50=15.43s / P90=22.69s、C 多面熔断 4/5 → 0/5，
+即挂牌根因「synthesis 慢侧撞满 fast.turn_timeout_s=60」已实测消解），故本文件四条硬约束
+（stage 主干序 / [n]↔sources 双向 / 字数上限 / 语言跟随）自此恢复自动化回归保护。
 """
 
 import json
@@ -38,7 +43,6 @@ import re
 import time
 
 import httpx
-import pytest
 
 from test.integration.test_sse import _assert_sse_envelope, _assert_stream_headers
 
@@ -286,12 +290,6 @@ def _assert_zh_char_cap(answer_md: str) -> None:
 # ---- 三条用例（用例清单逐条对应） ----
 
 
-@pytest.mark.skip(
-    reason="3/3 确定性红——真链路轮耗时撞满 fast.turn_timeout_s=60s 预算熔断 "
-    "500301/degraded/answer_md=None，批次 8 P50 预算调优后复跑收口"
-    "（2026-11-12 修复轮裁决：skip 挂牌，断言体与题面原样保留；"
-    "实证数据留痕 docs/m1-api-precheck-batch6.md）"
-)
 def test_e2e_fast_zh_multifacet_full_contract(base_url):
     """对比型中文题（中等展开度，60s 轮预算内留负载余量——2026-11-12 裁决收敛）：
     四硬约束全压——stage 顺序（§7.4:714 主干）+ [n]↔sources 一一对应（双向）+
@@ -301,13 +299,6 @@ def test_e2e_fast_zh_multifacet_full_contract(base_url):
     _assert_zh_char_cap(detail["answer_md"])
 
 
-@pytest.mark.skip(
-    reason="rewrite 已修复（2026-11-13 disable_streaming 落地，本轮复跑实证零 rewrite "
-    "兜底 WARNING、单调用 stream=False）、残余=synthesis 慢侧撞满 fast.turn_timeout_s=60 "
-    "（turn_service.py:1194 asyncio.timeout 500301 熔断 → answer_md=None，errors.log "
-    "实证）——复跑条件=M1 后调优专项（synthesis 提速，用户裁决口径）。断言体与题面"
-    "原样保留。"
-)
 def test_e2e_fast_zh_factoid_short(base_url):
     """事实型中文题：stage 顺序 + [n]↔sources 一一对应 + 中文 ≤3000 字（从简短答口径）+
     语言跟随——短答不豁免任何硬约束。
@@ -319,14 +310,6 @@ def test_e2e_fast_zh_factoid_short(base_url):
     _assert_zh_char_cap(detail["answer_md"])
 
 
-@pytest.mark.skip(
-    reason="rewrite 已修复（2026-11-13 disable_streaming 落地，本轮复跑实证零 rewrite "
-    "兜底 WARNING、单调用 stream=False）、残余=synthesis 慢侧撞满 fast.turn_timeout_s=60 "
-    "（turn_service.py:1194 asyncio.timeout 500301 熔断 → answer_md=None，errors.log "
-    "实证）——与 factoid 用例同源同型（间歇红：上轮 54.65s 绿/本轮 64.57s 红，synthesis "
-    "波动跨预算线）——复跑条件=M1 后调优专项（synthesis 提速，用户裁决口径）。断言体"
-    "与题面原样保留。"
-)
 def test_e2e_fast_en_language_follow(base_url):
     """英文题：语言跟随（英文题→英文答）+ 英文 ≤2000 词等价信息量口径 + 代码级字数上限
     仍适用 + stage 顺序 + [n]↔sources 一一对应。

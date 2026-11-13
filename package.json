@@ -2,5 +2,11 @@
   "name": "ai-search",
   "private": true,
   "description": "仓库根 private 包：仅承载 pnpm workspace 入口（成员 frontend/）；不放依赖，命令统一走根 Makefile",
-  "scripts": {}
+  "scripts": {},
+  "pnpm": {
+    "overrides": {
+      "glob": "14.0.6",
+      "minimatch": "11.0.8"
+    }
+  }
 }

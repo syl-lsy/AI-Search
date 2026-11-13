@@ -57,6 +57,14 @@ def build_chat_model(alias: str) -> Any:
 
     import reasoning_chat_model 即注册 openai_reasoning provider（R8）——GLM/DeepSeek
     思维链经 messages 流透传（§6.1 thinking 事件面）；采样参数不写死（§6.7）。
+
+    `extra_body={"enable_thinking": False}`（专项① 2026-11-13 synthesis 提速）：
+    chat-standard 通道（百炼 qwen3.7-plus，DashScope OpenAI 兼容端点）生效键形态经
+    网关探针钉死——`enable_thinking: false` 流式 delta 零 reasoning_content（1.0~1.7s），
+    rewrite 先例的 `think: false`（ollama 原生形态）被该通道上游忽略（思维链仍在，
+    ~4.3~5.1s ≈ 基线）。仅关思维链不关流式（disable_streaming 为 rewrite 结构化输出
+    通道专属，不外溢）；透传 reasoning_content 的 R8 补丁保持不变——GLM/DeepSeek 等未
+    受该键影响的通道若有思维链仍正常透出。
     """
     import app.utils.reasoning_chat_model  # noqa: F401 —— 注册副作用（幂等）
     from langchain.chat_models import init_chat_model
@@ -66,6 +74,7 @@ def build_chat_model(alias: str) -> Any:
         model_provider="openai_reasoning",
         base_url=str(litellm_settings.base_url),
         api_key=SecretStr(litellm_settings.api_key.get_secret_value()),
+        extra_body={"enable_thinking": False},
     )
 
 
