@@ -16,10 +16,12 @@ import ModelSelect from '@/components/search/ModelSelect.vue'
 import ToastHost from '@/components/common/ToastHost.vue'
 import { usePrefsStore } from '@/stores/prefs'
 import { useThreadListStore } from '@/stores/threadList'
+import { useTurnStore } from '@/stores/turn'
 
 const route = useRoute()
 const prefs = usePrefsStore()
 const listStore = useThreadListStore()
+const turnStore = useTurnStore()
 
 const isAnswer = computed(() => route.name === 'answer')
 const isHome = computed(() => route.name === 'home')
@@ -99,7 +101,16 @@ onMounted(() => {
           :title="t.title"
           @click="sidebarOpen = false"
         >
-          {{ t.title }}
+          <!-- 生成中指示（turnStore.generatingThreadIds 事件驱动；title 口径与 ThreadsView 一致） -->
+          <span
+            v-if="turnStore.generatingThreadIds.has(t.thread_id)"
+            class="sb-gen"
+            :data-testid="`sb-generating-${t.thread_id}`"
+            :title="$t('threads.generating')"
+          >
+            <UiIcon name="i-refresh" size="sm" class="spin" />
+          </span>
+          <span class="sb-recent-text">{{ t.title }}</span>
         </RouterLink>
       </nav>
       <div class="sb-foot">
@@ -179,6 +190,30 @@ onMounted(() => {
   display: flex;
   height: 100vh;
   overflow: hidden;
+}
+/* 侧栏「最近」行生成中指示（i-refresh 旋转；口径与 ThreadsView .spin 一致） */
+.sb-recent {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.sb-recent-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sb-gen {
+  display: inline-flex;
+  flex: none;
+  color: var(--color-accent);
+}
+.spin {
+  animation: sb-spin-rotate 1.2s linear infinite;
+}
+@keyframes sb-spin-rotate {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .page-host {
   flex: 1;

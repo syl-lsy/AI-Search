@@ -11,6 +11,10 @@ describe('client 环境接线（frontend-api.md §8.4：baseURL 只读 VITE_API_
   })
 
   it('缺省（env 未设）= 同源相对路径：baseURL 空 + 契约完整路径 /api/v1/...（走 vite proxy）', async () => {
+    // hermetic：显式 stub 置空（本地 frontend/.env 可能设了直连 origin——用例测「未设」形态
+    // 必须与环境解耦；afterEach unstubAllEnvs + resetModules 已有）
+    vi.stubEnv('VITE_API_BASE_URL', '')
+    vi.resetModules()
     const { client, API_BASE_URL } = await import('@/api/client')
     expect(API_BASE_URL).toBe('')
     expect(client.defaults.baseURL).toBe('')

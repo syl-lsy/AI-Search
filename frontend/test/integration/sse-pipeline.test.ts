@@ -28,6 +28,8 @@ vi.mock('@/api/client', () => ({
   apiPatch: vi.fn(),
   apiDelete: vi.fn(),
   apiDownload: vi.fn(),
+  // turnStore 失败兜底链消费（safeReconcile → normalizeError）——mock 面与 store import 面同构
+  normalizeError: () => ({ name: 'ApiError', code: 'network_error', message: '网络异常，请稍后重试' }),
 }))
 
 const mockedPost = vi.mocked(apiPost)

@@ -18,7 +18,8 @@
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 
-import { apiGet, apiPost } from '@/api/client'
+import { apiGet, apiPost, normalizeError } from '@/api/client'
+import { toast } from '@/composables/toast'
 import { closeTurnStream, subscribeTurn } from '@/sse/turnStream'
 import type { TurnStreamState } from '@/sse/turnStream'
 import { usePrefsStore } from '@/stores/prefs'
@@ -43,6 +44,13 @@ import type {
 
 /** §3 生命周期 5：本地 last seq 的 sessionStorage 键（标签页隔离语义） */
 const SEQ_STORAGE_PREFIX = 'ai-search.seq.'
+
+/** P3：seq 持久化节流窗（streaming-buffer 参数表「落库节流」200ms；控制事件/终态豁免） */
+const SEQ_PERSIST_MIN_INTERVAL_MS = 200
+
+/** P2：对账失败重试上限（初败后再试 3 次）；重试间隔（REST 为准源的收敛窗口） */
+const RECONCILE_RETRY_MAX = 3
+const RECONCILE_RETRY_DELAY_MS = 1000
 
 const TERMINAL_STATUSES: readonly TurnStatus[] = ['completed', 'degraded', 'failed', 'canceled']
 
@@ -167,10 +175,27 @@ export const useTurnStore = defineStore('turn', () => {
     markGenerating(threadId, statuses.some((s) => s === 'running' || s === 'queued') ? 'running' : 'completed')
   }
 
-  /* ---------- seq 游标持久化（生命周期 5 形态保留） ---------- */
+  /* ---------- seq 游标持久化（生命周期 5 形态保留；P3 写入节流） ---------- */
 
-  function persistSeq(turnId: string, seq: number): void {
+  /** 每 turn 上次落盘时刻（节流窗判定；turnId → epoch ms） */
+  const seqPersistedAt = new Map<string, number>()
+
+  /**
+   * sessionStorage 游标写入（P3 节流）：delta 事件 200ms 窗口内至多落一次（写放大收敛——
+   * 每帧一次 setItem 换成 ≤5 次/秒）；控制事件与终态（done）豁免立即落（重连续传游标与
+   * 终态恢复不落后）。窗口内跳过的游标仅落后内存 lastSeq ≤200ms——续传按重放幂等门
+   * （seq 去重）兜底，不产生语义偏差。
+   */
+  function persistSeq(turnId: string, seq: number, options: { immediate?: boolean } = {}): void {
     if (seq <= 0) return
+    const now = Date.now()
+    if (options.immediate === true) {
+      seqPersistedAt.set(turnId, now)
+    } else {
+      const last = seqPersistedAt.get(turnId) ?? 0
+      if (now - last < SEQ_PERSIST_MIN_INTERVAL_MS) return
+      seqPersistedAt.set(turnId, now)
+    }
     try {
       sessionStorage.setItem(SEQ_STORAGE_PREFIX + turnId, String(seq))
     } catch {
@@ -243,9 +268,11 @@ export const useTurnStore = defineStore('turn', () => {
     // 控制事件幂等门：seq ≤ lastSeq 丢弃（重放去重）。token/thinking 豁免——合帧 flush
     // 携带批内 maxSeq==lastSeq，其去重由传输层 seq 门承担（重复 push 已在源头消除）。
     const isDelta = event.event === 'token' || event.event === 'thinking'
+    const isTerminalWrite = event.event === 'done' // 终态游标立即落（崩溃恢复不落后于终态）
     if (!isDelta && seq <= turn.lastSeq) return
     turn.lastSeq = Math.max(turn.lastSeq, seq)
-    persistSeq(turnId, turn.lastSeq)
+    // P3 节流：控制事件/终态立即落，delta 事件 200ms 窗口内至多一次
+    persistSeq(turnId, turn.lastSeq, { immediate: !isDelta || isTerminalWrite })
     switch (event.event) {
       case 'stage':
         upsertStage(turn, event.data)
@@ -354,7 +381,7 @@ export const useTurnStore = defineStore('turn', () => {
           applyEvent(turnId, event)
           if (event.event === 'done') {
             // 生命周期 4：收到 done → 对账（REST 为准源）；v1.9 注：保活轮照旧在 done 到达时执行
-            void reconcile(turnId)
+            void safeReconcile(turnId)
           }
         },
         onStateChange: (state) => {
@@ -364,7 +391,7 @@ export const useTurnStore = defineStore('turn', () => {
           if (liveTurnId.value === turnId && !info.duringHold) sseState.value = 'idle'
           const t = turns.value[turnId]
           // done 之外的非终态关闭（error 后关闭/无 done 的异常收口）→ REST 对账收敛终态
-          if (t && !isTerminalStatus(t.status)) void reconcile(turnId)
+          if (t && !isTerminalStatus(t.status)) void safeReconcile(turnId)
         },
       },
     })
@@ -379,7 +406,66 @@ export const useTurnStore = defineStore('turn', () => {
     }
   }
 
-  /* ---------- REST 对账（生命周期 4/5：以 REST 为准源） ---------- */
+  /* ---------- REST 对账（生命周期 4/5：以 REST 为准源；失败兜底 P2） ---------- */
+
+  /** 对账失败链状态：turnId → 已重试次数（防 toast 雪崩 + 有限重试窗口判定） */
+  const reconcileRetries = new Map<string, number>()
+  const reconcileRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  /**
+   * safeReconcile —— subscribe 回调的对账唯一入口（评审留档 P2：原先两处裸 void reconcile
+   * 无 catch，GET 失败静默 → failed 无内容轮永卡 running / generatingThreadIds 不移除）：
+   *   ① 失败即复位连接态（该轮为活跃流时 sseState → idle，重连横幅不再悬置）；
+   *   ② toast 兜底（normalizeError 中文文案直达；同轮失败链仅首次提示，防雪崩）；
+   *   ③ 非终态轮有限重试（初败后再试至多 RECONCILE_RETRY_MAX 次，间隔 1s）——重试收敛即
+   *      消除「卡 running」；耗尽为网络长断路径：生成中集合移除（指示器不永转）+ errorMsg
+   *      兜底（错误条可见），status 字段仍以 REST 为准源不伪造本地终态，待网络恢复后由
+   *      重新进入页面/重订阅对账收敛。
+   */
+  async function safeReconcile(turnId: string): Promise<void> {
+    try {
+      await reconcile(turnId)
+      reconcileRetries.delete(turnId)
+      const timer = reconcileRetryTimers.get(turnId)
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        reconcileRetryTimers.delete(turnId)
+      }
+    } catch (error) {
+      handleReconcileFailure(turnId, error)
+    }
+  }
+
+  function handleReconcileFailure(turnId: string, error: unknown): void {
+    // ① 连接态复位（当前活跃流为该轮时）
+    if (liveTurnId.value === turnId) sseState.value = 'idle'
+    // ② toast 兜底（失败链仅首次）
+    const firstFailure = !reconcileRetries.has(turnId)
+    reconcileRetries.set(turnId, (reconcileRetries.get(turnId) ?? 0) + 1)
+    if (firstFailure) toast(normalizeError(error).message)
+    const turn = turns.value[turnId]
+    // 终态已收敛（done 先置位后对账失败等）：无需重试
+    if (!turn || isTerminalStatus(turn.status)) {
+      reconcileRetries.delete(turnId)
+      return
+    }
+    // ③ 有限重试耗尽：指示器移除 + 错误条兜底（防永卡生成中）
+    if (reconcileRetries.get(turnId)! > RECONCILE_RETRY_MAX) {
+      reconcileRetries.delete(turnId)
+      generatingThreadIds.value.delete(turn.threadId)
+      turn.errorMsg = turn.errorMsg ?? normalizeError(error).message
+      return
+    }
+    const previous = reconcileRetryTimers.get(turnId)
+    if (previous !== undefined) clearTimeout(previous)
+    reconcileRetryTimers.set(
+      turnId,
+      setTimeout(() => {
+        reconcileRetryTimers.delete(turnId)
+        void safeReconcile(turnId)
+      }, RECONCILE_RETRY_DELAY_MS),
+    )
+  }
 
   async function reconcile(turnId: string): Promise<void> {
     const detail = await apiGet<TurnDetail>(`/api/v1/turns/${turnId}`)
@@ -424,6 +510,8 @@ export const useTurnStore = defineStore('turn', () => {
     subscribe,
     applyEvent,
     reconcile,
+    /** 失败兜底对账（subscribe 回调/视图挂载统一入口；裸 reconcile 仅诊断用） */
+    safeReconcile,
     closeStream,
     calibrateThread,
     // 内部诊断用（生命周期 5 形态校验）

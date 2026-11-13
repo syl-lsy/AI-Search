@@ -3,6 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP 最小集（评审留档 P3）：
+      - style-src 'unsafe-inline'：index.html 内联防白闪 <style> + Tailwind 内联样式（必需）；
+      - img-src https:：来源卡/回答内图片为外部 http(s) 直链（vite proxy 下同源外全是外域）；
+      - connect-src 回落 default-src 'self'：dev 走 vite proxy（同源）；若以 VITE_API_BASE_URL
+        直连后端 origin（跨源形态），须按部署形态在部署侧补 connect-src，此处不硬编码端口。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' https:; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'self'; form-action 'self'"
+    />
     <!-- 暗色基座防白闪（值 = tokens.css --color-bg-primary） -->
     <style>html { background: #191a1a; }</style>
     <title>AI Search</title>

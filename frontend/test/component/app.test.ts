@@ -1,4 +1,4 @@
-import { createPinia, setActivePinia } from 'pinia'
+import { createPinia, getActivePinia, setActivePinia } from 'pinia'
 import { flushPromises, mount } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -10,6 +10,7 @@ import { THREAD_ID_FAST, TURN_ID_FAST, turnDetailFastCompleted } from '@/mocks/t
 import { threadListFixture } from '@/mocks/threads'
 import { router } from '@/router'
 import { usePrefsStore } from '@/stores/prefs'
+import { useTurnStore } from '@/stores/turn'
 
 const VALID_THREAD_ID = THREAD_ID_FAST
 
@@ -68,9 +69,10 @@ mockedPost.mockResolvedValue({})
 let wrapper: VueWrapper | null = null
 
 async function mountApp(): Promise<VueWrapper> {
-  setActivePinia(createPinia())
+  const pinia = createPinia()
+  setActivePinia(pinia)
   wrapper = mount(App, {
-    global: { plugins: [createPinia(), router, i18n] },
+    global: { plugins: [pinia, router, i18n] },
   })
   await router.isReady()
   await flushPromises()
@@ -138,5 +140,21 @@ describe('App 壳（组件层冒烟：装配 + 懒加载四页 + i18n）', () =>
     await flushPromises()
     expect(app.find('[data-testid="nav-home"]').text()).toBe('New')
     expect(app.find('[data-testid="home-view"]').text()).toContain('What do you want to know?')
+  })
+
+  it('侧栏「最近」行：生成中线程带 i-refresh 旋转指示（title=threads.generating；与 ThreadsView 口径一致，P2）', async () => {
+    const app = await mountApp()
+    // 侧栏最近列表已拉取（fixture 第一条 = THREAD_ID_FAST）；初始无生成中指示
+    expect(app.find(`[data-testid="sb-generating-${THREAD_ID_FAST}"]`).exists()).toBe(false)
+    const turnStore = useTurnStore(getActivePinia())
+    turnStore.generatingThreadIds.add(THREAD_ID_FAST)
+    await flushPromises()
+    const indicator = app.find(`[data-testid="sb-generating-${THREAD_ID_FAST}"]`)
+    expect(indicator.exists()).toBe(true)
+    expect(indicator.attributes('title')).toBe('生成中')
+    expect(indicator.find('svg').classes().join(' ')).toContain('icon-sm')
+    turnStore.generatingThreadIds.delete(THREAD_ID_FAST)
+    await flushPromises()
+    expect(app.find(`[data-testid="sb-generating-${THREAD_ID_FAST}"]`).exists()).toBe(false)
   })
 })

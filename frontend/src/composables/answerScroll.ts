@@ -75,6 +75,10 @@ export class AnswerScrollController {
   onContentGrew(): void {
     if (this.streaming && this.phase === 'following') {
       this.stickToBottom()
+    } else {
+      // 接管态/回看态：内容增长改变距底距离 → Fab 显隐复算（评审留档 P2：接管态内容增长
+      // 原先只在 scroll 事件复算，增长导致的距底跨屏不显示 Fab——恢复途径②不可见）
+      this.updateFab()
     }
   }
 

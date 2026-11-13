@@ -74,6 +74,21 @@ describe('HomeView（§1：提问 → POST /threads → 跳答案页）', () => 
     expect(w.findAll('[data-testid="home-suggest-item"]')).toHaveLength(3)
   })
 
+  it('推荐问题文案走 i18n（home.suggestItems，zh-CN 渲染中文文案；P2：散写中文文案迁移收口）', async () => {
+    const w = mount(HomeView, { global: { plugins: [createPinia(), router, i18n] } })
+    const items = w.findAll('[data-testid="home-suggest-item"]')
+    expect(items[0]?.text()).toContain('PostgreSQL 17')
+    expect(items[1]?.text()).toContain('AI Agent 框架')
+    expect(items[2]?.text()).toContain('检索融合')
+    // 切 en 后文案跟随（同一 i18n 单例响应式；DOM 重渲在 nextTick）
+    i18n.global.locale.value = 'en-US'
+    await flushPromises()
+    const en = w.findAll('[data-testid="home-suggest-item"]')
+    expect(en[0]?.text()).toContain('PostgreSQL 17 and 16')
+    i18n.global.locale.value = 'zh-CN'
+    await flushPromises()
+  })
+
   it('输入提交：turnStore.ask（POST /api/v1/threads，注入 mode）→ 跳 /thread/{thread_id}', async () => {
     const w = mount(HomeView, { global: { plugins: [createPinia(), router, i18n] } })
     await w.find('[data-testid="home-search-card"] textarea').setValue('PostgreSQL 17 新特性')

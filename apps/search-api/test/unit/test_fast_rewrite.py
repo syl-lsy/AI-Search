@@ -280,6 +280,21 @@ async def test_rewrite_schema_method_is_function_calling(
     assert model.schema_seen is fast_rewrite.RewriteOutput
 
 
+def test_light_model_disables_streaming_for_structured_tool_calling() -> None:
+    """2026-11-13 A 裁决根因修复锁面：build_light_model 产物必须 disable_streaming=True。
+
+    根因链（Langfuse GENERATION 实证）：langgraph stream_mode=["messages",...] 向图内
+    runnable 注入 token handler → langchain 强制 LLM 调用走流式 → litellm ollama
+    provider 流式路由到 /api/generate（ndjson）→ tools 语义降级 → qwen3.5:4b 把工具
+    调用写成文本 JSON（无 tool_calls）→ parser 返回 None → ValidationError → mechanism
+    兜底（性能抽样 41/41 全兜底）；隔离直调（无注入、非流式 → /api/chat）17/17 成功。
+    light 通道 = S15 结构化输出（无需流式），禁流式后 langgraph messages 注入不再劫持；
+    synthesis 流式走 chat-standard 实例不受影响（R14③ 本就只放行 synthesis token）。
+    """
+    model = fast_rewrite.build_light_model()
+    assert model.disable_streaming is True
+
+
 # ---- 校验失败：修复回喂 1 次 → 机制兜底（factoid 档 / 3 query 固定）----
 
 
@@ -301,7 +316,9 @@ async def test_validation_failure_repairs_once_then_mechanism_fallback(
     assert update["query_type"] == "factoid"
     assert update["rewritten_queries"] == [_STATE["query"]] * 3
     assert update["answerable_from_knowledge"] is False
-    assert update["degraded"] is True
+    # 2026-11-13 B 裁决：rewrite 兜底不置 FastState.degraded（不属 api.md §7.2
+    # degraded_reason 枚举任一语义，置位会被派生为 source_failure 误标正常轮）
+    assert "degraded" not in update
     assert update["errors"] == [{"stage": "rewrite", "reason": "structured_output_invalid"}]
     assert [(key, status) for key, status, _ in emitted] == [("rewrite", "done")]
     assert emitted[-1][2] == {"extra": {"fallback": "mechanism"}}  # 不终止：降级留痕
@@ -342,7 +359,8 @@ async def test_transport_failure_retries_then_degrades_to_single_raw_query(
     assert update["rewritten_queries"] == [_STATE["query"]]  # 原始 query 单发
     assert update["query_type"] == "other"  # 未分类诚实标注（评测按 other 分桶）
     assert update["answerable_from_knowledge"] is False
-    assert update["degraded"] is True
+    # 2026-11-13 B 裁决：transport 兜底同样不置 FastState.degraded（同 mechanism 口径）
+    assert "degraded" not in update
     assert update["errors"] == [{"stage": "rewrite", "reason": "llm_retry_exhausted"}]
     assert emitted[-1][2] == {"extra": {"fallback": "degraded"}}
 

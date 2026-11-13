@@ -8,6 +8,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { apiGet, apiPost } from '@/api/client'
+import { toast } from '@/composables/toast'
 import { THREAD_ID_FAST, TURN_ID_FAST } from '@/mocks/turnDetails'
 import { closeTurnStream, peekTurnStream, subscribeTurn } from '@/sse/turnStream'
 import type { SubscribeTurnOptions, TurnStreamController, TurnStreamState } from '@/sse/turnStream'
@@ -22,6 +23,12 @@ const OTHER_TURN_ID = '9f8e7d6c-5b4a-4321-8fed-cba987654321'
 vi.mock('@/api/client', () => ({
   apiPost: vi.fn(),
   apiGet: vi.fn(),
+  // store 失败兜底链消费（normalizeError 归一 toast 文案）——mock 面须与 store import 面同构
+  normalizeError: () => ({
+    name: 'ApiError',
+    code: 'network_error',
+    message: '网络异常，请稍后重试',
+  }),
 }))
 
 vi.mock('@/sse/turnStream', () => ({
@@ -30,11 +37,16 @@ vi.mock('@/sse/turnStream', () => ({
   peekTurnStream: vi.fn(),
 }))
 
+vi.mock('@/composables/toast', () => ({
+  toast: vi.fn(),
+}))
+
 const mockedPost = vi.mocked(apiPost)
 const mockedGet = vi.mocked(apiGet)
 const mockedSubscribe = vi.mocked(subscribeTurn)
 const mockedClose = vi.mocked(closeTurnStream)
 const mockedPeek = vi.mocked(peekTurnStream)
+const mockedToast = vi.mocked(toast)
 
 /** 被订阅捕获的传输层回调（onEvent/onStateChange/onClosed） */
 function capturedCallbacks(): SubscribeTurnOptions['callbacks'] {
@@ -372,6 +384,100 @@ describe('reconcile()（生命周期 4/5：REST 为准源对账）', () => {
     mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep' }))
     await store.reconcile(TURN_ID)
     expect(store.turns[TURN_ID]!.compactSeq).toBe(12)
+  })
+})
+
+describe('subscribe 对账失败兜底（P2：裸 void reconcile 加 catch）', () => {
+  it('onClosed 收口对账失败：sseState 复位 idle + toast 首次失败一次 + 非终态轮重试收敛', async () => {
+    vi.useFakeTimers()
+    try {
+      mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+      const store = useTurnStore()
+      await store.ask('测试问题', 'fast')
+      const callbacks = capturedCallbacks()
+      callbacks.onStateChange('connected')
+      expect(store.sseState).toBe('connected')
+      mockedGet.mockRejectedValueOnce(new Error('net down'))
+      callbacks.onClosed({ afterError: true, duringHold: false })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(store.sseState).toBe('idle') // ① 连接态复位
+      expect(mockedToast).toHaveBeenCalledTimes(1) // ② toast 兜底（失败链仅首次）
+      expect(mockedToast.mock.calls[0]?.[0]).toBe('网络异常，请稍后重试')
+      expect(store.turns[TURN_ID]!.status).toBe('running') // 首败未收敛
+      // ③ 有限重试：第 1 次重试成功 → 终态收敛、生成中集合移除
+      mockedGet.mockResolvedValueOnce(makeDetail({ status: 'failed', error: 'boom' }))
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(store.turns[TURN_ID]!.status).toBe('failed')
+      expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('重试耗尽（初败 + 3 次重试全败）：GET 至多 4 次、toast 仅一次；生成中集合移除 + errorMsg 兜底（不永卡指示器；状态字段仍以 REST 为准源）', async () => {
+    vi.useFakeTimers()
+    try {
+      mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+      const store = useTurnStore()
+      await store.ask('测试问题', 'fast')
+      const callbacks = capturedCallbacks()
+      mockedGet.mockRejectedValue(new Error('net down'))
+      callbacks.onClosed({ afterError: true, duringHold: false })
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(mockedGet).toHaveBeenCalledTimes(4) // 初次 + 3 次有限重试
+      expect(mockedToast).toHaveBeenCalledTimes(1) // 失败链只提示一次（防 toast 雪崩）
+      expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false) // 指示器不再永转
+      expect(store.turns[TURN_ID]!.errorMsg).not.toBeNull() // 错误条可见（失败语义不吞）
+      expect(store.turns[TURN_ID]!.status).toBe('running') // 未伪造本地终态（REST 为准源契约不破）
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('done 路径对账失败：同样复位连接态 + toast 兜底（生命周期 4 收口）', async () => {
+    vi.useFakeTimers()
+    try {
+      mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+      const store = useTurnStore()
+      await store.ask('测试问题', 'fast')
+      const callbacks = capturedCallbacks()
+      mockedGet.mockRejectedValueOnce(new Error('net down'))
+      callbacks.onEvent(wire(9, 'done', { finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 1, source_count: 0 }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(store.sseState).toBe('idle')
+      expect(mockedToast).toHaveBeenCalledTimes(1)
+      expect(store.turns[TURN_ID]!.status).toBe('completed') // done 事件已本地置终态 → 无需重试
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(mockedGet).toHaveBeenCalledTimes(1) // 终态已收敛：不重试
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('seq 持久化节流（P3：persistSeq 200ms 一次；控制事件/终态立即落）', () => {
+  it('delta 事件窗口内节流跳过（内存 lastSeq 照常推进）；控制事件/终态立即落', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = useTurnStore()
+      mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+      await store.ask('测试问题', 'fast')
+      const key = `ai-search.seq.${TURN_ID}`
+      store.applyEvent(TURN_ID, wire(1, 'token', { delta: 'a' }))
+      expect(sessionStorage.getItem(key)).toBe('1') // 首写立即（上次落盘为 0 时刻）
+      store.applyEvent(TURN_ID, wire(2, 'token', { delta: 'b' }))
+      expect(store.turns[TURN_ID]!.lastSeq).toBe(2) // 内存照常推进
+      expect(sessionStorage.getItem(key)).toBe('1') // 200ms 窗口内节流跳过
+      await vi.advanceTimersByTimeAsync(200)
+      store.applyEvent(TURN_ID, wire(3, 'sources', { batch: [], total: 0 }))
+      expect(sessionStorage.getItem(key)).toBe('3') // 控制事件立即落
+      store.applyEvent(TURN_ID, wire(4, 'token', { delta: 'c' }))
+      expect(sessionStorage.getItem(key)).toBe('3') // 刚落过 → 窗口内跳过
+      store.applyEvent(TURN_ID, wire(9, 'done', { finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 1, source_count: 0 }))
+      expect(sessionStorage.getItem(key)).toBe('9') // 终态立即落（崩溃恢复游标不落后于终态）
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

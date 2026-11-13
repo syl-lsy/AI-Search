@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError, client } from '@/api/client'
 import { fetchModels } from '@/api/models'
+import { fetchSnapshot } from '@/api/sources'
 import { fetchSuggestionPool } from '@/api/suggestions'
 import { asEnvelope } from '@/mocks/envelope'
 import { modelsFixture } from '@/mocks/models'
 import { suggestionsFixture } from '@/mocks/suggestions'
+import type { SnapshotData } from '@/types/api'
 
 /**
  * unit 层 LLM/网络全 mock（AGENTS.md 测试门禁）：以自定义 adapter 截获请求，
@@ -46,6 +48,22 @@ describe('api 模块（请求唯一出口 client.ts 之上）', () => {
     await expect(fetchSuggestionPool()).resolves.toEqual(suggestionsFixture)
     expect(captured[0]?.method).toBe('get')
     expect(captured[0]?.url).toBe('/api/v1/suggestions')
+  })
+
+  it('fetchSnapshot：GET /api/v1/sources/{source_id}/snapshot（api.md §5.1；P2：AnswerView 散写 URL 收敛出口面）', async () => {
+    const snapshotFixture: SnapshotData = {
+      snapshot_id: 'f00d0001-0000-4000-8000-000000000001',
+      url: 'https://example.com/article',
+      content_type: 'text/html',
+      size_bytes: 20480,
+      fetched_at: '2026-11-01T08:12:03Z',
+      download_url: 'https://minio.local/signed-url',
+      excerpt: '开头摘录',
+    }
+    client.defaults.adapter = okAdapter(asEnvelope(snapshotFixture))
+    await expect(fetchSnapshot('f00d0001-0000-4000-8000-000000000001')).resolves.toEqual(snapshotFixture)
+    expect(captured[0]?.method).toBe('get')
+    expect(captured[0]?.url).toBe('/api/v1/sources/f00d0001-0000-4000-8000-000000000001/snapshot')
   })
 
   it('业务错误经拦截器归一为 ApiError（code/message 透传）', async () => {

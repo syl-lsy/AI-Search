@@ -1,6 +1,8 @@
 /**
  * test/component/image-row.test.ts — ImageCardRow 组件层（REQ-004；api.md §7.2 v1.12 键可省）。
- * 缺键不渲染对应元数据（无来源链接/无标题占位/不按宽高预留布局）+ 协议白名单 + onerror 静默隐藏。
+ * 缺键不渲染对应元数据（无标题占位/不按宽高预留布局）+ 协议白名单 + onerror 静默隐藏。
+ * 链接分级口径（PRD A6）：有合法来源页跳来源页（完整形态）；仅 url 键或 source_url 不合法时
+ * 回落原图直链（分级形态——M1 池条目只有 url 键，可点击打开原图、不渲染逐条来源页链接）。
  */
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
@@ -18,11 +20,12 @@ describe('ImageCardRow（REQ-004 / v1.12 键可省口径）', () => {
     expect(w.find('[data-testid="image-row"]').exists()).toBe(false)
   })
 
-  it('仅 url 键条目：渲染图片，但无来源链接（缺 source_url 不渲染）、无标题（缺 title 不渲染）', () => {
+  it('仅 url 键条目（M1 池形态）：href 回落原图直链可点击（A6 分级口径）、无标题（缺 title 不渲染）', () => {
     const w = mountRow([{ url: 'https://example.com/a.png' }])
     expect(w.find('[data-testid="image-row"]').exists()).toBe(true)
     const card = w.find('a.img-card')
-    expect(card.attributes('href')).toBeUndefined()
+    expect(card.attributes('href')).toBe('https://example.com/a.png')
+    expect(card.attributes('target')).toBe('_blank')
     expect(w.find('.img-src').exists()).toBe(false)
     const img = w.find('img.img-el')
     expect(img.attributes('src')).toBe('https://example.com/a.png')
@@ -70,8 +73,8 @@ describe('ImageCardRow（REQ-004 / v1.12 键可省口径）', () => {
     expect(imgs[0]?.attributes('src')).toBe('https://example.com/good.png')
   })
 
-  it('source_url 非 http(s) 时不渲染来源链接（协议白名单）', () => {
+  it('source_url 非 http(s) 时协议白名单拦下来源页，href 回落原图直链（分级形态仍可点击）', () => {
     const w = mountRow([{ url: 'https://example.com/x.png', source_url: 'javascript:alert(1)', title: 't' }])
-    expect(w.find('a.img-card').attributes('href')).toBeUndefined()
+    expect(w.find('a.img-card').attributes('href')).toBe('https://example.com/x.png')
   })
 })

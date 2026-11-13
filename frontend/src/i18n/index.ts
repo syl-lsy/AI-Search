@@ -27,6 +27,12 @@ const zhCN = {
     suggestTitle: '推荐问题',
     suggestLabel: '推荐查询',
     suggestEmpty: '无匹配历史',
+    // 推荐问题卡三场景（HomeView；快速问答 / 深度调研 / 知识库问答——文案本体自此走词表）
+    suggestItems: {
+      'pg17-vs-16': 'PostgreSQL 17 相比 16 在复制与查询性能上有何差异？',
+      'agent-frameworks': '用深度模式调研：2026 年主流 AI Agent 框架的架构取舍',
+      'kb-fusion': '根据知识库里的设计文档，总结我们检索融合的三种备选方案',
+    },
     localRun: '本地运行',
     dataLocal: '数据不出本机',
   },
@@ -167,6 +173,11 @@ const enUS: typeof zhCN = {
     suggestTitle: 'Suggested questions',
     suggestLabel: 'Suggested queries',
     suggestEmpty: 'No matching threads',
+    suggestItems: {
+      'pg17-vs-16': 'What are the differences between PostgreSQL 17 and 16 in replication and query performance?',
+      'agent-frameworks': 'Deep research: architecture trade-offs of mainstream AI Agent frameworks in 2026',
+      'kb-fusion': 'Based on the design docs in my knowledge base, summarize our three retrieval-fusion options',
+    },
     localRun: 'Runs locally',
     dataLocal: 'Data stays on this machine',
   },

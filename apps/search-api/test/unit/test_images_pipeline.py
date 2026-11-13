@@ -25,7 +25,6 @@ import pytest
 from app.agent.nodes import merge_dedupe as merge_module
 from app.agent.nodes import fuse_rerank as fuse_module
 from app.agent.graphs import signals as signals_module
-from app.agent.tools import registry as registry_module
 from app.agent.tools.registry import _normalize_search_output, _search_args
 
 
@@ -357,6 +356,36 @@ def test_select_images_secondary_pool_fills_after_fused_candidates() -> None:
     assert "source_url" not in selected[-1]
 
 
+def test_select_images_pool_malformed_optional_keys_omitted() -> None:
+    """池条目畸形可省键直喂 select_images（旁路 descriptor 塑形直进 _image_item）→
+    不合规键省略（api.md v1.12「缺则省略、不置 null 不伪造」）：source_url 限 str、
+    width/height 限 int/float 且非 bool——与 merge_dedupe.image_descriptor_from_candidate
+    类型门口径对齐（评审 P3）；合法类型条目照常透传。"""
+    images_raw = [
+        {
+            "url": "https://i/malformed.png",
+            "source_url": 123,  # 非 str → 省略
+            "width": "1200",  # 非 int/float → 省略
+            "height": True,  # bool 冒充数值 → 省略
+            "title": "畸形条目",
+        },
+        {
+            "url": "https://i/ok-types.png",
+            "source_url": "https://a/ok",
+            "width": 1200,
+            "height": 75.5,
+        },
+    ]
+    malformed, ok = fuse_module.select_images([], images_raw)
+    assert malformed == {"url": "https://i/malformed.png", "title": "畸形条目"}
+    assert ok == {
+        "url": "https://i/ok-types.png",
+        "source_url": "https://a/ok",
+        "width": 1200,
+        "height": 75.5,
+    }
+
+
 def test_select_images_respects_limit_parameter() -> None:
     """limit 参数化（默认 IMAGES_MAX_COUNT；语义化入口便于 M4 评测复用）。"""
     fused = [_cand(f"https://a/{i}", img_src=f"https://i/{i}.png") for i in range(5)]
@@ -487,9 +516,27 @@ async def test_fuse_rerank_still_writes_only_faststate_keys(
 
 # ---- 模块防呆：registry 导出面不被误改 ----
 
+#: registry 公共导出集字面量快照（显式枚举现有导出；sorted 后相等断言——修正原
+#: 「registry_all == registry_module.__all__」恒真断言：registry_module 即被测模块
+#: 自身，两边引用同一列表对象、比较永真，锁不住导出面漂移，评审 P3）
+EXPECTED_REGISTRY_ALL = sorted(
+    [
+        "BACKUP_SEARCH_CHAIN",
+        "CircuitBreaker",
+        "SEARCH_SOURCE_NAMES",
+        "SearchChain",
+        "SearchChainUnavailable",
+        "SourceCallError",
+        "ToolRegistry",
+        "guarded_source_call",
+        "resolve_search_chain",
+    ]
+)
+
 
 def test_registry_module_exports_unchanged_surface() -> None:
-    """registry 公共面零新增（透传为出参字典键增量，不改函数签名/导出集）。"""
+    """registry 公共面零新增（透传为出参字典键增量，不改函数签名/导出集）——
+    字面量快照断言：导出面漂移（新增/删减/改名）即红。"""
     from app.agent.tools.registry import __all__ as registry_all
 
-    assert registry_all == registry_module.__all__  # 引用同一列表对象（无增量）
+    assert sorted(registry_all) == EXPECTED_REGISTRY_ALL

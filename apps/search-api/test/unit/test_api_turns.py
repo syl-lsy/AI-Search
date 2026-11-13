@@ -227,7 +227,7 @@ async def test_get_turn_completed_deep_full_shape(overrides: dict) -> None:
     assert data["incognito"] is False
     assert data["followups"] is None
     assert "memory_hits" not in data
-    assert data["images"] == []  # B2 桩不发 images 事件
+    assert data["images"] == []  # 零 images 行→§2.5 重建空数组（turn_service._rebuild_images_briefs）
     assert data["error"] is None
     assert data["usage"]["total_tokens"] is None  # usage={}（M1 简化）
     assert data["duration_ms"] == 152300

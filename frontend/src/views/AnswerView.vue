@@ -19,7 +19,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 
-import { apiGet, normalizeError } from '@/api/client'
+import { normalizeError } from '@/api/client'
+import { fetchSnapshot } from '@/api/sources'
 import { fetchThread } from '@/api/threads'
 import OutlineAnchor from '@/components/answer/OutlineAnchor.vue'
 import type { OutlineItem } from '@/components/answer/OutlineAnchor.vue'
@@ -29,10 +30,11 @@ import TurnBlock from '@/components/answer/TurnBlock.vue'
 import SearchCard from '@/components/search/SearchCard.vue'
 import { AnswerScrollController } from '@/composables/answerScroll'
 import { toast } from '@/composables/toast'
+import { isSameHeadingSet } from '@/components/markdown/renderer'
 import type { HeadingInfo } from '@/components/markdown/renderer'
 import { useTurnStore } from '@/stores/turn'
 import { isHttpUrl, isUuid } from '@/utils/guards'
-import type { AskMode, SnapshotData } from '@/types/api'
+import type { AskMode } from '@/types/api'
 
 const route = useRoute()
 const { t } = useI18n()
@@ -66,6 +68,9 @@ const renderableTurns = computed(() =>
 /* ---------- 滚动控制器（REQ-043 状态机装配） ---------- */
 let controller: AnswerScrollController | null = null
 const showFab = ref(false)
+/** 跟随相位镜像（e2e 测试通道：data-scroll-phase——流式静默段下 scrollTop 停驻不可区分
+ *  「接管生效」与「流式恰好静默」，相位是黑盒外唯一可靠观测；与 data-testid 同族约定） */
+const scrollPhase = ref<AnswerScrollController['phase']>('following')
 
 /** 流式进行中（快速 token / 深度撰写阶段；queued 等待期无内容增长，跟随无害） */
 const liveTurn = computed(() => {
@@ -165,6 +170,10 @@ async function refreshOutlineMetrics(): Promise<void> {
 }
 
 function onTurnHeadings(turnId: string, items: HeadingInfo[]): void {
+  // 仅标题集变化才重建（P2：流式限频批间标题未变时 AnswerRenderer 仍逐批上抛，
+  // 全量重建 outlineItems 是无效功——isSameHeadingSet 门禁跳过）
+  const previous = headingsByTurn.value[turnId]
+  if (previous !== undefined && isSameHeadingSet(previous, items)) return
   headingsByTurn.value[turnId] = items
   void refreshOutlineMetrics()
 }
@@ -208,15 +217,15 @@ function onCite(refNo: number): void {
   }, 1_600)
 }
 
-/* ---------- 快照（api.md §5.1：10 分钟预签名 URL，新开页） ---------- */
+/* ---------- 快照（api.md §5.1：10 分钟预签名 URL，新开页；出口面 = api/sources.ts） ---------- */
 const snapshotLoading = ref(false)
 async function onSnapshot(sourceId: string): Promise<void> {
   if (snapshotLoading.value) return
   snapshotLoading.value = true
   try {
-    const data = await apiGet<SnapshotData>(`/api/v1/sources/${sourceId}/snapshot`)
+    const data = await fetchSnapshot(sourceId)
     if (isHttpUrl(data.download_url)) {
-      window.open(data.download_url, '_blank', 'noopener')
+      window.open(data.download_url, '_blank', 'noopener,noreferrer')
     } else {
       toast(t('answer.snapshotUnavailable'))
     }
@@ -265,6 +274,7 @@ onMounted(async () => {
     controller = new AnswerScrollController(el)
     controller.onStateChange = (s) => {
       showFab.value = s.showFab
+      scrollPhase.value = s.phase
     }
     el.addEventListener('scroll', onScrollForAnchor, { passive: true })
   }
@@ -275,9 +285,9 @@ onMounted(async () => {
     threadTitle.value = detail.title
     turnIds.value = detail.turns.map((t) => t.turn_id)
     store.calibrateThread(tid, detail.turns.map((t) => t.status))
-    for (const turn of detail.turns) {
-      await store.reconcile(turn.turn_id)
-    }
+    // P3：逐轮对账并行化（Promise.allSettled）——单轮对账失败不再串行阻断后续轮与订阅段；
+    // 失败兜底语义统一走 store.safeReconcile（连接态复位 + toast + 非终态有限重试）
+    await Promise.allSettled(detail.turns.map((turn) => store.safeReconcile(turn.turn_id)))
     for (const turn of detail.turns) {
       const status = store.turns[turn.turn_id]?.status
       if (status === 'running' || status === 'queued') store.subscribe(turn.turn_id)
@@ -308,7 +318,7 @@ onUnmounted(() => {
     <template v-else>
       <div v-if="loadError" class="answer-empty" role="status">{{ $t('answer.loadFailed') }}</div>
 
-      <div ref="scrollEl" class="content" data-testid="answer-scroll">
+      <div ref="scrollEl" class="content" data-testid="answer-scroll" :data-scroll-phase="scrollPhase">
         <div class="answer-body">
           <div class="answer-grid">
             <div class="answer-col" data-testid="answer-col">

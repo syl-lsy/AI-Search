@@ -6,11 +6,16 @@
  *   不产标题 id，§3：不参与 [n] 引用解析）；
  * - 空内容不渲染（无空区块原则）；回看态不渲染（thinking_md 为流式域，对账不恢复）——
  *   由父级以「仅流式轮渲染」保证，组件内再以空内容兜底；
- * - 流式进行中展开态末尾带打字光标（tokens .caret）。
+ * - 流式进行中展开态末尾带打字光标（tokens .caret）；
+ * - 渲染节奏（streaming-buffer 规则 14/17）：markdown 源经 70ms 限频批驱动重解析；
+ *   折叠态（v-show 隐藏）跳过重渲——挂载时初渲一次（DOM 恒存在，v-show 仅隐藏），
+ *   折叠期间的源变更不合入渲染，展开时统一按最新源渲染（评审留档 P2）。
  */
-import { computed, ref } from 'vue'
+import { ref, shallowRef, watch } from 'vue'
 
 import { renderPlainMarkdown } from '@/components/markdown/renderer'
+import type { RenderedMarkdown } from '@/components/markdown/renderer'
+import { useThrottledSource } from '@/components/markdown/renderThrottle'
 import UiIcon from '@/components/icons/UiIcon.vue'
 
 const props = defineProps<{
@@ -20,7 +25,13 @@ const props = defineProps<{
 
 const open = ref(false)
 
-const rendered = computed(() => renderPlainMarkdown(props.markdown))
+// 初渲一次（折叠态 DOM 恒存在；后续渲染由下方 watch 驱动）
+const rendered = shallowRef<RenderedMarkdown>(renderPlainMarkdown(props.markdown))
+const throttledMarkdown = useThrottledSource(() => props.markdown)
+watch([throttledMarkdown, open], ([source, isOpen]) => {
+  if (!isOpen) return // 折叠态跳过重渲（不可见不烧渲染；展开时按最新源统一渲染）
+  rendered.value = renderPlainMarkdown(source)
+})
 const bodyId = `thinking-body-${Math.random().toString(36).slice(2, 8)}`
 </script>
 

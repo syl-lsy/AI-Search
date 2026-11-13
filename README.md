@@ -2,7 +2,7 @@
 
 类 Perplexity 的自建 AI 搜索引擎：快速模式（多源搜索 → ≤3000 字上限内带引用综合回答，篇幅按题型软引导，P50 ≤30s）+ 深度模式（deepagents 子代理并行研究 → 分节带引用报告），全程引用可溯源、成本可观测。
 
-> 当前阶段（2026-11-12）：**批次 0（工程骨架）+ 批次 1（S0 基础设施）+ 批次 2（B1 底座）+ 批次 3（B2 线程轮次·桩主图）+ 批次 4（B3 主图壳+fast 五节点）+ 批次 5（S2 SSE 联调）+ 批次 6（后端综合验证）+ 批次 7（前端 F1，含 A6 images 前置小修）已闭环**，下一批 = 批次 8（M1 综合测试与退出）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
+> 当前阶段（2026-11-13）：**M1（快速模式）已退出**——批次 0~8 全部闭环（工程骨架 → S0 基础设施 → B1 底座 → B2 线程轮次 → B3 主图壳+fast 五节点 → S2 SSE 联调 → 后端综合验证 → 前端 F1 → M1 综合测试与退出）。退出判定为**带注记达成**：A 表 M1 适用 10 条全 PASS、性能 P50 24.95s ≤30s / P90 46.64s ≤60s 双达标、审查无未处理 P0/P1、契约零漂移；两项如实注记（后端 e2e 三契约用例 skip 挂牌待 synthesis 提速专项摘牌、多面题熔断率记录项）见 `docs/m1-exit-batch8.md` 与 `docs/PROGRESS.md` §4。下一步 = M2（深度模式）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
 
 ## 快速开始
 
@@ -21,7 +21,7 @@ make dev-frontend                        # Vite :5173（/api 代理 → http://1
 ```
 
 - `frontend/.env` 的 `VITE_API_BASE_URL`：未设/留空 = 同源相对路径走 Vite dev proxy（推荐 dev 形态，无需 CORS）；直连 = 填后端 origin，改端口须同步后端 `CORS_ORIGINS`。仅 `VITE_` 前缀变量暴露给客户端（唯一读取处 `frontend/src/api/client.ts`）。
-- 前端测试：`make test-frontend`（unit/integration/component 三层 + 80% 覆盖率门禁）；e2e（playwright，真服务）运行期间 `make dev` + `make dev-frontend` 双服务须在跑；流式用例当前因本机代理环境 skip 挂牌（摘牌复跑条件见 `docs/PROGRESS.md` §2 批次 7 行）。
+- 前端测试：`make test-frontend`（unit/integration/component 三层 + 80% 覆盖率门禁）；e2e（playwright，真服务）运行期间 `make dev` + `make dev-frontend` 双服务须在跑。**流式 e2e 已于批次 8 摘牌复跑全绿**（2026-11-13，四页主链路 + A13/A26/A27/A28 全过，判定截图见 `docs/design/e2e-batch8/`）——此前 skip 挂牌的根因是本机系统代理未对 127.0.0.1/localhost 加 bypass，非项目缺陷；本机若复现同症状，先查代理 bypass 再怀疑链路。
 
 ## S0 基础设施栈（批次 1 已闭环）
 
@@ -73,4 +73,4 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 
 ## 里程碑路线（M1，状态见 `docs/PROGRESS.md`）
 
-批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 ✅ → 批次 7 前端 F1 ✅ → 批次 8 M1 综合测试与退出；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。
+批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 ✅ → 批次 7 前端 F1 ✅ → 批次 8 M1 综合测试与退出 ✅ → **M1（快速模式）已退出**（带注记达成，判定见 `docs/m1-exit-batch8.md`）；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。

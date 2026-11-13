@@ -62,7 +62,9 @@ _DEFAULT_FUSE_TOP_N = 10
 #: 语义化代码常量，口径已裁决不进 Nacos）
 IMAGES_MAX_COUNT = 3
 
-#: images 条目白名单键集（url 恒在；其余键上游缺则省略——api.md §7.2 v1.12）
+#: images 条目白名单键集（url 恒在；其余键上游缺或类型不合规则省略——api.md §7.2
+#: v1.12：source_url 限 str、title 限非空 str、width/height 限 int/float 且非 bool，
+#: 不置 null 不伪造；类型门口径与 merge_dedupe.image_descriptor_from_candidate 对齐）
 _IMAGE_ITEM_KEYS = ("source_url", "title", "width", "height")
 
 
@@ -163,19 +165,24 @@ def _url_allowed(url: str) -> bool:
 
 
 def _image_item(entry: Mapping[str, Any]) -> dict[str, Any] | None:
-    """images_raw 描述符 → §7.2 images 条目（url 恒在；白名单键缺失则省略——v1.12）。"""
+    """images_raw 描述符 → §7.2 images 条目（url 恒在；白名单键缺失或畸形则省略——
+    不置 null 不伪造；类型门与 merge_dedupe.image_descriptor_from_candidate 对齐，
+    池条目旁路 descriptor 塑形直进本函数，故同样收口）。"""
     url = entry.get("url")
     if not isinstance(url, str) or not url or not _url_allowed(url):
         return None
     item: dict[str, Any] = {"url": url}
     for key in _IMAGE_ITEM_KEYS:
         value = entry.get(key)
-        if key == "title":
+        if key == "source_url":
+            if isinstance(value, str) and value:
+                item[key] = value
+        elif key == "title":
             if isinstance(value, str) and value.strip():
                 item[key] = value
-            continue
-        if value is not None:
-            item[key] = value
+        else:  # width/height：数值门（bool 冒充数值不收——同 merge_dedupe 口径）
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                item[key] = value
     return item
 
 

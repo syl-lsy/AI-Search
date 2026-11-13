@@ -1015,6 +1015,38 @@ async def test_done_degraded_from_state_with_source_failure_reason() -> None:
     assert turn.status == "completed" and turn.degraded_reason == "source_failure"
 
 
+async def test_rewrite_mechanism_fallback_does_not_mark_degraded() -> None:
+    """2026-11-13 B 裁决护栏（「成功轮被误标 source_failure」回归面）：rewrite 兜底
+    不属 api.md §7.2 degraded_reason 枚举（timeout/budget/source_failure）任一语义
+    → 节点不再置 FastState.degraded（fast_rewrite._fallback_update 零 degraded 键）
+    → 正常完成轮 done.degraded=False + degraded_reason=null + status=completed；
+    降级观测面收敛在 stage done.extra={fallback} + state.errors[]（留痕不丢）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    # rewrite 机制兜底形态（B 修复后 update 无 degraded 键——机制兜底 errors 留痕保留）
+    graph = _FakeGraph([
+        _updates({"rewrite": {
+            "rewritten_queries": ["TCP 三次握手", "TCP 三次握手", "TCP 三次握手"],
+            "query_type": "factoid",
+            "answerable_from_knowledge": False,
+            "time_range": None,
+            "errors": [{"stage": "rewrite", "reason": "structured_output_invalid"}],
+        }}),
+        _updates({"write": {"answer_md": "正常综合答案（rewrite 兜底轮）"}}),
+    ])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = next(e for e in published if e.event_type == "done")
+    assert done.data["degraded"] is False
+    assert done.data["degraded_reason"] is None
+    assert turn.status == "completed"
+    assert getattr(turn, "degraded_reason", None) is None  # 列未被派生赋值
+
+
 async def test_execute_turn_timeout_guard_fails_with_500301() -> None:
     """spec.turn_timeout_s 包 astream：超时 → error(500301 硬超时熔断) + failed + close_channel。"""
     bus = _bus()

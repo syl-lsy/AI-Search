@@ -4,7 +4,9 @@
  *
  * - 无图不渲染区块（无空区块原则，父级 v-if + 组件内兜底）；
  * - 渲染前协议白名单校验 ^https?://（§2）；单图加载失败 onerror 静默隐藏该卡；
- * - 条目键可省（api.md §7.2 v1.12）：无 source_url 不渲染来源链接、无 title 不渲染标题占位、
+ * - 链接分级口径（PRD A6 / M1 验收）：有合法来源页跳来源页（完整形态）；仅 url 键（M1 池条目形态）
+ *   或 source_url 不合法时回落原图直链——卡片始终可点击打开原图，不渲染逐条来源页链接；
+ * - 条目键可省（api.md §7.2 v1.12）：无 title 不渲染标题占位、
  *   无 width/height 不按宽高预留布局（frontend-api.md §3 images 行 v1.13 口径）。
  */
 import { ref } from 'vue'
@@ -33,6 +35,15 @@ function aspectStyle(img: TurnImageItem): Record<string, string> | null {
 
 const usable = (): TurnImageItem[] =>
   props.images.filter((img) => isHttpUrl(img.url) && !failedUrls.value.has(img.url))
+
+/**
+ * 卡片链接目标分级（PRD A6 / M1 验收）：合法来源页优先（完整形态）；
+ * 否则回落原图直链（分级形态，M1 池条目仅 url 键）。两键均过协议白名单 ^https?://。
+ */
+function linkHref(img: TurnImageItem): string | undefined {
+  if (img.source_url && isHttpUrl(img.source_url)) return img.source_url
+  return isHttpUrl(img.url) ? img.url : undefined
+}
 </script>
 
 <template>
@@ -41,8 +52,8 @@ const usable = (): TurnImageItem[] =>
       v-for="img in usable()"
       :key="img.url"
       class="img-card"
-      :href="img.source_url && isHttpUrl(img.source_url) ? img.source_url : undefined"
-      :target="img.source_url && isHttpUrl(img.source_url) ? '_blank' : undefined"
+      :href="linkHref(img)"
+      :target="linkHref(img) ? '_blank' : undefined"
       rel="noopener noreferrer"
     >
       <img

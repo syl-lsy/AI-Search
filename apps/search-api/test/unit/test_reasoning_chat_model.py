@@ -376,3 +376,119 @@ class TestR8GuardOverrides:
         assert ReasoningChatModel._convert_chunk_to_generation_chunk is not (
             ChatOpenAI._convert_chunk_to_generation_chunk
         )
+
+
+# ---------------------------------------------------------------------------
+# 结构化输出交互护栏（2026-11-13 A 裁决）：ReasoningChatModel 覆写 × rewrite 节点
+# with_structured_output(method="function_calling") 的真实链路形状——性能抽样
+# 41/41 mechanism 兜底事故的形状锁面（真实响应形状 fixture，非 mock 恒真形态）。
+# 钉住语义：覆写**不得破坏 tool_calls 面**——tool_calls × reasoning_content 同帧
+# （think=false 失效时的真实形态）× content 空/None 两形态下，结构化解析链必须
+# 端到端产出合法 RewriteOutput（langchain 解析数据源 = AIMessage.tool_calls）。
+# ---------------------------------------------------------------------------
+
+
+def _invoke_response_with_tool_call(
+    *,
+    reasoning: str | None,
+    content: str | None,
+    arguments: str,
+    name: str = "RewriteOutput",
+) -> dict:
+    """工具调用响应（dict 形态，LiteLLM 网关透传路径）：tool_calls + content +
+    reasoning_content 同帧——rewrite 结构化调用的真实响应形状。"""
+    message: dict = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": "call_stub_1",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        ],
+    }
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    return {
+        "id": "chatcmpl-stub-tool",
+        "model": "stub-model",
+        "object": "chat.completion",
+        "created": 1,
+        "choices": [
+            {"index": 0, "finish_reason": "tool_calls", "message": message}
+        ],
+    }
+
+
+_VALID_TOOL_ARGS = (
+    '{"queries": ["TCP 三次握手流程"], "query_type": "factoid", '
+    '"answerable_from_knowledge": true, "time_range": null, '
+    '"memory_directive": null}'
+)
+
+
+class TestStructuredOutputInteraction:
+    """tool_calls × reasoning_content 同帧 × content 空/None 形态矩阵。"""
+
+    def _structured_out(self, response: dict):
+        from app.agent.nodes.fast_rewrite import RewriteOutput
+
+        model = _build_model(response=response)
+        chain = model.with_structured_output(RewriteOutput, method="function_calling")
+        return chain.invoke([HumanMessage(content="q")])
+
+    def test_tool_call_reasoning_with_empty_content_parses(self):
+        """content="" + reasoning 非空：覆写守卫触发（str content → blocks）但
+        tool_calls 面不丢——结构化解析端到端成功（rewrite 主形态）。"""
+        from app.agent.nodes.fast_rewrite import RewriteOutput
+
+        out = self._structured_out(
+            _invoke_response_with_tool_call(
+                reasoning="思考文本", content="", arguments=_VALID_TOOL_ARGS
+            )
+        )
+        assert isinstance(out, RewriteOutput)
+        assert out.queries == ["TCP 三次握手流程"]
+        assert out.query_type == "factoid"
+        assert out.answerable_from_knowledge is True
+
+    def test_tool_call_reasoning_with_none_content_parses(self):
+        """content=None + reasoning 非空：守卫跳过（None 非 str，零扰动）——
+        tool_calls 原样保留，结构化解析端到端成功。"""
+        from app.agent.nodes.fast_rewrite import RewriteOutput
+
+        out = self._structured_out(
+            _invoke_response_with_tool_call(
+                reasoning="思考文本", content=None, arguments=_VALID_TOOL_ARGS
+            )
+        )
+        assert isinstance(out, RewriteOutput)
+        assert out.queries == ["TCP 三次握手流程"]
+
+    def test_tool_call_without_reasoning_parses(self):
+        """content="" 无 reasoning：普通路径零扰动（覆写不触发）——结构化解析
+        端到端成功（think=false 生效时的常态形态，B3 实证基线）。"""
+        from app.agent.nodes.fast_rewrite import RewriteOutput
+
+        out = self._structured_out(
+            _invoke_response_with_tool_call(
+                reasoning=None, content="", arguments=_VALID_TOOL_ARGS
+            )
+        )
+        assert isinstance(out, RewriteOutput)
+        assert out.queries == ["TCP 三次握手流程"]
+
+    def test_tool_call_preserved_in_message_when_reasoning_present(self):
+        """AIMessage.tool_calls 必须在覆写后保留（langchain 解析数据源不丢）——
+        覆写仅动 content、不触碰 additional_kwargs/tool_calls 面。"""
+        model = _build_model(
+            response=_invoke_response_with_tool_call(
+                reasoning="思考文本", content="", arguments=_VALID_TOOL_ARGS
+            )
+        )
+        message = model.invoke([HumanMessage(content="q")])
+        assert isinstance(message, AIMessage)
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0]["name"] == "RewriteOutput"
+        assert message.tool_calls[0]["args"]["query_type"] == "factoid"

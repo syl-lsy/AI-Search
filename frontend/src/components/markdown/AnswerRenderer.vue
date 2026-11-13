@@ -6,12 +6,16 @@
  * - [n] 引用标注 → 可点击 sup.cite，点击上抛 cite(refNo) 与 sources 面板 ref_no 联动（REQ-003）；
  * - 标题 id 由渲染器生成（renderer.ts postProcess），headings 事件上抛 = OutlineAnchor 数据源
  *   （frontend-api.md §5：数据源复用 AnswerRenderer 标题 id 机制，SSE/API 协议零变更）；
- * - thinking 折叠区（ThinkingPanel）是本组件上方独立区块（§5），不在本组件内部。
+ * - thinking 折叠区（ThinkingPanel）是本组件上方独立区块（§5），不在本组件内部；
+ * - 渲染节奏（streaming-buffer 规则 14/17）：markdown 源经 70ms 限频批驱动重解析——流式期间
+ *   「每帧全量重解析」收敛为「≤70ms 一批」，窗口内合批尾帧取最新值（终值不丢）；
+ *   headingPrefix 变更不经限频（computed 直连 props，立即生效——多轮去重命名空间静态不变）。
  */
 import { computed, watch } from 'vue'
 
 import { renderAnswerMarkdown } from '@/components/markdown/renderer'
 import type { HeadingInfo } from '@/components/markdown/renderer'
+import { useThrottledSource } from '@/components/markdown/renderThrottle'
 
 const props = defineProps<{
   markdown: string
@@ -24,7 +28,8 @@ const emit = defineEmits<{
   cite: [refNo: number]
 }>()
 
-const rendered = computed(() => renderAnswerMarkdown(props.markdown, { headingPrefix: props.headingPrefix }))
+const throttledMarkdown = useThrottledSource(() => props.markdown)
+const rendered = computed(() => renderAnswerMarkdown(throttledMarkdown.value, { headingPrefix: props.headingPrefix }))
 
 // watch→emit 属合法副作用通道（computed 内禁止副作用）；headings 供父级装配 OutlineAnchor 条目
 watch(

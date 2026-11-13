@@ -254,6 +254,40 @@ describe('AnswerScrollController（REQ-043 状态机）', () => {
     c.detach()
   })
 
+  it('接管态流式内容增长 → Fab 显隐复算（距底跨过一屏即显示；P2：接管态内容增长不现修复）', () => {
+    const v = makeViewport({ scrollTop: 300, scrollHeight: 1000, clientHeight: 400 })
+    const c = new AnswerScrollController(v)
+    const seen: boolean[] = []
+    c.onStateChange = (s) => seen.push(s.showFab)
+    c.setStreaming(true)
+    expect(c.showFab).toBe(false) // 距底 300 < 一屏
+    v.scrollTop = 290
+    v.dispatchScroll() // 上滚 10 > 8 → 接管；距底 310 仍 < 一屏
+    expect(c.phase).toBe('taken_over')
+    expect(c.showFab).toBe(false)
+    // 流式内容增长 1000→2000：距底 = 2000-290-400 = 1310 > 一屏 → onContentGrew 复算 Fab
+    v.scrollHeight = 2000
+    c.onContentGrew()
+    expect(c.phase).toBe('taken_over') // 仍接管，未被拽回
+    expect(v.scrollTop).toBe(290) // 视口未动
+    expect(c.showFab).toBe(true) // Fab 出现（恢复途径②可见）
+    expect(seen.at(-1)).toBe(true) // onStateChange 已通知 Vue 层
+    c.detach()
+  })
+
+  it('回看态（非流式）内容增长 → Fab 显隐同样复算（与流式无关口径，REQ-045）', () => {
+    const v = makeViewport({ scrollTop: 0, scrollHeight: 1000, clientHeight: 400 })
+    const c = new AnswerScrollController(v)
+    c.setStreaming(false)
+    v.scrollTop = 600
+    v.dispatchScroll() // 贴底 → Fab 隐藏
+    expect(c.showFab).toBe(false)
+    v.scrollHeight = 2200 // 内容增长（如对账替换/图片加载）
+    c.onContentGrew() // 距底 = 2200-600-400 = 1200 > 一屏 → 显示
+    expect(c.showFab).toBe(true)
+    c.detach()
+  })
+
   it('detach 移除 scroll 监听（重复挂载/卸载安全）', () => {
     const v = makeViewport()
     const c = new AnswerScrollController(v)

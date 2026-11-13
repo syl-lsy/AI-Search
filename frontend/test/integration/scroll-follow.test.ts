@@ -59,6 +59,13 @@ const RUNNING_TURN: typeof turnDetailFastCompleted = {
   followups: null,
 }
 
+/** 可变轮详情控制通道（显式具型导出形态，替代 as unknown as 双重断言——§8.9①） */
+const turnDetailControls: { setDone(): void } = {
+  setDone() {
+    throw new Error('mountOnThread 尚未初始化控制通道')
+  },
+}
+
 /** wire fixture → EventSource 线格帧 */
 function frame(seq: number, delta: string): { id: number; type: string; data: string } {
   return {
@@ -129,12 +136,10 @@ describe('流式滚动：接管与恢复（REQ-043 / A26）', () => {
       if (url === `/api/v1/turns/${TURN_ID_FAST}`) return turnDetailState
       throw new Error(`unexpected GET ${url}`)
     })
-    ;(mountOnThread as unknown as { __state?: { setDone(): void } }).__state = {
-      setDone: () => {
-        turnDetailState.status = 'completed'
-        turnDetailState.answer_md = '终态落库内容'
-        turnDetailState.duration_ms = 7420
-      },
+    turnDetailControls.setDone = () => {
+      turnDetailState.status = 'completed'
+      turnDetailState.answer_md = '终态落库内容'
+      turnDetailState.duration_ms = 7420
     }
     mockedPost.mockResolvedValue({})
 
@@ -216,6 +221,8 @@ describe('流式滚动：接管与恢复（REQ-043 / A26）', () => {
     await streamToken(app, 3, 'Router 用于静态分支', 1400)
     expect(rendererText(app)).toContain('Router 用于静态分支')
     expect(scrollTopValue).toBe(300) // 未被拽回（渲染照常、仅停止自动滚动）
+    // 相位镜像（data-scroll-phase 测试通道）：接管即置 taken_over（e2e A26 黑盒外观测依据）
+    expect(app.find('[data-testid="answer-scroll"]').attributes('data-scroll-phase')).toBe('taken_over')
 
     // ── A26-4 消歧：重叠带/内容增长导致的距底变化不恢复 ──
     await streamToken(app, 4, '更多内容', 1700)
@@ -231,6 +238,8 @@ describe('流式滚动：接管与恢复（REQ-043 / A26）', () => {
       },
       { timeout: 3_000, interval: 20 },
     )
+    // 恢复①相位回 following（data-scroll-phase 测试通道）
+    expect(app.find('[data-testid="answer-scroll"]').attributes('data-scroll-phase')).toBe('following')
 
     // ── 恢复②：ScrollToBottomFab 点击（先制造离底超一屏 + Fab 可见）──
     userScroll(200) // 距底 = 2000-200-400 = 1400 > 一屏 400 → showFab
@@ -267,7 +276,7 @@ describe('流式滚动：接管与恢复（REQ-043 / A26）', () => {
         usage: { total_tokens: 1, cost_usd: 0 },
       }),
     })
-    ;(mountOnThread as unknown as { __state?: { setDone(): void } }).__state?.setDone()
+    turnDetailControls.setDone()
     // done → 对账（REST 权威 completed）→ canStop=false → 提交钮回归
     await vi.waitFor(
       () => {

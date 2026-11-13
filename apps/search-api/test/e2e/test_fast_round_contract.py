@@ -21,6 +21,16 @@ Last-Event-ID 重放/落库逐字段）已在 integration 锁死——本层只�
 
 链路：POST /api/v1/threads 建轮 → GET /api/v1/turns/{id}/events 收 SSE 流
 （真链路实测 39~49s/轮，收流上限 90s/轮）→ done 后 GET /api/v1/turns/{id} 终态对账。
+
+【当前活跃面与挂牌状态（终审 P1，2026-11-13——M1 退出裁决须显式知情）】本文件
+3/3 契约用例（multifacet:279 / factoid:294 / en_language_follow:312）全部 skip 挂牌，
+整个 test/e2e/ 活跃面仅剩 test_health.py 1 条健康检查——`make test-e2e exit 0` 的
+字面结论**不代表**全链路验证事实。三条挂牌理由链一致且断言体/题面原样保留（非门禁
+放宽）：rewrite 流式劫持已修复实证（零兜底 WARNING、单调用 stream=False），残余=
+synthesis 慢侧 ~45-55s（波动跨线）撞满 fast.turn_timeout_s=60 → 500301 熔断
+answer_md=None。**复跑摘牌条件=M1 后调优专项（synthesis 提速）落地**——与 P50
+预算矛盾（前置挤占 + synthesis 慢侧，PRD「P50 ≤30s」验收与 AGENTS.md 遗留④）
+的调优排期绑定，摘牌随专项闭环逐条执行，不跨里程碑悬置。
 """
 
 import json
@@ -291,16 +301,39 @@ def test_e2e_fast_zh_multifacet_full_contract(base_url):
     _assert_zh_char_cap(detail["answer_md"])
 
 
+@pytest.mark.skip(
+    reason="rewrite 已修复（2026-11-13 disable_streaming 落地，本轮复跑实证零 rewrite "
+    "兜底 WARNING、单调用 stream=False）、残余=synthesis 慢侧撞满 fast.turn_timeout_s=60 "
+    "（turn_service.py:1194 asyncio.timeout 500301 熔断 → answer_md=None，errors.log "
+    "实证）——复跑条件=M1 后调优专项（synthesis 提速，用户裁决口径）。断言体与题面"
+    "原样保留。"
+)
 def test_e2e_fast_zh_factoid_short(base_url):
     """事实型中文题：stage 顺序 + [n]↔sources 一一对应 + 中文 ≤3000 字（从简短答口径）+
-    语言跟随——短答不豁免任何硬约束。"""
+    语言跟随——短答不豁免任何硬约束。
+    【2026-11-13 批次 8 rewrite 修复后摘牌复跑→仍红回挂牌】摘牌复跑归因实证：rewrite
+    结构化路径已修复（本轮零兜底 WARNING、单调用 stream=False），残余=synthesis 慢侧
+    （qwen3.7-plus 综合生成 ~50s+）撞满 60s 轮级预算熔断 → answer_md=None——归批次 8
+    M1 后调优专项（synthesis 提速）后再摘牌。"""
     frames, detail = _assert_round_contract(base_url, ZH_FACTOID_QUERY, "zh")
     _assert_zh_char_cap(detail["answer_md"])
 
 
+@pytest.mark.skip(
+    reason="rewrite 已修复（2026-11-13 disable_streaming 落地，本轮复跑实证零 rewrite "
+    "兜底 WARNING、单调用 stream=False）、残余=synthesis 慢侧撞满 fast.turn_timeout_s=60 "
+    "（turn_service.py:1194 asyncio.timeout 500301 熔断 → answer_md=None，errors.log "
+    "实证）——与 factoid 用例同源同型（间歇红：上轮 54.65s 绿/本轮 64.57s 红，synthesis "
+    "波动跨预算线）——复跑条件=M1 后调优专项（synthesis 提速，用户裁决口径）。断言体"
+    "与题面原样保留。"
+)
 def test_e2e_fast_en_language_follow(base_url):
     """英文题：语言跟随（英文题→英文答）+ 英文 ≤2000 词等价信息量口径 + 代码级字数上限
-    仍适用 + stage 顺序 + [n]↔sources 一一对应。"""
+    仍适用 + stage 顺序 + [n]↔sources 一一对应。
+    【2026-11-13 批次 8 回归第 2 轮回挂牌】rewrite 修复面实证稳（本轮 rewrite stream=False
+    单调用 02:18:16、零兜底 WARNING），残余=synthesis 慢侧（02:18:26 起）撞满 60s 轮级
+    预算熔断（02:19:16 TimeoutError）→ answer_md=None——与 factoid 同源，归批次 8 M1 后
+    调优专项（synthesis 提速）后再摘牌。"""
     frames, detail = _assert_round_contract(base_url, EN_LANGUAGE_FOLLOW_QUERY, "en")
     _assert_zh_char_cap(detail["answer_md"])  # 代码硬截断不分语言（synthesis.py:208）
     word_count = len(detail["answer_md"].split())

@@ -12,6 +12,12 @@
   OQ-11 同源）重试 + 退避 jitter → 耗尽 → 降级原始 query 单发；每次重试尝试前查轮级
   剩余预算（deadline-aware，§6.2 P0——剩余 < 预计单调用成本即放弃重试）。
 
+兜底可见面（2026-11-13 B 裁决）：两兜底路径**不再置 FastState.degraded**——rewrite
+兜底不属 api.md §7.2 degraded_reason 枚举（timeout/budget/source_failure）任一语义，
+置位会被 TurnRunner 派生为 source_failure、把答案完整的正常轮误标「研究未完成」；
+降级观测面收敛在 stage done.extra={fallback} + state.errors[]（留痕不丢）+ 兜底路径
+AgentLog 埋点（失败原因可观测——批次 7 披露的零埋点缺口一并修）。
+
 纯函数边界：节点无 DB/EventBus；提示词经 AssetCenter 内存快照解析（未启动回落内置
 默认）；LLM 工厂（`build_light_model`）可注入可 mock——单测全 mock 零网络。
 memory_directive 为 M5 记忆通道：解析但**不写 state**（FastState 无该字段），仅经
@@ -38,6 +44,7 @@ from app.agent.guards import (
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
+from app.core.logger import AgentLog
 
 __all__ = [
     "MECHANISM_FALLBACK_QUERY_COUNT",
@@ -94,9 +101,18 @@ def build_light_model(mapping: Mapping[str, Any] | None = None) -> Any:
         #    契约值与 P50 ≤30s 预算；light 通道消费面 = S15 结构化输出（无需思维链），关思考后
         #    单调用 ~1.5s 且工具调用稳定。litellm_params 不透传 think（实测），故逐请求 extra_body
         #    注入；num_ctx=8192 在网关 light 条目（deploy/litellm/config.yaml）。
+        # ④ disable_streaming=True（2026-11-13 A 裁决根因修复，Langfuse GENERATION 实证）：
+        #    langgraph stream_mode=["messages",...] 向图内 runnable 注入 token handler，
+        #    langchain 据此强制本调用走流式 → litellm ollama provider 流式路由 /api/generate
+        #    （ndjson）→ tools 语义降级 → qwen3.5:4b 把工具调用写成文本 JSON（无 tool_calls）
+        #    → parser 返回 None → ValidationError → mechanism 兜底（性能抽样 41/41 全兜底、
+        #    +~2.8s/轮双重调用）。light 通道 = S15 结构化输出，零流式消费面；禁流式后注入不再
+        #    劫持，请求回落 /api/chat（tools 原生支持）。synthesis 流式走 chat-standard 实例
+        #    （resolve_chat_model），不受本参数影响；R14③ 本就只放行 synthesis token 事件。
         temperature=0,
         max_tokens=8192,
         extra_body={"think": False},
+        disable_streaming=True,
     )
 
 
@@ -223,14 +239,20 @@ async def _invoke_with_retry(
 def _fallback_update(
     query: str, *, query_type: str, count: int, reason: str
 ) -> dict[str, Any]:
-    """两路径共同形态：不终止、answerable 保守 false、degraded/errors 留痕（§4.1 横切字段）。"""
+    """两路径共同形态：不终止、answerable 保守 false、errors 留痕（§4.1 横切字段）。
+
+    **不置 FastState.degraded**（2026-11-13 B 裁决）：rewrite 兜底不属 api.md §7.2
+    degraded_reason 枚举（timeout/budget/source_failure）任一语义——置位会被
+    TurnRunner._finish_completed 一律派生为 source_failure（turn_service.py:856），
+    把答案完整的正常轮误标「研究未完成/源失败」；轮内降级可见面 = stage
+    done.extra={fallback} + errors[]（§6.2 stage detail 半句合规）。
+    """
     return {
         "rewritten_queries": [query] * count if query else [],
         "query_type": query_type,
         "answerable_from_knowledge": False,
         "time_range": None,
         "errors": [{"stage": "rewrite", "reason": reason}],
-        "degraded": True,
     }
 
 
@@ -282,6 +304,14 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             extra = {"memory_directive": parsed.memory_directive}
     except (OutputParserException, ValidationError) as exc:
         # 修复回喂 1 次（§6.2 P1）：校验错误文本回喂 LLM 修复 → 仍失败走机制兜底
+        AgentLog(
+            message=(
+                f"rewrite 结构化输出校验失败（进修复回喂）："
+                f"{type(exc).__name__}: {str(exc)[:800]}"
+            ),
+            graph="fast",
+            node="rewrite",
+        ).warning()
         repair_prompt = (
             f"{prompt_text}\n\n上一次输出未通过校验，错误信息：{exc}。"
             "请调用 RewriteOutput 工具重新提交结果，严格按 schema 填写每个字段；"
@@ -292,8 +322,18 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             repaired = _extract(
                 await _invoke(chain, repair_prompt, timeout_s=llm_timeout, config=config)
             )
-        except Exception:
+        except Exception as repair_exc:
             repaired = None
+            # 机制兜底前最后观测点：主调用+回喂双重失败形态（2026-11-13 A 裁决埋点
+            # ——41/41 兜底事故复发时此处直接给出失败原因，零埋点缺口收口）
+            AgentLog(
+                message=(
+                    f"rewrite 修复回喂仍失败（进机制兜底，双重 LLM 调用）："
+                    f"{type(repair_exc).__name__}: {str(repair_exc)[:200]}"
+                ),
+                graph="fast",
+                node="rewrite",
+            ).warning()
         if repaired is not None:
             update = {
                 "query_type": repaired.query_type,
@@ -315,8 +355,16 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
                 reason="structured_output_invalid",
             )
             extra = {"fallback": "mechanism"}
-    except Exception:
+    except Exception as exc:
         # LLM 调用重试耗尽（传输类经 RetryPolicy + deadline 门控）→ 降级原始 query 单发
+        AgentLog(
+            message=(
+                f"rewrite 传输失败重试耗尽（降级原始 query 单发）："
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            ),
+            graph="fast",
+            node="rewrite",
+        ).warning()
         update = _fallback_update(
             query,
             query_type=TRANSPORT_FALLBACK_QUERY_TYPE,

@@ -4,6 +4,7 @@
  * 跳 /thread/{thread_id}（turnStore.ask 已完成建轮+订阅两段式））。
  * 设计稿 01-home：侧栏（App 壳承担）+ 居中 logo/大标题 + 大搜索卡 + 推荐问题卡 + hero-foot。
  * M2 范围留位（本批不实现）：HomeSuggestions 输入推荐面板（SearchCard 已留插槽位）、换一批。
+ * 推荐问题文案走 i18n home.suggestItems（P2：散写中文文案迁移；四页文案全部 $t() 口径）。
  */
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -22,10 +23,11 @@ const query = ref('')
 const mode = ref<AskMode>('fast')
 const submitting = ref(false)
 
-const SUGGESTIONS: { text: string; icon: string; deep?: boolean }[] = [
-  { text: 'PostgreSQL 17 相比 16 在复制与查询性能上有何差异？', icon: 'i-search' },
-  { text: '用深度模式调研：2026 年主流 AI Agent 框架的架构取舍', icon: 'i-wave', deep: true },
-  { text: '根据知识库里的设计文档，总结我们检索融合的三种备选方案', icon: 'i-book' },
+/** 推荐问题 = i18n 键位 + 场景图标 + 提交模式（文案本体在 locales 词表，随语言切换） */
+const SUGGESTIONS: { key: 'pg17-vs-16' | 'agent-frameworks' | 'kb-fusion'; icon: string; deep?: boolean }[] = [
+  { key: 'pg17-vs-16', icon: 'i-search' },
+  { key: 'agent-frameworks', icon: 'i-wave', deep: true },
+  { key: 'kb-fusion', icon: 'i-book' },
 ]
 
 async function submit(q: string = query.value, m?: AskMode): Promise<void> {
@@ -66,14 +68,14 @@ async function submit(q: string = query.value, m?: AskMode): Promise<void> {
       </div>
       <button
         v-for="s in SUGGESTIONS"
-        :key="s.text"
+        :key="s.key"
         type="button"
         class="suggest-item"
         data-testid="home-suggest-item"
-        @click="submit(s.text, s.deep ? 'deep' : 'fast')"
+        @click="submit($t(`home.suggestItems.${s.key}`), s.deep ? 'deep' : 'fast')"
       >
         <UiIcon :name="s.icon" />
-        {{ s.text }}
+        {{ $t(`home.suggestItems.${s.key}`) }}
         <span class="go"><UiIcon name="i-chev-r" size="sm" /></span>
       </button>
     </div>

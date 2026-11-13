@@ -9,7 +9,12 @@
  */
 import { describe, expect, it } from 'vitest'
 
-import { renderAnswerMarkdown, renderPlainMarkdown } from '@/components/markdown/renderer'
+import {
+  isSameHeadingSet,
+  renderAnswerMarkdown,
+  renderPlainMarkdown,
+  SANITIZE_ALLOWED_TAGS,
+} from '@/components/markdown/renderer'
 
 describe('renderAnswerMarkdown（answer 通道）', () => {
   it('基础 markdown → 安全 HTML（标题/段落/列表/表格）', () => {
@@ -87,6 +92,41 @@ describe('renderAnswerMarkdown（answer 通道）', () => {
     const { html } = renderAnswerMarkdown('## 章节\n\n[跳转](#section)')
     expect(html).toContain('id=')
     expect(html).not.toContain('href="#')
+  })
+
+  it('外链统一 rel="noopener noreferrer"（DOMPurify afterSanitizeAttributes hook，模块级注册一次）', () => {
+    const { html } = renderAnswerMarkdown('[外链一](https://example.com/a) 与 [外链二](https://example.com/b)')
+    expect((html.match(/rel="noopener noreferrer"/g) ?? []).length).toBe(2)
+  })
+
+  it('thinking 通道同样补 rel（同净化底线共用 hook）', () => {
+    const { html } = renderPlainMarkdown('[链接](https://example.com)')
+    expect(html).toContain('rel="noopener noreferrer"')
+  })
+
+  it('ALLOWED_TAGS 显式收敛：文本级标签白名单（markdown 输出无 svg/mathml 需求，剥除）', () => {
+    expect(SANITIZE_ALLOWED_TAGS).toContain('a')
+    expect(SANITIZE_ALLOWED_TAGS).toContain('sup')
+    expect(SANITIZE_ALLOWED_TAGS).toContain('table')
+    expect(SANITIZE_ALLOWED_TAGS).toContain('img')
+    expect(SANITIZE_ALLOWED_TAGS).not.toContain('svg')
+    expect(SANITIZE_ALLOWED_TAGS).not.toContain('math')
+    expect(SANITIZE_ALLOWED_TAGS).not.toContain('script')
+    expect(SANITIZE_ALLOWED_TAGS).not.toContain('iframe')
+    expect(SANITIZE_ALLOWED_TAGS).not.toContain('form')
+    expect(SANITIZE_ALLOWED_TAGS).not.toContain('style')
+  })
+})
+
+describe('isSameHeadingSet（AnswerView outline 重建节流依据：仅标题集变化才重建）', () => {
+  it('同集（同 id 同 text）相等；顺序敏感；空集相等；任一差异不等', () => {
+    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [{ id: 'a', text: 'A' }])).toBe(true)
+    expect(isSameHeadingSet([], [])).toBe(true)
+    expect(isSameHeadingSet([{ id: 'a', text: 'A' }, { id: 'b', text: 'B' }], [{ id: 'a', text: 'A' }, { id: 'b', text: 'B' }])).toBe(true)
+    expect(isSameHeadingSet([{ id: 'a', text: 'A' }, { id: 'b', text: 'B' }], [{ id: 'b', text: 'B' }, { id: 'a', text: 'A' }])).toBe(false)
+    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [{ id: 'a', text: 'A2' }])).toBe(false)
+    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [{ id: 'a2', text: 'A' }])).toBe(false)
+    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [])).toBe(false)
   })
 })
 

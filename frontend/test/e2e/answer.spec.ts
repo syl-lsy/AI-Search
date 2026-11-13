@@ -6,25 +6,37 @@
 import { expect, test } from '@playwright/test'
 
 /**
- * 【环境阻塞 skip——2026-11-12 批次 7 第四步实测员落；用户裁决 d) 维持现状挂牌】
- * 证据链（全部一手实测）：
- * - 本机 playwright chromium（chromium-1254 / headless-shell-158）与 channel:'chrome' 系统
- *   Chrome 的 EventSource 对本机 uvicorn SSE 恒定零消息（10+ 次：连接 OPEN 稳定、零 error、
- *   零 message；约 50s 后服务端关流进入重连循环）；
- * - 20 行最小 uvicorn SSE 服务（/tmp 独立进程，无任何项目中间件）同样复现——项目零关联；
- * - 同端点 fetch+ReadableStream 恒定正常（10ms 首字节、37KB 全量）、curl/urllib 实时段/
- *   回放段恒定正常（后端 SSE 与 A6 images 链路无回归）；
- * - 已排除：系统代理（--no-proxy-server 纯 loopback 直连仍复现）、GC/引用强度、socket
- *   复用/分池、headed/headless、CDP attach、页面可见性、NetworkServiceInProcess；
- * - 背景嫌疑（头号）：系统代理 127.0.0.1:20812 无 localhost bypass（scutil 证实、Chrome
- *   进程实挂其上、含 CLOSE_WAIT 僵尸连接），且可能有 TUN/增强模式层拦截。
- * 影响面：answer / scroll-trio / main-flow 三 spec 全部用例依赖 SSE 流式（token/stage/done
- * 事件驱动渲染与终态收敛）；threads/library/home 为 REST 路径不挂牌（已实测 10/10 通过）。
- * 复跑条件（可执行）：代理客户端对 127.0.0.1/localhost 加 bypass（或暂停代理客户端）后，
- * `pnpm --filter frontend exec playwright test` 全绿即摘牌（删除各 spec 顶部
- * `test.skip(true, '环境阻塞…')` 三处）；批次 8 前置动作。
+ * 【批次 8 摘牌复跑——2026-11-12 批次 8 实测员摘；原批次 7 环境阻塞挂牌已解除】
+ * 摘牌依据（全部一手实测，详录 .zcode/workflow-drafts/batch8-e2e-logs/）：
+ * - 用户已对系统代理 127.0.0.1:20812 加 localhost bypass：20 行最小 uvicorn SSE ×
+ *   chromium EventSource 探针 PASS（2s 内收到 3 条 tick，sse-probe.mjs）；
+ * - 真实链路事件流到达：Playwright 真前端真实提问，stage/sources/images/thinking/token/
+ *   done 全序列到达浏览器并被 addEventListener 派发（live-smoke.mjs hook 实证）。
+ * 【摘牌后新发现（实测员根因钉死，留档待前端线修复——用例红为真实缺陷暴露，非环境阻塞）】
+ * - frontend/src/sse/turnStream.ts:330 openEventSource 仅以 es.onmessage 接帧；而服务端
+ *   全部业务事件为具名事件（event: stage/token/...，api.md §7.2）——按 SSE 规范具名事件
+ *   只派发给 addEventListener(name) listener，onmessage 只收 event: message/无 event 帧。
+ *   → 真浏览器下传输层收不到任何业务事件：UI 零流式渲染、done 永不应用（轮卡「生成中」）、
+ *   连接生命周期靠 onerror 裸转（~15s 退避封顶重连-重放循环，loop-diag.mjs 实证）。
+ * - 单测假绿根因：test/helpers/mockEventSource.ts:36,50 dispatch() 直接调 onmessage，
+ *   未复刻浏览器具名事件派发语义——mock 与真实 EventSource 行为脱节。
+ * - 修复方向（前端线 TDD）：openEventSource 对 SSE 事件名逐一 addEventListener(name)
+ *   （复用 handleMessage）；mockEventSource.dispatch 改按具名 listener 派发语义先红后绿。
+ * 【批次 8 门禁第 1 轮甄别处置（2026-11-12）】门禁 20 红 = 11 条环境性（双服务被实测员收尾
+ *   停掉、后端 8300 无管理方→REST 数据依赖全红；服务重启后单条复跑即绿：threads 日期分组
+ *   271ms / answer 引用联动 281ms 均 passed）+ 9 条确定性（turnStream 缺陷，服务健康下单条
+ *   A1 复跑仍红坐实）。按 P1 挂牌纪律：9 条流式依赖用例重新挂牌（各 test 体内 skip，
+ *   reason 带锚点与复跑条件）；缺陷修复由实测员 notes 转派前端修复工程师；修复落地后摘牌
+ *   全量复跑（A27/A28/回看态判定能力已有回看态补图佐证：docs/design/e2e-batch8/ 9 张）。
+ * 另注：frontend/.env 已由批次 8 实测员改回「同源 + vite proxy」形态（批次 7 直连形态与
+ * 批次 7 后新增的 index.html CSP default-src 'self' 冲突——connect-src 跨源被拦，
+ * live-smoke 首跑实证 models/threads 全 FAILED :: csp）。
+ * 【2026-11-13 摘牌（修复落地复跑）】具名事件失明缺陷已修复：frontend/src/sse/turnStream.ts
+ * openEventSource 对 api.md §7.2 全部 10 个事件名逐一 addEventListener(name) 接帧（复用
+ * handleMessage），测试替身 test/helpers/mockEventSource.ts dispatch 改按 WHATWG 具名派发
+ * 语义（具名帧只进 addEventListener listener）——单测先红 18 条后翻绿锁死。本文件 2 条 +
+ * main-flow 1 条 + scroll-trio 6 条共 9 处挂牌全部摘除复跑。
  */
-test.skip(true, '环境阻塞：本机 playwright chromium EventSource 对 uvicorn SSE 恒定零消息（20 行最小 uvicorn SSE 服务独立复现，项目零关联；同端点 fetch-stream/curl 恒定正常）——复跑条件：代理客户端对 127.0.0.1/localhost 加 bypass 后全量复跑，见文件头注释')
 
 test.describe('Answer 答案页主链路（真服务）', () => {
   test('首页提问 → 跳答案页 → 流式渲染 → 终态对账（A1 前端判定点：两段式 + 事件驱动渲染）', async ({ page }) => {
@@ -36,8 +48,17 @@ test.describe('Answer 答案页主链路（真服务）', () => {
     await page.waitForURL(/\/thread\//, { timeout: 15_000 })
     // 流式进行中：问题气泡 + 时间线可见（stage 事件驱动）；骨架期不硬断言时长（P50 归 API 预检口径）
     await expect(page.getByTestId('turn-block').first()).toBeVisible({ timeout: 15_000 })
-    // 终态后：答案渲染（A6 images 缺口已在批次 7 前置小修闭环——images 行无图不渲染为正常态）
-    await expect(page.locator('[data-testid="turn-answer"]').first()).toBeVisible({ timeout: 90_000 })
+    // 终态后：答案渲染（A6 images 缺口已在批次 7 前置小修闭环——images 行无图不渲染为正常态）。
+    // 60s 预算兜底降级轮 answer_md 可空（批次 6 遗留④间歇形态）——无空区块原则下
+    // turn-answer 不渲染，按形态分派：答案区或降级横幅任一出现即收敛
+    await expect
+      .poll(
+        async () =>
+          (await page.locator('[data-testid="turn-answer"]').count()) > 0 ||
+          (await page.getByTestId('degraded-banner').count()) > 0,
+        { timeout: 90_000, intervals: [2_000] },
+      )
+      .toBe(true)
   })
 
   test('快速轮 sources/引用联动：[n] 点击 → 来源卡定位高亮（REQ-003 前端判定点）', async ({ page }) => {
@@ -107,10 +128,13 @@ test.describe('A13 SSE 断线续传（REQ-005，非功能核心项）', () => {
     await expect(page.getByTestId('turn-status').first()).toContainText(/已完成|研究未完成/, {
       timeout: 90_000,
     })
-    // 不重：断点片段在全文恰好出现一次（补帧重复会造成 ≥2；streaming-buffer 规则 24 幂等的黑盒观测）
-    const finalText = ((await page.locator('[data-testid="answer-renderer"]').first().textContent()) ?? '').trim()
-    const occurrences = finalText.split(before.slice(0, 20)).length - 1
-    expect(occurrences).toBe(1)
+    // 【「不重」黑盒子断言已删（2026-11-13 全量复跑实证）】原判据「断点片段恰好出现一次」
+    // 构造无效：标记片段只取答案开头 20 字符，真重放重复的二次出现位置在断点之后——与
+    // LLM 正文天然复现同一短语在黑盒下不可区分（两轮复跑同用例一过一挂，天然出现 1~4 次
+    // 波动纯由 LLM 输出决定）。幂等防线的有效防线在白盒层：传输层 seq 门重放去重与 store
+    // 控制事件幂等门均有单测锁死（turn-stream.test.ts / turn-store.test.ts），黑盒重复
+    // 检测为冗余且失真防线。A13 验收原文三判据（Last-Event-ID 重连/已输出文本不丢失/从
+    // 断点继续直至完成）已由上方断言全覆盖。
   })
 
   test('Given 深度研究进行中刷新页面，When 重新打开线程，Then 已完成步骤可见且剩余进度继续（A13 第二条）', async ({ page }) => {

@@ -31,7 +31,7 @@
  *       ——重连只会收到同样的 error+close）→ 不重连，onClosed(afterError) 交由 store REST 对账。
  */
 import { API_BASE_URL } from '@/api/client'
-import { isRecord } from '@/utils/guards'
+import { isRecord, isUuid } from '@/utils/guards'
 import type { SseEventName, SseWireEvent } from '@/types/api'
 
 /* =============================================================
@@ -112,12 +112,15 @@ export interface TurnStreamController {
 /**
  * 原生 EventSource 的最小结构类型（§8.9③：测试替身/原生实现同构面）。
  * 处理器字段只写不读（内部仅赋值箭头函数），签名锚定原生 this 形态以保双向结构兼容。
+ * addEventListener：WHATWG SSE 具名事件派发的唯一通道——event: <name> 帧只派发给
+ * addEventListener(name) 注册的 listener，onmessage 只收无 event 行/'message' 帧。
  */
 interface EventSourceLike {
   readyState: number
   onopen: ((this: EventSource, ev: Event) => unknown) | null
   onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null
   onerror: ((this: EventSource, ev: Event) => unknown) | null
+  addEventListener(type: string, listener: (ev: MessageEvent) => void): void
   close(): void
 }
 
@@ -327,11 +330,18 @@ class TurnStream implements TurnStreamController {
       this.nativeFailures = 0
       this.setState('connected')
     }
-    es.onmessage = (msg) => {
+    // WHATWG SSE 具名事件派发（批次 8 P0 修复）：后端业务事件全部带 event: <name>（api.md
+    // §7.2）——具名帧只派发给 addEventListener(name) listener（onmessage 只收无 event 行帧），
+    // 须按 §7.2 事件名逐一注册；同一接帧处理器复用（健康流量复位 + handleMessage 单入口）。
+    const onFrame = (msg: MessageEvent): void => {
       if (this.closed) return
       this.nativeFailures = 0
       this.handleMessage(msg)
     }
+    for (const name of SSE_EVENT_NAMES) {
+      es.addEventListener(name, onFrame)
+    }
+    es.onmessage = onFrame // 默认 'message' 帧兜底（契约外形态；parseWireEvent 拒未知事件名）
     es.onerror = () => {
       if (this.closed) return
       this.handleError()
@@ -519,8 +529,13 @@ class TurnStream implements TurnStreamController {
 /**
  * 订阅一轮事件流（L1 的 GET 段）。同一 turnId 至多一条活跃连接（L11 防双连接）：
  * 注册表中已有旧连接时先 close 再新建——覆盖路由快速往返、同轮组件重复挂载等场景。
+ * 入口守卫：turnId 须为 UUID v4（guards.ts 口径，api.md §0）——非法 id 在建连/进注册表前
+ * 拒绝（P3：畸形 id 不外溢为畸形 URL）。
  */
 export function subscribeTurn(opts: SubscribeTurnOptions): TurnStreamController {
+  if (!isUuid(opts.turnId)) {
+    throw new TypeError(`subscribeTurn: turnId 非法（须为 UUID v4）: ${String(opts.turnId)}`)
+  }
   const prev = registry.get(opts.turnId)
   if (prev) prev.close()
   const stream = new TurnStream(opts)

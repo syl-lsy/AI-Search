@@ -505,4 +505,46 @@ describe('连接注册表（生命周期 11 防双连接：同一 turnId 至多�
     expect(peekTurnStream(TURN_ID)).toBeUndefined()
     expect(() => closeTurnStream('00000000-0000-4000-8000-000000000000')).not.toThrow()
   })
+
+  it('非法 turnId（非 UUID v4）→ 入口守卫拒绝订阅：抛错且不建连、不进注册表（P3：guards.ts 口径）', () => {
+    const factory = mockEventSourceFactory()
+    expect(() =>
+      subscribeTurn({
+        turnId: 'not-a-uuid',
+        callbacks: { onEvent: vi.fn(), onStateChange: vi.fn(), onClosed: vi.fn() },
+        eventSourceFactory: factory,
+      }),
+    ).toThrow()
+    expect(MockEventSource.instances).toHaveLength(0)
+    expect(peekTurnStream('not-a-uuid')).toBeUndefined()
+  })
+})
+
+describe('具名事件派发（WHATWG SSE 语义；批次 8 P0「具名事件失明」修复锁死）', () => {
+  it('openEventSource 对 api.md §7.2 全部 10 个事件名逐一 addEventListener 注册', () => {
+    const { es } = setup()
+    const NAMED_EVENTS = [
+      'stage', 'token', 'thinking', 'sources', 'images',
+      'context_compact', 'memory', 'done', 'followups', 'error',
+    ]
+    for (const name of NAMED_EVENTS) {
+      expect(es.hasListener(name)).toBe(true)
+    }
+  })
+
+  it('具名帧只进 addEventListener listener（onmessage 零命中）；无 event 行的 message 帧进 onmessage 且被 parseWireEvent 拒', () => {
+    const { es, onEvent } = setup()
+    es.open()
+    const onMessageTypes: string[] = []
+    es.onmessage = (ev) => onMessageTypes.push(ev.type)
+    // 具名 stage 帧：经 addEventListener 通道 → onEvent 立即交付（控制事件不过缓冲）；onmessage 不命中
+    es.dispatch(frame(1, 'stage', { stage_key: 'rewrite', status: 'running' }))
+    expect(onEvent).toHaveBeenCalledTimes(1)
+    expect(onEvent.mock.calls[0]![0].event).toBe('stage')
+    expect(onMessageTypes).toHaveLength(0)
+    // 默认 message 帧（契约外形态）：进 onmessage；parseWireEvent 拒未知事件名 → onEvent 不交付
+    es.dispatch(frame(2, 'message', { stage_key: 'x', status: 'running' }))
+    expect(onMessageTypes).toEqual(['message'])
+    expect(onEvent).toHaveBeenCalledTimes(1)
+  })
 })
