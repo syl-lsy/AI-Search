@@ -102,8 +102,15 @@ async def test_rewrite_real_llm_structure_via_fast_graph() -> None:
     # stage 信号：done 帧（running 已由 TurnRunner 图前发布——§4.3，不在子图事件流）
     assert [(s["stage_key"], s["status"]) for s in stage_signals] == [("rewrite", "done")]
     # FastState 产出结构（断言结构不断言文案）
-    rewrite_keys = {"query_type", "answerable_from_knowledge", "time_range", "rewritten_queries"}
+    rewrite_keys = {
+        "query_type",
+        "answerable_from_knowledge",
+        "search_strategy",
+        "time_range",
+        "rewritten_queries",
+    }
     assert rewrite_keys <= set(final)
+    assert final["search_strategy"] in {"direct", "verify", "web"}  # v1.20 三值枚举
     assert set(final) <= set(FastState.__annotations__)  # 无未声明字段
     queries = final["rewritten_queries"]
     assert isinstance(queries, list) and queries

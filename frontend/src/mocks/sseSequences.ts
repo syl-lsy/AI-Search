@@ -1,12 +1,12 @@
 /**
- * src/mocks/sseSequences.ts — §7.4 两种典型事件序列静态 fixture（api.md §7 线格镜像；
+ * src/mocks/sseSequences.ts — §7.4 典型事件序列静态 fixture（api.md §7 线格镜像；
  * §9 fixture 优先——后端就绪前 SSE 管线对 fixture 开发）。
  *
  * 形态 = SseWireEvent（id=seq、event=类型名、data=§7.2 payload）。
  * 注意（§7.1）：心跳 `: ping` 为注释行，不占 seq，不出现在本 fixture。
  */
 import type { SseWireEvent } from '@/types/api'
-import { THREAD_ID_FAST, TURN_ID_DEEP, TURN_ID_FAST } from './turnDetails'
+import { THREAD_ID_FAST, TURN_ID_DEEP, TURN_ID_DIRECT, TURN_ID_FAST } from './turnDetails'
 
 /**
  * 快速模式序列（api.md §7.4）：
@@ -57,5 +57,38 @@ export const deepSequence: SseWireEvent[] = [
   { id: 21, event: 'done', data: { seq: 21, turn_id: TURN_ID_DEEP, ts: '2026-11-01T08:14:32Z', finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 152300, source_count: 3, usage: { total_tokens: 89530, cost_usd: 0.0812 } } },
 ]
 
-/** 序列归属线程（fixture 自描述：THREAD_ID_FAST 也承载 deep 轮的 thread_id） */
+/**
+ * 快速 direct 形态序列（§9 v1.15 fixture①，api.md §7.4 v1.14 direct 形态）：
+ * 免检索直答轮（rewrite 输出 search_strategy=direct——闲聊/寒暄/能力询问/创作/翻译/纯计算），
+ * stage(rewrite,running) → stage(rewrite,done) → stage(write,running) → token…token
+ * → stage(write,done) → done(completed, source_count=0)——**无 stage(search)/sources/images 事件**。
+ * 时间线仅 rewrite/write 两节点（frontend-api.md §3 stage 行 v1.15 注：按 stage_key 驱动，
+ * 缺 key 即缺节点）；§3 sources 行 v1.15 注：无 sources 事件且 2.5 sources=[] → 不渲染来源面板
+ * 与「收集中」徽标（无空态、无「来源 0」占位）。
+ * seq 2 事件 extra={"strategy":"direct"} 为留痕字段（api.md §7.4 v1.14；前端不消费不展示，
+ * §3 v1.15 注）——StageExtra 镜像已同步该键（2026-11-14 调度方裁决 A 方案，镜像增量一行）。
+ */
+export const directSequence: SseWireEvent[] = [
+  { id: 1, event: 'stage', data: { seq: 1, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' } },
+  { id: 2, event: 'stage', data: { seq: 2, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:00Z', stage_key: 'rewrite', status: 'done', extra: { strategy: 'direct' } } },
+  { id: 3, event: 'stage', data: { seq: 3, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:00Z', stage_key: 'write', status: 'running', label: '综合中' } },
+  { id: 4, event: 'token', data: { seq: 4, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:01Z', delta: '你好！我是 AI 搜索助手，' } },
+  { id: 5, event: 'token', data: { seq: 5, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:01Z', delta: '可以帮你检索网页、深度调研与管理个人知识库。' } },
+  { id: 6, event: 'stage', data: { seq: 6, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:02Z', stage_key: 'write', status: 'done' } },
+  { id: 7, event: 'done', data: { seq: 7, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:02Z', finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 2400, source_count: 0, usage: { total_tokens: 1204, cost_usd: 0.0012 } } },
+]
+
+/**
+ * followups 追加于 direct 轮（§9 v1.15 fixture③——实验开关开启时 done 后经保活窗口下发，
+ * api.md §7.4 v1.14 注「direct 轮同样适用」+ §7.2 v1.14 注轮型不排除 direct）。
+ * 独立导出为「追加样例」：与 directSequence 尾部 done 拼接即完整 ③ 形态
+ * （`… → done(completed, source_count=0) → followups`，L13 收口①：交付后 close）。
+ */
+export const directFollowupsEvent: SseWireEvent = {
+  id: 8,
+  event: 'followups',
+  data: { seq: 8, turn_id: TURN_ID_DIRECT, ts: '2026-11-01T08:15:06Z', items: ['帮我写一首关于秋天的诗', '你能联网搜索吗？', '把上面的介绍翻译成英文'] },
+}
+
+/** 序列归属线程（fixture 自描述：THREAD_ID_FAST 也承载 deep/direct 轮的 thread_id） */
 export const SSE_SEQUENCE_THREAD_ID = THREAD_ID_FAST

@@ -22,3 +22,5 @@
 - 依赖用户个人上下文（个人记忆/私有资料）。
 true 判例：「什么是 REST API」→ true；「FastAPI 怎么定义一个路由」→ true（成熟文档知识）。
 false 判例：「LangGraph 最新版有什么新特性」→ false（时效敏感）；「qwen3.5-4b 的上下文窗口多大」→ false（小众精确数值）。
+
+【检索策略判定标准（产出 search_strategy；在类型判定之后进行）】①命中「零事实面」清单任一项、且问题不含任何需外部取证的事实断言 → direct（同时 answerable_from_knowledge=false）：寒暄/社交与助手元问题（问好、道谢、告别、「你是谁」「你能做什么」）；显式创作/改写/润色请求（写诗/文案/邮件/故事/代码/续写/润色）；翻译请求；纯计算/单位换算（数据全部在问题内）；解释或分析题目自带的代码/文本材料；对既有对话的纯致谢/确认。判例：「你好，能做什么？」→ direct（query_type=other）；「帮我写一首关于秋天的诗」→ direct（other）；「把这句话翻译成英文：……」→ direct（other）。②未命中 direct 且参数可答判定为 true（通用稳定知识 + 四排除项全不命中）→ verify（同时 answerable_from_knowledge=true）。判例：「什么是 REST API」→ verify；「FastAPI 怎么定义一个路由」→ verify。③其余一切（含拿不准、时效敏感、小众细节、需多源佐证、依赖个人上下文）→ web（answerable_from_knowledge=false）。纪律：direct 从严——问题含任何外部事实断言需求（人物/事件/数据/版本/价格/最新状态/客观结论）一律不判 direct；拿不准一律 web；verify ⇔ answerable_from_knowledge=true、direct/web 时 answerable_from_knowledge=false（两字段必须一致）。本节仅 fast.rewrite 消费，deep.planner 不产出不消费 search_strategy。

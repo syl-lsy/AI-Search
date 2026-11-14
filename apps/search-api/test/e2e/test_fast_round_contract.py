@@ -46,8 +46,10 @@ import httpx
 
 from test.integration.test_sse import _assert_sse_envelope, _assert_stream_headers
 
-#: api.md §7.4:714 fast 主干 stage_key 出现序（images 可选不计入）
+#: api.md §7.4 fast 常规形态 stage_key 出现序（images 可选不计入）
 FAST_TRUNK = ("rewrite", "search", "write")
+#: api.md §7.4 v1.14 fast **direct 形态** stage_key 出现序（免检索直答轮：无 search 段）
+FAST_TRUNK_DIRECT = ("rewrite", "write")
 #: 语言判定 CJK 占比阈值（镜像 turn_service.CJK_RATIO_THRESHOLD = 0.30，OQ-2 同口径）
 CJK_RATIO_THRESHOLD = 0.30
 #: 单轮 SSE 收流上限（真链路实测 39~49s，P50 预算矛盾为批次 5 已知遗留）
@@ -155,10 +157,29 @@ def _detect_answer_lang(text: str) -> str:
     return "zh" if cjk / len(chars) >= CJK_RATIO_THRESHOLD else "en"
 
 
+def _rewrite_strategy(frames: list[dict]) -> str | None:
+    """从 stage(rewrite,done).extra 读本轮策略（api.md §7.4 v1.14 direct 形态留痕）。"""
+    for frame in frames:
+        if (
+            frame["event"] == "stage"
+            and frame["data"].get("stage_key") == "rewrite"
+            and frame["data"].get("status") == "done"
+        ):
+            extra = frame["data"].get("extra") or {}
+            strategy = extra.get("strategy")
+            return strategy if isinstance(strategy, str) else None
+    return None
+
+
 def _assert_fast_trunk_order(frames: list[dict]) -> None:
-    """§7.4:714 fast 主干：首业务帧 stage(rewrite,running)；distinct stage_key 首现序
-    == [rewrite, search, write]；sources 全部落在 write(running) 之前；token 流在
-    write(running) 之后；末帧 done（finish 由调用方断言）。"""
+    """§7.4 fast 主干两形态判读（v1.14）：
+
+    - 常规形态（verify/web 轮）：distinct stage_key 首现序 == [rewrite, search, write]，
+      sources 全部落在 write(running) 之前、token 流在 write(running) 之后；
+    - direct 形态（`stage(rewrite,done).extra.strategy == "direct"`）：首现序 ==
+      [rewrite, write]，**无 stage(search) 与 sources/images 事件**；
+    两形态共用：首业务帧 stage(rewrite,running)、末帧 done（finish 由调用方断言）。
+    """
     assert frames, "事件流为空"
     stage_frames = [f for f in frames if f["event"] == "stage"]
     assert stage_frames, "无 stage 事件"
@@ -173,6 +194,26 @@ def _assert_fast_trunk_order(frames: list[dict]) -> None:
         key = frame["data"]["stage_key"]
         if key not in order:
             order.append(key)
+
+    strategy = _rewrite_strategy(frames)
+    if strategy == "direct":
+        assert order == list(FAST_TRUNK_DIRECT), (
+            f"direct 形态 stage 序列违规：{order}，期望 {list(FAST_TRUNK_DIRECT)}"
+        )
+        assert not [f for f in frames if f["event"] in ("sources", "images")], (
+            "direct 轮不得发 sources/images 事件（api.md §7.2 v1.14 抑制句）"
+        )
+        assert frames[-1]["event"] == "done", "末帧应为 done"
+        return
+
+    # 常规形态分支（B9 测试审计 #6）：strategy 合法域仅 {verify, web}——None（done 帧
+    # 缺 extra/strategy 留痕）或枚举外值属判定面回归，此处先显式失败；否则「direct
+    # miss」会顺流到下面的 stage 主干序断言，报出误导性的顺序违规信息。
+    assert strategy in {"verify", "web"}, (
+        f"stage(rewrite,done).extra.strategy 应为 verify|web|direct，实测 {strategy!r}"
+        "——direct miss 时优先查 rewrite 策略段与 light 模型判定"
+    )
+
     assert order == list(FAST_TRUNK), f"stage 主干顺序违规：{order}，期望 {list(FAST_TRUNK)}"
 
     write_running_seq = next(
@@ -322,4 +363,73 @@ def test_e2e_fast_en_language_follow(base_url):
     word_count = len(detail["answer_md"].split())
     assert word_count <= EN_ANSWER_WORD_CAP, (
         f"英文答案超等价信息量口径：{word_count} > {EN_ANSWER_WORD_CAP} 词"
+    )
+
+
+# ---- direct 形态契约用例（v1.14 / B9——零检索直答轮） ----
+
+#: 中文闲聊/能力询问题（nacos-config.md §1 v1.20 direct 判例原文）
+ZH_DIRECT_QUERY = "你好，能做什么？"
+
+
+def test_e2e_fast_direct_round_contract(base_url):
+    """direct 形态端到端：零 stage(search)/sources/images + source_count=0 + 秒级完成。
+
+    **严格断言，无 skip 门**（依据 v1.20 校验面）：e2e 服务捞到的 prompts 必经
+    `validator.py` §3 v1.20 条 1（`fast.rewrite` 输出 schema 须含 search_strategy），
+    旧 schema（v1.18）会被整版拒收并回落 L4 内置默认（= 本批同步的 v1.20 正文）——
+    即**无论现网 Nacos 是否已发布 v1.20，本用例运行时必然是 v1.20 判定文本**。
+    故该判例题（契约判例原文「你好，能做什么？」）必须判 direct：若实测非 direct，
+    说明提示词判定面回归/漂移（模型或 type_rules 策略段退化），用例红——不回退为
+    skip，避免「模型没判 direct」被环境理由掩盖（B9⑨ 探针 26 条实测该题 direct 稳定）。
+    """
+    turn_id = _create_turn(base_url, ZH_DIRECT_QUERY)
+    frames, _heartbeats = _collect_stream(base_url, turn_id)
+    detail = _get_detail(base_url, turn_id)
+
+    strategy = _rewrite_strategy(frames)
+    assert strategy == "direct", (
+        f"该判例题应判 direct（nacos §1 v1.20 判例），实测 strategy={strategy}——"
+        "检查 rewrite 提示词策略段与 light 模型判定"
+    )
+
+    for frame in frames:
+        _assert_sse_envelope(frame, turn_id)
+
+    done = frames[-1]
+    assert done["event"] == "done"
+    assert done["data"]["finish"] == "completed"
+    assert done["data"]["source_count"] == 0, "direct 轮 source_count 恒 0（零检索）"
+    assert done["data"]["degraded"] is False, "direct 轮不触搜索链 → 500201 天然不可达"
+    assert done["data"]["duration_ms"] == detail["duration_ms"]
+
+    _assert_fast_trunk_order(frames)  # 两形态判读：此处必命中 direct 形态
+    assert not [f for f in frames if f["event"] in ("sources", "images")]
+
+    assert detail["status"] == "completed"
+    assert detail["sources"] == [], "§2.5 direct 轮 sources 恒空数组"
+    assert detail["images"] == []
+    # §2.5 REST 侧 direct 专项（B9 测试审计 #7）：stages[] 是轮型判定的持久化事实源
+    # （SSE 是实时面、detail 是终态面，两侧同源核对）——direct 轮只应有 rewrite/write
+    # 两段（无 search/read/reflect 段），且 rewrite 段 extra 保留 strategy 留痕。
+    assert {s["stage_key"] for s in detail["stages"]} == {"rewrite", "write"}, (
+        "§2.5 direct 轮 stages 段集合应恰为 {rewrite, write}："
+        f"{[s['stage_key'] for s in detail['stages']]}"
+    )
+    rewrite_done = next(
+        s for s in detail["stages"]
+        if s["stage_key"] == "rewrite" and s["status"] == "done"
+    )
+    assert rewrite_done["extra"]["strategy"] == "direct", (
+        "§2.5 stages[] 应透传 rewrite done 的 extra.strategy=direct，"
+        f"实测 {rewrite_done.get('extra')!r}"
+    )
+    answer_md = detail["answer_md"]
+    assert answer_md, "answer_md 为空"
+    assert not _CITATION_RE.findall(answer_md), "零来源轮不得残留 [n] 引用标记"
+    # 价值证明观测项（**非契约条款**）：direct 轮免检索应远快于常规轮——上限取轮级
+    # 预算量级（spec fast.turn_timeout_s=60s，P50 ≤30s 为常规轮口径），此处只防
+    # 「direct 误走检索管道」的量级回归，不作为性能门禁。
+    assert detail["duration_ms"] < 60_000, (
+        f"direct 轮应远快于常规轮预算（<60s 观测上限），实测 {detail['duration_ms']}ms"
     )

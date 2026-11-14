@@ -20,7 +20,6 @@ from typing import Any
 import pytest
 
 from app.config_center.cache import AssetSnapshot
-from app.core.config import SseSettings
 from app.db.models import Source, TurnEvent
 from app.exception import (
     BadRequestException,
@@ -31,7 +30,7 @@ from app.exception import (
 from app.agent.nodes.synthesis import SynthesisError
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry
 from app.services import turn_service
-from app.services.event_bus import EventBus, SseEvent
+from app.services.event_bus import EventBus
 from app.services.turn_service import (
     HISTORY_WINDOW_TURNS,
     QUEUE_DEPTH_LIMIT,
@@ -43,147 +42,19 @@ from app.services.turn_service import (
     resolve_chat_model,
 )
 
-
-def _bus() -> EventBus:
-    """真 EventBus（内存实现零网络）：seq 盖章/缓冲/订阅/清扫走生产行为。"""
-    return EventBus(settings=SseSettings(event_ttl_minutes=30, buffer_max_events=20000))
-
-
-# ---- 假体（零网络；语句对象由被测实现构造后传入，假体只按调用形态返回预设行集）----
-
-
-class _FakeResult:
-    """scalars/execute 结果假体：scalars() 链式返回行集。"""
-
-    def __init__(self, rows: list[Any]) -> None:
-        self._rows = rows
-
-    def scalars(self) -> "_FakeResult":
-        return self
-
-    def all(self) -> list[Any]:
-        return list(self._rows)
-
-    def first(self) -> Any:
-        return self._rows[0] if self._rows else None
-
-
-class _FakeSession:
-    """最小 AsyncSession 假体：get/scalars/execute/add/commit 全记录。"""
-
-    def __init__(self, *, turn: Any = None, rows: list[Any] | None = None,
-                 execute_rows: list[Any] | None = None) -> None:
-        self.turn = turn
-        self.rows = rows or []
-        self.execute_rows = execute_rows or []
-        self.added: list[Any] = []
-        self.commits = 0
-        self.executed: list[Any] = []  # execute 收到的语句（FOR UPDATE 守卫断言用）
-
-    async def get(self, model: Any, key: Any, *, with_for_update: bool = False) -> Any:
-        return self.turn
-
-    async def scalars(self, statement: Any) -> _FakeResult:
-        return _FakeResult(self.rows)
-
-    async def execute(self, statement: Any) -> _FakeResult:
-        self.executed.append(statement)
-        return _FakeResult(self.execute_rows)
-
-    def add(self, obj: Any) -> None:
-        self.added.append(obj)
-
-    async def commit(self) -> None:
-        self.commits += 1
-
-    async def __aenter__(self) -> "_FakeSession":
-        return self
-
-    async def __aexit__(self, *args: object) -> bool:
-        return False
-
-
-class _FakeSessionFactory:
-    """短事务假工厂：每次 async with 返回同一假会话（跨事务累积写入记录）。"""
-
-    def __init__(self, session: _FakeSession) -> None:
-        self._session = session
-
-    def __call__(self) -> _FakeSession:
-        return self._session
-
-
-class _TurnRow:
-    """最小 turns 行假体：暴露 TurnRunner 读写触碰的字段。"""
-
-    def __init__(self, *, status: str = "running", mode: str = "fast",
-                 thread_id: str = "0b1f3a2e-0000-4000-8000-000000000001",
-                 user_id: str = "00000000-0000-4000-8000-000000000001",
-                 query: str = "桩问题", chat_model_key: str = "qwen") -> None:
-        self.id = uuid.uuid4()
-        self.thread_id = thread_id
-        self.user_id = user_id
-        self.status = status
-        self.mode = mode
-        self.query = query
-        self.chat_model_key = chat_model_key
-        self.query_lang: str | None = None  # TurnRunner 运行时写入（§2.5 事实源）
-        self.rewritten_queries: list[Any] = []
-        self.created_at = datetime.now(UTC)
-        self.started_at: datetime | None = None
-        self.finished_at: datetime | None = None
-        self.duration_ms: int | None = None
-        self.answer_md: str | None = None
-        self.error: dict[str, Any] | None = None
-        self.cancel_reason: str | None = None
-        self.timing: dict[str, Any] = {}
-        self.usage: dict[str, Any] = {}
-
-
-class _FakeGraph:
-    """假主图：astream 按脚本产出 (namespace, stream_mode, chunk) 三元组；步间可插 delay。
-
-    记录每次收到的初始 state payload（B3 第 0 步注入断言用）。
-    VR-2 关闭追踪：生成器帧终结（aclose 注入 GeneratorExit / 耗尽 / 异常穿透）时
-    置 closed=True；streams 持生成器引用阻断 GC 终结器——closed 断言与 GC 时机无关
-    （现状无显式 aclose 时 closed 恒 False，即取消收口护栏的红点）。
-    """
-
-    def __init__(self, steps: list[tuple[str, Any]], *, delay: float = 0.0) -> None:
-        self._steps = steps
-        self._delay = delay
-        self.payloads: list[Any] = []
-        self.configs: list[Any] = []
-        self.closed = False
-        self.streams: list[Any] = []
-
-    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
-                subgraphs: bool = False) -> Any:
-        self.payloads.append(payload)
-        self.configs.append(config)
-        steps = self._steps
-        delay = self._delay
-
-        async def gen():
-            try:
-                for stream, chunk in steps:
-                    if delay:
-                        await asyncio.sleep(delay)
-                    # updates 一律产顶层 ns（=()）——TurnRunner 仅吸收顶层 updates 最终 state；
-                    # messages 帧 namespace 带 synthesis 节点段（R14③ 过滤判定面，§6.1）
-                    if stream == "updates":
-                        namespace = ()
-                    elif stream == "messages":
-                        namespace = ("fast:run", "synthesis")
-                    else:
-                        namespace = ("fast:run",)
-                    yield (namespace, stream, chunk)
-            finally:
-                self.closed = True
-
-        gen_stream = gen()
-        self.streams.append(gen_stream)
-        return gen_stream
+from test.unit.turn_fakes import (
+    _MAPPING_PAYLOAD,
+    _SRC,
+    _SPEC_PAYLOAD,
+    _FakeGraph,
+    _FakeSession,
+    _FakeSessionFactory,
+    _MessageChunk,
+    _TurnRow,
+    _bus,
+    _drain_all,
+    _snapshot,
+)
 
 
 class _BoomGraph(_FakeGraph):
@@ -200,50 +71,7 @@ class _BoomGraph(_FakeGraph):
         return gen()
 
 
-class _MessageChunk:
-    """最小 AIMessageChunk 假体：content + additional_kwargs.reasoning_content。"""
-
-    def __init__(self, content: Any, *, reasoning: str | None = None) -> None:
-        self.content = content
-        self.additional_kwargs: dict[str, Any] = (
-            {"reasoning_content": reasoning} if reasoning else {}
-        )
-
-
 # ---- 公共编排助手 ----
-
-_SPEC_PAYLOAD: dict[str, Any] = {
-    "turn": {"default_on_conflict": "reject"},
-    "fast": {"turn_timeout_s": 5},
-    "deep": {"turn_timeout_s": 8},
-}
-
-_MAPPING_PAYLOAD: dict[str, Any] = {
-    "chat": {"options": {"qwen": "qwen3.5-4b-ollama", "glm": "glm-4.7"}, "default": "qwen"}
-}
-
-_SRC: dict[str, Any] = {
-    "source_id": "11111111-1111-4111-8111-111111111111",
-    "ref_no": 1,
-    "source_type": "web",
-    "title": "LangGraph 官方文档",
-    "url": "https://langchain-ai.github.io/langgraph/",
-    "snippet": "StateGraph 以节点与边编排。",
-    "score": 0.91,
-    "snapshot_available": False,
-    "kb_doc_id": None,
-}
-
-
-def _snapshot(payload: dict[str, Any]) -> AssetSnapshot:
-    return AssetSnapshot(
-        data_id="ai_search.agent.spec.json",
-        version=1,
-        md5="m",
-        updated_at="t",
-        payload=payload,
-    )
-
 
 def _scheduler(bus: EventBus, factory: _FakeSessionFactory, graph: Any = None,
                spec: dict[str, Any] | None = None) -> ThreadScheduler:
@@ -1148,7 +976,11 @@ async def test_messages_filter_only_fast_synthesis_yields_tokens() -> None:
 
 
 class _SynthesisBoomGraph(_FakeGraph):
-    """综合失败假图：先产 sources（部分内容）再抛 SynthesisError（500101 收束路径）。"""
+    """综合失败假图：先产 sources（部分内容）再抛 SynthesisError（500101 收束路径）。
+
+    注（B9 修复轮）：batch 必须是**非空**真实来源行——`ctx.sources_count` 由 batch 长度
+    累加，空 batch 等价零内容（走 §7.1 v1.10 例外条的 failed 收束，不由本用例覆盖）。
+    """
 
     def __init__(self) -> None:
         super().__init__([])
@@ -1159,7 +991,11 @@ class _SynthesisBoomGraph(_FakeGraph):
         self.configs.append(config)
 
         async def gen():
-            yield (("fast:r1",), "custom", {"type": "sources", "batch": [], "total": 0})
+            yield (
+                ("fast:r1",),
+                "custom",
+                {"type": "sources", "batch": [dict(_SRC)], "total": 1},
+            )
             raise SynthesisError("LLM 调用重试耗尽")
 
         return gen()
@@ -1181,6 +1017,7 @@ async def test_synthesis_error_degraded_finish_with_error_and_done() -> None:
     assert error_event.data["code"] == "500101"  # LLM 调用重试耗尽（§7.2 SSE 专属码）
     done = published[-1]
     assert done.data["finish"] == "degraded" and done.data["degraded"] is True
+    assert done.data["source_count"] == 1  # 「部分内容」判据=sources 已发布（非空 batch）
     assert turn.status == "degraded" and turn.error["code"] == "500101"
     channel = bus._channels.get(str(turn.id))
     assert channel is not None and channel.terminal is True
@@ -1316,6 +1153,9 @@ async def test_execute_turn_injects_full_fast_state_input() -> None:
     callbacks = config.get("callbacks", [])
     assert (len(callbacks) == 1) if _lf_configured else (callbacks == [])
     assert config["metadata"]["langfuse_session_id"] == turn.thread_id
+    # langfuse_* 契约键全量（langfuse 4.18.0 实证）：user=发起者、tags=模式标签（Langfuse 侧过滤维度）
+    assert config["metadata"]["langfuse_user_id"] == str(turn.user_id)
+    assert config["metadata"]["langfuse_tags"] == [f"mode:{turn.mode}"]
 
 
 @pytest.mark.parametrize(
@@ -1409,18 +1249,3 @@ def test_history_statement_filters_and_binds_params() -> None:
     assert any("canceled" in v for v in bound_values)
     assert str(HISTORY_WINDOW_TURNS) in [v for v in bound_values]  # LIMIT 6
 
-
-# ---- 辅助 ----
-
-
-async def _drain_all(bus: EventBus, turn_id: str) -> list[SseEvent]:
-    """订阅通道取全部已缓冲事件（重放路径）；无事件时静默返回空表。"""
-    gen = bus.subscribe(turn_id)
-    events: list[SseEvent] = []
-    while True:
-        try:
-            events.append(await asyncio.wait_for(gen.__anext__(), timeout=0.2))
-        except (StopAsyncIteration, TimeoutError):
-            break
-    await gen.aclose()
-    return events

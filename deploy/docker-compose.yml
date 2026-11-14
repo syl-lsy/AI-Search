@@ -40,10 +40,10 @@ name: ai-search
 # LANGFUSE_MCP_ALLOWED_HOSTS，见两服务各自 environment 注），不能进共享块互串，故拆分上提。
 x-langfuse-common-env: &langfuse-common-env
   PORT: "3030"                                  # 容器端口（host 3100 映射，ARCH §5）
-  # v4 迁移模式置空=关闭 events_only 硬模式：LiteLLM 旧式 langfuse callback（/api/public/ingestion）
-  # 需要它才能写入 trace/generation（2026-11-06 实测：v4.56 默认 events_only 时旧式写入 400）。
-  # v4 原生消费（SDK 5.2.0 OTLP 通路）不受此变量影响。空串在真值判断下=禁用该模式。
-  LANGFUSE_MIGRATION_V4_WRITE_MODE: "dual"      # dual=旧式 ingestion 与 v4 事件表双写（枚举：dual/events_only/legacy，worker dist 实证）；events_only 为 v4.56 默认，会 400 拒掉 LiteLLM 旧式 langfuse callback
+  # 2026-11-13 决策记录：不再设置 LANGFUSE_MIGRATION_V4_WRITE_MODE，收口到 events_only
+  # （v4 默认写模式）。两写方均已 v4-native：应用侧 langfuse SDK 4.18.0 走 OTLP 通路，
+  # LiteLLM 走 OTel callback；旧式 /api/public/ingestion 写入随 legacy 读端点一并废弃
+  # （2026-11-06 曾因旧式 callback 写入 400 短暂置 dual，现依赖升级后已无此需要）。
   NEXTAUTH_URL: http://127.0.0.1:3100
   DATABASE_URL: "postgresql://langfuse:${LANGFUSE_DB_PASSWORD:?Set LANGFUSE_DB_PASSWORD in .env}@postgres:5432/langfuse"
   # 加密盐与主密钥：首启生成后固定不变，丢失/更换致已存 API Key 与数据不可解（.env LANGFUSE_SALT/ENCRYPTION_KEY）

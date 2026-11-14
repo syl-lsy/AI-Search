@@ -144,3 +144,48 @@ def test_render_prompt_fails_fast_on_missing_and_unknown() -> None:
         render_prompt("问题={{query}}", {})  # 未提供 query
     with pytest.raises(PromptRenderError):
         render_prompt("问题={{query}} 未知={{nope}}", {"query": "x"})  # 未知占位符
+
+
+# ==== search_strategy 提示词增量（nacos-config.md §1 v1.20）====
+
+
+def test_type_rules_contains_search_strategy_section() -> None:
+    """common.type_rules v1.20 增「检索策略判定标准」段：三值枚举 + 判据 + 判例齐备。"""
+    text = PROMPTS_CONFIG["prompts"]["common.type_rules"]
+    assert "检索策略判定标准" in text
+    assert "search_strategy" in text
+    for token in ("direct", "verify", "web"):
+        assert token in text
+    # 判据三段（direct/verify/web 各一条）+ 纪律条（从严/拿不准）
+    assert "零事实面" in text
+    assert "拿不准一律 web" in text
+    # 仅 fast.rewrite 消费（deep 零波及钉死）
+    assert "仅 fast.rewrite 消费" in text
+    assert load_builtin_prompt("common.type_rules") == text
+
+
+def test_rewrite_prompt_schema_string_contains_search_strategy() -> None:
+    """fast.rewrite 输出 schema 串含 search_strategy（validator 条 1 的模板面来源）。"""
+    for text in (
+        PROMPTS_CONFIG["prompts"]["fast.rewrite"],
+        load_builtin_prompt("fast.rewrite"),
+    ):
+        assert '"search_strategy":"direct|verify|web"' in text
+
+
+def test_synthesis_prompt_has_three_variant_prefixes() -> None:
+    """fast.synthesis 三段行前缀齐备（validator 条 2 的模板面来源；行级切分锚点）。"""
+    for text in (
+        PROMPTS_CONFIG["prompts"]["fast.synthesis"],
+        load_builtin_prompt("fast.synthesis"),
+    ):
+        lines = text.splitlines()
+        for prefix in ("- 常规路径", "- 最小检索路径", "- 免检索直答路径"):
+            assert any(line.startswith(prefix) for line in lines), f"缺行前缀：{prefix}"
+
+
+def test_synthesis_direct_section_carries_misjudgment_guard() -> None:
+    """direct 段兜底句进提示词（误判事实题时如实说明，不得虚构——nacos §1 v1.20）。"""
+    text = PROMPTS_CONFIG["prompts"]["fast.synthesis"]
+    assert "建议联网搜索确认" in text
+    assert "不得虚构事实" in text

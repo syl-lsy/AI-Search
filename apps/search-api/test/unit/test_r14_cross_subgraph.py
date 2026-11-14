@@ -37,9 +37,10 @@ from app.agent.nodes import synthesis as synthesis_module
 from app.agent.nodes import web_search as ws_module
 from app.agent.tools.registry import SearchChain, ToolRegistry
 from app.services.event_bus import EventBus
-from test.unit.test_turn_service import (
+from test.unit.turn_fakes import (
     _MAPPING_PAYLOAD,
-    _SPEC_PAYLOAD,
+    _R14_SPEC,
+    _R14FakeRegistry,
     _FakeGraph,
     _FakeSession,
     _FakeSessionFactory,
@@ -49,46 +50,6 @@ from test.unit.test_turn_service import (
     _drain_all,
     _snapshot,
 )
-
-#: R14 用 spec 快照：带 routing（路由正常路径）+ fast 节（synthesis max_answer_chars）
-_R14_SPEC: dict[str, Any] = {
-    **_SPEC_PAYLOAD,
-    "routing": {"default_mode": "fast", "modes": {"fast": "fast", "deep": "deep"}},
-    "fast": {**_SPEC_PAYLOAD["fast"], "max_answer_chars": 3000},
-}
-
-
-# ---- LLM 假体（真主图运行零网络；test_stub_graphs 同构）----
-
-
-class _R14FakeRegistry(ToolRegistry):
-    """registry 假体：resolve 冻结链 [tavily]、search 返回确定性候选 + 可挂 hook。"""
-
-    def __init__(self, on_search: Callable[[int], None] | None = None) -> None:
-        super().__init__()
-        self._on_search = on_search
-        self.search_calls = 0
-
-    def resolve(self, mcp_payload: Any, query_lang: str) -> SearchChain:
-        return SearchChain(sources=["tavily"], backup=None, degraded=False, detail="tavily")
-
-    async def search(
-        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
-    ) -> list[dict[str, Any]]:
-        self.search_calls += 1
-        if self._on_search is not None:
-            self._on_search(self.search_calls)
-        if source == "tavily":
-            return [
-                {"url": "https://docs.langgraph.dev/send", "title": "Send API",
-                 "snippet": "Send 扇出", "score": 0.92, "origin": "tavily"},
-                {"url": "https://docs.langgraph.dev/state", "title": "State",
-                 "snippet": "状态归并", "score": 0.85, "origin": "tavily"},
-            ]
-        return []
-
-    def credential_ready(self, server: str) -> bool:  # 单测环境零凭证依赖
-        return True
 
 
 class _CaptureChain:

@@ -89,12 +89,24 @@ class _Envelope(BaseModel):
 
 # ---- §1 prompts ----
 
+#: fast.synthesis 三段变体行前缀（v1.20 校验条 2——行级切分锚点，任一缺失拒收）
+SYNTHESIS_VARIANT_PREFIXES: tuple[str, ...] = (
+    "- 常规路径",
+    "- 最小检索路径",
+    "- 免检索直答路径",
+)
+
 
 class PromptsPayload(_Envelope):
     """提示词模板：键位即契约（{graph}.{node} / memory.* / home.* / common.*）。
 
     值为 Jinja2 子集模板字符串；home.suggest_pool 为运营内容数组（§1 v1.11）。
     键缺失不拒收（§1「Nacos 键缺失时回落默认」），键集不锁定（新增键不改结构）。
+
+    v1.20 两条结构性校验（检索策略增量防热更漂移，§3 校验规则）：键存在即校验——
+    ① `fast.rewrite` 模板值的输出 schema 串须含 `search_strategy`（缺则模型按旧契约
+    产出，direct 边永不触发）；② `fast.synthesis` 模板值须含三段行前缀（行级变体
+    切分的锚点，任一缺失 synthesis 会渲染出错的变体合体）。
     """
 
     model_config = ConfigDict(extra="allow")
@@ -117,6 +129,24 @@ class PromptsPayload(_Envelope):
                 continue
             if not isinstance(item, str):
                 raise ValueError(f"{key}：模板值必须是字符串")
+
+        # §3 v1.20 条 1：fast.rewrite 输出 schema 串须含 search_strategy 键（缺键拒收）。
+        # 判据取带引号的键形态 `"search_strategy"`——只认 JSON schema 串内的字段声明，
+        # 防止散文提及该词即蒙混过关（schema 串缺失则模型按旧契约产出、direct 边永不触发）。
+        rewrite = value.get("fast.rewrite")
+        if isinstance(rewrite, str) and '"search_strategy"' not in rewrite:
+            raise ValueError(
+                "fast.rewrite：输出 schema 串须含 search_strategy 键（v1.20 检索策略契约）"
+            )
+        # §3 v1.20 条 2：fast.synthesis 须含三段行前缀，任一缺失拒收
+        synthesis = value.get("fast.synthesis")
+        if isinstance(synthesis, str):
+            lines = synthesis.splitlines()
+            for prefix in SYNTHESIS_VARIANT_PREFIXES:
+                if not any(line.startswith(prefix) for line in lines):
+                    raise ValueError(
+                        f"fast.synthesis：缺变体行前缀 {prefix}（v1.20 三段模板）"
+                    )
         return value
 
 

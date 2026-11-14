@@ -3,9 +3,10 @@
 LANGFUSE_ 未配置（单测/未接观测部署形态）→ 空表零开销；SDK 异常 → 告警回落空表
 （观测不阻塞主链路）。SDK 客户端走环境变量（LANGFUSE_PUBLIC_KEY/SECRET_KEY/HOST，
 与 core/config LANGFUSE_ 组同名——pydantic-settings 不导出 os.environ，此处把 settings
-值回填 env 供 langfuse v3 全局客户端读取）；trace id = turn_id（对账键：Langfuse
+值回填 env 供 langfuse 全局客户端读取）；trace id = turn_id（对账键：Langfuse
 trace 与 turns 行同 id 可查）；session=thread_id 由 RunnableConfig metadata 的
-langfuse_* 键承载（langfuse-langchain v3 契约键，TurnRunner 注入）。
+langfuse_* 键承载（CallbackHandler 契约键，4.18.0 探针确认保留，TurnRunner 注入；
+session 落 trace 根由 handler 根链入口内部 propagate_attributes 承担）。
 """
 
 import os
@@ -40,8 +41,9 @@ def build_turn_callbacks(
 
 
 def trace_id_for(turn_id: str) -> str:
-    """Langfuse trace id = turn_id 的 32-hex 形态（对账键；v3 trace_context 要求
-    W3C 32-hex——UUID 带杠形态会被静默换 id，此处 hex 化保 id==turn 互查）。"""
+    """Langfuse trace id = turn_id 的 32-hex 形态（对账键；trace_context 要求 W3C
+    32-hex——UUID 带杠形态会被静默换 id，此处 hex 化保 id==turn 互查；4.18.0
+    TraceContext 无运行时校验，形态正确性由本函数保证）。"""
     try:
         import uuid
 

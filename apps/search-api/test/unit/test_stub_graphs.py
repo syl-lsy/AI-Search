@@ -171,7 +171,13 @@ def _fast_expected(registry: _FakeRegistry) -> list[dict[str, Any]]:
     )
     # token 不在 custom 流（§6.1 messages 域——route 测试只收 custom）
     return [
-        {"type": "stage", "stage_key": "rewrite", "status": "done"},  # running 已由 TurnRunner 图前发布（§4.3）
+        # running 已由 TurnRunner 图前发布（§4.3）；v1.20 起 done.extra 恒带 strategy
+        {
+            "type": "stage",
+            "stage_key": "rewrite",
+            "status": "done",
+            "extra": {"strategy": "web"},
+        },
         {"type": "stage", "stage_key": "search", "status": "running", "detail": "tavily"},
         {
             "type": "stage",
@@ -216,6 +222,7 @@ _FAST_OUTPUT_KEYS = {
     "answer_md",
     "query_type",
     "answerable_from_knowledge",
+    "search_strategy",  # v1.44 B9②：rewrite 顺带产出（direct 条件边 + synthesis 变体消费）
     "time_range",
     "rewritten_queries",
     "candidates",

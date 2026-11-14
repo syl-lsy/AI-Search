@@ -1,10 +1,10 @@
 /**
- * src/types/api.d.ts — api.md（v1.12）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.14）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.12（REST + SSE 协议唯一事实源）
+ *   - docs/contract/api.md v1.14（REST + SSE 协议唯一事实源；§7.4 direct 形态留痕键 StageExtra.strategy 随本批镜像同步）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
- *   - frontend-api.md v1.13 §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
+ *   - frontend-api.md v1.15 §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
  *
  * 铁律：契约变更必须同步本文件（评审 diff 核对）；本文件是静态镜像、非运行时校验器——
@@ -132,6 +132,8 @@ export interface StageExtra {
   subagents?: SubAgent[]
   subtopics?: number
   sections?: number
+  /** api.md §7.4 v1.14 direct 形态留痕：rewrite 输出 search_strategy=direct 时携带（前端不消费不展示） */
+  strategy?: string
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */

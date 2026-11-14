@@ -320,7 +320,7 @@ class TestPartialContentDegradedFinish:
 
     async def test_zero_content_timeout_stays_failed_and_closes(self) -> None:
         """零内容（sources 未发布）：failed + close_channel 语义保持（§7.1 例外）。"""
-        from test.unit.test_turn_service import _FakeGraph
+        from test.unit.turn_fakes import _FakeGraph
 
         bus = _bus()
         turn = _turn_row()

@@ -12,8 +12,19 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { apiGet, apiPost } from '@/api/client'
-import { turnDetailFastCompleted } from '@/mocks/turnDetails'
-import { deepSequence, fastSequence, SSE_SEQUENCE_THREAD_ID } from '@/mocks/sseSequences'
+import {
+  TURN_ID_DIRECT,
+  turnDetailDirectCompleted,
+  turnDetailDirectWithFollowups,
+  turnDetailFastCompleted,
+} from '@/mocks/turnDetails'
+import {
+  deepSequence,
+  directFollowupsEvent,
+  directSequence,
+  fastSequence,
+  SSE_SEQUENCE_THREAD_ID,
+} from '@/mocks/sseSequences'
 import { peekTurnStream } from '@/sse/turnStream'
 import { useTurnStore } from '@/stores/turn'
 import type { SseWireEvent } from '@/types/api'
@@ -38,6 +49,12 @@ const mockedGet = vi.mocked(apiGet)
 const THREAD_ID = SSE_SEQUENCE_THREAD_ID
 const TURN_ID_FAST = fastSequence[0]!.data.turn_id
 const TURN_ID_DEEP = deepSequence[0]!.data.turn_id
+
+/** ③ followups 追加样例条目（判别收窄——联合 data 不随运行时断言收窄，§8.9 纪律） */
+const DIRECT_FOLLOWUPS_ITEMS = (() => {
+  if (directFollowupsEvent.event !== 'followups') throw new Error('③ 样例应为 followups 事件')
+  return directFollowupsEvent.data.items
+})()
 
 /** wire fixture → EventSource 线格帧 */
 function toFrames(events: SseWireEvent[]) {
@@ -103,6 +120,61 @@ describe('fast §7.4 序列（transport 全链路：两段式 → 合帧 → don
     expect(turn.followups).toEqual(['Send API 的失败分支怎么处理？', 'Router 的条件边怎么写？', '两者能在一张图里混用吗？'])
     expect(es.closedByClient).toBe(true)
     expect(peekTurnStream(TURN_ID_FAST)).toBeUndefined()
+  })
+})
+
+describe('direct §7.4 序列（v1.15 免检索直答：两节点时间线 + 零来源投影 + L13 保活收口）', () => {
+  it('① 序列投影：时间线仅 rewrite/write、sources/images 恒空、done 对账 source_count=0', async () => {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID_DIRECT, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('你好，请介绍一下你自己', 'fast')
+
+    const es = MockEventSource.instances[0]!
+    expect(es.url).toContain(`/api/v1/turns/${TURN_ID_DIRECT}/events`)
+    es.open()
+    // 中段（seq 1..3）：rewrite running→done + write running——两节点、无 search、无来源/图片
+    for (const f of toFrames(directSequence.filter((w) => w.id <= 3))) es.dispatch(f)
+    vi.advanceTimersByTime(2000)
+    const turn = store.turns[TURN_ID_DIRECT]!
+    expect(turn.stages.map((s) => [s.stage_key, s.status])).toEqual([
+      ['rewrite', 'done'],
+      ['write', 'running'],
+    ])
+    expect(turn.sources).toEqual([])
+    expect(turn.images).toEqual([])
+
+    // 尾段（seq 4..7）：token → write done → done(completed, source_count=0) → 对账（REST 权威）
+    mockedGet.mockResolvedValueOnce(turnDetailDirectCompleted)
+    for (const f of toFrames(directSequence.filter((w) => w.id >= 4))) es.dispatch(f)
+    await vi.waitFor(() => expect(turn.status).toBe('completed'))
+    expect(turn.answer_md).toBe(turnDetailDirectCompleted.answer_md)
+    expect(turn.sources).toEqual([]) // direct 轮零来源（2.5 对账同口径）
+    expect(turn.images).toEqual([])
+    expect(turn.stages.find((s) => s.stage_key === 'rewrite')?.extra?.strategy).toBe('direct') // 留痕随 2.5 重建投影
+    expect(turn.lastSeq).toBe(7)
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+
+    // ③ L13 保活窗口（fast 轮 done 后不主动 close）→ followups 到达写入 → 收口① close
+    expect(es.closedByClient).toBe(false)
+    es.dispatch({ id: directFollowupsEvent.id, type: directFollowupsEvent.event, data: JSON.stringify(directFollowupsEvent.data) })
+    expect(turn.followups).toEqual(DIRECT_FOLLOWUPS_ITEMS)
+    expect(es.closedByClient).toBe(true)
+  })
+
+  it('② direct 回看对账：2.5 sources=[] 种子化投影（回看态同口径零来源）', async () => {
+    mockedGet.mockResolvedValueOnce(turnDetailDirectWithFollowups)
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID_DIRECT)
+    const turn = store.turns[TURN_ID_DIRECT]!
+    expect(turn.status).toBe('completed')
+    expect(turn.sources).toEqual([])
+    expect(turn.images).toEqual([])
+    expect(turn.stages.map((s) => [s.stage_key, s.status])).toEqual([
+      ['rewrite', 'done'],
+      ['write', 'done'],
+    ])
+    expect(turn.followups).toEqual(DIRECT_FOLLOWUPS_ITEMS) // 回看态双源回填（REST 事实源）
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
   })
 })
 

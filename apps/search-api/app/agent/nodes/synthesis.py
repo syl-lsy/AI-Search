@@ -10,6 +10,10 @@ synthesis 节点放行，§6.1/R14③），节点只累积 text → answer_md。
   第 1/3 条）；
 - **最小检索分支**：answerable_from_knowledge=true → 提示词确定性切「先知识后取证」
   （组织方式段行级切换，键位与占位符集零变更——§4.1「提示词切」）；
+- **免检索直答分支（v1.44 B9④）**：search_strategy=direct → 切「免检索直答」段
+  （无 sources_block、无 [n] 义务、含误判兜底句；空 fused 不触发 500201 防御短路，
+  [n] 经越界剔除全量清空——nacos-config.md §1 v1.20）；verify/web 轮沿用 answerable
+  两段切换（回滚态行为零变化）；
 - **外部内容包裹**（§6.4.3 铁律）：来源逐条 `<external_content source="{url}" type="web">`
   包裹（声明行在提示词内）；memory_block M5 前恒空串；
 - **失败语义**：全源失败防御性短路（主短路在 merge_dedupe）；LLM 传输类失败按 spec.retry
@@ -43,9 +47,13 @@ __all__ = ["SynthesisError", "build_chat_model", "synthesis"]
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
-#: 组织方式段行前缀（answerable 确定性切分的锚点——键位与占位符集零变更）
+#: 组织方式段行前缀（确定性切分的锚点——键位与占位符集零变更）
 _REGULAR_LINE_PREFIX = "- 常规路径"
 _KNOWLEDGE_FIRST_LINE_PREFIX = "- 最小检索路径"
+_DIRECT_LINE_PREFIX = "- 免检索直答路径"  # v1.20 第三变体段（direct 免检索直答轮）
+
+#: 检索策略三值（v1.44 B9——缺省/非法一律按 web 处理，灰度安全）
+_SEARCH_STRATEGIES = ("direct", "verify", "web")
 
 
 class SynthesisError(Exception):
@@ -78,17 +86,63 @@ def build_chat_model(alias: str) -> Any:
     )
 
 
-def _apply_answerable_variant(template: str, answerable: bool) -> str:
-    """组织方式段确定性切分：answerable → 最小检索段；否则常规段（行级过滤）。"""
-    keep_prefix = _KNOWLEDGE_FIRST_LINE_PREFIX if answerable else _REGULAR_LINE_PREFIX
+def _resolve_strategy(state: Mapping[str, Any]) -> str:
+    """state 侧策略归一：只认三值，其余（旧提示词/未声明）一律 web。"""
+    strategy = state.get("search_strategy")
+    return strategy if strategy in _SEARCH_STRATEGIES else "web"
+
+
+def _apply_answerable_variant(
+    template: str, answerable: bool, strategy: str = "web"
+) -> str:
+    """组织方式段确定性三态切分（行级过滤，键位与占位符集零变更）。
+
+    消费面（nacos-config.md §1 v1.20 钉死）：`direct` 按 strategy 切「免检索直答」
+    段（该轮零来源，无 [n] 义务）；`verify`/`web` 沿用既有 answerable 两段切换——
+    回滚态（web + answerable=true）仍切「先知识后取证」段=现行行为零变化。
+    """
+    if strategy == "direct":
+        keep_prefix = _DIRECT_LINE_PREFIX
+    elif answerable:
+        keep_prefix = _KNOWLEDGE_FIRST_LINE_PREFIX
+    else:
+        keep_prefix = _REGULAR_LINE_PREFIX
     lines = template.splitlines()
     kept = [
         line
         for line in lines
-        if not line.startswith((_REGULAR_LINE_PREFIX, _KNOWLEDGE_FIRST_LINE_PREFIX))
+        if not line.startswith(
+            (_REGULAR_LINE_PREFIX, _KNOWLEDGE_FIRST_LINE_PREFIX, _DIRECT_LINE_PREFIX)
+        )
         or line.startswith(keep_prefix)
     ]
     return "\n".join(kept)
+
+
+def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, str]:
+    """轮策略观测元数据（ARCH §6.6 v1.44：search_strategy 与 query_type 同通道）。
+
+    时序约束：本决策在 rewrite 之后才可知，而 Langfuse 轮级 trace 属性只能随 span
+    创建写入（CallbackHandler 在根 run 启动时读 RunnableConfig.metadata）——故挂在
+    **synthesis 生成 span**（本文最晚的 LLM run）的 metadata 上：M4 按策略分桶可从
+    generation metadata 过滤；轮级留痕另走 stage(rewrite,done).extra（turn_events→§2.5）。
+    """
+    metadata = {"search_strategy": _resolve_strategy(state)}
+    query_type = state.get("query_type")
+    if isinstance(query_type, str) and query_type:
+        metadata["query_type"] = query_type
+    return metadata
+
+
+def _with_strategy_metadata(
+    config: RunnableConfig | None, state: Mapping[str, Any]
+) -> RunnableConfig:
+    """config 浅拷贝 + metadata 合并（callbacks/configurable 原样保留）。"""
+    base: dict[str, Any] = dict(config or {})
+    metadata = dict((config or {}).get("metadata") or {})
+    metadata.update(_strategy_metadata(state))
+    base["metadata"] = metadata
+    return base  # type: ignore[return-value]
 
 
 def _sources_block(fused: list[dict[str, Any]]) -> str:
@@ -176,7 +230,9 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
     model = build_chat_model(_chat_alias(state, config))
 
     template = _apply_answerable_variant(
-        resolve_prompt("fast.synthesis"), bool(state.get("answerable_from_knowledge"))
+        resolve_prompt("fast.synthesis"),
+        bool(state.get("answerable_from_knowledge")),
+        _resolve_strategy(state),
     )
     prompt_text = render_prompt(
         template,
@@ -201,7 +257,9 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
             await asyncio.sleep(random.uniform(0, delay) if policy.jitter else delay)
         accumulated: list[str] = []
         try:
-            async for chunk in model.astream(messages, config=config):
+            async for chunk in model.astream(
+                messages, config=_with_strategy_metadata(config, state)
+            ):
                 accumulated.append(_text_of(chunk))
             answer = "".join(accumulated)
             break

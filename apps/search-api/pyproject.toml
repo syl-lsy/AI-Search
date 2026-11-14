@@ -32,11 +32,15 @@ dependencies = [
     # 锁版本 + 单测护栏（登录硬编码 v1 兼容端点 /nacos/v1/auth/users/login——上游收掉 v1 auth 即断，
     # R8 同口径）；导入名 v2.nacos、方法全 asyncio 协程
     "nacos-sdk-python==3.2.0",
-    # B3 rewrite：Langfuse 节点级 span（trace root=轮、session=thread_id，ARCH §6.6）——
-    # langfuse-langchain CallbackHandler（v3；trace_id=turn_id 经 trace_context，session 经
-    # config metadata langfuse_* 契约键）。== 锁定（R8 同口径：与 langchain-openai 私有面
-    # 联动升级前先跑观测护栏）
-    "langfuse==3.15.0",
+    # Langfuse 节点级 span（trace root=轮、session=thread_id，ARCH §6.6）：B3 落 3.15.0，
+    # 2026-11-13 升 4.18.0——v5 首选路径被服务端版本卡死（Langfuse server 4.56.0 < SDK 5.x
+    # 硬要求 4.59.0，:4 大版本锁 pull 未滚动），按用户阶梯裁决回退 4.x 线最新的 4.18.0；
+    # 服务端升到 ≥4.59 后可重探 v5（v5.2.0 主包 requires_dist 实测无 langchain-core 项）。
+    # CallbackHandler 接入面不变：trace_id=turn_id（32-hex）经 trace_context；session/user/
+    # tags 经 config metadata 契约键 langfuse_session_id/langfuse_user_id/langfuse_tags
+    # （官方文档保留）；metadata 收紧 dict[str,str] 且值≤200 字符。== 锁定（R8 同口径：
+    # 与 langchain-openai 私有面联动升级前先跑观测护栏，断言见 test_observability.py）
+    "langfuse==4.18.0",
 ]
 
 [build-system]

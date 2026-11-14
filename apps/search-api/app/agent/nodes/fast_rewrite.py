@@ -1,8 +1,16 @@
 """rewrite 节点（B3 节点 1/5——ARCH §4.1 rewrite 行 / DEV §5.1 五步闭环）。
 
-职责四合一（light 模型，S14/S15 基元）：
-① 指代消解 ② 顺带分类（6+1）③ 参数可答判定 ④ 检索 query 集（type_query_map 夹取）。
+职责五合一（light 模型，S14/S15 基元）：
+① 指代消解 ② 顺带分类（6+1）③ 参数可答判定 ④ 检索 query 集（type_query_map 夹取）
+⑤ 检索策略判定（v1.44 B9：`search_strategy ∈ {direct,verify,web}`，nacos-config.md
+§1 v1.20——「搜不搜」与「答案形态」两维正交，QueryType 枚举零变更）。
 语言判定已前置纯代码（TurnRunner 注入 `query_lang`，改写不改判——PRD OQ-2）。
+
+**策略灰度安全（v1.20 硬约束）**：字段缺失（旧提示词 v1.18）/ 值非法 / 两兜底路径一律
+`web`——pydantic 缺省 `web` + 修复回喂失败走机制兜底（strategy=web, answerable=false），
+旧提示词 + 新代码 = 全量轮零行为变化。对齐纪律（nacos §1「两字段必须一致」）：
+`verify → answerable=True`；`direct → answerable=False`；`web → 保留模型原值`
+（回滚态 answerable 驱动的 synthesis 变体不变——ARCH §8 B9①）。
 
 失败语义（ARCH §4.1/§6.2，不终止两路径）：
 - **校验失败**（结构化输出解析/校验不过）→ 修复回喂 1 次（§6.2 P1：校验错误文本回喂）
@@ -22,6 +30,8 @@ AgentLog 埋点（失败原因可观测——批次 7 披露的零埋点缺口�
 默认）；LLM 工厂（`build_light_model`）可注入可 mock——单测全 mock 零网络。
 memory_directive 为 M5 记忆通道：解析但**不写 state**（FastState 无该字段），仅经
 stage done.extra 留档（api.md §7.2 stage 可选业务字段，TurnRunner 吸收进 timing）。
+`strategy` 恒随 stage(rewrite,done).extra 留痕（api.md §7.4 v1.14 direct 形态钉死
+`extra.strategy=direct`；verify/web 轮为观测增量，M4 按策略分桶）。
 """
 
 import asyncio
@@ -49,8 +59,10 @@ from app.core.logger import AgentLog
 __all__ = [
     "MECHANISM_FALLBACK_QUERY_COUNT",
     "MECHANISM_FALLBACK_QUERY_TYPE",
+    "FALLBACK_SEARCH_STRATEGY",
     "TRANSPORT_FALLBACK_QUERY_TYPE",
     "RewriteOutput",
+    "SearchStrategy",
     "build_light_model",
     "rewrite",
 ]
@@ -60,18 +72,28 @@ MECHANISM_FALLBACK_QUERY_TYPE: str = "factoid"
 MECHANISM_FALLBACK_QUERY_COUNT: int = 3
 #: 传输降级路径的类型标注（未分类诚实标注，评测按 other 分桶；单发原始 query）
 TRANSPORT_FALLBACK_QUERY_TYPE: str = "other"
+#: 两兜底路径的检索策略（nacos §1 v1.20 回落规则：兜底态 strategy=web、answerable=false）
+FALLBACK_SEARCH_STRATEGY: str = "web"
 
 QueryType = Literal[
     "factoid", "list", "comparison", "multi_facet", "temporal", "how_to", "other"
 ]
 
+#: 检索策略三值（v1.44 B9 / nacos-config.md §1 v1.20——「搜不搜」正交维度）
+SearchStrategy = Literal["direct", "verify", "web"]
+
 
 class RewriteOutput(BaseModel):
-    """rewrite 结构化输出（nacos-config.md §1 fast.rewrite 输出 JSON 契约，S15）。"""
+    """rewrite 结构化输出（nacos-config.md §1 fast.rewrite 输出 JSON 契约，S15）。
+
+    `search_strategy` 缺省 `web`（v1.20 灰度安全：旧提示词无本字段即全量 web，
+    存量轮零行为变化——字段由提示词热更启用）。
+    """
 
     queries: list[str] = Field(min_length=1)
     query_type: QueryType
     answerable_from_knowledge: bool
+    search_strategy: SearchStrategy = "web"
     time_range: Literal["day", "week", "month", "year"] | None = None
     memory_directive: str | None = None
 
@@ -239,20 +261,53 @@ async def _invoke_with_retry(
 def _fallback_update(
     query: str, *, query_type: str, count: int, reason: str
 ) -> dict[str, Any]:
-    """两路径共同形态：不终止、answerable 保守 false、errors 留痕（§4.1 横切字段）。
+    """两路径共同形态：不终止、strategy=web、answerable 保守 false、errors 留痕（§4.1 横切字段）。
 
     **不置 FastState.degraded**（2026-11-13 B 裁决）：rewrite 兜底不属 api.md §7.2
     degraded_reason 枚举（timeout/budget/source_failure）任一语义——置位会被
     TurnRunner._finish_completed 一律派生为 source_failure（turn_service.py:856），
     把答案完整的正常轮误标「研究未完成/源失败」；轮内降级可见面 = stage
     done.extra={fallback} + errors[]（§6.2 stage detail 半句合规）。
+
+    **search_strategy 回落 web**（nacos §1 v1.20 灰度安全硬约束）：两兜底路径与
+    缺省/非法值同口径——旧提示词 + 新代码全量轮零行为变化。
     """
     return {
         "rewritten_queries": [query] * count if query else [],
         "query_type": query_type,
         "answerable_from_knowledge": False,
+        "search_strategy": FALLBACK_SEARCH_STRATEGY,
         "time_range": None,
         "errors": [{"stage": "rewrite", "reason": reason}],
+    }
+
+
+def _aligned_answerable(strategy: str, answerable: bool) -> bool:
+    """策略↔answerable 对齐（nacos-config.md §1 v1.20 纪律：两字段必须一致）。
+
+    - `verify`：强制 True（模型判 verify 但答 false 时以 strategy 为准修正）；
+    - `direct`：强制 False（零事实面轮；synthesis 变体消费 strategy，不读该位）；
+    - `web`：**保留原值**——回滚态（web + answerable=true）仍切「先知识后取证」段，
+      旧提示词 + 新代码的合成行为零变化（ARCH §8 B9① 明文）。
+    """
+    if strategy == "verify":
+        return True
+    if strategy == "direct":
+        return False
+    return answerable
+
+
+def _success_update(parsed: RewriteOutput, spec: Mapping[str, Any]) -> dict[str, Any]:
+    """合法输出 → state 增量（strategy 透传 + answerable 对齐 + query 夹取）。"""
+    return {
+        "query_type": parsed.query_type,
+        "answerable_from_knowledge": _aligned_answerable(
+            parsed.search_strategy, parsed.answerable_from_knowledge
+        ),
+        "search_strategy": parsed.search_strategy,
+        "time_range": parsed.time_range,
+        "rewritten_queries": _clamp_queries(parsed.queries, spec, parsed.query_type),
+        "degraded": False,
     }
 
 
@@ -282,7 +337,7 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
     prompt_text = _render_prompt(state)
 
     update: dict[str, Any]
-    extra: dict[str, Any] | None = None
+    extra_parts: dict[str, Any] = {}
     try:
         raw = await _invoke_with_retry(
             chain,
@@ -293,15 +348,9 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             config=config,
         )
         parsed = _extract(raw)
-        update = {
-            "query_type": parsed.query_type,
-            "answerable_from_knowledge": parsed.answerable_from_knowledge,
-            "time_range": parsed.time_range,
-            "rewritten_queries": _clamp_queries(parsed.queries, spec, parsed.query_type),
-            "degraded": False,
-        }
+        update = _success_update(parsed, spec)
         if parsed.memory_directive:
-            extra = {"memory_directive": parsed.memory_directive}
+            extra_parts = {"memory_directive": parsed.memory_directive}
     except (OutputParserException, ValidationError) as exc:
         # 修复回喂 1 次（§6.2 P1）：校验错误文本回喂 LLM 修复 → 仍失败走机制兜底
         AgentLog(
@@ -335,17 +384,9 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
                 node="rewrite",
             ).warning()
         if repaired is not None:
-            update = {
-                "query_type": repaired.query_type,
-                "answerable_from_knowledge": repaired.answerable_from_knowledge,
-                "time_range": repaired.time_range,
-                "rewritten_queries": _clamp_queries(
-                    repaired.queries, spec, repaired.query_type
-                ),
-                "degraded": False,
-            }
+            update = _success_update(repaired, spec)
             if repaired.memory_directive:
-                extra = {"memory_directive": repaired.memory_directive}
+                extra_parts = {"memory_directive": repaired.memory_directive}
         else:
             # 机制兜底：factoid 档 / 3 query 固定（显式常量，不经夹取，不终止）
             update = _fallback_update(
@@ -354,7 +395,7 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
                 count=MECHANISM_FALLBACK_QUERY_COUNT,
                 reason="structured_output_invalid",
             )
-            extra = {"fallback": "mechanism"}
+            extra_parts = {"fallback": "mechanism"}
     except Exception as exc:
         # LLM 调用重试耗尽（传输类经 RetryPolicy + deadline 门控）→ 降级原始 query 单发
         AgentLog(
@@ -371,10 +412,10 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             count=1,
             reason="llm_retry_exhausted",
         )
-        extra = {"fallback": "degraded"}
+        extra_parts = {"fallback": "degraded"}
 
-    if extra is not None:
-        emit_stage("rewrite", "done", extra=extra)
-    else:
-        emit_stage("rewrite", "done")
+    # strategy 恒随 done.extra 留痕（direct 形态为 api.md §7.4 钉死形态；verify/web
+    # 轮为观测增量）+ 分支标注（fallback / memory_directive）合并
+    extra = {"strategy": update["search_strategy"], **extra_parts}
+    emit_stage("rewrite", "done", extra=extra)
     return update

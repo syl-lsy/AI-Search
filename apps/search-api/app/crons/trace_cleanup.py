@@ -6,7 +6,7 @@ LangfuseSettings.trace_retention_days）计算截止时间，经 Langfuse 公共
 过期 trace 并逐批删除，每批 ≤50（ARCH §3.1 crons 注）。
 
 【为什么走 REST 不走 Langfuse SDK】公共 REST 是稳定契约面（Basic auth =
-LANGFUSE_PUBLIC_KEY:LANGFUSE_SECRET_KEY，目标 LANGFUSE_HOST）；Langfuse SDK 5.2.0
+LANGFUSE_PUBLIC_KEY:LANGFUSE_SECRET_KEY，目标 LANGFUSE_HOST）；Langfuse SDK
 API 面换代快且不提供删除能力（s0-batch1-handoff.md 续 10/13）。
 
 【观察项（langfuse#8834）】本任务只经公共 API 删 trace 主记录；ClickHouse
@@ -14,9 +14,17 @@ API 面换代快且不提供删除能力（s0-batch1-handoff.md 续 10/13）。
 v3 曾有 MinIO 残留 bug（langfuse#8834）——M1 部署后需实测磁盘回收效果并观察
 ClickHouse/MinIO 清理滞后，不是本任务代码面能闭环的问题。
 
-分批形态：GET /api/public/traces?toTimestamp=<cutoff>&limit=50&page=N 收齐全部过期
-id（页不足 limit 即停）→ 按 BATCH_SIZE(50) 切批 → 逐条 DELETE /api/public/traces/{id}，
+分批形态：GET /api/public/v2/observations?toStartTime=<cutoff>&limit=1000 按
+observation.startTime 过滤，cursor 链式翻页收齐观测行、去重 traceId 推导过期 trace
+（2026-11-13 探针定参数面：时间参数为 fromStartTime/toStartTime，v1 traces 列表
+零漏删等价、超集为已删 trace 孤儿观测，404 幂等兜住）→ 按 BATCH_SIZE(50) 切批 →
+逐条 DELETE /api/public/traces/{id}（v1 删除路由，部署 server v4 实测健在），
 逐批记录结果（CronLog 结构化日志 + 返回值 TraceCleanupResult）。
+
+【边界：零观测行 trace 漏删（结构性）】v2 按 observation 推导，trace 集 = 观测行的
+traceId 去重——trace 行存在但零 observation 的 trace 结构上不可被发现。当前两个写方
+（应用 SDK 的 OTel root span + LiteLLM OTel callback）均必产 observation，缺口纯理论；
+若未来出现零观测写方，需回补 trace 级扫描（不能只靠本函数扩大查询面）。
 
 失败语义：
 - 查询失败（非 2xx / 传输错误）→ TraceCleanupException（保留 original_exception），
@@ -32,6 +40,7 @@ id（页不足 limit 即停）→ 按 BATCH_SIZE(50) 切批 → 逐条 DELETE /a
 HttpUrlStr 校验），URL 不来自请求参数/用户输入（SSRF 面禁项，ARCH §7）；第一方
 基建端点绑 127.0.0.1 属部署设计，不做内网地址拒绝。
 """
+
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlparse
@@ -44,7 +53,13 @@ from app.exception.base import BusinessException
 
 # 环境无关的纯逻辑值收敛为常量（配置三分法 → 代码常量，语义化命名收敛于此）：
 BATCH_SIZE: int = 50  # 单批删除上限（ARCH §3.1：每批 ≤50）
-PAGE_SIZE: int = 50  # 列表分页大小（Langfuse 公共 API 单页 limit 上限即 50）
+LIST_PAGE_SIZE: int = (
+    1000  # v2 observations 列表单页 limit（部署 server v4 实测 ≥1000 生效）
+)
+# cursor 链翻页上限：10000 页 × LIST_PAGE_SIZE(1000) = 可覆盖 1000 万观测行（远超
+# 单轮清理现实量级）。服务端恒返非空 cursor 时防静默挂起——达上限落 CronLog warning
+# 后按已收结果收敛返回（清理是幂等收敛型任务，残余下轮自然重试，不抛异常）。
+MAX_PAGES: int = 10_000
 TRACE_CLEANUP_INTERVAL_SECONDS: int = 86_400  # 每日一次（注册表注册项，ARCH §3.1）
 _REST_TIMEOUT_S: float = 10.0  # 单请求超时：内网自部署 REST，宽松但不悬挂
 _TASK_NAME: str = "trace_cleanup"  # 注册表 name（CronLog 的 task 字段同源）
@@ -131,38 +146,78 @@ def _format_utc(value: datetime) -> str:
 async def _list_expired_trace_ids(
     client: httpx.AsyncClient, cutoff: datetime
 ) -> list[str]:
-    """收齐全部过期 trace id：toTimestamp=cutoff 分页拉取（页不足 PAGE_SIZE 即停）。"""
+    """收齐全部过期 trace id（v4-native，2026-11-13 探针钉参数面后迁移）：
+
+    GET /api/public/v2/observations?toStartTime=<cutoff>&limit=LIST_PAGE_SIZE
+    按 observation.startTime 过滤 → cursor 链式翻页（meta.cursor 缺失即停）→
+    去重收集 traceId 推导过期 trace。
+
+    探针结论（127.0.0.1:3100 server v4 实测，2026-11-13）：
+    - 时间过滤参数是 fromStartTime/toStartTime（fromTimestamp/toTimestamp 被
+      静默忽略——老窗口仍返回当天行）；
+    - 响应行为 observation 行（id≠traceId，一行一条观测），traceId 去重即推导
+      过期 trace 集合；
+    - 分页是 cursor 链式（meta.cursor），无 v1 的 page/limit=50 上限；
+    - 与 v1 traces 列表等价性：同 cutoff 实测 v1 ∪ 推导 ⊆ 推导（零漏删）；推导
+      超集部分=已删 trace 的孤儿观测（observations 清理滞后，langfuse#8834），
+      DELETE 404 幂等语义天然兜住。
+
+    边界（结构性，非本函数可补）：推导源只有 observation 行——trace 行存在但零
+    observation 的 trace 不被发现。当前两个写方（应用 SDK OTel root span + LiteLLM
+    OTel callback）均必产 observation，缺口纯理论；出现零观测写方需回补 trace 级扫描。
+    """
     ids: list[str] = []
-    page = 1
+    seen: set[str] = set()
+    cursor: str | None = None
+    pages = 0
     while True:
+        params: dict[str, str | int] = {
+            "toStartTime": _format_utc(cutoff),
+            "limit": LIST_PAGE_SIZE,
+        }
+        if cursor:
+            params["cursor"] = cursor
         try:
-            response = await client.get(
-                "/api/public/traces",
-                params={
-                    "toTimestamp": _format_utc(cutoff),
-                    "limit": PAGE_SIZE,
-                    "page": page,
-                },
-            )
+            response = await client.get("/api/public/v2/observations", params=params)
             response.raise_for_status()
-            data = response.json().get("data", [])
-            page_ids = [item["id"] for item in data]
+            payload = response.json()
+            data = payload.get("data", [])
+            page_trace_ids = [item["traceId"] for item in data]
+            # meta 可能是显式 null / 非 dict 形态：先收窄再取 cursor，AttributeError
+            # 不留在 except 面之外（下方捕获面同时补 AttributeError 作纵深）。
+            meta = payload.get("meta")
+            next_cursor = meta.get("cursor") if isinstance(meta, dict) else None
         except httpx.HTTPError as exc:
             raise TraceCleanupException(
                 "查询 Langfuse 过期 trace 失败",
-                detail=f"GET /api/public/traces 失败：{type(exc).__name__}",
+                detail=f"GET /api/public/v2/observations 失败：{type(exc).__name__}",
                 original_exception=exc,
             ) from exc
-        except (ValueError, KeyError, TypeError) as exc:  # 非 JSON / 条目缺 id
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # 非 JSON / 顶层非 dict（如 JSON 数组）/ 条目缺 traceId / meta 形态异常
             raise TraceCleanupException(
                 "Langfuse 过期 trace 响应解析失败",
-                detail=f"GET /api/public/traces 响应形态异常：{type(exc).__name__}",
+                detail=f"GET /api/public/v2/observations 响应形态异常：{type(exc).__name__}",
                 original_exception=exc,
             ) from exc
-        ids.extend(page_ids)
-        if len(data) < PAGE_SIZE:
+        for trace_id in page_trace_ids:  # 保序去重：一 trace 多观测只推导一次
+            if trace_id not in seen:
+                seen.add(trace_id)
+                ids.append(trace_id)
+        pages += 1
+        if not next_cursor:
             return ids
-        page += 1
+        if pages >= MAX_PAGES:  # 恒返非空 cursor 的退化服务端：按已收收敛，不挂起
+            CronLog(
+                message=(
+                    f"trace_cleanup 查询已达分页上限 {MAX_PAGES} 页："
+                    f"已收 {len(ids)} 条 trace，按已收结果本轮继续，残余下轮重试"
+                ),
+                task=_TASK_NAME,
+                total=len(ids),
+            ).warning()
+            return ids
+        cursor = next_cursor
 
 
 async def _delete_trace(client: httpx.AsyncClient, trace_id: str) -> str | None:

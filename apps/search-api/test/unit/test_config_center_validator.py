@@ -103,10 +103,16 @@ class TestSecretSniffing:
             validate_asset(PROMPTS_DATA_ID, payload)
 
     def test_mid_string_dash_not_false_positive(self):
-        """非开头子串（如 task-xxx）不误伤——契约正则为开头锚定。"""
+        """非开头子串（如 task-xxx）不误伤——契约正则为开头锚定。
+
+        注：v1.20 起 fast.rewrite 覆盖值须含 `"search_strategy"`（§3 校验条 1），
+        故本用例取值带上该 token（本用例只验密钥嗅探不误伤，与内容规则正交）。
+        """
         payload = _mutated(
             PROMPTS_DATA_ID,
-            lambda p: p["prompts"].update({"fast.rewrite": "前缀 task-123 后缀"}),
+            lambda p: p["prompts"].update(
+                {"fast.rewrite": '前缀 task-123 "search_strategy":"direct|verify|web" 后缀'}
+            ),
         )
         assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
@@ -405,3 +411,49 @@ class TestModelMappingRules:
         payload = _mutated(MODEL_DATA_ID, lambda p: p.update({"light": ""}))
         with pytest.raises(AssetValidationError):
             validate_asset(MODEL_DATA_ID, payload)
+
+
+class TestPromptsSearchStrategyRules:
+    """§3 v1.20 两条 prompts 校验（检索策略增量防热更漂移）。"""
+
+    def test_rewrite_template_without_search_strategy_rejected(self):
+        """fast.rewrite 输出 schema 串缺 search_strategy → 整版拒收（防漂移至旧契约）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
+                        '"search_strategy":"direct|verify|web",', ""
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="search_strategy"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_synthesis_template_missing_direct_prefix_rejected(self):
+        """fast.synthesis 缺「免检索直答路径」行前缀 → 整版拒收（行级切分结构性校验）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {"fast.synthesis": p["prompts"]["fast.synthesis"].replace("- 免检索直答路径", "- 其他路径")}
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="免检索直答路径"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_synthesis_template_missing_regular_prefix_rejected(self):
+        """三段中任一缺失即拒收（常规段缺失同判）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {"fast.synthesis": p["prompts"]["fast.synthesis"].replace("- 常规路径", "- 通用路径")}
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="常规路径"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_defaults_pass_new_prompt_rules(self):
+        """内置默认（v1.20 文本）过新校验——校验面与契约文本同源。"""
+        payload = _mutated(PROMPTS_DATA_ID, lambda p: None)
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload

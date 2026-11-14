@@ -50,6 +50,7 @@ class MainState(TypedDict, total=False):
     answer_md: str
     query_type: QueryType
     answerable_from_knowledge: bool
+    search_strategy: Literal["direct", "verify", "web"]
     time_range: TimeRange
     rewritten_queries: list[str]
     candidates: list[Candidate]
@@ -84,6 +85,7 @@ class FastState(TypedDict, total=False):
     # rewrite 产出（light 模型结构化输出，S14/S15）
     query_type: QueryType
     answerable_from_knowledge: bool
+    search_strategy: Literal["direct", "verify", "web"]  # v1.44 B9②：direct 条件边 + synthesis 变体消费（缺省/非法=web）
     time_range: TimeRange
     rewritten_queries: list[str]
     # 检索产出（Send 扇出并行写入 → merge_dedupe 消费）

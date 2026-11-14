@@ -85,7 +85,17 @@ const isStreaming = computed(() => liveTurn.value?.status === 'running')
 /** 来源面板投影：进行中轮优先（liveTurnId），否则最新一轮（回看态） */
 const panelTurnId = computed(() => store.liveTurnId ?? turnIds.value[turnIds.value.length - 1] ?? null)
 const panelSources = computed(() => store.turns[panelTurnId.value ?? '']?.sources ?? [])
-const collecting = computed(() => liveTurn.value !== null)
+/**
+ * 「收集中」语义门控（frontend-api.md §3 sources 行 v1.15 注 / api.md §7.4 v1.14 direct 形态）：
+ * 收集态 = 进行中轮已进入搜索阶段（stage_key 驱动，与 Timeline「缺 key 即缺节点」同构——
+ * 不消费 extra.strategy 留痕字段）。direct 轮（仅 rewrite/write、无 sources 事件）不进入收集态，
+ * 配合模板 v-if 使无来源轮整块不渲染：无来源面板、无「收集中」徽标、无「来源 0」占位计数
+ * （同 images「无图不渲染」同构口径；2.5 对账 sources=[] 回看态同口径）。
+ */
+const collecting = computed(() => {
+  const t = liveTurn.value
+  return t !== null && (t.sources.length > 0 || t.stages.some((s) => s.stage_key === 'search'))
+})
 const canStop = computed(() => liveTurn.value !== null)
 
 watch(isStreaming, (v) => controller?.setStreaming(v), { immediate: true })
@@ -351,8 +361,15 @@ onUnmounted(() => {
               </p>
             </div>
 
+            <!-- 来源面板门控（§3 sources 行 v1.15 注）：无来源数据且非收集态整块不渲染
+                （direct 轮无面板/无徽标/无「来源 0」占位；见 collecting 注释） -->
             <div ref="panelEl" class="panel-host">
-              <SourcePanel :sources="panelSources" :collecting="collecting" @snapshot="onSnapshot" />
+              <SourcePanel
+                v-if="panelSources.length > 0 || collecting"
+                :sources="panelSources"
+                :collecting="collecting"
+                @snapshot="onSnapshot"
+              />
             </div>
           </div>
         </div>

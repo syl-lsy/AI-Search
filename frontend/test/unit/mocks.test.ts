@@ -3,15 +3,19 @@ import { describe, expect, it } from 'vitest'
 import { threadListFixture } from '@/mocks/threads'
 import {
   TURN_ID_DEEP,
+  TURN_ID_DIRECT,
   TURN_ID_FAST,
   turnDetailDeepCompleted,
+  turnDetailDirectCompleted,
+  turnDetailDirectWithFollowups,
   turnDetailFastCompleted,
   turnDetailFastWithFollowups,
   turnDetailQueued,
 } from '@/mocks/turnDetails'
-import { deepSequence, fastSequence } from '@/mocks/sseSequences'
+import { deepSequence, directFollowupsEvent, directSequence, fastSequence } from '@/mocks/sseSequences'
 import { modelsFixture } from '@/mocks/models'
 import { suggestionsFixture } from '@/mocks/suggestions'
+import type { SseWireEvent } from '@/types/api'
 
 const SSE_EVENT_NAMES = new Set([
   'stage',
@@ -83,6 +87,81 @@ describe('SSE 序列 fixture（api.md §7.4 两种序列形态）', () => {
       'url',
       'width',
     ])
+  })
+})
+
+describe('direct 轮 fixture（§9 v1.15 三用例：免检索直答，api.md §7.4 v1.14 direct 形态）', () => {
+  it('① direct 序列：rewrite/write 两 stage、无 sources/images 事件、done(completed, source_count=0) 收尾', () => {
+    expect(directSequence.length).toBeGreaterThan(0)
+    // 序列基本不变量与其他序列同构：seq 单调、事件名合法、turn_id 一致
+    const turnId = directSequence[0]?.data.turn_id
+    let prevSeq = 0
+    for (const wire of directSequence) {
+      expect(SSE_EVENT_NAMES.has(wire.event)).toBe(true)
+      expect(wire.data.seq).toBe(wire.id)
+      expect(wire.data.seq).toBeGreaterThan(prevSeq)
+      expect(wire.data.turn_id).toBe(turnId)
+      prevSeq = wire.data.seq
+    }
+    expect(turnId).toBe(TURN_ID_DIRECT)
+    // §7.4 direct：无 stage(search)/sources/images/thinking 事件
+    const stageKeys = directSequence
+      .filter((w): w is Extract<SseWireEvent, { event: 'stage' }> => w.event === 'stage')
+      .map((w) => w.data.stage_key)
+    expect(stageKeys).toEqual(['rewrite', 'rewrite', 'write', 'write'])
+    expect(directSequence.some((w) => w.event === 'sources')).toBe(false)
+    expect(directSequence.some((w) => w.event === 'images')).toBe(false)
+    // §7.4 v1.14 留痕键：stage(rewrite,done) 携带 extra.strategy（前端不消费，镜像已同步）
+    const rewriteDone = directSequence.find(
+      (w): w is Extract<SseWireEvent, { event: 'stage' }> =>
+        w.event === 'stage' && w.data.stage_key === 'rewrite' && w.data.status === 'done',
+    )
+    expect(rewriteDone?.data.extra).toEqual({ strategy: 'direct' })
+    // done 收尾：completed、degraded=false、source_count=0（api.md §7.2 v1.14 对账口径）
+    const done = directSequence.at(-1)
+    if (done?.event !== 'done') throw new Error('direct 序列应以 done 收尾')
+    expect(done.data.finish).toBe('completed')
+    expect(done.data.degraded).toBe(false)
+    expect(done.data.source_count).toBe(0)
+    // token 拼接与 2.5 fixture answer_md 一致（fixture 互洽）
+    const joined = directSequence
+      .filter((w): w is Extract<SseWireEvent, { event: 'token' }> => w.event === 'token')
+      .map((w) => w.data.delta)
+      .join('')
+    expect(joined).toBe(turnDetailDirectCompleted.answer_md)
+  })
+
+  it('② direct 回看 fixture（2.5）：sources/images 恒空、stages 仅两节点、答案无 [n] 悬挂引用', () => {
+    expect(turnDetailDirectCompleted.status).toBe('completed')
+    expect(turnDetailDirectCompleted.mode).toBe('fast')
+    expect(turnDetailDirectCompleted.sources).toEqual([])
+    expect(turnDetailDirectCompleted.images).toEqual([])
+    expect(turnDetailDirectCompleted.stages.map((s) => [s.stage_key, s.status])).toEqual([
+      ['rewrite', 'done'],
+      ['write', 'done'],
+    ])
+    expect(turnDetailDirectCompleted.stages[0]?.extra).toEqual({ strategy: 'direct' }) // §2.5 v1.14 留痕重建
+    expect(turnDetailDirectCompleted.degraded).toBe(false)
+    expect(turnDetailDirectCompleted.export_available).toBe(false) // fast 不计入 report
+    expect(turnDetailDirectCompleted.followups).toBeNull() // 默认关闭态（③ 另有非空孪生）
+    expect(turnDetailDirectCompleted.answer_md).not.toMatch(/\[\d+\]/) // 零来源轮无引用标注
+  })
+
+  it('③ followups 追加于 direct 轮：事件样例与 2.5 孪生（api.md §7.2 v1.14 注轮型不排除 direct）', () => {
+    if (directFollowupsEvent.event !== 'followups') {
+      throw new Error('③ 样例应为 followups 事件')
+    }
+    const followups = directFollowupsEvent.data
+    expect(followups.turn_id).toBe(TURN_ID_DIRECT)
+    expect(followups.seq).toBeGreaterThan(directSequence.at(-1)?.data.seq ?? 0) // 必然晚于 done
+    expect(followups.items.length).toBeLessThanOrEqual(5)
+    for (const item of followups.items) {
+      expect(item.length).toBeGreaterThan(0)
+      expect(item.length).toBeLessThanOrEqual(200)
+    }
+    // 2.5 孪生（REST 为事实源）：followups 内容与 SSE 事件一致
+    expect(turnDetailDirectWithFollowups.followups).toEqual(followups.items)
+    expect(turnDetailDirectWithFollowups.sources).toEqual([])
   })
 })
 

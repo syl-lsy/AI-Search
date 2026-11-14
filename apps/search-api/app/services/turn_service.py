@@ -842,6 +842,7 @@ class ThreadScheduler:
         # 图内降级留痕接线（§6.2）：search 单源失败/备位装载 → FastState.degraded=True
         # → done.degraded=True + degraded_reason=source_failure（turns.degraded_reason 列同步）
         degraded = bool(final_state.get("degraded"))
+        self._log_search_strategy(ctx, final_state, degraded=degraded)
         raw_queries = final_state.get("rewritten_queries")
         rewritten = (
             [str(q) for q in raw_queries]
@@ -872,6 +873,36 @@ class ThreadScheduler:
             },
         )
         self._nudge_thread(ctx.thread_id)
+
+    @staticmethod
+    def _log_search_strategy(
+        ctx: _RunContext, final_state: dict[str, Any], *, degraded: bool
+    ) -> None:
+        """轮末检索策略留痕（v1.44 B9⑤ / ARCH §6.6 v1.44「按策略分桶」）。
+
+        **为什么不在 trace metadata 里**（如实注记，避免后人误加）：Langfuse 轮级
+        trace 属性只能在根 run 创建时写入（`CallbackHandler` 启动时读
+        `RunnableConfig.metadata`），而 `search_strategy` 由图内 rewrite 判定、晚于
+        trace 创建；v4 events_only 部署下 `trace-create` 事后 upsert 被拒收（2026-11-14
+        探针实证：`/api/public/ingestion` 仅收 score 事件，`/api/public/traces/{id}`
+        返回 404）。可落地的观测面两条：
+        ① synthesis 生成 span 的 metadata（`synthesis._with_strategy_metadata`——
+           M4 可在 generation 维度按策略过滤）；
+        ② `stage(rewrite,done).extra={"strategy":…}` 随 turn_events 落库并重建进
+           api.md §2.5 `stages[].extra`（direct 轮型判定事实源）。
+        本处补结构化日志，作为轮级（同 trace_id=turn_id）的第三条可检索留痕。
+        """
+        strategy = final_state.get("search_strategy")
+        if not isinstance(strategy, str):
+            return  # 非 fast 轮（deep 不产出 search_strategy）：零留痕零噪音
+        query_type = final_state.get("query_type")
+        AgentLog(
+            message=(
+                f"轮次检索策略：strategy={strategy} query_type={query_type} "
+                f"source_count={ctx.sources_count} degraded={degraded}"
+            ),
+            graph="turn_runner",
+        ).info()
 
     async def _finish_canceled(
         self,
@@ -1206,7 +1237,11 @@ class ThreadScheduler:
                             "tools_registry": tools_registry,
                         },
                         # Langfuse trace root=轮（ARCH §6.6）：trace_id=turn_id 对账、
-                        # session=thread_id 经 langfuse_* metadata 键承载（v3 契约键）
+                        # session=thread_id 经 langfuse_* metadata 键承载（v3 契约键）。
+                        # 注：search_strategy 不在本 dict——rewrite 在图内判定、晚于根
+                        # run 创建（v4 events_only 无事后 trace upsert），留痕走
+                        # synthesis 生成 span metadata + stage extra + 轮末结构化日志
+                        # （见 _log_search_strategy docstring）。
                         "callbacks": build_turn_callbacks(
                             thread_id=thread_id,
                             turn_id=turn_id,
@@ -1271,8 +1306,16 @@ class ThreadScheduler:
             )
             return
         except SynthesisError as exc:
-            # LLM 调用重试耗尽（§4.1 synthesis 行 / api.md §7.2 500101）：已收集 sources
-            # 保留——error 后跟 done(finish=degraded)（v1.10 error 收束括注「有部分内容」形态）
+            # LLM 调用重试耗尽（§4.1 synthesis 行 / api.md §7.2 500101）：收束形态按
+            # 「有/无部分内容」二分（§7.1 v1.10 例外条）——**direct 轮恒零 sources**（§7.2
+            # v1.14 direct 形态：零检索、不发 sources/images、done.source_count=0），失败即
+            # 必然「无部分内容」→ 零内容收束（error 后直接关闭、不发 done，failed 终态经
+            # §2.5 对账）；sources 已发布轮保留已收集来源 → 降级收束 done(finish=degraded)。
+            if ctx.sources_count == 0:
+                await self._fail_turn(
+                    ctx, code="500101", message="综合生成失败，请稍后重试", exc=exc
+                )
+                return
             await self._finish_degraded_with_error(
                 ctx, code="500101", message="综合生成失败，已保留检索来源", exc=exc,
                 degraded_reason=None,  # 枚举（timeout/budget/source_failure）外不上报
@@ -1417,7 +1460,8 @@ class ThreadScheduler:
         winner 的 done 已把流收口，失败方零事件退出。
         """
         if ctx.sources_count > 0:
-            # timeout/未知异常落在 sources 之后=有部分内容——降级收束（同 500101 形态）
+            # 已发布 sources 即在失败前有部分内容（timeout 500301 / 搜索链 500201 /
+            # LLM 重试耗尽 500101 / 未知异常 500001 同款）——降级收束（同 500101 形态）
             degraded_reason = "timeout" if code == "500301" else None  # 枚举内才上报
             await self._finish_degraded_with_error(
                 ctx, code=code, message=message, exc=exc, degraded_reason=degraded_reason

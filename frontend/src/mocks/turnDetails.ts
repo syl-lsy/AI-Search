@@ -2,7 +2,8 @@
  * src/mocks/turnDetails.ts — 轮次终态静态 fixture（api.md §2.5 镜像形态；§9 fixture 优先）。
  * 覆盖：快速完成态（followups 恒 null=实验默认关闭）、达标 fast 轮（followups 非空，
  * §9 v1.9 fixture③ 回看渲染样例）、深度完成态（export_available=true）、排队轮
- * （§9 v1.5 queued 用例——仅 query 与状态已持久化）。
+ * （§9 v1.5 queued 用例——仅 query 与状态已持久化）、direct 完成态（§9 v1.15 fixture②——
+ * sources=[]/images=[]/stages 仅 rewrite+write 两节点）。
  */
 import type { TurnDetail } from '@/types/api'
 
@@ -10,6 +11,7 @@ export const THREAD_ID_FAST = '7d2f0a1e-1c3b-4e5a-9d8f-0a1b2c3d4e5f'
 export const TURN_ID_FAST = 'c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b'
 export const TURN_ID_DEEP = 'd4e5f6a7-8b90-4cde-a123-4567890abcde'
 export const TURN_ID_QUEUED = 'e5f6a7b8-9c0d-4e1f-b2a3-4c5d6e7f8a9b'
+export const TURN_ID_DIRECT = 'f6a7b8c9-0d1e-4f2a-b3c4-5d6e7f809a2c'
 
 const USAGE_ZERO = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 }
 
@@ -119,6 +121,51 @@ export const turnDetailDeepCompleted: TurnDetail = {
   incognito: false,
   cancel_reason: null,
   followups: null,
+}
+
+/**
+ * direct 完成态（§9 v1.15 fixture②——2.5 direct 轮回看渲染用例，api.md §7.4 v1.14 direct 形态 /
+ * §2.5 v1.14：免检索直答轮 sources 恒空数组、stages 仅 rewrite/write 两节点、degraded 恒 false、
+ * export_available=false（fast 不计入 report）、答案正文无 [n] 引用（零来源无悬挂引用）。
+ *
+ * stage(rewrite,done) 的 extra 携带 {"strategy":"direct"} 留痕（api.md §2.5 v1.14，
+ * 评测/审计可判轮型；前端不消费不展示）——StageExtra 镜像已同步该键（2026-11-14
+ * 调度方裁决 A 方案，镜像增量一行；sseSequences.ts directSequence 同步）。
+ */
+export const turnDetailDirectCompleted: TurnDetail = {
+  turn_id: TURN_ID_DIRECT,
+  thread_id: THREAD_ID_FAST,
+  mode: 'fast',
+  status: 'completed',
+  query: '你好，请介绍一下你自己',
+  query_lang: 'zh',
+  rewritten_queries: ['你好，请介绍一下你自己'],
+  parent_turn_id: null,
+  answer_md: '你好！我是 AI 搜索助手，可以帮你检索网页、深度调研与管理个人知识库。',
+  sources: [],
+  images: [],
+  stages: [
+    { stage_key: 'rewrite', status: 'done', label: '改写意图', started_at: '2026-11-01T08:15:00Z', ended_at: '2026-11-01T08:15:00Z', duration_ms: 180, extra: { strategy: 'direct' } },
+    { stage_key: 'write', status: 'done', label: '综合中', started_at: '2026-11-01T08:15:00Z', ended_at: '2026-11-01T08:15:02Z', duration_ms: 2220, extra: undefined },
+  ],
+  degraded: false,
+  degraded_reason: null,
+  error: null,
+  usage: { prompt_tokens: 640, completion_tokens: 564, total_tokens: 1204, cost_usd: 0.0012 },
+  duration_ms: 2400,
+  export_available: false,
+  created_at: '2026-11-01T08:15:00Z',
+  finished_at: '2026-11-01T08:15:02Z',
+  incognito: false,
+  cancel_reason: null,
+  followups: null,
+}
+
+/** direct 轮 + followups 非空（§9 v1.15 fixture③ 的 2.5 对账孪生形态——REST 为事实源，
+ *  api.md §7.2 v1.14 注：轮型不排除 direct，闲聊/创作轮追问建议同为高价值目标） */
+export const turnDetailDirectWithFollowups: TurnDetail = {
+  ...turnDetailDirectCompleted,
+  followups: ['帮我写一首关于秋天的诗', '你能联网搜索吗？', '把上面的介绍翻译成英文'],
 }
 
 /** 排队轮（§9 v1.5：status=queued——仅 query 与状态已持久化，等待期无业务事件） */

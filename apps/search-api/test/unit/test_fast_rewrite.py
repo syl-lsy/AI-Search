@@ -219,12 +219,16 @@ async def test_rewrite_stage_events_and_extra_for_memory_directive(
     assert [(key, status) for key, status, _ in emitted] == [
         ("rewrite", "done"),
     ]  # running 已由 TurnRunner 图前发布（§4.3）——节点只发 done
-    assert emitted[-1][2] == {}  # 成功且 memory_directive 为 null：done 无 extra
+    # v1.20：strategy 恒随 done.extra 留痕（direct 形态为 api.md §7.4 钉死形态，
+    # verify/web 轮为观测增量）；memory_directive 为 null 时不携带
+    assert emitted[-1][2] == {"extra": {"strategy": "web"}}
 
     chain2 = _FakeChain([{**_OK_OUTPUT, "memory_directive": "记住：偏好官方文档源"}])
     _, emitted2 = _install(monkeypatch, chain2)
     await rewrite({**_STATE}, _config())
-    assert emitted2[-1][2] == {"extra": {"memory_directive": "记住：偏好官方文档源"}}
+    assert emitted2[-1][2] == {
+        "extra": {"strategy": "web", "memory_directive": "记住：偏好官方文档源"}
+    }
 
 
 async def test_rewrite_prompt_renders_contract_variables(
@@ -321,7 +325,8 @@ async def test_validation_failure_repairs_once_then_mechanism_fallback(
     assert "degraded" not in update
     assert update["errors"] == [{"stage": "rewrite", "reason": "structured_output_invalid"}]
     assert [(key, status) for key, status, _ in emitted] == [("rewrite", "done")]
-    assert emitted[-1][2] == {"extra": {"fallback": "mechanism"}}  # 不终止：降级留痕
+    # 不终止：降级留痕 + 兜底态 strategy 回落 web（v1.20 灰度安全硬约束）
+    assert emitted[-1][2] == {"extra": {"strategy": "web", "fallback": "mechanism"}}
 
 
 async def test_validation_failure_repaired_successfully(
@@ -362,7 +367,7 @@ async def test_transport_failure_retries_then_degrades_to_single_raw_query(
     # 2026-11-13 B 裁决：transport 兜底同样不置 FastState.degraded（同 mechanism 口径）
     assert "degraded" not in update
     assert update["errors"] == [{"stage": "rewrite", "reason": "llm_retry_exhausted"}]
-    assert emitted[-1][2] == {"extra": {"fallback": "degraded"}}
+    assert emitted[-1][2] == {"extra": {"strategy": "web", "fallback": "degraded"}}
 
 
 async def test_deterministic_failure_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -433,3 +438,138 @@ def test_fallback_constants_are_explicit() -> None:
     assert fast_rewrite.MECHANISM_FALLBACK_QUERY_COUNT == 3
     assert fast_rewrite.MECHANISM_FALLBACK_QUERY_TYPE == "factoid"
     assert fast_rewrite.TRANSPORT_FALLBACK_QUERY_TYPE == "other"
+
+
+# ==== search_strategy 三值增量（B9⑧ 契约义务，nacos-config.md §1 v1.20）====
+#
+# 灰度安全硬约束（逐条红锁）：字段缺失/值非法/两兜底路径一律 web——旧提示词（v1.18，
+# 无本字段）+ 新代码 → 缺省 web → 全量轮零行为变化；verify ⇔ answerable=true 对齐；
+# direct 轮 synthesis 按 strategy（非 answerable）切换变体，故 direct 强制
+# answerable=false 保持「两字段一致」（nacos §1 纪律条），web 保留 answerable 原值
+# （回滚态 answerable 驱动不变——ARCH §8 B9①「web 保留 answerable 原值」）。
+
+
+async def test_search_strategy_missing_defaults_to_web(monkeypatch: pytest.MonkeyPatch) -> None:
+    """旧提示词形态（输出无 search_strategy）→ pydantic 缺省 web（灰度安全底线）。"""
+    legacy = {
+        "queries": ["旧提示词 query"],
+        "query_type": "factoid",
+        "answerable_from_knowledge": True,  # 旧提示词可产 answerable=true
+        "time_range": None,
+        "memory_directive": None,
+    }
+    chain = _FakeChain([legacy])
+    _, emitted = _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "web"
+    assert update["answerable_from_knowledge"] is True  # web 保留原值（零行为变化）
+    assert emitted[-1][2]["extra"]["strategy"] == "web"
+
+
+async def test_search_strategy_direct_passthrough_and_answerable_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """direct 合法输出：strategy 透传；answerable 强制 false（两字段一致纪律）。"""
+    chain = _FakeChain([
+        {**_OK_OUTPUT, "search_strategy": "direct", "answerable_from_knowledge": True}
+    ])
+    _, emitted = _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "direct"
+    assert update["answerable_from_knowledge"] is False
+    assert emitted[-1][2]["extra"]["strategy"] == "direct"  # api.md §7.4 direct 形态
+
+
+async def test_search_strategy_verify_forces_answerable_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify ⇔ answerable=true：模型判 verify 但答 false → 以 strategy 为准修正为 true
+    （nacos §1「两字段必须一致」；synthesis 走「先知识后取证」段）。"""
+    chain = _FakeChain([
+        {**_OK_OUTPUT, "search_strategy": "verify", "answerable_from_knowledge": False}
+    ])
+    _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "verify"
+    assert update["answerable_from_knowledge"] is True
+
+
+async def test_search_strategy_illegal_value_repairs_to_parsed_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非法枚举值（如 "search"）→ ValidationError → 修复回喂 1 次 → 修复后合法值生效。"""
+    bad = {**_OK_OUTPUT, "search_strategy": "search"}  # 枚举外值 → 校验失败
+    fixed = {**_OK_OUTPUT, "search_strategy": "direct", "queries": ["你好 能做什么"]}
+    chain = _FakeChain([bad, fixed])
+    _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert len(chain.prompts) == 2  # 初始 + 修复回喂
+    assert update["search_strategy"] == "direct"
+    assert update["answerable_from_knowledge"] is False
+
+
+async def test_search_strategy_illegal_value_double_failure_falls_back_web(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非法值 + 修复仍非法 → 机制兜底：strategy=web（回落硬约束）+ answerable=false。"""
+    bad = {**_OK_OUTPUT, "search_strategy": "search"}
+    chain = _FakeChain([bad, bad])
+    _, emitted = _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "web"
+    assert update["answerable_from_knowledge"] is False
+    assert update["errors"] == [{"stage": "rewrite", "reason": "structured_output_invalid"}]
+    assert emitted[-1][2] == {"extra": {"strategy": "web", "fallback": "mechanism"}}
+
+
+async def test_search_strategy_transport_fallback_is_web(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """传输兜底路径 strategy=web（同机制兜底口径；不终止、降级原始 query 单发）。"""
+    request = httpx.Request("POST", "http://litellm/v1")
+    chain = _FakeChain([
+        httpx.ConnectError("refused", request=request),
+        httpx.ConnectError("refused", request=request),
+    ])
+    _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "web"
+    assert update["answerable_from_knowledge"] is False
+    assert update["rewritten_queries"] == [_STATE["query"]]
+
+
+def test_rewrite_output_search_strategy_default_is_web() -> None:
+    """schema 缺省值锁死：RewriteOutput().search_strategy == "web"（pydantic 缺省）。"""
+    from app.agent.nodes.fast_rewrite import RewriteOutput
+
+    parsed = RewriteOutput(
+        queries=["q"], query_type="other", answerable_from_knowledge=False
+    )
+    assert parsed.search_strategy == "web"
+
+
+def test_rewrite_output_search_strategy_rejects_illegal_literal() -> None:
+    """枚举三值锁死：direct|verify|web 之外一律 ValidationError（非法值经修复回喂）。"""
+    from pydantic import ValidationError
+
+    from app.agent.nodes.fast_rewrite import RewriteOutput
+
+    with pytest.raises(ValidationError):
+        RewriteOutput(
+            queries=["q"],
+            query_type="other",
+            answerable_from_knowledge=False,
+            search_strategy="offline",
+        )

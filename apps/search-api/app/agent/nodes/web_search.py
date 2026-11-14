@@ -34,7 +34,15 @@ WEB_SEARCH_TOP_K = 5
 
 
 def search_fanout(state: Any) -> list[Send] | str:
-    """rewrite 出边：按 rewritten_queries 产 Send×N；空 queries 回落默认边（不悬挂）。"""
+    """rewrite 出边三目标路由（v1.44 B9③ / api.md §7.4 direct 形态）。
+
+    判定顺序（契约钉死）：① `search_strategy=direct` → `"synthesis"`（免检索直答，
+    绕过检索段；**先于空 queries 判定**——direct 轮 queries 内容不参与路由）；
+    ② 空 queries → `"merge_dedupe"`（不悬挂，既有逻辑）；③ 其余 → `Send("web_search")×N`。
+    缺省/非法 strategy（旧提示词形态、state 侧未声明值）一律走 ③——灰度安全。
+    """
+    if state.get("search_strategy") == "direct":
+        return "synthesis"
     queries = state.get("rewritten_queries") or []
     if not queries:
         return "merge_dedupe"

@@ -53,6 +53,8 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 
 初始化细节（Nacos 鉴权与只读账号、dataId 顺序）见 `AGENTS.md`「S0 基建 UI 初始化 checklist」与 `docs/s0-batch1-handoff.md`。
 
+> **升级既有部署（非首次起栈）的部署次序【B9 起硬前置】**：新代码的 prompts 校验会拒收 Nacos 上的旧版（v1.19 及更早）`ai_search.agent.prompts` 文本——dev 环境回落 L4 内置 v1.20 正文、代码部署即启用免检索直答（direct）；**production 环境 L4 回落触发 `_enforce_production_floor` 拒绝启动**。故生产升级须**先向 Nacos 发布含 v1.20 内容的 prompts（`NACOS_INIT_FORCE=1` + 管理员凭据）再部署代码**（反向无害：旧代码 + 新 prompts 忽略未知字段、行为不变）。机制与回退门见 `docs/contract/nacos-config.md` v1.21 §1/§8。
+
 ## 常用命令（make，一律从仓库根跑）
 
 | 命令 | 作用 |

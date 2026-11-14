@@ -60,9 +60,11 @@ class _FakeModel:
     def __init__(self, script: list[Any]) -> None:
         self.script = list(script)
         self.prompts: list[list[Any]] = []
+        self.configs: list[Any] = []
 
     def astream(self, messages: list[Any], config: Any = None, **kw: Any) -> Any:
         self.prompts.append(list(messages))
+        self.configs.append(config)
         if not self.script:  # 脚本耗尽即失败（防被测代码静默多调）
             raise AssertionError("FakeModel 脚本耗尽：astream 调用次数超出预期")
         item = self.script.pop(0)  # 每次调用消费一项（一项=单次尝试的 chunk 序列）
@@ -102,8 +104,10 @@ def _state(
     max_chars: int = 3000,
     errors: list[dict[str, Any]] | None = None,
     chat_model_key: str = "qwen",
+    strategy: str | None = None,
+    query_type: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    state: dict[str, Any] = {
         "query": query,
         "fused": fused if fused is not None else [_cand("https://a/1"), _cand("https://b/2")],
         "answerable_from_knowledge": answerable,
@@ -112,6 +116,11 @@ def _state(
         "errors": errors or [],
         "chat_model_key": chat_model_key,
     }
+    if strategy is not None:
+        state["search_strategy"] = strategy
+    if query_type is not None:
+        state["query_type"] = query_type
+    return state
 
 
 def _config(mapping: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -331,3 +340,119 @@ async def test_synthesis_writes_only_faststate_keys(monkeypatch: pytest.MonkeyPa
     from app.agent.state import FastState
 
     assert set(update) <= set(FastState.__annotations__)
+
+
+# ==== direct 变体三态切分（v1.44 B9④，nacos-config.md §1 v1.20 三段模板）====
+#
+# 变体消费面（契约钉死）：direct 轮按 search_strategy 切「免检索直答路径」段；
+# verify/web 轮沿用既有 answerable 两段切换（回滚态 web + answerable=true 仍切
+# 「先知识后取证」段=现行行为零变化）。
+
+
+async def test_synthesis_direct_switches_to_direct_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """strategy=direct → 免检索直答段保留；常规/最小检索两段剔除（行级切分）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("你好！我可以帮你搜索与深度研究。")])
+
+    await synthesis(_state(strategy="direct"), _config())
+
+    prompt_text = model.prompts[0][0].content
+    assert "免检索直答路径" in prompt_text
+    assert "常规路径" not in prompt_text
+    assert "最小检索路径" not in prompt_text
+
+
+async def test_synthesis_direct_has_misjudgment_guard_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """direct 段含误判兜底句（需外部核查时如实说明，不得虚构事实——nacos §1 v1.20）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(_state(strategy="direct"), _config())
+
+    prompt_text = model.prompts[0][0].content
+    assert "建议联网搜索确认" in prompt_text
+    assert "不得虚构事实" in prompt_text
+
+
+async def test_synthesis_direct_empty_fused_does_not_raise_search_chain_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """direct 轮天然无检索结果：空 fused + 空 errors 不得触发 500201 防御短路。"""
+    from app.agent.nodes.synthesis import SearchChainUnavailable, SynthesisError  # noqa: F401
+
+    model, _, _ = _install(monkeypatch, [_text_chunks("你好！我是 AI 搜索助手。")])
+
+    update = await synthesis(_state(strategy="direct", fused=[]), _config())
+
+    assert update["answer_md"] == "你好！我是 AI 搜索助手。"
+    assert update["degraded"] is False
+
+
+async def test_synthesis_direct_empty_fused_strips_all_citations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """零来源轮 [n] 全量剔除（_strip_out_of_range_citations 天然防悬空引用：无来源可引）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("事实一[1]；事实二[2]；结论。")])
+
+    update = await synthesis(_state(strategy="direct", fused=[]), _config())
+
+    assert "[1]" not in update["answer_md"]
+    assert "[2]" not in update["answer_md"]
+    assert update["answer_md"] == "事实一；事实二；结论。"
+
+
+async def test_synthesis_direct_renders_empty_sources_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """direct 轮 {{sources_block}} 渲染空串合法（followups 空 sources_block 同款先例）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(_state(strategy="direct", fused=[]), _config())
+
+    prompt_text = model.prompts[0][0].content
+    assert "<external_content" not in prompt_text  # 零来源 → 零包裹块
+    assert "{{sources_block}}" not in prompt_text  # 占位符已渲染（非残留）
+
+
+async def test_synthesis_web_with_answerable_keeps_knowledge_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回滚态零行为变化：strategy=web + answerable=true 仍切「先知识后取证」段。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("知识先答[1]")])
+
+    await synthesis(_state(strategy="web", answerable=True), _config())
+
+    prompt_text = model.prompts[0][0].content
+    assert "最小检索路径" in prompt_text
+    assert "免检索直答路径" not in prompt_text
+    assert "常规路径" not in prompt_text
+
+
+async def test_synthesis_missing_strategy_keeps_answerable_driven_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧提示词形态（state 无 search_strategy）→ 仍按 answerable 切分（灰度安全）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(_state(answerable=False), _config())
+
+    prompt_text = model.prompts[0][0].content
+    assert "常规路径" in prompt_text
+    assert "免检索直答路径" not in prompt_text
+
+
+async def test_synthesis_llm_generation_metadata_carries_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """观测面（ARCH §6.6 v1.44）：synthesis 生成 span metadata 携带 strategy/query_type。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(
+        _state(strategy="direct", query_type="other", fused=[]), _config()
+    )
+
+    metadata = (model.configs[0] or {}).get("metadata") or {}
+    assert metadata.get("search_strategy") == "direct"
+    assert metadata.get("query_type") == "other"

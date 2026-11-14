@@ -289,3 +289,47 @@ async def test_fanout_empty_queries_returns_default_edge() -> None:
     """空 queries（异常兜底形态）→ 回落默认边 'merge_dedupe'（扇出零副本时不悬挂）。"""
     result = ws_module.search_fanout({"rewritten_queries": []})
     assert result == "merge_dedupe"
+
+
+# ---- 扇出三目标路由（v1.44 B9③：search_strategy=direct 先于空 queries 判定）----
+
+
+async def test_fanout_direct_routes_to_synthesis_without_search() -> None:
+    """strategy=direct + 有 queries → 条件边返回 "synthesis"（绕过检索段，零 Send）。"""
+    result = ws_module.search_fanout(
+        {
+            "search_strategy": "direct",
+            "rewritten_queries": ["你好 能做什么", "闲聊"],
+            "query_lang": "zh",
+        }
+    )
+    assert result == "synthesis"
+
+
+async def test_fanout_direct_takes_precedence_over_empty_queries() -> None:
+    """direct 判定优先于空 queries（契约钉死顺序）：空 queries 也不落 merge_dedupe。"""
+    result = ws_module.search_fanout(
+        {"search_strategy": "direct", "rewritten_queries": []}
+    )
+    assert result == "synthesis"
+
+
+async def test_fanout_verify_and_web_keep_send_path() -> None:
+    """verify/web 两值走既有扇出（verify ≡ 现行 answerable 路径，不改变拓扑）。"""
+    from langgraph.types import Send
+
+    for strategy in ("verify", "web", None):  # None = 旧提示词缺省形态
+        state: dict[str, Any] = {"rewritten_queries": ["q1", "q2"], "query_lang": "zh"}
+        if strategy is not None:
+            state["search_strategy"] = strategy
+        sends = ws_module.search_fanout(state)
+        assert [type(s) for s in sends] == [Send, Send]
+        assert [s.arg["query"] for s in sends] == ["q1", "q2"]
+
+
+async def test_fanout_illegal_strategy_falls_back_to_search_path() -> None:
+    """state 侧非法/未知 strategy（非 pydantic 面）→ 按既有检索路径处理（不悬挂）。"""
+    result = ws_module.search_fanout(
+        {"search_strategy": "offline", "rewritten_queries": ["q1"]}
+    )
+    assert result != "synthesis"
