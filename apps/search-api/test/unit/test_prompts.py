@@ -199,3 +199,30 @@ def test_synthesis_direct_section_carries_misjudgment_guard() -> None:
     text = PROMPTS_CONFIG["prompts"]["fast.synthesis"]
     assert "建议联网搜索确认" in text
     assert "不得虚构事实" in text
+
+
+def test_synthesis_length_section_is_soft_guidance_only() -> None:
+    """篇幅段按题型软引导、无硬带（nacos §1 v1.25 篇幅段回调，2026-11-16 用户裁决③）。
+
+    钉住的语义：
+    - 事实型「从简直答」、操作/对比/多面型「充分展开」、不为凑篇幅注水（软引导三句）；
+    - 「总长不超过{{max_answer_chars}}字（硬上限兜底，不是目标篇幅）」保留；
+    - 批次 9 为提速加入的「目标篇幅 150~300 字」硬带**已删除**——正文时长不受 P50
+      30s 挤压（PRD 5.1 v1.22 计时终点改为首个正文内容事件），篇幅由题型与信息需要决定。
+    """
+    for text in (
+        PROMPTS_CONFIG["prompts"]["fast.synthesis"],
+        load_builtin_prompt("fast.synthesis"),
+    ):
+        assert "150~300" not in text
+        assert "目标篇幅 150" not in text
+        assert "事实型问题（单一事实点）从简直答" in text
+        assert "充分展开" in text
+        assert "不为凑篇幅注水" in text
+        assert "总长不超过{{max_answer_chars}}字（硬上限兜底，不是目标篇幅）" in text
+
+
+def test_synthesis_direct_section_length_sentence_unchanged() -> None:
+    """direct 段篇幅句不动（裁决③：仅篇幅组织段回调；direct 行「篇幅按请求类型组织」保留）。"""
+    text = PROMPTS_CONFIG["prompts"]["fast.synthesis"]
+    assert "篇幅按请求类型组织（寒暄从简、创作按请求展开）" in text

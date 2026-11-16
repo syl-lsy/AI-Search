@@ -129,7 +129,9 @@ _MCP_DATA_ID = "ai_search.agent.mcp.json"
 
 # spec 缺省兜底（TurnSpec 节缺失时组装层回落 reject 的同款内置口径）
 _DEFAULT_POLICY = "reject"
-_DEFAULT_TURN_TIMEOUT_S = 60.0
+# 轮级硬超时内置兜底（nacos-config §3 v1.25）：fast 60→120（2026-11-16 用户裁决②——
+# P50 计时终点改为首个正文内容事件后正文时长释放，给 3000 字慢侧留余量）；快照给值者优先。
+_DEFAULT_TURN_TIMEOUT_S = 120.0
 
 # 历史装配窗口（ARCH §4.1/§6.5：最近 6 轮 {q, a_head≤200 chars}）。nacos spec `history`
 # 节为弃用迁移口径（memory.short_term 于 M5 接管，nacos-config.md §3），B3 以实现常量

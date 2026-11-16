@@ -382,6 +382,25 @@ async def test_deterministic_failure_not_retried(monkeypatch: pytest.MonkeyPatch
     assert update["query_type"] == "factoid"  # 机制兜底
 
 
+async def test_rewrite_deadline_default_is_120(monkeypatch: pytest.MonkeyPatch) -> None:
+    """spec 缺 turn_timeout_s 时轮预算兜底 120s（nacos-config §3 v1.25，2026-11-16 裁决②）。"""
+    captured: list[float] = []
+    real_deadline = fast_rewrite.TurnDeadline
+
+    def _factory(budget_s: float) -> Any:
+        captured.append(budget_s)
+        return real_deadline(budget_s)
+
+    monkeypatch.setattr(fast_rewrite, "TurnDeadline", _factory)
+    chain = _FakeChain([dict(_OK_OUTPUT)])
+    _install(monkeypatch, chain)
+    spec = {"fast": {k: v for k, v in _SPEC["fast"].items() if k != "turn_timeout_s"}}
+
+    await rewrite({**_STATE, "spec": spec}, _config())
+
+    assert captured == [120.0]
+
+
 async def test_retry_honors_deadline_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """deadline-aware（§6.2 P0）：轮级剩余预算 < 预计单次成本 → 不再重试直接降级。"""
     request = httpx.Request("POST", "http://litellm/v1")

@@ -558,7 +558,7 @@ onUnmounted(() => {
         </div>
         <!-- 最近列表（REQ-058/059，v1.21；v1.23 增 hover 预览卡 + 标题 marquee 双形态；v1.24
             区头折叠 v-show；v1.25 语义收窄=只显未置顶项——置顶项已拆入上方独立分区）：
-            max-height 内部滚动 + 未读点 + 行级三点菜单（ThreadActionMenu 与会话页共用；
+            不自设内滚（随 .sb-nav 整体滚动）+ 未读点 + 行级三点菜单（ThreadActionMenu 与会话页共用；
             动作经 threadListStore 动作面，侧栏随 store 自愈） -->
         <div id="sb-recent-list" v-show="!recentCollapsed" class="sb-recent-list" data-testid="sb-recent-list">
           <div
@@ -783,14 +783,12 @@ onUnmounted(() => {
     display: none;
   }
 }
-/* 侧栏「最近」列表（v1.21 REQ-058/059）：max-height 内部滚动（导航区自身滚动不受影响）+
+/* 侧栏「最近」列表（v1.21 REQ-058/059）：列表不自设限高/内滚（用户裁决 2026-11-16：去掉嵌套
+   滚动区，分区列表自然撑开、随 .sb-nav 整体滚动——对标 Perplexity 侧栏单一滚动容器）；
    行级 = 链接（flex:1）+ 三点菜单（hover 显现，ThreadActionMenu 内聚显隐规则）；
-   max-height 为布局值（非色彩/间距语义，无对应 token——38vh 约一屏侧栏高度的 2/5） */
+   『已置顶』分区与『最近』分区共用本列表样式。纯布局语义（非色彩/间距，无对应 token） */
 .sb-recent-list {
   display: grid;
-  max-height: 38vh;
-  overflow-y: auto;
-  min-height: 0;
 }
 /* ---- 最近区头（v1.24）：折叠开关钮 + hover 显形筛选钮 + 筛选弹层 ----
    （.sb-section 基础样式在 tokens.css：flex/space-between/字号色——此处仅补组件级扩展） */

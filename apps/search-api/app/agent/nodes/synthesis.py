@@ -248,9 +248,9 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
     connection_policy = connection_retry_policy_from_spec(spec, "fast")
     call_timeout_s = llm_timeout_s(spec, "fast")
     budget = TurnDeadline(
-        float(fast_section.get("turn_timeout_s", 60.0))
+        float(fast_section.get("turn_timeout_s", 120.0))
         if isinstance(fast_section, Mapping)
-        else 60.0
+        else 120.0
     )
     model = build_chat_model(_chat_alias(state, config))
 

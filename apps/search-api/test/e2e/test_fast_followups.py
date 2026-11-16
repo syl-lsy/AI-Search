@@ -58,8 +58,9 @@ ROOT = Path(__file__).resolve().parents[4]
 L4_PORT = 18001
 L4_BASE_URL = f"http://127.0.0.1:{L4_PORT}"
 
-#: 收流上限：单轮预算 60s（fast.turn_timeout_s）+ 生成 8s（generate_timeout_ms）+ 余量
-STREAM_TIMEOUT_S = 120.0
+#: 收流上限：单轮预算 120s（fast.turn_timeout_s，nacos-config §3 v1.25）+ 生成 8s
+#: （generate_timeout_ms）+ 余量
+STREAM_TIMEOUT_S = 150.0
 
 #: items 契约上限（api.md §7.2：1~5 条、单条非空且 ≤200 字符）
 ITEMS_MAX_COUNT = 5

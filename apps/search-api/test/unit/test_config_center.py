@@ -302,6 +302,21 @@ class TestBuiltinDefaultsSerializable:
         )
 
 
+class TestTurnTimeoutDefaults:
+    """轮级预算初值（nacos-config §3 v1.25）：fast 120s / deep 300s（2026-11-16 用户裁决②）。
+
+    fast 60→120 的语义：P50 计时终点改为「首个正文内容事件」（PRD 5.1 v1.22）后正文
+    时长不再被 30s 口径挤压，轮预算需给 3000 字慢侧留余量、避免长答案被截断成 degraded；
+    deep 300s 不动。`scripts/nacos_init.py` 侧由 TestNacosInitScriptParity 兜住双投影。
+    """
+
+    def test_fast_turn_timeout_default_is_120(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["turn_timeout_s"] == 120
+
+    def test_deep_turn_timeout_default_stays_300(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]["turn_timeout_s"] == 300
+
+
 class TestNacosInitScriptParity:
     """scripts/nacos_init.py 五份初值 ≡ defaults.py BUILTIN_DEFAULTS（同一契约 §1~§5 的双投影）。
 

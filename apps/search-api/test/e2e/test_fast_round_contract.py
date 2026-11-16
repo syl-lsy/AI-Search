@@ -52,8 +52,9 @@ FAST_TRUNK = ("rewrite", "search", "write")
 FAST_TRUNK_DIRECT = ("rewrite", "write")
 #: 语言判定 CJK 占比阈值（镜像 turn_service.CJK_RATIO_THRESHOLD = 0.30，OQ-2 同口径）
 CJK_RATIO_THRESHOLD = 0.30
-#: 单轮 SSE 收流上限（真链路实测 39~49s，P50 预算矛盾为批次 5 已知遗留）
-SSE_ROUND_TIMEOUT_S = 90.0
+#: 单轮 SSE 收流上限（真链路实测 39~49s；轮预算 fast.turn_timeout_s 已于 v1.25 改为
+#: 120s——正文篇幅不再被 30s 口径压缩，收流上限随预算放宽留余量）
+SSE_ROUND_TIMEOUT_S = 150.0
 #: 中文答案字数硬上限（spec fast.max_answer_chars，nacos-config.md §3 v1.14）
 ZH_ANSWER_CHAR_CAP = 3000
 #: 英文答案词数上限（≤3000 字的等价信息量口径，PRD v1.11）
@@ -64,7 +65,8 @@ _CJK_RANGES = ((0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0x20000, 0x2A6DF))
 
 ZH_MULTIFACET_QUERY = "TCP 和 UDP 有什么区别？"
 #: 原工单题面（定义面+对比面双面型，2026-11-12 实测 65s 触发 500301 轮级熔断——
-#: fast.turn_timeout_s=60 是 PRD v1.11「P90 ≤60s」判定面执行参数，裁决不放宽）：
+#: fast.turn_timeout_s=60 是 PRD v1.11「P90 ≤60s」判定面执行参数，裁决不放宽
+#: ——历史留档（nacos-config §3 v1.25 起该值已改 120s，正文时长不再被 30s 口径压缩））：
 #: 「什么是 RAG（检索增强生成）？它和直接微调大模型相比各有什么优缺点？」
 #: 「逼近 3000 字的充分展开压力口径」归批次 8 性能/评测线实测项，不进本批 e2e 硬门
 #: （批次 5 已知遗留：P50 预算矛盾，synthesis 39~49s vs 60s 兜底，归批次 8 调优）。
@@ -427,9 +429,10 @@ def test_e2e_fast_direct_round_contract(base_url):
     answer_md = detail["answer_md"]
     assert answer_md, "answer_md 为空"
     assert not _CITATION_RE.findall(answer_md), "零来源轮不得残留 [n] 引用标记"
-    # 价值证明观测项（**非契约条款**）：direct 轮免检索应远快于常规轮——上限取轮级
-    # 预算量级（spec fast.turn_timeout_s=60s，P50 ≤30s 为常规轮口径），此处只防
-    # 「direct 误走检索管道」的量级回归，不作为性能门禁。
+    # 价值证明观测项（**非契约条款**）：direct 轮免检索应远快于常规轮——上限取观测
+    # 量级 60s（现行轮预算 spec fast.turn_timeout_s=120s，nacos-config §3 v1.25；P50
+    # ≤30s 为常规轮首字前口径），此处只防「direct 误走检索管道」的量级回归，不作为
+    # 性能门禁。
     assert detail["duration_ms"] < 60_000, (
         f"direct 轮应远快于常规轮预算（<60s 观测上限），实测 {detail['duration_ms']}ms"
     )

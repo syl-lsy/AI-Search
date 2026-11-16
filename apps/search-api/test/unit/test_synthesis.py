@@ -529,6 +529,24 @@ async def test_synthesis_connection_retry_total_window_gate(
     assert len(model.prompts) == 2
 
 
+async def test_synthesis_deadline_default_is_120(monkeypatch: pytest.MonkeyPatch) -> None:
+    """spec 缺 turn_timeout_s 时轮预算兜底 120s（nacos-config §3 v1.25，2026-11-16 裁决②：
+    正文时长释放后给 3000 字慢侧留余量，防长答案被截断成 degraded）。"""
+    captured: list[float] = []
+    real_deadline = synthesis_module.TurnDeadline
+
+    def _factory(budget_s: float) -> Any:
+        captured.append(budget_s)
+        return real_deadline(budget_s)
+
+    monkeypatch.setattr(synthesis_module, "TurnDeadline", _factory)
+    _install(monkeypatch, [_text_chunks("答")])
+
+    await synthesis(_state(), _config())
+
+    assert captured == [120.0]
+
+
 async def test_synthesis_connection_retry_deadline_double_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

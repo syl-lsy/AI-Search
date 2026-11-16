@@ -48,7 +48,7 @@ const renameInputEl = ref<HTMLInputElement | null>(null)
 const renameValue = ref('')
 
 /* ---------- 弹层定位（v1.25 裁剪修复）：Teleport body + position:fixed ----------
- * 侧栏列表（38vh 限高+overflow）与会话页行级容器都会裁剪 absolute 弹层（置顶区单行时
+ * 侧栏导航区（.sb-nav overflow-y:auto 滚动容器）与会话页行级列表容器都会裁剪 absolute 弹层（置顶区单行时
  * 菜单只剩首项可见）——脱离容器改为 fixed：读触发钮 rect，向下首选（贴底翻上）、右对齐
  * 触发钮右缘并左右钳制视口内；渲染后 nextTick 实测菜单宽高校正。window scroll/resize
  * 即隐（capture 捕获侧栏容器滚动；与预览卡「滚动即隐」口径一致——fixed 不随容器滚，
@@ -265,7 +265,7 @@ onUnmounted(() => {
     </UiTooltip>
 
     <!-- 菜单层（role=menu；打开即落首项；方向键移动焦点）。
-        v1.25 裁剪修复：Teleport body + fixed 定位——脱离侧栏列表（38vh+overflow）与
+        v1.25 裁剪修复：Teleport body + fixed 定位——脱离侧栏导航区滚动容器（.sb-nav overflow-y:auto）与
         会话页行级容器的 overflow 裁剪，完整盖在内容上（Perplexity 形态）；
         定位=触发钮 rect 驱动（positionMenu：向下首选/贴底翻上/右对齐+视口钳制） -->
     <Teleport to="body">

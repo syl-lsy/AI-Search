@@ -321,9 +321,9 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
     spec = spec if isinstance(spec, Mapping) else {}
     fast_section = spec.get("fast") if isinstance(spec, Mapping) else None
     turn_timeout = (
-        float(fast_section.get("turn_timeout_s", 60.0))
+        float(fast_section.get("turn_timeout_s", 120.0))
         if isinstance(fast_section, Mapping)
-        else 60.0
+        else 120.0
     )
     policy = retry_policy_from_spec(spec, "fast")
     llm_timeout = llm_timeout_s(spec, "fast")
