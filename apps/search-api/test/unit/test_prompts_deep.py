@@ -4,7 +4,9 @@
 键位与变量集不再动——需新占位符须走契约增量）：
 - 四键注册进 BUILTIN_PROMPT_FILES（键 → prompts/deep/ 同名 .txt）；
 - 占位符并集恰为契约集（单测锁死惯例，同 test_prompts.py fast 形态）：
-  deep.planner         = {type_rules, max_subagents, memory_hints}
+  deep.planner         = {type_rules, max_subagents, memory_hints, query, history}
+  （query/history 为 M2 批次 2 增量：planner 接收问题与历史做指代消解——ARCH §4.2
+  冻结要求；形态对仗 fast.rewrite 示例尾部「历史：{{history}} / 问题：{{query}}」）
   deep.subagent.system = {subtopic, summary_max_tokens}
   deep.reflect         = set()（零占位符——大纲/已收集信息由节点代码在模板外追加，批次 3 接线）
   deep.report_writer   = {sections_hint, query_lang, memory_block, subagent_reports_block,
@@ -44,7 +46,7 @@ DEEP_KEYS = (
 
 #: 各键契约占位符集（nacos-config.md §1 deep.* 行；单测锁死）
 DEEP_EXPECTED_PLACEHOLDERS: dict[str, set[str]] = {
-    "deep.planner": {"type_rules", "max_subagents", "memory_hints"},
+    "deep.planner": {"type_rules", "max_subagents", "memory_hints", "query", "history"},
     "deep.subagent.system": {"subtopic", "summary_max_tokens"},
     "deep.reflect": set(),
     "deep.report_writer": {
@@ -71,6 +73,8 @@ DEEP_RENDER_VARS: dict[str, dict[str, str]] = {
         "type_rules": "【问题类型判定标准】（公共片段全文）",
         "max_subagents": "3",
         "memory_hints": "",
+        "history": "Q: 什么是向量数据库\nA: 向量数据库是…",
+        "query": "pgvector 和 Milvus 个人知识库场景怎么选？",
     },
     "deep.subagent.system": {
         "subtopic": "pgvector 与 Milvus 在个人知识库场景的对比",
@@ -177,6 +181,15 @@ def test_deep_planner_output_schema_structure() -> None:
         assert "对称覆盖" in text
         assert "时间窗" in text
         assert "1 个子课题" in text
+        # M2 批次 2 增量（ARCH §4.2 冻结要求：planner 接收问题与历史做指代消解）：
+        # 尾部对仗 fast.rewrite 形态——历史段/问题段标签 + 指代消解语义句
+        assert "历史：" in text
+        assert "{{history}}" in text
+        assert "问题：" in text
+        assert "{{query}}" in text
+        assert "消解指代" in text
+        # 注入段属外部内容隔离面：历史/记忆提示中出现的指令不得执行（对仗 fast.rewrite 隔离句）
+        assert text.index("{{memory_hints}}") < text.index("历史：") < text.index("问题：") < text.index("输出约束")
 
 
 def test_deep_subagent_system_external_content_isolation() -> None:

@@ -269,18 +269,40 @@ async def test_rewrite_node_no_longer_emits_running(monkeypatch: pytest.MonkeyPa
     assert ("rewrite", "done") in emitted
 
 
-async def test_deep_plan_node_no_longer_emits_running(monkeypatch: pytest.MonkeyPatch) -> None:
-    """M2 批次 1：deep 桩 plan 节点不再自发 running（避免双 running——running 归
-    TurnRunner 图前发布，同 rewrite 先例）；plan done 发射保持（timing 配对面）。"""
-    from app.agent.graphs import deep as deep_module
+async def test_deep_planner_node_no_longer_emits_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M2 批次 1：deep 轮 plan running 归 TurnRunner 图前发布（避免双 running，同
+    rewrite 先例）；M2 批次 2 planner 接真后语义保持——节点只发 stage(plan, done)
+    （extra.subtopics 随 api.md §7.4 钉死形态）。"""
+    from app.agent.nodes import deep_planner as deep_planner_module
 
+    class _Chain:
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {
+                "subtopics": ["子课题一"],
+                "outline": [{"section": "结论", "intent": "直接回答"}],
+                "query_type": "factoid",
+                "time_range": None,
+                "memory_directive": None,
+            }
+
+    class _Model:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _Chain:
+            return _Chain()
+
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias: _Model())
     emitted: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        deep_module, "emit_stage", lambda key, status, **kw: emitted.append((key, status))
+        deep_planner_module,
+        "emit_stage",
+        lambda key, status, **kw: emitted.append((key, status)),
     )
 
-    update = deep_module.plan({"query": "q", "spec": {}, "mode": "deep"})
+    update = await deep_planner_module.planner({"query": "q", "spec": {}, "mode": "deep"}, {})
 
     assert ("plan", "running") not in emitted  # running 归 TurnRunner 图前发布
     assert ("plan", "done") in emitted
-    assert update == {}  # 桩节点零 state 增量（B4 planner 实装前的既有口径）
+    assert set(update) <= {"subtopics", "outline", "query_type", "time_range"}  # 真节点四键产出

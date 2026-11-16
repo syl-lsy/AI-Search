@@ -13,7 +13,8 @@
 - fast 事件序列（B3 节点 1-3/5 接真后）：rewrite（LLM 假体）→ search 扇出
   （running×1 + done×N 带 progress）→ sources(batch=归并候选) → write 桩 token 流；
   web_search 走假 registry（可冻结链经 configurable 注入，零网络）；
-- deep 桩序列不变（B4 实装）；
+- deep 序列（M2 批次 2：planner 接真 + write 桩）：plan done 带 extra.subtopics
+  （api.md §7.4 钉死形态），planner LLM 假体直注（test_deep_planner.py 锁节点语义）；
 - 状态契约（R14①）：MainState 投影薄壳 ⊇ FastState 输入字段（TurnRunner 注入面），
   产出键同名声明经顶层 updates 回填；candidates/errors 带 add、degraded 带或 reducer
   （Send 扇出并行副本正确合并——键集不变）；
@@ -69,8 +70,10 @@ _ROUTING_SPEC: dict[str, Any] = {
 
 @pytest.fixture(autouse=True)
 def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rewrite/synthesis 已接真（节点 1/5+5/5）：路由/序列测试不依赖真 LLM——fixture 假体
-    直注（rewrite 结构化输出 + synthesis 流式 content，零网络）。"""
+    """rewrite/synthesis/deep planner 已接真（fast 节点 1/5+5/5 + deep planner）：
+    路由/序列测试不依赖真 LLM——fixture 假体直注（rewrite/planner 结构化输出 +
+    synthesis 流式 content，零网络）。"""
+    from app.agent.nodes import deep_planner as deep_planner_module
     from app.agent.nodes import fast_rewrite as rewrite_module
     from app.agent.nodes import synthesis as synthesis_module
 
@@ -90,6 +93,25 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
         ) -> _Chain:
             return _Chain()
 
+    class _PlanChain:
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {
+                "subtopics": ["deep planner 桩期子课题一", "deep planner 桩期子课题二"],
+                "outline": [
+                    {"section": "背景", "intent": "问题背景与信息面"},
+                    {"section": "分析", "intent": "各子课题证据综合"},
+                ],
+                "query_type": "multi_facet",
+                "time_range": None,
+                "memory_directive": None,
+            }
+
+    class _PlannerModel:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _PlanChain:
+            return _PlanChain()
+
     class _SynthModel:
         async def astream(self, messages: Any, config: Any = None, **kw: Any) -> Any:
             from langchain_core.messages import AIMessageChunk
@@ -98,6 +120,7 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
                 yield AIMessageChunk(content=piece)
 
     monkeypatch.setattr(rewrite_module, "build_light_model", lambda mapping: _RewriteModel())
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias: _PlannerModel())
     monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: _SynthModel())
 
 
@@ -408,10 +431,13 @@ async def test_route_fast_to_fast_subgraph(log_records: list[dict[str, Any]]) ->
 
 
 async def test_route_deep_to_deep_subgraph(log_records: list[dict[str, Any]]) -> None:
-    """路由二：轮内 spec.routing 快照 mode=deep → deep 桩子图；序列对齐 §7.4；零告警。"""
+    """路由二：轮内 spec.routing 快照 mode=deep → deep 子图（M2 批次 2 planner 接真）；
+    序列对齐 §7.4（plan done 带 extra.subtopics）；产出经顶层 updates 回填；零告警。"""
     signals, final = await _run({"mode": "deep", "query": "多框架对比研究报告", "spec": _ROUTING_SPEC})
 
     assert final["answer_md"] == STUB_DEEP_ANSWER_MD
+    assert final["subtopics"] == ["deep planner 桩期子课题一", "deep planner 桩期子课题二"]
+    assert final["query_type"] == "multi_facet"
     assert signals == _deep_expected()
     assert all(signal["type"] != "sources" for signal in signals)
     assert _warnings(log_records) == []
@@ -604,7 +630,8 @@ async def test_sources_payload_matches_api_contract() -> None:
 
 
 def _deep_expected() -> list[dict[str, Any]]:
-    """api.md §7.4 深度模式主干（701-708 行）的桩展开：plan/write 两阶段。
+    """api.md §7.4 深度模式主干（701-708 行）的现行展开：plan/write 两阶段
+    （M2 批次 2：planner 接真——plan done 带 extra.subtopics；write 仍为桩）。
 
     M2 批次 1：plan running 归 TurnRunner 图前发布（同 fast rewrite 先例——§7.4
     序列的 stage(plan,running) 仍在，但发射源改为 TurnRunner，图内 plan 只发 done，
@@ -612,7 +639,12 @@ def _deep_expected() -> list[dict[str, Any]]:
     test_first_stage.py 锁定）。
     """
     return [
-        {"type": "stage", "stage_key": "plan", "status": "done"},
+        {
+            "type": "stage",
+            "stage_key": "plan",
+            "status": "done",
+            "extra": {"subtopics": 2},  # api.md §7.4「stage(plan,done,extra.subtopics)」钉死形态
+        },
         {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"},
         *({"type": "token", "delta": d} for d in STUB_DEEP_TOKEN_DELTAS),
         {"type": "stage", "stage_key": "write", "status": "done"},

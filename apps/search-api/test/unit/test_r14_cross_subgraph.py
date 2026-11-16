@@ -316,12 +316,38 @@ async def test_real_main_graph_messages_frames_only_from_synthesis(
     assert inner_update_nodes == {"rewrite", "web_search", "merge_dedupe", "fuse_rerank", "synthesis"}
 
 
-async def test_deep_stub_zero_messages_and_runner_zero_token_events() -> None:
-    """deep 桩零泄漏（R14③ 桩期基线，M2 批次 1 修订为 writer 形态语义）：
-    (a) 真 deep 子图经主图壳运行零 messages 帧（桩 token 走 custom、被翻译器丢弃）；
+async def test_deep_stub_zero_messages_and_runner_zero_token_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deep 零泄漏基线（R14③，M2 批次 2 修订：planner 接真 + write 桩形态）：
+    (a) 真 deep 子图经主图壳运行零 messages 帧（planner 结构化输出为非流式调用、
+    假体零回调帧；write 桩 token 走 custom、被翻译器丢弃）；
     (b) TurnRunner 侧零 token/thinking SSE 事件（stage 序列 + done 正常）——
-    桩期零 messages 帧，writer 放行语义由下方模拟 namespace 门控测试单独锁定
-    （批次 4 writer 实装后本基线零改动、由真 writer 帧形态接通）。"""
+    writer 放行语义由下方模拟 namespace 门控测试单独锁定（批次 4 writer 实装后
+    本基线由真 writer 帧形态接通）。"""
+    from app.agent.nodes import deep_planner as deep_planner_module
+
+    class _PlanChain:
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {
+                "subtopics": ["r14 deep 子课题一", "r14 deep 子课题二"],
+                "outline": [
+                    {"section": "背景", "intent": "背景信息面"},
+                    {"section": "结论", "intent": "综合结论"},
+                ],
+                "query_type": "multi_facet",
+                "time_range": None,
+                "memory_directive": None,
+            }
+
+    class _PlannerModel:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _PlanChain:
+            return _PlanChain()
+
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias: _PlannerModel())
+
     # (a) raw 帧面
     payload: dict[str, Any] = {
         "turn_id": "r14-deep",
@@ -352,7 +378,7 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events() -> None:
     published = await _drain_all(bus, str(turn.id))
     assert [e.event_type for e in published if e.event_type in ("token", "thinking")] == []
     assert published[-1].event_type == "done" and published[-1].data["finish"] == "completed"
-    assert turn.status == "completed"  # 桩答案经 updates 回填（custom token 被丢弃不影响终态）
+    assert turn.status == "completed"  # write 桩答案经 updates 回填（custom token 被丢弃不影响终态）
 
 
 class _ScriptedTripleGraph:
