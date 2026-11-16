@@ -12,8 +12,8 @@ import { i18n } from '@/i18n'
 
 const ITEMS: OutlineItem[] = [
   { id: 'turn-a-q', label: 'LangGraph 和 deepagents 是什么关系？' },
-  { id: 'turn-a-h-0', label: '分层关系' },
-  { id: 'turn-a-h-1', label: '如何选择' },
+  { id: 'turn-b-q', label: '对比 pgvector 与 Milvus 怎么选？' },
+  { id: 'turn-c-q', label: 'RAG 检索增强有哪些主流优化手段？' },
 ]
 
 function mountAnchor(props: { items?: OutlineItem[]; activeId: string | null; visible: boolean }) {
@@ -67,7 +67,7 @@ describe('OutlineAnchor（REQ-044 / A27）', () => {
   })
 
   it('激活项携带 aria-current（a11y 硬性）', () => {
-    const w = mountAnchor({ activeId: 'turn-a-h-0', visible: true })
+    const w = mountAnchor({ activeId: 'turn-b-q', visible: true })
     const buttons = w.findAll('.toc-item')
     expect(buttons[1]?.attributes('aria-current')).toBe('true')
     expect(buttons[1]?.classes()).toContain('active')
@@ -76,8 +76,8 @@ describe('OutlineAnchor（REQ-044 / A27）', () => {
 
   it('点击条目 → select(id) 上抛（父级平滑滚动定位）', async () => {
     const w = mountAnchor({ activeId: null, visible: true })
-    await w.find('[data-testid="outline-item-turn-a-h-1"]').trigger('click')
-    expect(w.emitted('select')).toEqual([['turn-a-h-1']])
+    await w.find('[data-testid="outline-item-turn-c-q"]').trigger('click')
+    expect(w.emitted('select')).toEqual([['turn-c-q']])
   })
 
   it('<720px 窄屏隐藏（REQ-044；与 REQ-045 箭头保留策略不同）', async () => {

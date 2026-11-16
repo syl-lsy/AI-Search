@@ -249,6 +249,10 @@ describe('流式滚动：接管与恢复（REQ-043 / A26）', () => {
       },
       { timeout: 3_000, interval: 20 },
     )
+    // 修复项②落位断言：fab 移至输入框上方——挂在 .follow-bar 内 .fab-above-input 绝对定位
+    // wrapper（sticky 包含块），旧顶部零高槽位 .scroll-fab-slot 不再存在
+    expect(app.find('.follow-bar .fab-above-input [data-testid="scroll-fab"]').exists()).toBe(true)
+    expect(app.find('.scroll-fab-slot').exists()).toBe(false)
     await app.find('[data-testid="scroll-fab"]').trigger('click')
     // 恢复后内容增长继续跟随（smooth 滚动由真实浏览器完成；断言状态机恢复）
     await streamToken(app, 6, 'Fab 恢复后内容', 2300)

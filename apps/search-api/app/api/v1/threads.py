@@ -1,4 +1,5 @@
-"""threads 域路由（api.md §2.1~§2.4）：建线程+首问轮 / 线程列表 / 线程详情 / 追问。
+"""threads 域路由（api.md §2.1~§2.4、§2.10/§2.11 v1.18）：建线程+首问轮 / 线程列表 /
+线程详情 / 追问 / 线程管理部分更新 / 删除线程。
 
 路由层零业务逻辑：只做解析 + 参数校验 + 依赖注入 + 调 service——建轮与聚合在
 ThreadService（thread_service.py）、并发策略裁决与排程在 ThreadScheduler
@@ -24,8 +25,10 @@ from app.schemas import (
     ThreadBrief,
     ThreadCreate,
     ThreadCreateResult,
+    ThreadDeleteData,
     ThreadDetail,
     ThreadListQuery,
+    ThreadPatchRequest,
     TurnCreate,
     TurnStatus,
 )
@@ -128,7 +131,11 @@ async def list_threads(
     user_id: Annotated[str, Depends(get_current_user)],
     service: Annotated[ThreadService, Depends(get_thread_service)],
 ) -> PageResponse[ThreadBrief]:
-    """线程列表（api.md §2.2）：分页 + mode 过滤（缺省=全部；一期无归档概念）。"""
+    """线程列表（api.md §2.2 v1.18）：分页 + mode/q/archived/unread 过滤（AND 叠加）。
+
+    `archived` 缺省 false=活跃集（true=仅归档）；`unread=true`=仅未读；`q`=标题
+    ILIKE 模糊搜索（trim 后空串=不过滤，1~200 字符）。排序与三布尔投影在 service 层。
+    """
     return await service.list_threads(query, user_id=user_id)
 
 
@@ -138,8 +145,41 @@ async def get_thread_detail(
     user_id: Annotated[str, Depends(get_current_user)],
     service: Annotated[ThreadService, Depends(get_thread_service)],
 ) -> ThreadDetail:
-    """线程详情（api.md §2.3）：答案页骨架聚合；不存在或不属当前用户 → 404001。"""
+    """线程详情（api.md §2.3）：答案页骨架聚合；不存在或不属当前用户 → 404001。
+
+    v1.18 写副作用：未读线程打开即置已读（幂等，service 层实现，§2.3 注 / D-12）。
+    """
     return await service.get_thread_detail(thread_id, user_id=user_id)
+
+
+@router.patch("/threads/{thread_id}", response_model=ThreadBrief)
+async def patch_thread(
+    thread_id: str,
+    payload: ThreadPatchRequest,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[ThreadService, Depends(get_thread_service)],
+) -> ThreadBrief:
+    """线程管理部分更新（api.md §2.10 v1.18）：title/pinned/is_unread/archived 任意组合。
+
+    请求体至少一项（空对象/非法布尔/title 空白或超长 → 400001）；线程不存在或越权
+    → 404001；响应=更新后的线程投影（与 §2.2 items[] 同构）。`updated_at` 不随动
+    （冻结语义，service 层保证）。字段校验全在 DTO 边界层，本函数零业务逻辑。
+    """
+    return await service.patch_thread(thread_id, payload, user_id=user_id)
+
+
+@router.delete("/threads/{thread_id}", response_model=ThreadDeleteData)
+async def delete_thread(
+    thread_id: str,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[ThreadService, Depends(get_thread_service)],
+) -> ThreadDeleteData:
+    """删除线程（api.md §2.11 v1.18）：物理删除 + service 显式级联 + MinIO best-effort。
+
+    错误：404001（不存在/越权）；409005（存在 pending/running/queued 轮，先停止或
+    等待终态）。归档态线程可直接删除（归档不是进行中）。
+    """
+    return await service.delete_thread(thread_id, user_id=user_id)
 
 
 @router.post("/threads/{thread_id}/turns", response_model=ThreadCreateResult)

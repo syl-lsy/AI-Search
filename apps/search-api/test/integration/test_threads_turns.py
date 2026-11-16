@@ -8,7 +8,8 @@
 - §2.1 POST /threads：data={thread_id,turn_id,status}（status∈{running,queued}）、
   query 1~2000/mode·model·on_conflict·incognito 校验失败 400001；
 - §2.2 GET /threads：data={total,items[{thread_id,title,mode_summary,turn_count,
-  created_at,updated_at}]}、updated_at DESC、mode 过滤；
+  pinned,is_unread,archived,created_at,updated_at}]}（v1.18 三布尔投影）、
+  缺省活跃集按 pinned DESC/updated_at DESC、mode 过滤；
 - §2.3 GET /threads/{id}：骨架字段集与 turns[]（has_report/degraded 推导）；
 - §2.4 POST /threads/{id}/turns：请求体同 §2.1、404001/409001；
 - §2.5 GET /turns/{id}：全字段集 + sources[]/stages[] 形状、进行中可读、分期口径
@@ -53,6 +54,10 @@ _THREAD_LIST_ITEM_KEYS = {
     "title",
     "mode_summary",
     "turn_count",
+    # v1.18（api.md §2.2，REQ-058~060）：三布尔投影
+    "pinned",
+    "is_unread",
+    "archived",
     "created_at",
     "updated_at",
 }
@@ -77,7 +82,8 @@ _TURN_SKELETON_KEYS = {
     "duration_ms",
     "created_at",
 }
-# §2.5 全字段（含 v1.2 incognito / v1.4 cancel_reason / v1.7 followups；无 memory_hits）
+# §2.5 全字段（含 v1.2 incognito / v1.4 cancel_reason / v1.7 followups /
+# v1.16 feedback_helpful；无 memory_hits）
 _TURN_DETAIL_KEYS = {
     "turn_id",
     "thread_id",
@@ -99,6 +105,7 @@ _TURN_DETAIL_KEYS = {
     "export_available",
     "incognito",
     "followups",
+    "feedback_helpful",  # §2.5 v1.16（REQ-057）：M2 起返回，未反馈为 null
     "cancel_reason",
     "created_at",
     "finished_at",

@@ -84,4 +84,14 @@ describe('ModelSelect（REQ-010）', () => {
     expect(w.find('[data-testid="model-select"]').exists()).toBe(true)
     expect(w.find('[data-testid="model-menu"]').exists()).toBe(false)
   })
+
+  it('菜单向下弹出（v1.24 修复：触发钮位于顶栏上缘，向上弹出被 .app overflow:hidden 裁剪）', async () => {
+    const w = mountSelect()
+    await flushPromises()
+    await w.find('[data-testid="model-select"]').trigger('click')
+    const menu = w.find('[data-testid="model-menu"]')
+    expect(menu.exists()).toBe(true)
+    // 方向语义类：向下弹出（挂载方向断言——避免脆样式断言，方向收敛为一等 DOM 语义）
+    expect(menu.classes()).toContain('ms-menu--below')
+  })
 })

@@ -347,6 +347,12 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
         "app.services.turn_service.main_graph",
         stub_flow.ModeRoutingFakeGraph(real_main_graph),
     )
+    # regenerate 微图假体（B11 P2 / api.md §2.12 v1.19）：只重跑 synthesis 的确定性替身
+    # ——真 synthesis 需 LLM，联装面用脚本图验证「同通道续推/收尾口径/前置裁决」
+    monkeypatch.setattr(
+        "app.services.turn_service.regenerate_graph",
+        stub_flow.RegenerateFakeGraph(),
+    )
 
     # 搜索链假体：registry.resolve 恒 [tavily]、search 恒确定性候选（TurnRunner 轮启动
     # resolve 面兜底——假图下节点不执行，此处保 resolve 不抛）
@@ -371,7 +377,8 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
             return True
 
         async def search(
-            self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+            self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+            retry_sink: dict[str, int] | None = None
         ) -> list[dict[str, Any]]:
             import asyncio as _asyncio
 
@@ -396,6 +403,16 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
     )
     monkeypatch.setattr(
         "app.services.turn_service.get_tools_registry", lambda: _FakeSearchRegistry()
+    )
+
+    # followups 图外钩子假体（REQ-046；v1.22 起 spec 默认 enabled=true）：桩流测试不得
+    # 触真 LLM（否则 integration 依赖本地 ollama）——生成恒「静默放弃」（返回 None），
+    # 窗口随之提前收口；真实生成链路由 unit（全 mock fixture）与 e2e（真链路）承担。
+    async def _no_followups(**kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "app.services.turn_service.generate_followups", _no_followups
     )
 
 @pytest.fixture

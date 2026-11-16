@@ -16,10 +16,15 @@ synthesis 节点放行，§6.1/R14③），节点只累积 text → answer_md。
   两段切换（回滚态行为零变化）；
 - **外部内容包裹**（§6.4.3 铁律）：来源逐条 `<external_content source="{url}" type="web">`
   包裹（声明行在提示词内）；memory_block M5 前恒空串；
-- **失败语义**：全源失败防御性短路（主短路在 merge_dedupe）；LLM 传输类失败按 spec.retry
-  重试（退避+jitter+deadline 门控）→ 耗尽 → SynthesisError → TurnRunner error 500101
-  （LLM 调用重试耗尽）+ done(finish=degraded)——已收集 sources 保留（api.md §7.2 error
-  收束「有部分内容时 error 后跟 done(finish=degraded)」）。
+- **失败语义**：全源失败防御性短路（主短路在 merge_dedupe）；LLM 失败按**错误三档
+  分级**重试（B11 P1a / ARCH §6.2 v1.49）——连接类（httpx transport / 单调用包络超时 /
+  openai 连接形态）走 `spec.fast.retry.connection` 长窗指数退避（1/2/4/8，总窗
+  total_window_s 硬闸，与 TurnDeadline 双闸先到先放弃）；5xx 类沿用 `spec.fast.retry`
+  主节短窗；业务类（4xx/结构化解析失败）不重试。耗尽 → SynthesisError → TurnRunner
+  error 500101（LLM 调用重试耗尽）+ done(finish=degraded)——已收集 sources 保留
+  （api.md §7.2 error 收束「有部分内容时 error 后跟 done(finish=degraded)」）。
+- **单调用超时包络**（决策 4）：每次 astream 包 `asyncio.timeout(min(llm_timeout_s,
+  剩余轮预算))`——无包络时单次挂起会直接吃光 60s 兜底、重试窗形同虚设。
 
 stage(write, running, label=综合中 → done) 夹全部动作（api.md §7.4）。节点纯函数：模型
 工厂可注入可 mock，零 DB/EventBus。
@@ -29,6 +34,7 @@ import asyncio
 import html
 import random
 import re
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -36,7 +42,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import SecretStr
 
-from app.agent.guards import TurnDeadline, default_retry_on, ensure_not_canceled, retry_policy_from_spec
+from app.agent.guards import (
+    RetryWindow,
+    TurnDeadline,
+    classify_retry_tier,
+    connection_retry_policy_from_spec,
+    ensure_not_canceled,
+    llm_timeout_s,
+    retry_policy_from_spec,
+)
 from app.agent.graphs.signals import emit_stage
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.agent.tools.registry import SearchChainUnavailable
@@ -54,6 +68,15 @@ _DIRECT_LINE_PREFIX = "- 免检索直答路径"  # v1.20 第三变体段（direc
 
 #: 检索策略三值（v1.44 B9——缺省/非法一律按 web 处理，灰度安全）
 _SEARCH_STRATEGIES = ("direct", "verify", "web")
+
+#: 单调用超时包络下限（秒）：剩余轮预算为 0 时仍留一次极短尝试，让重试闸门裁决
+_MIN_CALL_TIMEOUT_S = 0.001
+
+#: 退避等待（测试注入点：单测断言退避序列/总窗闸时替换；生产恒 asyncio.sleep）
+_sleep = asyncio.sleep
+
+#: 单调钟（测试注入点：RetryWindow 总窗闸的确定性断言）
+_clock = time.monotonic
 
 
 class SynthesisError(Exception):
@@ -222,6 +245,8 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
         else 3000
     )
     policy = retry_policy_from_spec(spec, "fast")
+    connection_policy = connection_retry_policy_from_spec(spec, "fast")
+    call_timeout_s = llm_timeout_s(spec, "fast")
     budget = TurnDeadline(
         float(fast_section.get("turn_timeout_s", 60.0))
         if isinstance(fast_section, Mapping)
@@ -249,24 +274,69 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
 
     answer = ""
     last_error: Exception | None = None
-    for attempt in range(policy.max_attempts):
-        if attempt:
-            if not budget.can_attempt(30.0):
-                break
-            delay = policy.initial_interval_s * (policy.backoff_factor ** (attempt - 1))
-            await asyncio.sleep(random.uniform(0, delay) if policy.jitter else delay)
+    short_failures = 0  # 短窗（transient / 无 connection 节点的连接类）失败次数
+    connection_failures = 0  # 连接类长窗失败次数（含首试失败）
+    total_attempts = 0  # 物理尝试总次数（混档共享上限，见下）
+    window: RetryWindow | None = None  # 连接类重试总窗（首次连接类失败时开窗）
+    # **混档总尝试上限**（评审 P2-3）：两档计数器独立会让交替失败（5xx→连接→5xx…）
+    # 叠加出 1+4+2=7 次尝试，超出 connection.max_attempts=5 的契约语义。口径钉死：
+    # connection 节在场时**总物理尝试 ≤ connection.max_attempts**（长窗是本次轮的
+    # 治理预算）；节缺失时维持主节 max_attempts（=旧行为）。两档各自上限仍先判。
+    attempts_cap = (
+        connection_policy.max_attempts
+        if connection_policy is not None
+        else policy.max_attempts
+    )
+    while True:
+        total_attempts += 1
         accumulated: list[str] = []
         try:
-            async for chunk in model.astream(
-                messages, config=_with_strategy_metadata(config, state)
-            ):
-                accumulated.append(_text_of(chunk))
+            # 单调用超时包络（决策 4）：min(llm_timeout_s, 剩余轮预算)
+            per_call = max(
+                _MIN_CALL_TIMEOUT_S, min(call_timeout_s, budget.remaining_s())
+            )
+            async with asyncio.timeout(per_call):
+                async for chunk in model.astream(
+                    messages, config=_with_strategy_metadata(config, state)
+                ):
+                    accumulated.append(_text_of(chunk))
             answer = "".join(accumulated)
             break
         except Exception as exc:
-            if not default_retry_on(exc):
+            tier = classify_retry_tier(exc)
+            if tier == "non_retryable":
                 raise SynthesisError(f"综合生成失败（不可重试）：{exc}") from exc
             last_error = exc
+            if tier == "connection" and connection_policy is not None:
+                # 连接类长窗（1/2/4/8，cap max_interval_s）+ 总窗硬闸 + TurnDeadline 双闸
+                connection_failures += 1
+                if connection_failures >= connection_policy.max_attempts:
+                    break
+                if total_attempts >= attempts_cap:
+                    break  # 混档共享上限：交替失败不放大总尝试
+                if window is None:
+                    window = RetryWindow(
+                        connection_policy.total_window_s, clock=_clock
+                    )
+                delay = connection_policy.delay_for(connection_failures)
+                if not window.can_wait(delay) or not budget.can_attempt(call_timeout_s):
+                    break
+                await _sleep(delay)
+                if window.remaining_s() <= 0.0:
+                    break  # 尝试耗时吃满窗口：先到先放弃（既有 SynthesisError 语义）
+                continue
+            # 短窗（维持现状）：spec.<mode>.retry 主节，可选 jitter
+            short_failures += 1
+            if short_failures >= policy.max_attempts:
+                break
+            if total_attempts >= attempts_cap:
+                break  # 混档共享上限（同 connection 分支注释）
+            if not budget.can_attempt(30.0):
+                break
+            delay = policy.initial_interval_s * (
+                policy.backoff_factor ** (short_failures - 1)
+            )
+            await _sleep(random.uniform(0, delay) if policy.jitter else delay)
     if not answer:
         raise SynthesisError(
             f"综合生成失败（LLM 调用重试耗尽）：{last_error!r}" if last_error else "综合生成失败（空输出）"

@@ -18,8 +18,10 @@ from app.schemas.thread import (
     ThreadBrief,
     ThreadCreate,
     ThreadCreateResult,
+    ThreadDeleteData,
     ThreadDetail,
     ThreadListQuery,
+    ThreadPatchRequest,
     TurnSkeleton,
 )
 from app.schemas.turn import (
@@ -135,6 +137,9 @@ def test_page_response_carries_total_and_items():
         title="t",
         mode_summary="fast",
         turn_count=1,
+        pinned=False,
+        is_unread=False,
+        archived=False,
         created_at="2026-11-01T08:12:00Z",
         updated_at="2026-11-01T09:40:11Z",
     )
@@ -148,7 +153,50 @@ def test_thread_list_query_mode_filter_enum():
     assert query.mode is None  # 缺省=全部
     assert ThreadListQuery(mode="mixed").mode == "mixed"
     with pytest.raises(ValidationError):
-        ThreadListQuery(mode="archived")  # 一期无归档概念（api.md §2.2）
+        ThreadListQuery(mode="archived")  # mode 枚举仍只有 fast|deep|mixed
+
+
+def test_thread_list_query_v118_params_and_q_rules():
+    """§2.2 v1.18（REQ-058）：q/archived/unread 缺省与 q 的 trim/长度边界。"""
+    query = ThreadListQuery()
+    assert (query.q, query.archived, query.unread) == (None, False, False)
+    # trim 后空串=不过滤
+    assert ThreadListQuery(q="   ").q is None
+    assert ThreadListQuery(q="  LangGraph  ").q == "LangGraph"
+    # 1~200 字符：200 合法、201 → ValidationError（→ 400001）
+    assert len(ThreadListQuery(q="长" * 200).q or "") == 200
+    with pytest.raises(ValidationError):
+        ThreadListQuery(q="长" * 201)
+
+
+def test_thread_patch_request_partial_update_rules():
+    """§2.10 v1.18：任意组合至少一项；title trim/长度；布尔 strict；显式 null 拒绝。"""
+    assert ThreadPatchRequest(pinned=True).pinned is True
+    assert ThreadPatchRequest(title="  新标题  ").title == "新标题"
+    # 多字段组合合法（字段间无互斥）
+    combo = ThreadPatchRequest(title="t", pinned=True, is_unread=False, archived=True)
+    assert (combo.pinned, combo.is_unread, combo.archived) == (True, False, True)
+    # 空对象 → 至少一项（400001）
+    with pytest.raises(ValidationError):
+        ThreadPatchRequest()
+    # title：空串 / 纯空白 / 121 字符
+    for bad in ("", "   ", "长" * 121):
+        with pytest.raises(ValidationError):
+            ThreadPatchRequest(title=bad)
+    # 非法布尔（strict：字符串不算 bool）
+    with pytest.raises(ValidationError):
+        ThreadPatchRequest(pinned="true")  # type: ignore[arg-type]
+    # 显式 null 不构成合法更新
+    with pytest.raises(ValidationError):
+        ThreadPatchRequest(pinned=None)
+    with pytest.raises(ValidationError):
+        ThreadPatchRequest(title=None)
+
+
+def test_thread_delete_data_shape():
+    """§2.11 v1.18：data={"deleted": true}（§4.5 KbDeleteData 同构）。"""
+    assert ThreadDeleteData().deleted is True
+    assert ThreadDeleteData(deleted=True).model_dump() == {"deleted": True}
 
 
 # ---- 响应 DTO：§2.2/§2.3/§2.5 形状 ----
@@ -160,6 +208,9 @@ def test_thread_brief_and_skeleton_shapes():
         title="LangGraph 的 Send API 和 Router 的区别？",
         mode_summary="mixed",
         turn_count=3,
+        pinned=True,
+        is_unread=False,
+        archived=False,
         created_at="2026-11-01T08:12:00Z",
         updated_at="2026-11-01T09:40:11Z",
     )

@@ -103,3 +103,52 @@ def _chunk(text: str) -> Any:
     from langchain_core.messages import AIMessageChunk
 
     return AIMessageChunk(content=text)
+
+
+# ---- regenerate 微图假体（B11 P2 / api.md §7.4 regenerate 形态）----
+
+#: 运行窗口旋钮（秒）：事件间睡眠——重复点击 409006 / 取消联动的确定性窗口
+FAKE_REGENERATE_DELAY_S: float = 0.0
+
+#: 失败旋钮：非 None 时在 write(running)+token 之后抛出（再失败 → error(500101)+degraded）
+FAKE_REGENERATE_ERROR: Exception | None = None
+
+#: 重生成答案（token 拼接一致——SSE token/对账断言基准；带 [1] 引用核对映射不变）
+FAKE_REGENERATE_TOKEN_DELTAS: list[str] = ["【重生成答案】", "仅重跑综合，来源不变[1]。"]
+FAKE_REGENERATE_ANSWER_MD: str = "".join(FAKE_REGENERATE_TOKEN_DELTAS)
+
+
+class RegenerateFakeGraph:
+    """regenerate 微图假体：stage(write) custom + token messages + updates(answer_md)。
+
+    契约事件面（§7.4 regenerate 形态）：无 stage(rewrite)/stage(search)/sources/images
+    ——不重检索；同一 turn 通道内第二个 done 由 TurnRunner 续发。
+    """
+
+    def astream(
+        self, payload: Any, config: Any = None, stream_mode: Any = None,
+        subgraphs: bool = False,
+    ) -> Any:
+        import asyncio
+
+        async def gen():
+            delay = FAKE_REGENERATE_DELAY_S
+            error = FAKE_REGENERATE_ERROR
+            yield ((), "custom", {
+                "type": "stage", "stage_key": "write", "status": "running", "label": "综合中",
+            })
+            if delay:
+                await asyncio.sleep(delay)
+            if error is not None:
+                raise error
+            for delta in FAKE_REGENERATE_TOKEN_DELTAS:
+                yield ((), "messages", (_chunk(delta), {"langgraph_node": "synthesis"}))
+                if delay:
+                    await asyncio.sleep(delay)
+            yield ((), "custom", {"type": "stage", "stage_key": "write", "status": "done"})
+            yield ((), "updates", {
+                "synthesis": {"answer_md": FAKE_REGENERATE_ANSWER_MD, "degraded": False},
+            })
+
+        return gen()
+

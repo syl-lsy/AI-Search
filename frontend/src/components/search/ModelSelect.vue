@@ -72,7 +72,7 @@ function onBlurRoot(e: FocusEvent): void {
       <span>{{ $t('common.model') }}<template v-if="currentLabel"> · {{ currentLabel }}</template></span>
       <UiIcon name="i-chev-d" size="sm" />
     </button>
-    <ul v-if="open && options.length > 0" class="ms-menu" role="listbox" data-testid="model-menu">
+    <ul v-if="open && options.length > 0" class="ms-menu ms-menu--below" role="listbox" data-testid="model-menu">
       <li v-for="o in options" :key="o.key">
         <button
           type="button"
@@ -109,9 +109,11 @@ function onBlurRoot(e: FocusEvent): void {
   background: var(--color-surface-hover);
   color: var(--color-text-primary);
 }
+/* 弹出方向收敛为一等语义类（v1.24 修复）：触发钮位于顶栏最上缘，向上弹出（旧
+   bottom: calc(100% + 6px)）被 .app{overflow:hidden} 裁剪不可见——改向下弹出；
+   .topbar 无 overflow 裁剪（tokens.css 布局段确认），最小改动=换向即修复 */
 .ms-menu {
   position: absolute;
-  bottom: calc(100% + 6px);
   right: 0;
   min-width: 160px;
   margin: 0;
@@ -122,6 +124,9 @@ function onBlurRoot(e: FocusEvent): void {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-floating);
   z-index: 30;
+}
+.ms-menu--below {
+  top: calc(100% + 6px);
 }
 .ms-item {
   width: 100%;

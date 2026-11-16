@@ -10,7 +10,6 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  isSameHeadingSet,
   renderAnswerMarkdown,
   renderPlainMarkdown,
   SANITIZE_ALLOWED_TAGS,
@@ -115,18 +114,6 @@ describe('renderAnswerMarkdown（answer 通道）', () => {
     expect(SANITIZE_ALLOWED_TAGS).not.toContain('iframe')
     expect(SANITIZE_ALLOWED_TAGS).not.toContain('form')
     expect(SANITIZE_ALLOWED_TAGS).not.toContain('style')
-  })
-})
-
-describe('isSameHeadingSet（AnswerView outline 重建节流依据：仅标题集变化才重建）', () => {
-  it('同集（同 id 同 text）相等；顺序敏感；空集相等；任一差异不等', () => {
-    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [{ id: 'a', text: 'A' }])).toBe(true)
-    expect(isSameHeadingSet([], [])).toBe(true)
-    expect(isSameHeadingSet([{ id: 'a', text: 'A' }, { id: 'b', text: 'B' }], [{ id: 'a', text: 'A' }, { id: 'b', text: 'B' }])).toBe(true)
-    expect(isSameHeadingSet([{ id: 'a', text: 'A' }, { id: 'b', text: 'B' }], [{ id: 'b', text: 'B' }, { id: 'a', text: 'A' }])).toBe(false)
-    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [{ id: 'a', text: 'A2' }])).toBe(false)
-    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [{ id: 'a2', text: 'A' }])).toBe(false)
-    expect(isSameHeadingSet([{ id: 'a', text: 'A' }], [])).toBe(false)
   })
 })
 

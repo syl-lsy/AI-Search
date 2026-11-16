@@ -1,8 +1,8 @@
-"""integration 层：迁移链（0001_m1_core + 0008_m1_turn_scheduler）真库验证
-（requires_db；跑在 .env.test 测试库）。
+"""integration 层：迁移链（0001_m1_core → 0008_m1_turn_scheduler → 0009_m1_turn_followups
+→ 0010_m2_turn_feedback → 0011_m2_thread_mgmt）真库验证（requires_db；跑在 .env.test 测试库）。
 
-链路：upgrade head → 断言五表 + alembic_version=head(0008) + vector 扩展；downgrade
-base → 断言五表与 alembic_version 清除、vector 扩展保留（0001 契约：downgrade
+链路：upgrade head → 断言核心表 + alembic_version=head(0011) + vector 扩展；downgrade
+base → 断言表与 alembic_version 清除、vector 扩展保留（0001 契约：downgrade
 不删 extension）；再 upgrade head → 全链可重复；末尾 `alembic check` 零漂移
 （迁移产物 == ORM metadata，即 autogenerate 闭环的运行时验证）。
 
@@ -10,6 +10,15 @@ base → 断言五表与 alembic_version 清除、vector 扩展保留（0001 契
 重建（扩 queued）的 upgrade→downgrade→upgrade 三段逐段断言（列存在性/类型/可空/
 无默认 + 索引 WHERE 条件按 pg_indexes 实文核对，PG 对 IN 有规范化改写，断言取
 字面值出现性而非完整 DDL 文本）。
+
+0009/0010（REQ-046/REQ-057，v1.9/v1.13 契约）专段：turns.followups jsonb 增列 +
+turn_feedback 表（UNIQUE(turn_id) 索引、FK CASCADE）的 upgrade→downgrade→upgrade
+逐段断言。
+
+0011（v1.14 契约，REQ-058~060，B10）专段：threads 三增列（pinned NOT NULL DEFAULT
+false / read_at / archived_at）+ **存量行 read_at 回填 created_at** 的
+upgrade→downgrade→upgrade 逐段断言（回填必须在 0010 态的存量行上验证——先降级造行
+再升级）。零新索引断言（§1.2 v1.14 取舍注）。
 
 默认用户 seed 断言（0001 已落地——2026-11-07 评审解锁，经 app/db/seed.py 的 ORM
 形态，见迁移文件 docstring）：upgrade 后 users 恰一行且 id/name == 配置值；
@@ -19,6 +28,8 @@ alembic 经 conftest 的 alembic fixture 子进程运行（.env.test DB_ 变量�
 密码脱敏后进断言信息）。缺 .env.test/测试库不可达时整模块 skip（conftest 口径）。
 """
 
+import uuid
+
 import pytest
 from psycopg2 import connect  # 断言面连接（conftest 管理面已建库）
 
@@ -26,7 +37,18 @@ from app.core.config import common_settings
 
 pytestmark = pytest.mark.requires_db
 
-CORE_TABLES = ("users", "threads", "turns", "turn_events", "sources")
+#: 测试库应有的 public 表全集（M1 五表 + §1.16 turn_feedback）
+CORE_TABLES = (
+    "users",
+    "threads",
+    "turns",
+    "turn_events",
+    "sources",
+    "turn_feedback",
+)
+
+#: 链尾 revision（data-model.md §4：0010 turn_feedback → 0011 thread_mgmt）
+CHAIN_HEAD = "0011"
 
 
 def _connect(info):
@@ -84,7 +106,7 @@ def test_chain_upgrade_downgrade_upgrade(alembic, test_db, db_truncate):
         assert "vector" in _extensions(cursor)
 
         cursor.execute("SELECT version_num FROM alembic_version")
-        assert cursor.fetchall() == [("0008",)]
+        assert cursor.fetchall() == [(CHAIN_HEAD,)]
 
     # ── downgrade base ──
     alembic(["downgrade", "base"])
@@ -168,5 +190,182 @@ def test_0008_turn_scheduler_upgrade_downgrade_upgrade(alembic, test_db, db_trun
         assert _turns_cancel_reason(cursor) == [("character varying", 16, "YES", None)]
         assert "'queued'" in _turns_running_indexdef(cursor)
 
-    # 迁移产物 == ORM metadata（含 0008 列与索引形态）
+    # 迁移产物 == ORM metadata（含 0008 列与索引形态）：0008 非链尾，先升至 head
+    # （0009/0010 为纯增量，不触本段断言面）
+    alembic(["upgrade", "head"])
+    alembic(["check"])
+
+
+def _turns_followups(cursor) -> list[tuple]:
+    """followups 列事实（data_type/可空/默认）；information_schema 参数化查询。"""
+    cursor.execute(
+        "SELECT data_type, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s AND column_name = %s",
+        ("turns", "followups"),
+    )
+    return cursor.fetchall()
+
+
+def _turn_feedback_indexdef(cursor) -> str:
+    """uq_turn_feedback_turn 实际 DDL（唯一索引 + 列 turn_id）。"""
+    cursor.execute(
+        "SELECT indexdef FROM pg_indexes "
+        "WHERE schemaname = 'public' AND indexname = %s",
+        ("uq_turn_feedback_turn",),
+    )
+    rows = cursor.fetchall()
+    assert len(rows) == 1, f"uq_turn_feedback_turn 应恰一个，得到 {len(rows)}"
+    return rows[0][0]
+
+
+def test_0009_0010_followups_and_feedback_upgrade_downgrade_upgrade(
+    alembic, test_db, db_truncate
+) -> None:
+    """0009（turns.followups）+ 0010（turn_feedback）三段真库验证（REQ-046/REQ-057）。
+
+    段 1：0008→0010 增列 + 建表/唯一索引落地；段 2：downgrade 到 0008 全量可逆
+    （列与表/索引一并消失）；段 3：再 upgrade head 可重复 + `alembic check` 零漂移。
+    """
+    alembic(["upgrade", "head"])
+    alembic(["downgrade", "0008"])
+
+    # ── 段 1：upgrade 0008→0010 ──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [(CHAIN_HEAD,)]
+        # 0009：nullable jsonb、无默认
+        assert _turns_followups(cursor) == [("jsonb", "YES", None)]
+        # 0010：表 + UNIQUE(turn_id) 索引
+        assert "turn_feedback" in _public_tables(cursor)
+        indexdef = _turn_feedback_indexdef(cursor)
+        assert "UNIQUE INDEX" in indexdef.upper() and "(turn_id)" in indexdef
+
+    # ── 段 2：downgrade 0010→0008（列/表/索引全量可逆）──
+    alembic(["downgrade", "0008"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [("0008",)]
+        assert _turns_followups(cursor) == []
+        assert "turn_feedback" not in _public_tables(cursor)
+
+    # ── 段 3：再 upgrade head（可重复）+ 零漂移 ──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        assert _turns_followups(cursor) == [("jsonb", "YES", None)]
+        assert "turn_feedback" in _public_tables(cursor)
+    alembic(["check"])
+
+
+def test_turn_feedback_fk_cascade(alembic, test_db, db_truncate) -> None:
+    """FK 定义含 ON DELETE CASCADE（data-model §1.16：线程删除经 turns 级联）。"""
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT confdeltype FROM pg_constraint "
+            "WHERE conrelid = 'turn_feedback'::regclass AND contype = 'f'"
+        )
+        assert cursor.fetchall() == [("c",)]  # 'c' = CASCADE
+
+
+# ---- 0011（v1.14，REQ-058~060/B10）：threads 三增列 + read_at 存量回填 ----
+
+
+def _threads_mgmt_columns(cursor) -> list[tuple]:
+    """threads 三增列事实（列名/类型/可空/默认），按 DDL 顺序返回。"""
+    cursor.execute(
+        "SELECT column_name, data_type, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'threads' "
+        "AND column_name IN ('pinned', 'read_at', 'archived_at') "
+        "ORDER BY ordinal_position"
+    )
+    return cursor.fetchall()
+
+
+def _insert_legacy_thread(info, *, title: str) -> uuid.UUID:
+    """在 0010 态（无三列）造存量线程行：用于验证 0011 的 read_at 回填。"""
+    thread_id = uuid.uuid4()
+    conn = _connect(info)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (id, name) VALUES (%s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (
+                    common_settings.default_user_id,
+                    common_settings.default_user_name,
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO threads (id, user_id, title, created_at, updated_at) "
+                "VALUES (%s, %s, %s, now() - interval '2 days', now())",
+                (str(thread_id), common_settings.default_user_id, title),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return thread_id
+
+
+def test_0011_thread_mgmt_upgrade_downgrade_upgrade(alembic, test_db, db_truncate) -> None:
+    """0011 三段真库验证（B-1）：升级增列 + 存量回填 → 降级三列移除 → 再升级可重复。
+
+    回填断言必须在 0010 态的存量行上做（全新表无行 → 回填无从验证），故段 1 前先
+    降级到 0010 并插入一行，再升级 head。
+    """
+    alembic(["upgrade", "head"])
+    alembic(["downgrade", "0010"])
+
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        assert _threads_mgmt_columns(cursor) == []  # 0010 态无三列
+    legacy_id = _insert_legacy_thread(test_db, title="存量线程（升级前创建）")
+
+    # ── 段 1：upgrade 0010→0011（三增列 + 存量回填）──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [(CHAIN_HEAD,)]
+        assert _threads_mgmt_columns(cursor) == [
+            ("pinned", "boolean", "NO", "false"),  # NOT NULL DEFAULT false（§1.2）
+            ("read_at", "timestamp with time zone", "YES", None),
+            ("archived_at", "timestamp with time zone", "YES", None),
+        ]
+        cursor.execute(
+            "SELECT pinned, read_at = created_at, archived_at "
+            "FROM threads WHERE id = %s",
+            (str(legacy_id),),
+        )
+        assert cursor.fetchall() == [(False, True, None)]  # 存量全部视为已读
+        # 零新索引（§1.2 v1.14 取舍注）
+        cursor.execute(
+            "SELECT indexname FROM pg_indexes "
+            "WHERE schemaname = 'public' AND tablename = 'threads' "
+            "AND indexname <> 'threads_pkey'"
+        )
+        assert {row[0] for row in cursor.fetchall()} == {"idx_threads_user_updated"}
+
+    # ── 段 2：downgrade 0011→0010（drop 三列；read_at 数据丢失属回退语义）──
+    alembic(["downgrade", "0010"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [("0010",)]
+        assert _threads_mgmt_columns(cursor) == []
+        cursor.execute("SELECT count(*) FROM threads WHERE id = %s", (str(legacy_id),))
+        assert cursor.fetchone() == (1,)  # 降级只 drop 列，不动行
+        # 回 0010 后存量行仍在（read_at 状态随列一起消失——schema 回退可接受语义）
+        cursor.execute("SELECT title FROM threads WHERE id = %s", (str(legacy_id),))
+        assert cursor.fetchone() == ("存量线程（升级前创建）",)
+
+    # ── 段 3：再 upgrade head（可重复）+ 零漂移（ORM metadata 对齐）──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        assert len(_threads_mgmt_columns(cursor)) == 3
+        # 再升级时该行已存在 → 回填按 NULL 条件跳过（幂等）且 pinned 恢复 default
+        cursor.execute(
+            "SELECT pinned, read_at = created_at FROM threads WHERE id = %s",
+            (str(legacy_id),),
+        )
+        assert cursor.fetchall() == [(False, True)]
     alembic(["check"])

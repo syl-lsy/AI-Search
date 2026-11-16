@@ -30,9 +30,13 @@ from typing import Any
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel, ValidationError, model_validator
 
+from app.agent.guards import is_connection_failure
+from app.core.logger import AgentLog
+
 __all__ = [
     "SEARCH_SOURCE_NAMES",
     "BACKUP_SEARCH_CHAIN",
+    "SOURCE_RETRY_DELAY_S",
     "CircuitBreaker",
     "SearchChain",
     "SearchChainUnavailable",
@@ -81,13 +85,37 @@ _SOURCE_EXTRA_CHILD_ENV: dict[str, tuple[str, ...]] = {
 #: conftest 假体 search 睡眠本值模拟运行窗口）
 STUB_SEARCH_DELAY_S: float = 0.0
 
+#: 同源延迟重试间隔（B11 P1b 决策 7：代码常量——环境无关节奏值，同
+#: SWEEP_INTERVAL_SECONDS 先例；不入 Nacos，调优诉求出现再上收）
+SOURCE_RETRY_DELAY_S: float = 2.0
+
+#: 重试等待函数（测试注入点：单测断言延迟值，生产恒 asyncio.sleep）
+_sleep = asyncio.sleep
+
 
 class SearchChainUnavailable(Exception):
     """搜索链不可用（主位+备位全断 / 全源调用失败）——TurnRunner 捕获后 500201 收轮。"""
 
 
 class SourceCallError(Exception):
-    """单源调用失败（出参校验失败/超时/传输异常）——计熔断一次、由节点记 errors。"""
+    """单源调用失败（出参校验失败/超时/传输异常）——计熔断一次、由节点记 errors。
+
+    B11 P1b 结构化分类（决策 7「先改造再消费」）：`retryable` = 连接类/超时类
+    （httpx transport 族 / asyncio 超时 / ConnectionError / MCP transport 断连），
+    由 `ToolRegistry.search` 消费做同源延迟重试一次；`original` 保留原始异常供
+    诊断（分类判据来自类型，不依赖 message 字符串）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        original: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.original = original
 
 
 @dataclass
@@ -365,11 +393,16 @@ def guarded_source_call(
     breaker: CircuitBreaker,
     timeout_s: float,
     clock: Callable[[], float] = time.monotonic,
+    record_circuit: bool = True,
 ) -> Any:
-    """schema_guard 双向校验的单源调用（返回协程）。
+    """schema_guard 双向校验的单源**物理**调用（返回协程）。
 
     入参校验失败=编程错误 → ValueError（熔断计数不动、不发调用）；出参归一失败/调用
-    异常/超时 → 计该源一次失败 + SourceCallError（节点记 errors，不产 state 写入）。
+    异常/超时 → SourceCallError（携带 `retryable` 连接类分类与原始异常）。
+
+    `record_circuit=False`（B11 P1b 逻辑调用计账）：本函数不改熔断状态——由调用方
+    （`ToolRegistry.search`）在一次**逻辑调用**（首试+同源重试）收口时统一记一次
+    success/failure，防两次物理失败打穿 `failure_threshold=3`（决策 7）。
     """
     async def _run() -> list[dict[str, Any]]:
         try:
@@ -381,9 +414,15 @@ def guarded_source_call(
                 raw = await invoke(args)
             candidates = normalize(raw)
         except Exception as exc:
-            breaker.record_failure(clock())
-            raise SourceCallError(f"{type(exc).__name__}: {exc}") from exc
-        breaker.record_success(clock())
+            if record_circuit:
+                breaker.record_failure(clock())
+            raise SourceCallError(
+                f"{type(exc).__name__}: {exc}",
+                retryable=is_connection_failure(exc),
+                original=exc,
+            ) from exc
+        if record_circuit:
+            breaker.record_success(clock())
         return candidates
 
     return _run()
@@ -458,9 +497,27 @@ class ToolRegistry:
     # ---- guarded 搜索调用（web_search 节点消费面）----
 
     async def search(
-        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+        self,
+        query: str,
+        source: str,
+        *,
+        time_range: str | None = None,
+        top_k: int = 5,
+        retry_sink: dict[str, int] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> list[dict[str, Any]]:
-        """单源 guarded 搜索：mcp.json timeout_s 包络 + 双向 schema_guard + 熔断联动。"""
+        """单源 guarded 搜索（逻辑调用）：mcp timeout 包络 + schema_guard + 同源延迟重试。
+
+        B11 P1b（决策 7）：
+        - **同源延迟重试一次**：首试失败且为连接类/超时类（`SourceCallError.retryable`）
+          → 等待 `SOURCE_RETRY_DELAY_S`（2s 代码常量）后重试一次；重试仍失败才进入
+          既有换源/短路语义（4xx 凭证类、出参归一失败、入参编程错误零重试）。
+        - **熔断按逻辑调用计账**：首试+重试只记一次 success/failure——重试成功计
+          success（连续计数清零）、重试再失败计一次 failure（防 2 次物理失败立即
+          打穿 failure_threshold=3）。
+        - `retry_sink`：源名→重试次数累加（web_search 汇入 `stage(search,done).extra
+          .source_retries` 留痕，api.md §7.2 v1.19；无重试时零键）。
+        """
         if source not in SEARCH_SOURCE_NAMES:
             raise SearchChainUnavailable(f"{source} 不在 fast 搜索源白名单")
         entry = self._entries.get(source) or {}
@@ -474,14 +531,45 @@ class ToolRegistry:
         async def _invoke(call_args: dict[str, Any]) -> Any:
             return await tool.ainvoke(call_args)
 
-        return await guarded_source_call(
-            invoke=_invoke,
-            args_model=_SearchArgs,
-            args=args,
-            normalize=lambda raw: _normalize_search_output(source, raw),
-            breaker=breaker,
-            timeout_s=timeout_s,
-        )
+        retried = False
+        while True:
+            try:
+                candidates = await guarded_source_call(
+                    invoke=_invoke,
+                    args_model=_SearchArgs,
+                    args=args,
+                    normalize=lambda raw: _normalize_search_output(source, raw),
+                    breaker=breaker,
+                    timeout_s=timeout_s,
+                    record_circuit=False,  # 逻辑调用计账：熔断在本方法收口处统一记
+                )
+            except SourceCallError as exc:
+                if exc.retryable and not retried:
+                    retried = True
+                    if retry_sink is not None:
+                        retry_sink[source] = retry_sink.get(source, 0) + 1
+                    AgentLog(
+                        message=(
+                            f"搜索源连接类失败——{SOURCE_RETRY_DELAY_S:g}s 后同源重试一次："
+                            f"source={source} error={type(exc.original).__name__ if exc.original else 'SourceCallError'}"
+                        ),
+                        graph="web_search",
+                    ).warning()
+                    await _sleep(SOURCE_RETRY_DELAY_S)
+                    continue
+                breaker.record_failure(clock())
+                if retried:
+                    AgentLog(
+                        message=f"搜索源同源重试仍失败：source={source}",
+                        graph="web_search",
+                    ).warning()
+                raise
+            breaker.record_success(clock())
+            if retried:
+                AgentLog(
+                    message=f"搜索源同源重试成功：source={source}", graph="web_search"
+                ).info()
+            return candidates
 
     @staticmethod
     def _resolve_pointer(name: str) -> str:

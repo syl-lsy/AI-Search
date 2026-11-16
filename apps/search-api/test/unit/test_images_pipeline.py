@@ -524,6 +524,7 @@ EXPECTED_REGISTRY_ALL = sorted(
         "BACKUP_SEARCH_CHAIN",
         "CircuitBreaker",
         "SEARCH_SOURCE_NAMES",
+        "SOURCE_RETRY_DELAY_S",
         "SearchChain",
         "SearchChainUnavailable",
         "SourceCallError",

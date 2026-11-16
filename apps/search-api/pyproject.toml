@@ -72,12 +72,26 @@ dev = [
     "pyright==1.1.414",
     "ruff==0.17.4",
     "python-dotenv==1.2.4",
-    # R4 遗留承载（2026-11-13 批次 9 终审留档）：本行 inmem 额外依赖钉住
-    #   langgraph-api<0.6.0，而 0.5.x 全档反钉 cryptography<45.0 —— 两包修复线
-    #   （langgraph-api ≥0.15.0 / cryptography ≥50.0.0）在本行钉版下互锁不可达，
-    #   升级路径与接受理由见 docs/security-audit-m1-batch8.md §五.4（需同批抬
-    #   langgraph-cli ≥0.4.43 把 inmem 上界放宽到 <1.0.0）。
-    "langgraph-cli[inmem]==0.4.9",
+    # R4 依赖 CVE 清零（2026-11-15 专项，原「互锁接受」解除）：langgraph-cli 的 inmem
+    #   extra 此前钉 langgraph-api<0.6.0，而 0.5.x 全档反钉 cryptography<45.0，使两条
+    #   修复线（langgraph-api ≥0.15.0 / cryptography ≥50.0.0）互锁不可达。0.4.43 起该
+    #   上界放宽为 langgraph-api<1.0.0，故三包可同批过线。版本三元组（2026-11-15）：
+    #   ① langgraph-cli 0.4.43、cryptography 50.0.2 = 当日 PyPI 最高稳定版；
+    #   ② langgraph-api 0.17.2 = mcp==1.30.0 兼容线内最高稳定版（全库最高稳定 0.18.0
+    #      因 mcp<3,>=2.3.0 与运行依赖 mcp==1.30.0／langchain-mcp-adapters 0.3.2 的
+    #      mcp<2.0.0 硬冲突而排除，升级路径挂 M2+）。
+    #   附带上限效应：langgraph-api 0.17.2 要求 grpcio>=1.81.0,<1.82.0，运行依赖
+    #   nacos-sdk-python 共用的 grpcio 随之降至 1.81.2。
+    #   附：0.17.2 强制引入 opentelemetry-exporter-prometheus 0.66b2（pre-release，区间
+    #   <0.67,>=0.63b1 内无稳定版可选，dev-only 不进运行闭包；用户已批 pre-release 进
+    #   dev 组 2026-11-15）。
+    #   证据与处置见 docs/security-audit-m1-batch8.md §五.4。
+    "langgraph-cli[inmem]==0.4.43",
+    # 显式钉版（dev 工具链传递）：studio inmem server 版本不再被动漂移
+    "langgraph-api==0.17.2",
+    # 显式钉版：cryptography 同时是运行时传递依赖（alibabacloud-* / google-auth / pyjwt
+    #   链路），钉在修复线最高稳定版；uv.lock 单版本解析使运行侧同样拿 50.0.2
+    "cryptography==50.0.2",
     # R4 依赖 CVE 机扫通道（security-audit-m1-batch8.md）：pip-audit 环境审计模式
     # （枚举本 venv 已装发行版比对 PyPI Advisory DB），命令入口 make audit。
     # == 钉版（2026-11-13 PyPI 当日稳定版 2.10.1）；其传递依赖自带 pip（uv venv 默认无 pip，

@@ -15,7 +15,7 @@ import { computed } from 'vue'
 import { useMediaQuery } from '@/composables/mediaQuery'
 
 export interface OutlineItem {
-  /** 目标元素 id（turn 问题块 / AnswerRenderer 标题 id / 快答容器 id） */
+  /** 目标元素 id（2026-11-14 修复项③：条目只保留用户问题——即 `turn-{id}-q` 问题块） */
   id: string
   /** 条目文本（块首文本截断，父级负责截断） */
   label: string

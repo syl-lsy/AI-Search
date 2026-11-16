@@ -1,9 +1,16 @@
 /* ==========================================================================
-   AI Search — Design Tokens v1.1
+   AI Search — Design Tokens v1.4
    提取来源：Perplexity 线上桌面版暗色主题截图（2026-11-01，1440×900，中文界面）
    v1.1（2026-11-03）增补：滚动交互三件套（REQ-043~045 / A26~A28）——
    新增 --color-surface-translucent（右侧锚点收起胶囊 80% 半透明底，见 §1）；
    悬浮钮 / 展开卡复用既有 --shadow-card / --radius-lg / --duration-base，不另立 token。
+   v1.4（2026-11-15）增补：UiTooltip 深色气泡主题不变量（frontend-api.md v1.23 交互对齐小批）——
+   新增 --color-tooltip-bg / --color-tooltip-text（两主题恒近黑底浅字，对标 Perplexity tooltip 恒暗；
+   浅色组无需覆写，取值见色板段内注）。
+   v1.3（2026-11-14）增补：界面主题三选（REQ-054 / A38）——
+   新增 :root[data-theme='light'] 浅色变量组（覆盖全部 --color-* 色板与阴影系）+ 
+   --color-bg-primary-translucent（渐隐遮罩用主背景透明变体）；暗色保持 :root 缺省不变；
+   生效机制 = useThemeEffect 写 document.documentElement.dataset.theme（frontend-api.md v1.18）。
    用法：四页 HTML 通过 <link rel="stylesheet" href="./tokens.css"> 引用；
         变量命名可直接映射 Tailwind 配置：
         --color-*            → theme.extend.colors
@@ -56,6 +63,11 @@
   --color-danger-bg: rgba(229, 72, 77, 0.12);
   --color-kb: #8f7ff0;               /* 【知识库】来源徽标专用紫 */
   --color-kb-bg: rgba(143, 127, 240, 0.14);
+
+  /* v1.4（v1.23 UiTooltip）：tooltip 深色气泡主题不变量——对标 Perplexity tooltip 恒暗
+     （两主题都近黑底浅字；浅色组无需覆写，--color-text-inverse 在浅色主题是白色不适用） */
+  --color-tooltip-bg: #131414;
+  --color-tooltip-text: #f2f2ee;
 
   /* ------------------------------------------------------------------
      3. 字体
@@ -124,8 +136,10 @@
   /* ------------------------------------------------------------------
      8. 布局尺度
      截图实测：侧栏 ≈240px；首页搜索卡 ≈640px；来源面板 ≈320px
+     v1.2（2026-11-14 修复项⑧c）：侧栏桌面折叠态 56px 图标栏
      ------------------------------------------------------------------ */
   --layout-sidebar-w: 248px;
+  --layout-sidebar-collapsed-w: 56px; /* 侧栏桌面折叠态（修复项⑧c） */
   --layout-content-max: 768px;      /* 答案正文列宽 */
   --layout-sources-w: 320px;        /* 答案页右侧来源面板 */
   --layout-searchcard-w: 640px;     /* 首页搜索卡片宽 */
@@ -133,6 +147,58 @@
 
   /* 触控目标：交互控件最小 44px（WCAG 2.5.5 / 触屏友好） */
   --hit-min: 44px;
+
+  /* v1.3（REQ-054）：主背景透明变体（渐隐遮罩用——follow-bar 顶部渐变等，
+     主题切换时须跟随主背景色相，避免暗色硬编码 rgba 泄漏进浅色主题） */
+  --color-bg-primary-translucent: rgba(25, 26, 26, 0);
+}
+
+/* ==========================================================================
+   浅色主题（REQ-054 / A38，frontend-api.md v1.18；2026-11-14 批次 2「Perplexity 交互对齐」）
+   作用域：:root[data-theme='light']（useThemeEffect 写 dataset.theme）；
+   暗色保持上方 :root 缺省值不变（data-theme='dark' 或缺省均命中缺省组）。
+   取值对标 Perplexity 亮色实机（2026-11-14）：白底 #ffffff 系、深灰文字、浅灰面、
+   accent 色相保持青蓝系（亮色下加深至 #0d7688 保文字态对比 ≥4.5:1）。
+   ========================================================================== */
+:root[data-theme='light'] {
+  --color-bg-primary: #ffffff;                     /* 页面主背景（白） */
+  --color-bg-sidebar: #f7f7f8;                     /* 侧栏（浅灰，比主区略深一档） */
+  --color-surface: #f7f7f8;                        /* 卡片/搜索框/query 气泡 */
+  --color-surface-hover: #ebebee;                  /* 卡片悬停 */
+  --color-surface-active: #e3e3e6;                 /* 卡片按下 / 表头 */
+  --color-surface-ghost: rgba(0, 0, 0, 0.04);      /* 极浅叠层（行悬停，黑系反转） */
+  --color-surface-translucent: rgba(255, 255, 255, 0.80); /* 锚点收起胶囊半透明底（白 @ 80%） */
+
+  --color-border: #e4e4e7;                         /* 常规分隔线 */
+  --color-border-strong: #d4d4d8;                  /* 输入框/搜索卡片描边 */
+  --color-border-faint: rgba(0, 0, 0, 0.06);
+
+  --color-text-primary: #1a1a1a;                   /* 主文字（深灰，非纯黑） */
+  --color-text-secondary: #61666d;                 /* 次级文字（对白底 ≈ 6.6:1） */
+  --color-text-tertiary: #7d858c;                  /* 元信息/时间戳（对白底 ≈ 4.6:1，≥13px） */
+  --color-text-faint: #a0a6ad;                     /* 禁用/占位符 */
+  --color-text-inverse: #ffffff;                   /* 深色按钮上的文字（反转） */
+
+  --color-accent: #0d7688;                         /* 品牌青蓝（亮色加深档，对白底 ≈ 5.3:1 AA） */
+  --color-accent-hover: #0a8a9f;
+  --color-accent-bg: rgba(13, 118, 136, 0.10);
+  --color-accent-border: rgba(13, 118, 136, 0.35);
+
+  --color-success: #1a7f37;                        /* 亮色下加深保徽标对比 */
+  --color-success-bg: rgba(26, 127, 55, 0.10);
+  --color-warning: #9a6700;
+  --color-warning-bg: rgba(154, 103, 0, 0.10);
+  --color-danger: #cf222e;
+  --color-danger-bg: rgba(207, 34, 46, 0.10);
+  --color-kb: #6c5ce7;
+  --color-kb-bg: rgba(108, 92, 231, 0.12);
+
+  --color-bg-primary-translucent: rgba(255, 255, 255, 0);
+
+  /* 阴影（浅色主题阴影更轻、以边框分层为主不变） */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-floating: 0 12px 40px rgba(0, 0, 0, 0.16);
+  --shadow-focus: 0 0 0 2px rgba(13, 118, 136, 0.45);
 }
 
 /* ==========================================================================
@@ -383,6 +449,7 @@ img, svg { display: block; }
 .dot-warning { background: var(--color-warning); animation: pulse 1.4s ease-in-out infinite; }
 .dot-danger  { background: var(--color-danger); }
 .dot-accent  { background: var(--color-accent); animation: pulse 1.4s ease-in-out infinite; }
+.dot-neutral { background: var(--color-text-tertiary); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 @keyframes blink-caret { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }

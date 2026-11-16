@@ -6,10 +6,11 @@ import { ApiError, client } from '@/api/client'
 import { fetchModels } from '@/api/models'
 import { fetchSnapshot } from '@/api/sources'
 import { fetchSuggestionPool } from '@/api/suggestions'
+import { sendTurnFeedback } from '@/api/turns'
 import { asEnvelope } from '@/mocks/envelope'
 import { modelsFixture } from '@/mocks/models'
 import { suggestionsFixture } from '@/mocks/suggestions'
-import type { SnapshotData } from '@/types/api'
+import type { FeedbackResponse, SnapshotData } from '@/types/api'
 
 /**
  * unit 层 LLM/网络全 mock（AGENTS.md 测试门禁）：以自定义 adapter 截获请求，
@@ -48,6 +49,22 @@ describe('api 模块（请求唯一出口 client.ts 之上）', () => {
     await expect(fetchSuggestionPool()).resolves.toEqual(suggestionsFixture)
     expect(captured[0]?.method).toBe('get')
     expect(captured[0]?.url).toBe('/api/v1/suggestions')
+  })
+
+  it('sendTurnFeedback：POST /api/v1/turns/{turn_id}/feedback 提交体={helpful}（api.md §2.9，REQ-057）', async () => {
+    const feedbackFixture: FeedbackResponse = {
+      turn_id: 'c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b',
+      helpful: true,
+      updated_at: '2026-11-14T08:30:00Z',
+    }
+    client.defaults.adapter = okAdapter(asEnvelope(feedbackFixture))
+    await expect(sendTurnFeedback('c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b', true)).resolves.toEqual(feedbackFixture)
+    expect(captured[0]?.method).toBe('post')
+    expect(captured[0]?.url).toBe('/api/v1/turns/c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b/feedback')
+    // axios transformRequest 已序列化请求体（adapter 层观察到字符串形态）
+    const raw = captured[0]?.data
+    const body: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw
+    expect(body).toEqual({ helpful: true })
   })
 
   it('fetchSnapshot：GET /api/v1/sources/{source_id}/snapshot（api.md §5.1；P2：AnswerView 散写 URL 收敛出口面）', async () => {

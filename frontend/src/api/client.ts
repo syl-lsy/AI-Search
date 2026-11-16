@@ -71,8 +71,14 @@ export function unwrapEnvelope(response: AxiosResponse): unknown {
   return body.data
 }
 
-/** 任意异常归一为 ApiError（错误信封优先——服务端中文 message 直达 toast） */
+/**
+ * 任意异常归一为 ApiError（错误信封优先——服务端中文 message 直达 toast）。
+ * 已归一的 ApiError **直通**（不二次归一）：client 拦截器在响应层已归一一次，
+ * 调用方 catch 后再 normalizeError 时保持 code/message（此前二次归一会把业务错误
+ * 降级为网络兜底文案，丢失服务端 message——P2-4 修复，2026-11-15）。
+ */
 export function normalizeError(error: unknown): ApiError {
+  if (error instanceof ApiError) return error
   if (axios.isAxiosError(error)) {
     const body: unknown = error.response?.data
     if (isEnvelope(body)) {

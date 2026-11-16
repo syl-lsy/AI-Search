@@ -3,15 +3,20 @@
  *
  * 职责：
  *   - 当前线程 turns 映射：每轮 question/answer_md/thinking_md/sources/images/stages/
- *     memory_hits/compactSeq/incognito/cancelReason/followups/status/lastSeq（§4 逐字段），
- *     另附 errorMsg/degradedReason/memorySaved/compactAt 四个派生展示字段（派发表对应
- *     Banner/错误条/M5 toast/v1.4 瞬态提示的数据形态就绪）。
+ *     memory_hits/compactSeq/incognito/cancelReason/followups/feedbackHelpful/status/lastSeq
+ *     （§4 逐字段），另附 errorMsg/degradedReason/memorySaved/compactAt 四个派生展示字段
+ *     （派发表对应 Banner/错误条/M5 toast/v1.4 瞬态提示的数据形态就绪）。
  *   - SSE 连接编排：ask()/followUp() POST 建轮（两段式第一段，经 client.ts 唯一出口）→
  *     subscribe() GET 订阅（第二段，经 turnStream.ts 唯一出口）；所有事件经 applyEvent()
  *     单入口进状态机（§3 派发表 / §8.7 传输与渲染解耦）。
  *   - reconcile()：REST 为准源对账（生命周期 4/5）；终态权威替换、运行中轮保留流式增量
  *     （后端 token/thinking 只发布不落库、answer_md 仅终态落库——apps/search-api/app/services/
  *     turn_service.py:21-22/:753-754，运行中 2.5 answer_md 为空串，替换会清空流式内容）。
+ *   - sendFeedback()：轮反馈乐观 UI（v1.17，REQ-057/A41；api.md §2.9——经 api/turns.ts，
+ *     失败静默回滚不 toast，reconcile 对 2.5 feedback_helpful 还原）。
+ *   - regenerate()：degraded/failed-with-sources fast 轮「仅重新生成」（v1.26，REQ-063/A47；
+ *     api.md §2.12——POST → 状态置 running + 清空渲染态 + SSE 重订阅，§3 生命周期 14
+ *     清空重渲约定；失败 409006/404001 toast 既有链路）。
  *   - generatingThreadIds：侧边栏生成中线程集合（生命周期 12），轮生命周期事件驱动、不轮询。
  *   - closeStream()：路由切走主动断流（生命周期 11，连接注册表保证同 turnId 至多一条连接）。
  */
@@ -19,6 +24,7 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { apiGet, apiPost, normalizeError } from '@/api/client'
+import { regenerateTurn, sendTurnFeedback } from '@/api/turns'
 import { toast } from '@/composables/toast'
 import { closeTurnStream, subscribeTurn } from '@/sse/turnStream'
 import type { TurnStreamState } from '@/sse/turnStream'
@@ -101,6 +107,11 @@ export interface TurnState {
   cancelReason: CancelReason | null
   /** SSE followups 事件与 reconcile() 对账双源写入（v1.9） */
   followups: string[] | null
+  /**
+   * 轮反馈现值（v1.17，REQ-057/A41）：sendFeedback 响应回写 + reconcile() 对账
+   * 2.5 feedback_helpful 双源；SSE 无对应事件。null=未反馈。
+   */
+  feedbackHelpful: boolean | null
   lastSeq: number
   /** error 事件 message（错误条展示；error 非终态，§3 派发表） */
   errorMsg: string | null
@@ -137,6 +148,7 @@ function seedTurnState(init: {
     incognito: init.incognito,
     cancelReason: null,
     followups: null,
+    feedbackHelpful: null,
     lastSeq: 0,
     errorMsg: null,
     degradedReason: null,
@@ -159,6 +171,17 @@ export const useTurnStore = defineStore('turn', () => {
   const liveTurnId = ref<string | null>(null)
   const sseState = ref<SseConnectionState>('idle')
   const generatingThreadIds = ref(new Set<string>())
+  /**
+   * 线程装配快照（App 顶栏导出/分享的数据源）：threadId → 2.3 线程标题 + 轮次序
+   * （turns 按 created_at 升序——store.turns 为轮 id 键映射无序，整线程导出按此序重建时序）。
+   * 写入点唯一 = AnswerView.loadThread（2.3 取数成功后）；顶栏导出/分享消费。
+   */
+  const threadMetas = ref<Record<string, { title: string; turnIds: string[] }>>({})
+
+  /** 线程装配快照写入（AnswerView.loadThread 调用；覆盖式——watch(threadId) 切线程重装即更新） */
+  function setThreadMeta(threadId: string, meta: { title: string; turnIds: string[] }): void {
+    threadMetas.value[threadId] = meta
+  }
 
   /* ---------- 生成中集合（生命周期 12：轮生命周期事件驱动，不轮询） ---------- */
 
@@ -275,6 +298,22 @@ export const useTurnStore = defineStore('turn', () => {
     persistSeq(turnId, turn.lastSeq, { immediate: !isDelta || isTerminalWrite })
     switch (event.event) {
       case 'stage':
+        // 生命周期 14 清空重渲边界（v1.26，REQ-063；双评审 P2 修复）：stage(write,running) 是
+        // 新一轮渲染边界——regenerate 重订阅的全量重放中旧 token/thinking 会先再累积（delta
+        // 通道豁免 seq 门，新标签页无落盘游标时可达），边界到达且答案区/思考流已有渲染态 →
+        // 两者同时清位重新累积。thinking 必清的语义依据：thinking 为持久渲染面（ThinkingPanel
+        // 终态后常驻、REST 无对应字段不对账），旧代+新代拼接即持久错 mixed。事件序安全性：
+        // thinking 仅与 token 同构交替、严格晚于 write-running（§7.2 v1.4 / §7.4 fixture——deep
+        // seq 13 write-running → seq 14 首个 thinking），故旧代 thinking 全部早于新边界 seq、
+        // 触发条件含 thinking_md 恒无误伤（常规首轮流 write 前两缓冲恒空，条件不成立零行为变化）。
+        if (
+          event.data.stage_key === 'write' &&
+          event.data.status === 'running' &&
+          (turn.answer_md !== '' || turn.thinking_md !== '')
+        ) {
+          turn.answer_md = ''
+          turn.thinking_md = ''
+        }
         upsertStage(turn, event.data)
         break
       case 'token':
@@ -306,9 +345,17 @@ export const useTurnStore = defineStore('turn', () => {
         turn.durationMs = event.data.duration_ms
         generatingThreadIds.value.delete(turn.threadId)
         break
-      case 'followups':
-        turn.followups = event.data.items
+      case 'followups': {
+        // 安全守卫（评审 P3-3）：items 须为字符串数组才入 state——镜像类型 string[] 是静态
+        // 形态，运行时契约回归混入非字符串会崩 FollowupChips 渲染（§8.9⑥ 盲区口径的运行时
+        // 防线）；非法静默丢弃、维持既有值（与后端生成失败静默语义一致）。seq 门在进入
+        // switch 前已推进 lastSeq：游标与内容分离，丢弃不卡重放。
+        const items = event.data.items
+        if (Array.isArray(items) && items.every((s) => typeof s === 'string')) {
+          turn.followups = items
+        }
         break
+      }
       case 'error':
         // error 非终态：保留已生成内容 + 错误条 + 节点标 failed；生成中集合不动（只认 done/对账）
         turn.errorMsg = event.data.message
@@ -367,6 +414,78 @@ export const useTurnStore = defineStore('turn', () => {
     return apiPost<CancelTurnData>(`/api/v1/turns/${turnId}/cancel`)
   }
 
+  /**
+   * 重新生成（v1.26 增，REQ-063/A47；api.md §2.12 / frontend-api.md §3 生命周期 14）：
+   * degraded/failed-with-sources fast 轮「仅重新生成」——复用既有 sources 只重跑 synthesis。
+   *   ① POST /api/v1/turns/{turnId}/regenerate（经 api/turns.ts 唯一出口；请求体空）；
+   *   ② 成功 → 状态置 running + 清空该轮渲染态：answer_md/thinking_md 缓冲与旧终态展示字段
+   *     （errorMsg/degradedReason/durationMs——状态条/DegradedBanner 随 TurnBlock isLive
+   *     既有分支接管，零改动）；sources/stages 保留（api.md §2.12：不重检索、时间线按
+   *     stage(write,running) 就地重渲，第二次 done 对账时 REST 权威回填）；
+   *   ③ 重订阅 SSE（同通道续推，api.md §7.1 通道重开注）：重放门抬升为 max(内存 lastSeq,
+   *     sessionStorage 落盘游标)——同页/同标签页刷新路径旧轨迹（旧 done/error/token/thinking）
+   *     在传输层与派发层双门幂等丢弃；新标签页无落盘游标 → 全量重放由「stage(write,running)
+   *     清空重渲边界」（applyEvent，token/thinking 双缓冲同清——双评审 P2）兜底 delta 泄漏，
+   *     旧 done/error 瞬态由二次 done + 2.5 对账收敛（REST 为准源）；
+   *   ④ 失败（409006/404001/网络）→ toast（normalizeError 服务端中文 message 直达，
+   *     既有链路），状态不清空、不订阅——轮保持原终态可再次点击；进行中重复点击由服务端
+   *     条件 UPDATE 以同码 409006 拒绝（§2.12，前端不再加防抖门）。
+   */
+  async function regenerate(turnId: string): Promise<void> {
+    const turn = turns.value[turnId]
+    if (!turn) return
+    try {
+      await regenerateTurn(turnId)
+    } catch (error) {
+      toast(normalizeError(error).message)
+      return
+    }
+    turn.status = 'running'
+    turn.answer_md = ''
+    turn.thinking_md = ''
+    turn.errorMsg = null
+    turn.degradedReason = null
+    turn.durationMs = null
+    // 重放幂等门抬升（生命周期 14）：内存 lastSeq 随刷新归零，本标签页曾观测的游标仍在
+    // sessionStorage（L5 形态，persistSeq done 即时落）——max() 合成重放基线（落盘不可用
+    // 时回退内存值；两者皆 0 = 新标签页全量重放，由边界清空 + 二次对账收敛）
+    turn.lastSeq = Math.max(turn.lastSeq, readStoredSeq(turnId))
+    markGenerating(turn.threadId, 'running')
+    subscribe(turnId)
+  }
+
+  /**
+   * 轮反馈（v1.17，REQ-057/A41；api.md §2.9 upsert 改判 + 取消——同钮再点即取消，v1.17）：
+   *   - 乐观 UI：本地即置 → POST（经 api/turns.ts 唯一出口）→ 响应回写；
+   *   - helpful: true/false = upsert 改判；null = 清除反馈（删除该轮反馈行，响应
+   *     helpful=null 且 updated_at=null——同钮再点即取消，Perplexity 实机行为，v1.17）；
+   *   - 失败静默回滚至 lastServerConfirmed（服务端最后一次确认值）、不 toast
+   *     （404004/网络错误同口径，仅 console 留痕，可重试）；批次3评审-F1：回滚锚点不再是
+   *     点击时刻快照——快照可能是上一代未被确认的乐观值（两连败滚出「未落盘假态」）；
+   *   - 改判 = 再点另一按钮再次调用（每次调用独立乐观置位 → POST 覆盖）；
+   *   - 乱序守卫（评审 P2-2）：per-turn 请求代数（feedbackSeqs）——快速互点两钮 + 响应乱序
+   *     时，非最新代数的响应/失败一律丢弃（不回写、不回滚），旧请求不再覆盖新状态。
+   */
+  async function sendFeedback(turnId: string, helpful: boolean | null): Promise<void> {
+    const turn = turns.value[turnId]
+    if (!turn) return
+    const seq = (feedbackSeqs.get(turnId) ?? 0) + 1
+    feedbackSeqs.set(turnId, seq)
+    turn.feedbackHelpful = helpful
+    try {
+      const data = await sendTurnFeedback(turnId, helpful)
+      if (feedbackSeqs.get(turnId) !== seq) return // 旧响应后到：丢弃不写（新点击已接管状态）
+      turn.feedbackHelpful = data.helpful
+      feedbackServerConfirmed.set(turnId, data.helpful) // 锚点回写（批次3评审-F1）
+    } catch (error) {
+      if (feedbackSeqs.get(turnId) !== seq) return // 旧请求失败后到：不回滚新状态、不留痕
+      // 回滚锚点 = lastServerConfirmed（null=服务端从未确认 → 回未反馈态）
+      turn.feedbackHelpful = feedbackServerConfirmed.get(turnId) ?? null
+      // 静默留痕（frontend-api.md §1 v1.17：失败静默回滚不 toast——回滚后回未反馈/改判前态）
+      console.warn(`[turnStore] feedback 回滚（turn=${turnId}, helpful=${String(helpful)}）`, error)
+    }
+  }
+
   /* ---------- SSE 订阅编排 ---------- */
 
   function subscribe(turnId: string): void {
@@ -411,6 +530,17 @@ export const useTurnStore = defineStore('turn', () => {
   /** 对账失败链状态：turnId → 已重试次数（防 toast 雪崩 + 有限重试窗口判定） */
   const reconcileRetries = new Map<string, number>()
   const reconcileRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  /** 反馈请求代数（评审 P2-2 乱序守卫）：turnId → 最新请求序号；响应/失败按代数判定丢弃 */
+  const feedbackSeqs = new Map<string, number>()
+
+  /**
+   * 服务端最后确认值（批次3评审-F1 失败回滚锚点）：turnId → 最后一次被服务端确认的
+   * feedbackHelpful（缺省=null=从未确认）。写入点两个：sendFeedback 响应成功回写、
+   * reconcile() 对账（2.5 feedback_helpful 为准源）。失败回滚目标 = 此锚点而非点击时刻
+   * 快照——快照可能是上一代未被确认的乐观值（两连败会滚出「服务端从未落盘」的 UI 假态）。
+   */
+  const feedbackServerConfirmed = new Map<string, boolean | null>()
 
   /**
    * safeReconcile —— subscribe 回调的对账唯一入口（评审留档 P2：原先两处裸 void reconcile
@@ -491,8 +621,14 @@ export const useTurnStore = defineStore('turn', () => {
     turn.incognito = detail.incognito
     turn.cancelReason = detail.cancel_reason
     turn.followups = detail.followups
+    turn.feedbackHelpful = detail.feedback_helpful ?? null
+    // 对账值同为服务端确认（批次3评审-F1：回滚锚点随准源同步）
+    feedbackServerConfirmed.set(turnId, turn.feedbackHelpful)
     turn.memory_hits = detail.memory_hits ?? null
-    turn.errorMsg = detail.error
+    // 2.5 error 为 TurnError 对象载荷（data-model.md §1.3 {code,message,stage_key?}；镜像勘误
+    // 2026-11-15）——只取 message 文本保持 errorMsg: string|null 形状（TurnBlock 渲染零改动，
+    // 直写对象会渲染 [object Object]）；SSE error 事件路径（event.data.message）本就是字符串。
+    turn.errorMsg = detail.error?.message ?? null
     turn.degradedReason = detail.degraded ? detail.degraded_reason : null
     turn.durationMs = detail.duration_ms
     // lastSeq/compactSeq/thinking_md 为传输层/流式域：REST 无对应字段，一律保留
@@ -504,9 +640,13 @@ export const useTurnStore = defineStore('turn', () => {
     liveTurnId,
     sseState,
     generatingThreadIds,
+    threadMetas,
+    setThreadMeta,
     ask,
     followUp,
     cancel,
+    sendFeedback,
+    regenerate,
     subscribe,
     applyEvent,
     reconcile,

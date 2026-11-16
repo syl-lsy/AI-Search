@@ -6,7 +6,8 @@ SourceBrief/StageBrief 对齐 §2.5 sources[]/stages[] 形状。
 
 分期口径字段（用户裁决 2026-11-08，逐字段注释标注真实值启用批次）：
 - incognito：请求侧（ThreadCreate）接收并校验、不落库；TurnDetail 恒 false——M5 起；
-- followups：恒 null——0009 迁移 + B7 工单起；
+- followups：**M2 批次 2 起真实值**（0009 迁移 + 图外钩子 REQ-046；turns.followups 直读）；
+- feedback_helpful：**M2 批次 2 起真实值**（0010 turn_feedback + api.md §2.9 REQ-057）；
 - memory_hits：**不在 TurnDetail 返回**（api.md §2.5「M5 及之前无此字段」——评审 P2
   勘误：此前预置恒空命中字段属提前出面；M6（记忆 P1）随迁移与 §7.2 memory 事件一并增）；
 - has_artifacts 属 ThreadDetail（thread.py），同口径 0002-M2 起真实值。
@@ -130,6 +131,17 @@ class TurnCancelResult(BaseModel):
     status: Literal["canceling"]
 
 
+class TurnRegenerateResult(BaseModel):
+    """POST /turns/{turn_id}/regenerate 响应 data（api.md §2.12 v1.19 / REQ-063）。
+
+    status 恒 "running"：条件推进成功后该轮已置 running（SSE 同通道 seq 续推，
+    前端重新订阅 + `stage(write,running)` 清空重渲约定承担重放幂等）。
+    """
+
+    turn_id: str
+    status: Literal["running"]
+
+
 class TurnDetail(BaseModel):
     """轮次终态详情（§2.5）：进行中（running/queued）调用同样合法，返回已持久化部分。
 
@@ -162,7 +174,20 @@ class TurnDetail(BaseModel):
     )
     followups: list[str] | None = Field(
         default=None,
-        description="分期口径（用户裁决 2026-11-08）：恒 null——0009 迁移 + B7 工单起真实值",
+        description=(
+            "后续提问建议（1~5 条，语言跟随 query_lang；REQ-046，api.md §2.5）：仅 "
+            "fast 轮 + status=completed + answer_md 非空 + Agent Spec followups.enabled "
+            "且生成成功时非空；TurnRunner 图外钩在 done 之后异步回填（done 时刻查询可能"
+            "仍为 null，晚到对账可见）；生成失败/超时静默放弃，deep 轮与其余终态恒 null"
+        ),
+    )
+    feedback_helpful: bool | None = Field(
+        default=None,
+        description=(
+            "轮次用户反馈现值（REQ-057，api.md §2.5 v1.16 / §2.9）：true=有帮助 / "
+            "false=没有帮助 / null=未反馈；数据源 turn_feedback（UNIQUE(turn_id) 一轮"
+            "一行），经 POST /turns/{id}/feedback 写入，本字段为回看/刷新还原的读通道"
+        ),
     )
     cancel_reason: CancelReason | None = None  # 仅 status=canceled 时非空（§2.5 v1.4）
     created_at: datetime

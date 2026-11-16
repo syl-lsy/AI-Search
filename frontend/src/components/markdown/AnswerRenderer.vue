@@ -4,17 +4,17 @@
  *
  * - markdown-it + DOMPurify（白名单 + §2 http/https 协议白名单）+ highlight.js（renderer.ts）；
  * - [n] 引用标注 → 可点击 sup.cite，点击上抛 cite(refNo) 与 sources 面板 ref_no 联动（REQ-003）；
- * - 标题 id 由渲染器生成（renderer.ts postProcess），headings 事件上抛 = OutlineAnchor 数据源
- *   （frontend-api.md §5：数据源复用 AnswerRenderer 标题 id 机制，SSE/API 协议零变更）；
+ * - 标题 id 由渲染器生成（renderer.ts postProcess，锚点定位目标保留）；headings 上抛事件已随
+ *   「锚点只保留用户问题」（2026-11-14 修复项③）移除——renderer.ts 仍返回 headings（渲染器
+ *   契约不变，仅组件层不再上抛）；
  * - thinking 折叠区（ThinkingPanel）是本组件上方独立区块（§5），不在本组件内部；
  * - 渲染节奏（streaming-buffer 规则 14/17）：markdown 源经 70ms 限频批驱动重解析——流式期间
  *   「每帧全量重解析」收敛为「≤70ms 一批」，窗口内合批尾帧取最新值（终值不丢）；
  *   headingPrefix 变更不经限频（computed 直连 props，立即生效——多轮去重命名空间静态不变）。
  */
-import { computed, watch } from 'vue'
+import { computed } from 'vue'
 
 import { renderAnswerMarkdown } from '@/components/markdown/renderer'
-import type { HeadingInfo } from '@/components/markdown/renderer'
 import { useThrottledSource } from '@/components/markdown/renderThrottle'
 
 const props = defineProps<{
@@ -24,21 +24,11 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  headings: [items: HeadingInfo[]]
   cite: [refNo: number]
 }>()
 
 const throttledMarkdown = useThrottledSource(() => props.markdown)
 const rendered = computed(() => renderAnswerMarkdown(throttledMarkdown.value, { headingPrefix: props.headingPrefix }))
-
-// watch→emit 属合法副作用通道（computed 内禁止副作用）；headings 供父级装配 OutlineAnchor 条目
-watch(
-  rendered,
-  (r) => {
-    emit('headings', r.headings)
-  },
-  { immediate: true },
-)
 
 function refNoFrom(target: EventTarget | null): number | null {
   const el = target instanceof Element ? target.closest('sup.cite[data-ref-no]') : null

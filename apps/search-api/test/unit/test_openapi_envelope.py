@@ -184,6 +184,36 @@ def test_non_json_api_response_documentation_untouched():
     assert "code" not in content["text/plain"]["schema"].get("properties", {})
 
 
+def test_thread_mgmt_routes_are_envelope_wrapped():
+    """B-12（api.md §2.10/§2.11 v1.18）：PATCH/DELETE 线程路由的信封组件同步。
+
+    PATCH 响应 = 更新后线程投影（ThreadBrief）；DELETE 响应 = ThreadDeleteData；
+    非 200 响应（400/404/409）在 /api/ 文档侧一律删除（错误形态由错误文档统一说明）。
+    """
+    schema = _get_schema()
+    path_item = schema["paths"]["/api/v1/threads/{thread_id}"]
+
+    patch_op = path_item["patch"]
+    assert set(patch_op["responses"]) == {"200"}
+    assert patch_op["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ApiResponse_ThreadBrief"
+    }
+
+    delete_op = path_item["delete"]
+    assert set(delete_op["responses"]) == {"200"}
+    assert delete_op["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ApiResponse_ThreadDeleteData"
+    }
+
+    components = schema["components"]["schemas"]
+    assert components["ApiResponse_ThreadDeleteData"]["properties"]["data"] == {
+        "$ref": "#/components/schemas/ThreadDeleteData"
+    }
+    # PATCH 请求体模型进文档（§2.10 四字段全可选）
+    patch_ref = patch_op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+    assert patch_ref.endswith("/ThreadPatchRequest")
+
+
 def test_openapi_schema_is_generated_once_and_cached():
     app.openapi_schema = None
     first = app.openapi()

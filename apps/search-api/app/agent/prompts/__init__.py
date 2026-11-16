@@ -39,6 +39,7 @@ BUILTIN_PROMPT_FILES: dict[str, str] = {
     "fast.synthesis": "fast/synthesis.txt",
     "common.type_rules": "common/type_rules.txt",
     "common.citation_rules": "common/citation_rules.txt",
+    "fast.followups": "fast/followups.txt",
 }
 
 _BUILTIN_DIR = Path(__file__).resolve().parent

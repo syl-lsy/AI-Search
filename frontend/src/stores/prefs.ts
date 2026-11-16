@@ -1,15 +1,18 @@
 /**
  * src/stores/prefs.ts — 偏好 store（frontend-api.md §4 prefsStore；setup store 写法，§8.2）。
  *
- * 状态：lang / model / incognito（v1.3）/ onConflict（v1.5），localStorage 同步（§2）：
+ * 状态：lang / model / incognito（v1.3）/ onConflict（v1.5）/ theme（v1.18，REQ-054），
+ * localStorage 同步（§2）：
  *   - ai-search.lang：zh-CN | en-US
  *   - ai-search.model：qwen | glm | deepseek（初值不本地硬编码——无用户选择为 null，
  *     提交体不携带走服务端缺省，ModelSelect 落位时以 GET /models 的 default 兜底）
  *   - ai-search.incognito：'true' | 'false'（默认 false）
  *   - ai-search.onConflict：reject | enqueue | interrupt | rollback | null（默认 null=不携带字段）
- * 语义：所有开关「对下一轮生效」，进行中轮次不受切换影响。
+ *   - ai-search.theme：light | dark | system（默认 system；resolvedTheme 经
+ *     matchMedia prefers-color-scheme 解析，dataset 写入与 change 监听归 composables/theme.ts）
+ * 语义：业务开关「对下一轮生效」；theme/lang 切换即时全页生效。
  */
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { setLocale } from '@/i18n'
@@ -18,15 +21,18 @@ import {
   isAppLocale,
   isChatModelKey,
   isOnConflictStrategy,
+  isThemePreference,
   parseStoredFlag,
 } from '@/utils/guards'
 import type { ChatModelKey, OnConflictStrategy } from '@/types/api'
+import type { ThemePreference } from '@/utils/guards'
 
 const STORAGE_KEYS = {
   lang: 'ai-search.lang',
   model: 'ai-search.model',
   incognito: 'ai-search.incognito',
   onConflict: 'ai-search.onConflict',
+  theme: 'ai-search.theme',
 } as const
 
 /** §8.9③：localStorage 无类型边界——读值先守卫收窄；存储不可用（隐私模式等）静默降级 */
@@ -69,11 +75,35 @@ function readStoredOnConflict(): OnConflictStrategy | null {
   return isOnConflictStrategy(stored) ? stored : null
 }
 
+function readStoredTheme(): ThemePreference {
+  const stored = readStorage(STORAGE_KEYS.theme)
+  return isThemePreference(stored) ? stored : 'system'
+}
+
+/** 当前系统偏好是否深色（jsdom/无 matchMedia 环境守卫为 false——解析回落浅色） */
+function readSystemPrefersDark(): boolean {
+  try {
+    return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: dark)').matches
+  } catch {
+    return false
+  }
+}
+
 export const usePrefsStore = defineStore('prefs', () => {
   const lang = ref<AppLocale>(readStoredLocale())
   const model = ref<ChatModelKey | null>(readStoredModel())
   const incognito = ref<boolean>(readStoredIncognito())
   const onConflict = ref<OnConflictStrategy | null>(readStoredOnConflict())
+  /** 界面主题三选（REQ-054，v1.18）：用户档；system=跟随系统（resolvedTheme 解析） */
+  const theme = ref<ThemePreference>(readStoredTheme())
+  /** 系统深色偏好镜像（useThemeEffect 经 matchMedia change 回调同步——数据面单一归属 store） */
+  const systemPrefersDark = ref<boolean>(readSystemPrefersDark())
+  /** 解析后生效档：system → 系统偏好；显式档原样（渲染层 dataset.theme 数据源） */
+  const resolvedTheme = computed<'light' | 'dark'>(() => {
+    if (theme.value === 'dark') return 'dark'
+    if (theme.value === 'light') return 'light'
+    return systemPrefersDark.value ? 'dark' : 'light'
+  })
 
   /** 切换界面语言：即时生效（i18n 响应式）+ 持久化（§2/§7） */
   function setLang(next: AppLocale): void {
@@ -103,5 +133,29 @@ export const usePrefsStore = defineStore('prefs', () => {
     writeStorage(STORAGE_KEYS.onConflict, next)
   }
 
-  return { lang, model, incognito, onConflict, setLang, setModel, toggleIncognito, setOnConflict }
+  /** 主题三选（REQ-054）：切换即时生效（dataset 写入归 useThemeEffect）+ 持久化 */
+  function setTheme(next: ThemePreference): void {
+    theme.value = next
+    writeStorage(STORAGE_KEYS.theme, next)
+  }
+
+  /** 系统深色偏好同步（useThemeEffect 的 matchMedia change 回调；system 档实时跟随的数据面） */
+  function syncSystemPrefersDark(matches: boolean): void {
+    systemPrefersDark.value = matches
+  }
+
+  return {
+    lang,
+    model,
+    incognito,
+    onConflict,
+    theme,
+    resolvedTheme,
+    setLang,
+    setModel,
+    toggleIncognito,
+    setOnConflict,
+    setTheme,
+    syncSystemPrefersDark,
+  }
 })

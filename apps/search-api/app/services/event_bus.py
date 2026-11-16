@@ -16,6 +16,9 @@
   （ADR-003 v1.7 增注 1 / api.md §7.3 v1.5 增注）；
 - **done 后事件**（followups，ADR-003 v1.16）：照常占号、入缓冲、刷新 last_activity
   ——publish 不因终态拒绝写入。
+- **regenerate 通道重开**（api.md §7.1 v1.19 / ADR-003 v1.19 增注）：`reopen_channel`
+  解除 terminal/closed、清 followups 状态，**历史缓冲保留**——同通道 seq 续推，
+  第二个 done 发布后重新终态。
 
 生命周期：main.py lifespan（B2 接线）调 start_event_bus()；api/ 层经
 app/dependencies.py 的 get_event_bus 消费（未启动即取 fail-fast，与
@@ -40,6 +43,7 @@ from typing import Any
 from app.core.config import SseSettings, sse_settings
 
 __all__ = [
+    "FOLLOWUPS_EVENT_TYPE",
     "TERMINAL_EVENT_TYPE",
     "EventBus",
     "SseEvent",
@@ -50,6 +54,9 @@ __all__ = [
 # 轮终态标记：done 事件到达即置通道终态（清扫资格判据）。
 # api.md §7.2：error 非终态（error 后必跟 done）；done 后仍可发布（followups）。
 TERMINAL_EVENT_TYPE = "done"
+
+# done 后保活窗口内可能出现的事件（api.md §7.1/§7.2：实验增强层，必然晚于 done）
+FOLLOWUPS_EVENT_TYPE = "followups"
 
 # 后台清扫周期（秒）：环境无关节奏值，代码常量判据；TTL 判定粒度 ≤ 本周期。
 SWEEP_INTERVAL_SECONDS = 60.0
@@ -91,6 +98,11 @@ class _TurnChannel:
     terminal: bool = False  # done 事件后置位（ADR-003 v1.7 增注 1 清扫判据）
     closed: bool = False  # close_channel 显式关闭置位（订阅流结束信号；done 不置它）
     last_activity: float = 0.0  # 滑动 TTL 基准（clock() 每写入刷新）
+    # done 后保活窗口（followups，ADR-003 v1.16）：TurnRunner 在 done 发布**之前**登记
+    # 单调钟截止时刻（api.md §7.1 窗口 = spec.followups.sse_hold_window_ms）；SSE 端点
+    # 据此决定 done 后是否继续跟随；未登记（开关关闭/非达标轮）= done 后立即收口。
+    followups_hold_deadline: float | None = None
+    followups_seq: int | None = None  # followups 事件已发布时的 seq（重放/late-subscriber 判据）
 
 
 class EventBus:
@@ -134,6 +146,9 @@ class EventBus:
         channel.last_activity = self._clock()
         if event.event_type == TERMINAL_EVENT_TYPE:
             channel.terminal = True
+        elif event.event_type == FOLLOWUPS_EVENT_TYPE:
+            # followups 已发布：记录 seq（重放/late-subscriber 的「还有事件可取」判据）
+            channel.followups_seq = seq
 
         async with channel.cond:  # 持锁唤醒（notify 要求持锁）；缓冲变更本身无竞争
             channel.cond.notify_all()
@@ -263,6 +278,79 @@ class EventBus:
             if event.event_type == TERMINAL_EVENT_TYPE and event.seq is not None:
                 return event.seq
         return None
+
+    # ---- done 后保活窗口（followups，api.md §7.1 / ADR-003 v1.16）----
+
+    def expect_followups(self, turn_id: str, *, window_ms: int) -> bool:
+        """登记 done 后保活窗口（TurnRunner 在 done 发布**之前**调用）。
+
+        达标轮（`followups.enabled=true` ∧ fast ∧ completed ∧ 答案非空）才登记——
+        登记后 SSE 端点 done 后不立即关闭，等待 followups 事件或窗口耗尽；未登记
+        （开关关闭/非达标轮/deep 轮）= done 后立即收口（v1.7 前语义零差异）。
+        通道不存在（该轮从未发布事件——编程错误面）→ no-op 返回 False，不建空通道。
+        """
+        channel = self._channels.get(turn_id)
+        if channel is None:
+            return False
+        channel.followups_hold_deadline = self._clock() + max(0, int(window_ms)) / 1000
+        return True
+
+    def followups_hold_remaining(self, turn_id: str) -> float | None:
+        """窗口剩余秒数：未登记/已耗尽（或通道不存在）→ None。
+
+        SSE 端点据此裁决 done 后的去留：None 且 followups 未发布 → 立即收口。
+        """
+        channel = self._channels.get(turn_id)
+        if channel is None or channel.followups_hold_deadline is None:
+            return None
+        remaining = channel.followups_hold_deadline - self._clock()
+        return remaining if remaining > 0 else None
+
+    def followups_seq(self, turn_id: str) -> int | None:
+        """followups 事件已发布时的 seq（未发布/通道不存在 → None）。
+
+        重放与 late-subscriber 判据：客户端 cursor 未覆盖该 seq 时应继续重放/跟随
+        （`terminal_seq` 的「已持有 done 即关闭」对偶面）。
+        """
+        channel = self._channels.get(turn_id)
+        return None if channel is None else channel.followups_seq
+
+    def abandon_followups(self, turn_id: str) -> None:
+        """生成已静默放弃（失败/超时/空结果）→ 提前收口窗口。
+
+        TurnRunner 在 generate_followups 返回 None 后调用：SSE 端点下一次窗口轮询
+        （`followups_hold_remaining` → None）即静默关闭——api.md §7.1「窗口超时或
+        生成已静默放弃 → 静默关闭、不报错」，避免客户端白等满整个窗口。
+        已发布 followups（followups_seq 非 None）时不动：重放路径仍需按 seq 补发。
+        """
+        channel = self._channels.get(turn_id)
+        if channel is None or channel.followups_seq is not None:
+            return
+        channel.followups_hold_deadline = None
+
+    def reopen_channel(self, turn_id: str) -> bool:
+        """通道重开（regenerate，api.md §7.1 v1.19 / §2.12 / ADR-003 v1.19 增注）。
+
+        POST /turns/{id}/regenerate 推进成功（turn 置 running）后由 ThreadScheduler
+        调用——**同通道 seq 续推**（不新建事件流/新 turn）：
+        - `terminal=False`：解除「客户端已持有 done 即零帧关闭」短路（terminal_seq
+          返回 None），重订阅先重放旧事件后跟随实时；
+        - `closed=False`：failed 路径经 close_channel 关过通道时同样解除（否则新
+          订阅在重放排空后立即结束、收不到续发事件）；
+        - 清 followups 状态（hold deadline / seq）：上一轮 done 后保活窗口作废，
+          第二次 done 重新登记。
+        **历史缓冲保留**（晚到客户端重放补帧仍可用）；第二次 done 发布后
+        terminal 重新置位——自洽。通道不存在（regenerate 前从未发布事件）返回
+        False：订阅先行会自建空通道，无需预置。
+        """
+        channel = self._channels.get(turn_id)
+        if channel is None:
+            return False
+        channel.terminal = False
+        channel.closed = False
+        channel.followups_hold_deadline = None
+        channel.followups_seq = None
+        return True
 
     async def close_channel(self, turn_id: str) -> bool:
         """显式关闭轮通道并唤醒订阅者结束（B2：TurnRunner 失败路径调用）。

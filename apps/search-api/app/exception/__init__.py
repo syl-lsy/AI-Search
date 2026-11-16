@@ -7,8 +7,14 @@
 from app.exception.bad_request import BadRequestException
 from app.exception.base import BusinessException
 from app.exception.config_center import ConfigCenterException
-from app.exception.conflict import ConflictException, TurnTerminalException
+from app.exception.conflict import (
+    ConflictException,
+    ThreadBusyException,
+    TurnNotRegenerableException,
+    TurnTerminalException,
+)
 from app.exception.database import DatabaseException
+from app.exception.feedback import FeedbackTurnNotFoundException
 from app.exception.not_found import NotFoundException
 
 __all__ = [
@@ -17,6 +23,9 @@ __all__ = [
     "ConfigCenterException",
     "ConflictException",
     "DatabaseException",
+    "FeedbackTurnNotFoundException",
     "NotFoundException",
+    "ThreadBusyException",
+    "TurnNotRegenerableException",
     "TurnTerminalException",
 ]

@@ -125,6 +125,12 @@ test.describe('A26 流式自动滚动（REQ-043）', () => {
     const scroller = page.getByTestId('answer-scroll')
     const stillStreaming = await page.getByTestId('stop-btn').count()
     test.skip(stillStreaming === 0, '非流式窗口——实测员在流式生成期执行本条')
+    // 前置守卫（2026-11-14 复跑确定性红修正，与 A26-03/A26-05 两屏 skip 纪律同族）：
+    // 内容须长到 maxScroll > 200px 才有有效上滚量——不足时程序化赋值恒被 clamp 为 0、
+    // 不触发 scroll 事件、相位永不翻转（turn-block 在 POST 后即刻渲染，openLiveAnswerPage
+    // 返回时 rewrite/search 阶段零内容，短答案轮 15s 重试窗内涨不到 clientHeight+200 即红）
+    const scrollable = await waitContentTwoScreens(scroller)
+    test.skip(!scrollable, '内容不足两屏——实测员备长回答线程执行')
     // 上滚 >8px（单次程序化赋值有帧级竞态，见 scrollUpUntilTakenOver 注记）
     await scrollUpUntilTakenOver(scroller, 200)
     await page.waitForTimeout(1_500)
@@ -178,13 +184,22 @@ test.describe('A26 流式自动滚动（REQ-043）', () => {
     const scroller = page.getByTestId('answer-scroll')
     const stillStreaming = await page.getByTestId('stop-btn').count()
     test.skip(stillStreaming === 0, '非流式窗口——实测员在流式生成期执行本条')
-    // 上滚 10px 接管（距底仍 <40px 的重叠带；单次赋值失明竞态见 scrollUpUntilTakenOver 注记）
+    // Given（瞬态前提，不落硬阈值断言）：上滚 10px 触发接管——触发瞬间距底 <40px 的重叠带
+    // 成立，但活流式下 scrollHeight 持续增长、taken_over 相位设计上不跟随，距离为瞬时值且
+    // 必然增长；「10px 上滚即触发接管」这一前提由 scrollUpUntilTakenOver 的循环退出条件
+    // （相位翻转为 taken_over）保证，此处只记录观测值。【2026-11-14 复跑确定性红修正】原断言
+    // 把「距底 <40px」（Given）放在 1.5s 等待窗之后断言（断言结构错位）——后端 P50 提速后
+    // synthesis 出字快，等待期内距离必然增长越过 40px，此前撞绿属时机运气。
     await scrollUpUntilTakenOver(scroller, 10)
+    const baseline = await scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)
+    void baseline // 瞬态观测值，不作断言（理由见上）
     await page.waitForTimeout(1_500)
-    // 接管不被拽回（相位判定）且距底仍 <40px（重叠带语义）
+    // Then①（不拽回的相位判定）：相位保持 taken_over——following 态贴底拉回会翻回 following
     await expect(scroller).toHaveAttribute('data-scroll-phase', 'taken_over')
+    // Then②（接管生效的直接证据）：distance > 4——内容只增不减，若发生 yank-back 视口会被
+    // 拉到贴底（distance→0）；等待窗后距离仍 >4 即「视口停留原位、未被拽回」
     const distance = await scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)
-    expect(distance).toBeLessThan(40)
+    expect(distance).toBeGreaterThan(4)
     await page.screenshot({ path: join(SHOT_DIR, 'A26-04-overlap-band.png'), fullPage: false })
   })
 
@@ -206,14 +221,12 @@ test.describe('A27 右侧导航锚点（REQ-044）', () => {
     await openLiveAnswerPage(page)
     // 真服务内容不足一屏且条目 <2 时 outline-anchor 不存在
     const anchor = page.getByTestId('outline-anchor')
+    // 【2026-11-14 修复项③】锚点条目只保留用户问题——单轮新线程恰 1 条（问题条）。
+    // PRD A27「条目 ≥2 或内容超约一屏」为或条件，live 场景走「内容超一屏」路径：
+    // 以 anchor 可见为收敛判据（条目数随轮数增长，不再以 ≥2 为等待条件）
+    await expect(anchor).toBeVisible({ timeout: 90_000 })
     const items = page.locator('[data-testid^="outline-item-"]')
-    // 等流式产出多节内容（真服务轮 30~65s）——条目数须轮询判定：anchor 在「内容超一屏」
-    // 路径下允许单条目（问题条）提前显示（PRD A27「条目 ≥2 或内容超约一屏」为或条件），
-    // 不能以 anchor 可见反推条目数（摘牌复跑实证 count=1 时 anchor 已合法可见）
-    await expect
-      .poll(async () => items.count(), { timeout: 90_000, intervals: [2_000] })
-      .toBeGreaterThanOrEqual(2)
-    await expect(anchor).toBeVisible()
+    expect(await items.count()).toBeGreaterThanOrEqual(1)
     await page.screenshot({ path: join(SHOT_DIR, 'A27-01-anchor-visible.png'), fullPage: false })
   })
 
@@ -221,7 +234,8 @@ test.describe('A27 右侧导航锚点（REQ-044）', () => {
     await openLiveAnswerPage(page)
     const items = page.locator('[data-testid^="outline-item-"]')
     await expect(items.first()).toBeVisible({ timeout: 90_000 })
-    test.skip((await items.count()) < 2, '条目不足——实测员备长回答线程执行')
+    // 修复项③：条目 = 问题（单轮线程恰 1 条）——a11y 断言单条目即成立，skip 门槛降为 <1
+    test.skip((await items.count()) < 1, '锚点不可见——实测员备长回答线程执行')
     // button 语义 + Tab 可达：focus 后激活项带 aria-current
     await items.first().focus()
     await expect(items.first()).toBeFocused()
@@ -254,7 +268,7 @@ test.describe('A27 右侧导航锚点（REQ-044）', () => {
 })
 
 test.describe('A28 顶部向下箭头（REQ-045）', () => {
-  test('距底超过约一视口高 → 对话列水平中央顶部悬空圆钮淡入；贴底 → 淡出', async ({ page }) => {
+  test('距底超过约一视口高 → 输入框上方中央悬空圆钮淡入；贴底 → 淡出', async ({ page }) => {
     await openLiveAnswerPage(page)
     await expect(page.getByTestId('turn-block').first()).toBeVisible()
     const scroller = page.getByTestId('answer-scroll')
@@ -280,20 +294,24 @@ test.describe('A28 顶部向下箭头（REQ-045）', () => {
     await page.screenshot({ path: join(SHOT_DIR, 'A28-01-fab-hidden-at-bottom.png'), fullPage: false })
     // 滚到顶部（距底超一屏）→ 箭头淡入（滚顶接管见 scrollToTopUntilFab 竞态注记）
     await scrollToTopUntilFab(page, scroller)
-    // 「对话列水平中央顶部悬空」以 fab 几何位置判定：.scroll-fab-slot 为零高 sticky 槽位
-    // 设计（height:0 不占文档流），恒不满足 Playwright 非空 bounding box 可见语义——
-    // 断言对象为本体 fab（中央=对话列中心 ±40px；顶部=sticky 吸顶于滚动容器 top=--space-3，
-    // 以容器顶为参照 <40px——视口参照会叠加 topbar 高度，第 2 轮复跑实测 72px=56+16）
+    // 【2026-11-14 修复项②落位反转】fab 从「对话列顶部零高 sticky 槽位」移至「输入框上方」：
+    // .follow-bar（sticky 包含块）内 .fab-above-input 绝对定位 wrapper，bottom=卡片顶+--space-2。
+    // 几何判定（y 差值语义反转）：fab 底边贴近 follow-bar 顶边（间距≈8px，容差带 [0,24)）；
+    // fab 悬于滚动容器视口内且在其顶边之下（不再是吸顶形态）；水平居中=输入区中心 ±40px
+    // （follow-bar 与其内 max-width 900px 的 search-card 同中心，fab 以 follow-bar 50% 定位）
     const fab = page.getByTestId('scroll-fab')
     const fabBox = await fab.boundingBox()
-    const colBox = await page.getByTestId('answer-col').boundingBox()
+    const followBox = await page.getByTestId('follow-bar').boundingBox()
     const scrollBox = await scroller.boundingBox()
     expect(fabBox).not.toBeNull()
-    expect(colBox).not.toBeNull()
+    expect(followBox).not.toBeNull()
     expect(scrollBox).not.toBeNull()
-    if (fabBox && colBox && scrollBox) {
-      expect(Math.abs(fabBox.x + fabBox.width / 2 - (colBox.x + colBox.width / 2))).toBeLessThan(40)
-      expect(fabBox.y - scrollBox.y).toBeLessThan(40)
+    if (fabBox && followBox && scrollBox) {
+      expect(Math.abs(fabBox.x + fabBox.width / 2 - (followBox.x + followBox.width / 2))).toBeLessThan(40)
+      const gap = followBox.y - (fabBox.y + fabBox.height)
+      expect(gap).toBeGreaterThanOrEqual(-4)
+      expect(gap).toBeLessThan(24)
+      expect(fabBox.y).toBeGreaterThan(scrollBox.y)
     }
     await page.screenshot({ path: join(SHOT_DIR, 'A28-02-fab-appear-top.png'), fullPage: false })
   })

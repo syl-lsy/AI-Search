@@ -20,6 +20,9 @@ const THREAD_ID = '7d2f0a1e-1c3b-4e5a-9d8f-0a1b2c3d4e5f'
 const TURN_ID = 'c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b'
 const OTHER_TURN_ID = '9f8e7d6c-5b4a-4321-8fed-cba987654321'
 
+/** normalizeError 归一结果可调（regenerate 409006 用例断言服务端 message 直达 toast；缺省=网络兜底文案） */
+const normalizeState = vi.hoisted(() => ({ message: '网络异常，请稍后重试' }))
+
 vi.mock('@/api/client', () => ({
   apiPost: vi.fn(),
   apiGet: vi.fn(),
@@ -27,7 +30,7 @@ vi.mock('@/api/client', () => ({
   normalizeError: () => ({
     name: 'ApiError',
     code: 'network_error',
-    message: '网络异常，请稍后重试',
+    message: normalizeState.message,
   }),
 }))
 
@@ -94,6 +97,7 @@ beforeEach(() => {
   localStorage.clear()
   sessionStorage.clear()
   vi.clearAllMocks()
+  normalizeState.message = '网络异常，请稍后重试'
   mockedSubscribe.mockImplementation(() => fakeController())
   mockedPeek.mockReturnValue(undefined)
 })
@@ -287,6 +291,21 @@ describe('applyEvent 派发表（§3 事件 → store 单一状态机）', () =>
     expect(store.turns[TURN_ID]!.lastSeq).toBe(10)
   })
 
+  it('followups 非法载荷静默丢弃（安全审计 P3-3：items 混入非字符串/非数组不入 state，与后端静默语义一致）', async () => {
+    const store = await seeded()
+    // 混入非字符串元素（契约回归形态）→ 整批丢弃、维持既有值（null）
+    store.applyEvent(TURN_ID, wire(11, 'followups', { items: ['ok', 42, null] }))
+    expect(store.turns[TURN_ID]!.followups).toBeNull()
+    // items 非数组 → 同口径丢弃
+    store.applyEvent(TURN_ID, wire(12, 'followups', { items: 'not-an-array' }))
+    expect(store.turns[TURN_ID]!.followups).toBeNull()
+    // 非法载荷仍推进 lastSeq（游标与内容分离——丢弃不卡重放门）
+    expect(store.turns[TURN_ID]!.lastSeq).toBe(12)
+    // 守卫不误伤：合法形态照常写入
+    store.applyEvent(TURN_ID, wire(13, 'followups', { items: ['合法追问'] }))
+    expect(store.turns[TURN_ID]!.followups).toEqual(['合法追问'])
+  })
+
   it('error（非终态）：errorMsg + 对应节点标 failed；status 与生成中集合不动', async () => {
     const store = await seeded()
     store.applyEvent(TURN_ID, wire(1, 'stage', { stage_key: 'search', status: 'running' }))
@@ -385,6 +404,36 @@ describe('reconcile()（生命周期 4/5：REST 为准源对账）', () => {
     await store.reconcile(TURN_ID)
     expect(store.turns[TURN_ID]!.compactSeq).toBe(12)
   })
+
+  it('失败轮对账：errorMsg=TurnError.message 文本（镜像勘误——2.5 error 为对象形态 {code,message,stage_key?}，非 string；直写会渲染 [object Object]）', async () => {
+    mockedGet.mockResolvedValueOnce(
+      makeDetail({
+        status: 'failed',
+        error: { code: '500301', message: '研究超时，已降级结束', stage_key: 'synthesis' },
+      }),
+    )
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    const turn = store.turns[TURN_ID]!
+    expect(turn.status).toBe('failed')
+    expect(turn.errorMsg).toBe('研究超时，已降级结束')
+    expect(typeof turn.errorMsg).toBe('string')
+    expect(turn.errorMsg).not.toContain('object')
+  })
+
+  it('error=null 轮不受影响（errorMsg 恒 null）；stage_key 缺省形态同样只取 message', async () => {
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'completed', error: null }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    expect(store.turns[TURN_ID]!.errorMsg).toBeNull()
+
+    // 后端 exclude_none 序列化形态：stage_key 键可省——只消费 message 不受影响
+    mockedGet.mockResolvedValueOnce(
+      makeDetail({ status: 'failed', error: { code: '500101', message: '模型调用失败' } }),
+    )
+    await store.reconcile(TURN_ID)
+    expect(store.turns[TURN_ID]!.errorMsg).toBe('模型调用失败')
+  })
 })
 
 describe('subscribe 对账失败兜底（P2：裸 void reconcile 加 catch）', () => {
@@ -405,7 +454,7 @@ describe('subscribe 对账失败兜底（P2：裸 void reconcile 加 catch）', 
       expect(mockedToast.mock.calls[0]?.[0]).toBe('网络异常，请稍后重试')
       expect(store.turns[TURN_ID]!.status).toBe('running') // 首败未收敛
       // ③ 有限重试：第 1 次重试成功 → 终态收敛、生成中集合移除
-      mockedGet.mockResolvedValueOnce(makeDetail({ status: 'failed', error: 'boom' }))
+      mockedGet.mockResolvedValueOnce(makeDetail({ status: 'failed', error: { code: '500301', message: 'boom' } }))
       await vi.advanceTimersByTimeAsync(10_000)
       expect(store.turns[TURN_ID]!.status).toBe('failed')
       expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
@@ -542,7 +591,7 @@ describe('subscribe()（生命周期 5/11：fromSeq 门与防双连接）', () =
     const store = useTurnStore()
     await store.ask('测试问题', 'fast')
     const callbacks = capturedCallbacks()
-    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'failed', error: 'boom' }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'failed', error: { code: '500301', message: 'boom' } }))
     callbacks.onClosed({ afterError: true, duringHold: false })
     await vi.waitFor(() => expect(store.turns[TURN_ID]!.status).toBe('failed'))
 
@@ -602,6 +651,217 @@ describe('done.memory_saved 数据形态就绪（M5 toast 数据，无痕轮恒�
     expect(store.turns[TURN_ID]!.memorySaved).toBeNull()
     store.applyEvent(TURN_ID, wire(10, 'done', { finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 1, source_count: 0, memory_saved: 2 }))
     expect(store.turns[TURN_ID]!.memorySaved).toBe(2)
+  })
+})
+
+describe('regenerate()（v1.26 REQ-063/A47：§3 生命周期 14 / api.md §2.12）', () => {
+  /** 来源 fixture（degraded-with-sources 轮：ref_no 稳定不变——regenerate 不重检索） */
+  const SOURCE_A = {
+    source_id: 'f00d0001-0000-4000-8000-000000000001',
+    ref_no: 1,
+    source_type: 'web' as const,
+    title: '来源一',
+    url: 'https://a.example.com/x',
+    snippet: '…',
+    score: 0.9,
+    snapshot_available: false,
+    kb_doc_id: null,
+  }
+
+  /** ask 建轮种子（与派发表 describe 同构；本 describe 自持一份——作用域独立） */
+  async function seededFast(mode: 'fast' | 'deep' = 'fast') {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('测试问题', mode)
+    return store
+  }
+
+  /**
+   * 同页路径种子：ask 建轮后走完一轮流至 degraded 终态（lastSeq=5、渲染态就位、
+   * 生成中集合已随 done 移除）——用户在答案页看到降级横幅后点「重新生成」的现场。
+   */
+  async function seededDegraded() {
+    const store = await seededFast()
+    store.applyEvent(TURN_ID, wire(1, 'stage', { stage_key: 'rewrite', status: 'done' }))
+    store.applyEvent(TURN_ID, wire(2, 'sources', { batch: [SOURCE_A], total: 1 }))
+    store.applyEvent(TURN_ID, wire(3, 'token', { delta: '旧答案片段' }))
+    store.applyEvent(TURN_ID, wire(4, 'error', { code: '500101', message: '综合失败', stage_key: 'write' }))
+    store.applyEvent(TURN_ID, wire(5, 'done', { finish: 'degraded', degraded: true, degraded_reason: 'source_failure', duration_ms: 6100, source_count: 1 }))
+    return { store, turn: store.turns[TURN_ID]! }
+  }
+
+  it('成功（api.md §2.12）：POST regenerate → 状态置 running + 清空渲染态（answer_md/thinking/旧终态展示字段）+ 生成中集合回归 + 重订阅（fromSeq=lastSeq 幂等门）', async () => {
+    const { store } = await seededDegraded()
+    const turn = store.turns[TURN_ID]!
+    expect(turn.status).toBe('degraded')
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+
+    await store.regenerate(TURN_ID)
+
+    expect(mockedPost).toHaveBeenCalledWith(`/api/v1/turns/${TURN_ID}/regenerate`)
+    expect(turn.status).toBe('running')
+    expect(turn.answer_md).toBe('')
+    expect(turn.thinking_md).toBe('')
+    expect(turn.errorMsg).toBeNull()
+    expect(turn.degradedReason).toBeNull()
+    expect(turn.durationMs).toBeNull()
+    // 不重检索：sources/stages 保留（api.md §2.12——时间线按 stage(write,running) 就地重渲）
+    expect(turn.sources).toHaveLength(1)
+    expect(turn.stages.some((s) => s.stage_key === 'rewrite' && s.status === 'done')).toBe(true)
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true)
+    // 重订阅：第二次 subscribeTurn 调用，fromSeq=lastSeq=5（旧轨迹传输层幂等丢弃）、fast 轮保活照旧
+    expect(mockedSubscribe).toHaveBeenCalledTimes(2)
+    expect(mockedSubscribe.mock.calls[1]![0].fromSeq).toBe(5)
+    expect(mockedSubscribe.mock.calls[1]![0].holdAfterDone).toBe(true)
+  })
+
+  it('fresh-page 重放门（生命周期 14）：内存 lastSeq=0 但 sessionStorage 落盘游标在 → fromSeq=落盘值（同标签页刷新后点重新生成，旧轨迹传输层丢弃）', async () => {
+    sessionStorage.setItem(`ai-search.seq.${TURN_ID}`, '7')
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('测试问题', 'fast')
+    const turn = store.turns[TURN_ID]!
+    // 刷新形态模拟：内存 lastSeq=0、终态 degraded（REST 对账重建后即此形态）
+    turn.status = 'degraded'
+    turn.answer_md = '旧答案片段'
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+
+    await store.regenerate(TURN_ID)
+
+    expect(turn.lastSeq).toBe(7)
+    expect(mockedSubscribe.mock.calls[1]![0].fromSeq).toBe(7)
+    expect(turn.answer_md).toBe('')
+    expect(turn.status).toBe('running')
+  })
+
+  it('幂等门保留：regenerate 后旧 done/error（seq ≤ lastSeq）丢弃——状态不被旧终态拉回、生成中不移除、不触发对账', async () => {
+    const { store } = await seededDegraded()
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+    await store.regenerate(TURN_ID)
+    mockedGet.mockClear()
+
+    // 全量重放泄漏到派发层的旧轨迹（seq ≤ lastSeq=5）：控制事件被 seq 门丢弃
+    store.applyEvent(TURN_ID, wire(4, 'error', { code: '500101', message: '综合失败', stage_key: 'write' }))
+    store.applyEvent(TURN_ID, wire(5, 'done', { finish: 'degraded', degraded: true, degraded_reason: 'source_failure', duration_ms: 6100, source_count: 1 }))
+
+    const turn = store.turns[TURN_ID]!
+    expect(turn.status).toBe('running')
+    expect(turn.errorMsg).toBeNull()
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true)
+    expect(mockedGet).not.toHaveBeenCalled() // 旧 done 不触发 2.5 对账
+  })
+
+  it('清空重渲边界（生命周期 14 判读核心）：新 stage(write,running) 到达且答案区已有渲染态 → 清空重新累积（重放旧 token 泄漏路径兜底）', async () => {
+    const { store } = await seededDegraded()
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+    await store.regenerate(TURN_ID)
+
+    // 新标签页全量重放形态：旧 token（delta 通道豁免 seq 门）先再累积
+    store.applyEvent(TURN_ID, wire(3, 'token', { delta: '旧答案片段' }))
+    expect(store.turns[TURN_ID]!.answer_md).toBe('旧答案片段')
+    // 新一轮渲染边界到达 → 清空答案区
+    store.applyEvent(TURN_ID, wire(10, 'stage', { stage_key: 'write', status: 'running', label: '综合中' }))
+    expect(store.turns[TURN_ID]!.answer_md).toBe('')
+    // 边界后新 token 正常累积；write 节点就地重渲 running
+    store.applyEvent(TURN_ID, wire(11, 'token', { delta: '新答案' }))
+    expect(store.turns[TURN_ID]!.answer_md).toBe('新答案')
+    expect(store.turns[TURN_ID]!.stages.find((s) => s.stage_key === 'write')!.status).toBe('running')
+  })
+
+  it('边界规则零误伤：常规首轮流 stage(write,running) 到达时答案区为空 → 条件不成立零清空', async () => {
+    const store = await seededFast()
+    store.applyEvent(TURN_ID, wire(1, 'stage', { stage_key: 'rewrite', status: 'done' }))
+    store.applyEvent(TURN_ID, wire(2, 'stage', { stage_key: 'write', status: 'running', label: '综合中' }))
+    store.applyEvent(TURN_ID, wire(3, 'token', { delta: '正常流答案' }))
+    expect(store.turns[TURN_ID]!.answer_md).toBe('正常流答案')
+  })
+
+  it('二次 done（seq > lastSeq）：终态置位 + 生成中移除 + 2.5 对账（REST 为准源，answer_md 原地更新）', async () => {
+    const { store } = await seededDegraded()
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+    await store.regenerate(TURN_ID)
+    const callbacks = capturedCallbacks() // 第二次 subscribeTurn = regenerate 订阅
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'completed', answer_md: 'REST 新答案', duration_ms: 9400 }))
+
+    callbacks.onEvent(wire(10, 'stage', { stage_key: 'write', status: 'running', label: '综合中' }))
+    callbacks.onEvent(wire(11, 'token', { delta: '新答案' }))
+    callbacks.onEvent(wire(20, 'done', { finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 9400, source_count: 1 }))
+    await vi.waitFor(() => expect(store.turns[TURN_ID]!.answer_md).toBe('REST 新答案'))
+
+    const turn = store.turns[TURN_ID]!
+    expect(turn.status).toBe('completed')
+    expect(turn.degradedReason).toBeNull()
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    expect(mockedGet).toHaveBeenCalledWith(`/api/v1/turns/${TURN_ID}`)
+  })
+
+  it('新标签页全量重放：旧 thinking/token 再累积 → 边界清空含 thinking_md → 新 thinking 重累积无拼接（双评审 P2：thinking 持久渲染面，混合即终态常驻）', async () => {
+    // 原始流含 thinking（§7.2 v1.4：与 token 同构交替，write 期穿插）；lastSeq=7
+    const store = await seededFast()
+    store.applyEvent(TURN_ID, wire(1, 'stage', { stage_key: 'rewrite', status: 'done' }))
+    store.applyEvent(TURN_ID, wire(2, 'sources', { batch: [SOURCE_A], total: 1 }))
+    store.applyEvent(TURN_ID, wire(3, 'stage', { stage_key: 'write', status: 'running', label: '综合中' }))
+    store.applyEvent(TURN_ID, wire(4, 'token', { delta: '旧答案' }))
+    store.applyEvent(TURN_ID, wire(5, 'thinking', { delta: '旧思考' }))
+    store.applyEvent(TURN_ID, wire(6, 'error', { code: '500101', message: '综合失败', stage_key: 'write' }))
+    store.applyEvent(TURN_ID, wire(7, 'done', { finish: 'degraded', degraded: true, degraded_reason: 'source_failure', duration_ms: 6100, source_count: 1 }))
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+    await store.regenerate(TURN_ID)
+
+    // 新标签页形态（落盘游标缺席，重放门=0）：旧 delta（豁免 seq 门）先再累积
+    store.applyEvent(TURN_ID, wire(4, 'token', { delta: '旧答案' }))
+    store.applyEvent(TURN_ID, wire(5, 'thinking', { delta: '旧思考' }))
+    expect(store.turns[TURN_ID]!.answer_md).toBe('旧答案')
+    expect(store.turns[TURN_ID]!.thinking_md).toBe('旧思考')
+
+    // 新一轮渲染边界到达：answer_md 与 thinking_md 同时清位（旧代 thinking 若残留，
+    // 与新代 thinking 拼接后经 ThinkingPanel 终态常驻——持久呈现非瞬态）
+    store.applyEvent(TURN_ID, wire(10, 'stage', { stage_key: 'write', status: 'running', label: '综合中' }))
+    expect(store.turns[TURN_ID]!.answer_md).toBe('')
+    expect(store.turns[TURN_ID]!.thinking_md).toBe('')
+
+    // 新代 thinking/token 从零重累积，无「旧代+新代」拼接
+    store.applyEvent(TURN_ID, wire(11, 'thinking', { delta: '新思考' }))
+    store.applyEvent(TURN_ID, wire(12, 'token', { delta: '新答案' }))
+    expect(store.turns[TURN_ID]!.thinking_md).toBe('新思考')
+    expect(store.turns[TURN_ID]!.answer_md).toBe('新答案')
+  })
+
+  it('409006（进行中重复点击/前置不满足）：toast 服务端 message + 状态不清空不订阅（轮保持原终态可再次点击）', async () => {
+    const { store } = await seededDegraded()
+    const turn = store.turns[TURN_ID]!
+    normalizeState.message = '轮次不支持重新生成'
+    mockedPost.mockRejectedValueOnce(new Error('409006'))
+
+    await expect(store.regenerate(TURN_ID)).resolves.toBeUndefined()
+
+    expect(mockedToast).toHaveBeenCalledTimes(1)
+    expect(mockedToast).toHaveBeenCalledWith('轮次不支持重新生成')
+    expect(turn.status).toBe('degraded')
+    expect(turn.answer_md).toBe('旧答案片段')
+    expect(turn.degradedReason).toBe('source_failure')
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    expect(mockedSubscribe).toHaveBeenCalledTimes(1) // 仅 ask 时的订阅，无重订阅
+  })
+
+  it('404001 同 toast 链路（归属校验落败同口径）', async () => {
+    const { store } = await seededDegraded()
+    normalizeState.message = '资源不存在'
+    mockedPost.mockRejectedValueOnce(new Error('404001'))
+
+    await store.regenerate(TURN_ID)
+
+    expect(mockedToast).toHaveBeenCalledWith('资源不存在')
+    expect(store.turns[TURN_ID]!.status).toBe('degraded')
+    expect(mockedSubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('未知轮：无 POST 无副作用', async () => {
+    const store = useTurnStore()
+    await store.regenerate('00000000-0000-4000-8000-000000000000')
+    expect(mockedPost).not.toHaveBeenCalled()
+    expect(mockedToast).not.toHaveBeenCalled()
   })
 })
 

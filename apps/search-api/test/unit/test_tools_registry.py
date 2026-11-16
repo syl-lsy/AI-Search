@@ -28,6 +28,7 @@ from app.agent.tools.registry import (
     CircuitBreaker,
     SearchChain,
     SearchChainUnavailable,
+    SourceCallError,
     ToolRegistry,
     resolve_search_chain,
 )
@@ -487,3 +488,151 @@ def test_no_vacuous_test_functions_in_this_module() -> None:
         if not meaningful:
             vacuous.append(node.name)
     assert vacuous == [], f"空壳测试函数（无可执行语句）: {vacuous}"
+
+
+# ---- B11 P1b：同源延迟重试（连接类一次，决策 7）+ 逻辑调用熔断计账 + source_retries ----
+
+
+def _valid_search_payload() -> dict[str, Any]:
+    return {
+        "results": [
+            {"url": "https://a.io/1", "title": "A", "content": "正文", "score": 0.9},
+        ]
+    }
+
+
+class _ScriptedTool:
+    """MCP 工具假体：按脚本产出异常/出参；记录物理调用次数与入参。"""
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.calls: list[dict[str, Any]] = []
+
+    async def ainvoke(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _SearchRegistry(ToolRegistry):
+    """registry 假体：跳过 MCP 连接（_acquire_tool 直返脚本工具）。"""
+
+    def __init__(self, tool: _ScriptedTool) -> None:
+        super().__init__()
+        self._scripted = tool
+
+    async def _acquire_tool(self, source: str) -> Any:  # type: ignore[override]
+        return self._scripted
+
+
+def _install_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    from app.agent.tools import registry as registry_module
+
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(registry_module, "_sleep", fake_sleep)
+    return delays
+
+
+async def test_search_retries_once_on_connection_failure_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连接类失败 → 2s 后同源重试一次成功：候选照常返回、熔断计 success、留痕计 1。"""
+    import httpx
+
+    delays = _install_retry_sleep(monkeypatch)
+    tool = _ScriptedTool([httpx.ConnectError("瞬断"), _valid_search_payload()])
+    registry = _SearchRegistry(tool)
+    registry.breakers["tavily"] = CircuitBreaker(failure_threshold=3, cooldown_s=60.0)
+    registry.breakers["tavily"].record_failure(0.0)  # 预置 1 次历史失败
+    retries: dict[str, int] = {}
+
+    candidates = await registry.search("q", "tavily", retry_sink=retries, clock=lambda: 10.0)
+
+    assert delays == [2.0]  # SOURCE_RETRY_DELAY_S 代码常量
+    assert len(tool.calls) == 2
+    assert candidates[0]["url"] == "https://a.io/1"
+    assert retries == {"tavily": 1}
+    assert registry.breakers["tavily"].consecutive_failures == 0  # 逻辑调用成功 → 清零
+
+
+async def test_search_no_retry_on_4xx_credential_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4xx 凭证类不重试：物理调用一次、熔断计一次 failure、异常带 retryable=False。"""
+    import httpx
+
+    delays = _install_retry_sleep(monkeypatch)
+    request = httpx.Request("POST", "https://mcp.local/search")
+    error_401 = httpx.HTTPStatusError(
+        "401", request=request, response=httpx.Response(401, request=request)
+    )
+    tool = _ScriptedTool([error_401, _valid_search_payload()])
+    registry = _SearchRegistry(tool)
+    retries: dict[str, int] = {}
+
+    with pytest.raises(SourceCallError) as caught:
+        await registry.search("q", "tavily", retry_sink=retries)
+    assert caught.value.retryable is False
+    assert isinstance(caught.value.original, httpx.HTTPStatusError)
+    assert delays == []
+    assert len(tool.calls) == 1
+    assert retries == {}  # 无重试零键
+    assert registry.breakers["tavily"].consecutive_failures == 1
+
+
+async def test_search_no_retry_on_output_normalization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """出参归一失败（ValueError）不重试：一次物理调用即上抛（retryable=False）。"""
+    delays = _install_retry_sleep(monkeypatch)
+    tool = _ScriptedTool([{"unexpected": "shape"}, _valid_search_payload()])
+    registry = _SearchRegistry(tool)
+
+    with pytest.raises(SourceCallError) as caught:
+        await registry.search("q", "tavily")
+    assert caught.value.retryable is False
+    assert delays == []
+    assert len(tool.calls) == 1
+
+
+async def test_search_double_physical_failure_counts_one_circuit_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """熔断按逻辑调用计账：首试+重试均失败 = 1 次 failure（不推穿 threshold=3）。"""
+    import httpx
+
+    _install_retry_sleep(monkeypatch)
+    tool = _ScriptedTool([httpx.ConnectError("断1"), httpx.ConnectError("断2")])
+    registry = _SearchRegistry(tool)
+    breaker = CircuitBreaker(failure_threshold=3, cooldown_s=60.0)
+    registry.breakers["tavily"] = breaker
+    retries: dict[str, int] = {}
+
+    with pytest.raises(SourceCallError) as caught:
+        await registry.search("q", "tavily", retry_sink=retries, clock=lambda: 5.0)
+
+    assert caught.value.retryable is True
+    assert len(tool.calls) == 2  # 首试 + 一次重试
+    assert retries == {"tavily": 1}
+    assert breaker.consecutive_failures == 1  # 逻辑调用计数（非 2 次物理失败）
+    assert breaker.is_open(5.0) is False  # 1 次逻辑失败不触开熔断（threshold=3）
+
+
+async def test_search_input_programming_error_propagates_without_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """入参校验失败（编程错误）→ ValueError 上抛、零调用、熔断计数不动（既有口径不变）。"""
+    _install_retry_sleep(monkeypatch)
+    tool = _ScriptedTool([_valid_search_payload()])
+    registry = _SearchRegistry(tool)
+
+    with pytest.raises(ValueError):
+        await registry.search("   ", "tavily")  # query 空白 → _SearchArgs 校验失败
+    assert tool.calls == []
+    assert registry.breakers["tavily"].consecutive_failures == 0

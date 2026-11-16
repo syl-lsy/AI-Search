@@ -56,16 +56,29 @@ describe('prefsStore（frontend-api.md §4 / §2 localStorage 约定）', () => 
     expect(localStorage.getItem('ai-search.onConflict')).toBeNull()
   })
 
+  it('setTheme：三档持久化 ai-search.theme，缺省 system（REQ-054，v1.18）', () => {
+    const prefs = usePrefsStore()
+    expect(prefs.theme).toBe('system')
+    prefs.setTheme('light')
+    expect(localStorage.getItem('ai-search.theme')).toBe('light')
+    prefs.setTheme('dark')
+    expect(localStorage.getItem('ai-search.theme')).toBe('dark')
+    prefs.setTheme('system')
+    expect(localStorage.getItem('ai-search.theme')).toBe('system')
+  })
+
   it('初始化收窄：localStorage 脏值回退默认（§8.9③）', () => {
     localStorage.setItem('ai-search.lang', 'fr-FR')
     localStorage.setItem('ai-search.model', 'chatgpt')
     localStorage.setItem('ai-search.incognito', '1')
     localStorage.setItem('ai-search.onConflict', 'fallback')
+    localStorage.setItem('ai-search.theme', 'sepia')
     const prefs = usePrefsStore()
     expect(prefs.lang).toBe('zh-CN')
     expect(prefs.model).toBeNull()
     expect(prefs.incognito).toBe(false)
     expect(prefs.onConflict).toBeNull()
+    expect(prefs.theme).toBe('system')
   })
 
   it('存储不可用时静默降级：内存态照常生效（读/写两 catch 分支）', () => {

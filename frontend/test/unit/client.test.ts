@@ -96,4 +96,16 @@ describe('normalizeError（错误归一）', () => {
   it('非 axios 异常 → 网络兜底', () => {
     expect(normalizeError(new Error('boom')).code).toBe(NETWORK_FALLBACK_CODE)
   })
+
+  it('已归一 ApiError 直通（不二次归一）——视图层 catch 再 normalizeError 不丢服务端 message/code（P2-4）', () => {
+    const normalized = normalizeError({
+      isAxiosError: true,
+      response: { data: { code: '409005', message: '线程有进行中轮次，不可删除' }, status: 409 },
+    })
+    expect(normalized.code).toBe('409005')
+    // 直通断言：同一错误两次归一结果恒等（拦截器已归一 → 视图二次归一不再降级为网络兜底）
+    const twice = normalizeError(normalized)
+    expect(twice.code).toBe('409005')
+    expect(twice.message).toBe('线程有进行中轮次，不可删除')
+  })
 })

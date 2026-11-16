@@ -176,16 +176,8 @@ function postProcessSanitized(sanitizedHtml: string, prefix: string): HeadingHos
   return { html, headings }
 }
 
-/**
- * 标题集相等判定（AnswerView outline 重建节流依据）：id+text 逐项全等且顺序一致才视为
- * 同一集合——流式限频批之间标题未变时上抛值相同，消费面据此跳过 outlineItems 重建。
- */
-export function isSameHeadingSet(a: HeadingInfo[], b: HeadingInfo[]): boolean {
-  if (a.length !== b.length) return false
-  return a.every((item, i) => item.id === b[i]?.id && item.text === b[i]?.text)
-}
-
-/** answer 通道：markdown-it 渲染 → DOMPurify 净化 → 标题 id 注入（OutlineAnchor 数据源） */
+/** answer 通道：markdown-it 渲染 → DOMPurify 净化 → 标题 id 注入（锚点定位目标；
+ *  headings 上抛消费面已随「锚点只保留用户问题」（2026-11-14 修复项③）移除） */
 export function renderAnswerMarkdown(source: string, options: RenderOptions = {}): RenderedMarkdown {
   const prefix = options.headingPrefix ?? 'a'
   // DOMPurify 3.4 返回类型 string | TrustedHTML（TrustedTypes 环境）——统一归一为 string

@@ -143,16 +143,17 @@ build-frontend:
 # 任一通道非零退出即整体 FAIL，不吞错——审计信号缺失必须显性暴露（网络不可达时如实红）。
 # 首跑（2026-11-13）= 周期性手动门禁；接 CI 周期跑属后续工程化事项
 #
-# 已知接受（2026-11-13 批次 9 终审留档，证据与升级计划见
-# security-audit-m1-batch8.md §五.4 处置小节）——后端通道在下列两条修复前会预期 FAIL：
-#   ① cryptography 44.0.3（运行时传递：nacos-sdk-python==3.2.0 → alibabacloud-* / google-auth）
-#      修复线 ≥50.0.0（最低档 46.0.5 起分档收敛，全部清空需 50.0.0）；
-#   ② langgraph-api 0.5.42（dev 工具链传递：langgraph-cli[inmem]==0.4.9）
-#      修复线 ≥0.15.0（PYSEC-2026-3857/3858 + CVE-2026-118668）。
-#   二者相互咬合、受 langgraph-cli==0.4.9 的 inmem 上界 <0.6.0 锁死：该区间内所有
-#   langgraph-api 0.5.x 反钉 cryptography<45.0，故单独升 cryptography 必然解析失败。
-#   升级路径 = 同批抬 langgraph-cli ≥0.4.43（inmem 上界放宽到 <1.0.0）+ langgraph-api==0.18.0
-#   + cryptography==50.0.2（后者会引入 pre-release 的 langgraph-runtime-inmem，须单独评审）。
+# 已知接受（2026-11-13 批次 9 终审留档 → 2026-11-15 专项清零，证据与升级路径见
+# security-audit-m1-batch8.md §五.4 处置小节）——后端两包已升至修复线，通道现为绿：
+#   ① cryptography 44.0.3 → 50.0.2（运行时传递：nacos-sdk-python==3.2.0 → alibabacloud-*
+#      / google-auth / pyjwt；修复线 ≥50.0.0）；
+#   ② langgraph-api 0.5.42 → 0.17.2（dev 工具链传递：langgraph-cli[inmem] 0.4.9 → 0.4.43；
+#      修复线 ≥0.15.0，PYSEC-2026-3857/3858 + CVE-2026-118668）
+#   ——原「cli==0.4.9 inmem 上界 <0.6.0 × langgraph-api 0.5.x 反钉 cryptography<45.0」
+#   互锁随 cli 0.4.43 放宽上界到 <1.0.0 解除。
+#   langgraph-api 取 0.17.2 而非 0.18.0：后者新增 mcp≥2.3.0 约束，与运行依赖
+#   mcp==1.30.0（langchain-mcp-adapters 0.3.2 钉 mcp<2.0.0）冲突（升级路径详见
+#   apps/search-api/pyproject.toml dev 组注释）。
 # 前端 2 条 moderate（glob/minimatch，均 @vue/test-utils>js-beautify dev 链）已用
 # package.json pnpm.overrides 升至修复线（glob 14.0.6 / minimatch 11.0.8），通道现为绿。
 audit:

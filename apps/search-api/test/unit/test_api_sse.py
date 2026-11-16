@@ -316,3 +316,59 @@ def test_sse_route_db_dependency_is_function_scoped() -> None:
     depends = hints["db"].__metadata__[0]
     assert depends.dependency is get_db  # 同一依赖 callable（overrides 可整体替换）
     assert getattr(depends, "scope", None) == "function"
+
+
+# ---- B11 P2：regenerate 通道重开后的 done 终态判定（api.md §7.1 v1.19）----
+
+
+async def test_sse_replay_historical_done_does_not_close_before_latest(overrides: dict) -> None:
+    """重放旧 done（regenerate 轨迹留痕）不关流：继续到最新 done 才收口。"""
+    bus = EventBus()
+    await _publish(bus, "stage", {"stage_key": "write", "status": "done"})
+    await _publish(bus, "done", {"finish": "degraded", "source_count": 1})
+    bus.reopen_channel(_TURN_ID)  # POST regenerate 成功（terminal 解除、缓冲保留）
+    await _publish(bus, "stage", {"stage_key": "write", "status": "running"})
+    await _publish(bus, "done", {"finish": "completed", "source_count": 1})
+    _wire(bus, _owned())
+
+    async with _client() as client:
+        async with asyncio.timeout(10):
+            async with client.stream("GET", _URL) as response:
+                body = (await response.aread()).decode("utf-8")
+
+    frames = [f for f in _parse_frames(body) if f.get("event")]
+    assert [f.get("event") for f in frames] == ["stage", "done", "stage", "done"]
+    finishes = [
+        json.loads(f["data"])["finish"] for f in frames if f.get("event") == "done"
+    ]
+    assert finishes == ["degraded", "completed"]  # 旧 done 留痕 + 最新 done 收口
+
+
+async def test_sse_reopened_channel_follows_live_after_historical_done(
+    overrides: dict,
+) -> None:
+    """通道重开期（latest=None）遇到重放的旧 done 不关流：继续跟随实时新 done。"""
+    bus = EventBus()
+    await _publish(bus, "stage", {"stage_key": "write", "status": "done"})
+    await _publish(bus, "done", {"finish": "degraded"})
+    bus.reopen_channel(_TURN_ID)
+    _wire(bus, _owned())
+
+    async def _late_second_done() -> None:
+        await asyncio.sleep(0.3)
+        await _publish(bus, "done", {"finish": "completed"})
+
+    async with _client() as client:
+        task = asyncio.create_task(_late_second_done())
+        try:
+            async with asyncio.timeout(10):
+                async with client.stream("GET", _URL) as response:
+                    body = (await response.aread()).decode("utf-8")
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    frames = [f for f in _parse_frames(body) if f.get("event")]
+    assert [f.get("event") for f in frames] == ["stage", "done", "done"]
+    assert json.loads(frames[-1]["data"])["finish"] == "completed"

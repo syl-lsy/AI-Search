@@ -1,9 +1,10 @@
 /**
  * src/mocks/turnDetails.ts — 轮次终态静态 fixture（api.md §2.5 镜像形态；§9 fixture 优先）。
- * 覆盖：快速完成态（followups 恒 null=实验默认关闭）、达标 fast 轮（followups 非空，
- * §9 v1.9 fixture③ 回看渲染样例）、深度完成态（export_available=true）、排队轮
- * （§9 v1.5 queued 用例——仅 query 与状态已持久化）、direct 完成态（§9 v1.15 fixture②——
- * sources=[]/images=[]/stages 仅 rewrite+write 两节点）。
+ * 覆盖：快速完成态（followups 恒 null=实验默认关闭、feedback_helpful 字段缺席=M2 前端点）、
+ * 达标 fast 轮（followups 非空，§9 v1.9 fixture③ 回看渲染样例）、达标 fast 轮 + 已反馈
+ * （feedback_helpful=true，§9 反馈判定点 v1.17 回看还原样例 A41）、深度完成态
+ * （export_available=true）、排队轮（§9 v1.5 queued 用例——仅 query 与状态已持久化）、
+ * direct 完成态（§9 v1.15 fixture②——sources=[]/images=[]/stages 仅 rewrite+write 两节点）。
  */
 import type { TurnDetail } from '@/types/api'
 
@@ -68,6 +69,16 @@ export const turnDetailFastWithFollowups: TurnDetail = {
     'Router 的条件边怎么写？',
     '两者能在一张图里混用吗？',
   ],
+}
+
+/**
+ * 达标 fast 轮 + feedback_helpful=true（§9 反馈判定点（v1.17，REQ-057/A41）——2.5 回看/刷新
+ * 还原样例：A41「刷新后按钮态还原」的读通道 fixture；基线 fixture（turnDetailFastCompleted）
+ * 无此字段 = M2 前端点形态，reconcile 按 undefined → null 归一）。
+ */
+export const turnDetailFastHelpful: TurnDetail = {
+  ...turnDetailFastCompleted,
+  feedback_helpful: true,
 }
 
 /** 深度完成态（export_available=true：mode=deep 且 answer_md 非空且 completed，§2.5 v1.10 判据） */

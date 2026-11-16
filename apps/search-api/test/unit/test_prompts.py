@@ -73,6 +73,16 @@ def test_builtin_registry_covers_rewrite_keys() -> None:
     assert files["common.type_rules"] == "common/type_rules.txt"
 
 
+def test_followups_placeholder_union_locked() -> None:
+    """fast.followups 占位符并集恰为五变量（nacos-config §1 v1.10/v1.22/v1.23，单测锁死）：
+    count/query_lang/query/answer/sources_block——消费方 = TurnRunner 图外钩子
+    （v1.23 答案侧包裹不增删占位符：{{answer}} 的值变包裹体，键集零变更）。"""
+    expected = {"count", "query_lang", "query", "answer", "sources_block"}
+    assert _placeholders(PROMPTS_CONFIG["prompts"]["fast.followups"]) == expected
+    assert _placeholders(load_builtin_prompt("fast.followups")) == expected
+    assert builtin_prompt_files()["fast.followups"] == "fast/followups.txt"
+
+
 class _FakeSnapshot:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload

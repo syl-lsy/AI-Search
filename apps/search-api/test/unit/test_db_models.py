@@ -5,15 +5,16 @@ models/ 未落地或列漂移时本文件先红（TDD 红绿循环的契约锚�
 断言粒度 = DDL 逐条：列/类型/可空/服务端默认/主键/FK（含 ON DELETE CASCADE）/
 索引（唯一/DESC/部分索引 WHERE）/identity。
 
-0001 范围护栏：后续迁移的增列（turns.incognito/memory_hits/followups、
+0001 范围护栏：后续迁移的增列（turns.incognito/memory_hits、
 sources.snapshot_id/kb_doc_id/kb_chunk_ids）在 0001 不得提前出现（turns.cancel_reason
-已随 0008 落地，移出护栏、纳入 §1.3 逐列断言）。
+已随 0008、turns.followups 已随 0009 落地，移出护栏、纳入 §1.3 逐列断言）。
 """
 import uuid
 
 import pytest
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     Integer,
     Numeric,
@@ -85,7 +86,15 @@ def _assert_uuid_pk(col, *, client_default_uuid4: bool) -> None:
 
 
 def test_metadata_contains_exactly_five_core_tables():
-    assert set(Base.metadata.tables) == {"users", "threads", "turns", "turn_events", "sources"}
+    """M1 五表 + M2 增量表（§1.16 turn_feedback，0010）——不得有多余/漏登表。"""
+    assert set(Base.metadata.tables) == {
+        "users",
+        "threads",
+        "turns",
+        "turn_events",
+        "sources",
+        "turn_feedback",
+    }
 
 
 # ---- §1.1 users ----
@@ -119,6 +128,10 @@ def test_threads_columns():
         "turn_count",
         "created_at",
         "updated_at",
+        # v1.14 增列（0011，REQ-058~060）：线程管理三列
+        "pinned",
+        "read_at",
+        "archived_at",
     ]
 
     _assert_uuid_pk(_col(threads, "id"), client_default_uuid4=True)
@@ -143,6 +156,23 @@ def test_threads_columns():
 
     _assert_tz_now(_col(threads, "created_at"))
     _assert_tz_now(_col(threads, "updated_at"))
+
+    # 0011（data-model.md §1.2 v1.14）：pinned NOT NULL DEFAULT false；
+    # read_at/archived_at 可空无默认（NULL = 未读 / 活跃，事件语义同构）
+    pinned = _col(threads, "pinned")
+    assert isinstance(pinned.type, Boolean) and pinned.nullable is False
+    _assert_server_default(pinned, "false")
+
+    for name in ("read_at", "archived_at"):
+        col = _col(threads, name)
+        assert isinstance(col.type, DateTime) and col.type.timezone is True
+        assert col.nullable is True and col.server_default is None
+
+
+def test_threads_mgmt_columns_add_no_index():
+    """§1.2 取舍注（v1.14）：三增列零新索引——唯一既有索引仍是 idx_threads_user_updated。"""
+    threads = _table("threads")
+    assert {ix.name for ix in threads.indexes} == {"idx_threads_user_updated"}
 
 
 def test_threads_index_user_updated_desc():
@@ -179,6 +209,7 @@ def test_turns_columns():
         "langfuse_trace_id",
         "degraded_reason",
         "cancel_reason",
+        "followups",
         "started_at",
         "finished_at",
         "duration_ms",
@@ -262,11 +293,19 @@ def test_turns_columns():
 
 
 def test_turns_excludes_later_migration_columns():
-    """0005/0006/0009 的增列不得提前出现（防 autogenerate 过度生成）；
-    cancel_reason 已随 0008（REQ-042）落地，不再属护栏清单。"""
+    """0005/0006 的增列不得提前出现（防 autogenerate 过度生成）；cancel_reason 已随
+    0008（REQ-042）、followups 已随 0009（REQ-046）落地，不再属护栏清单。"""
     turns = _table("turns")
-    for name in ("incognito", "memory_hits", "followups"):
+    for name in ("incognito", "memory_hits"):
         assert name not in turns.columns, f"{name} 属后续迁移增列，不应提前包含"
+
+    # 0009（REQ-046）：followups jsonb nullable 无默认无索引（§1.3 followups 行）
+    followups = _col(turns, "followups")
+    assert isinstance(followups.type, JSONB)
+    assert followups.nullable is True and followups.server_default is None
+    assert not any(
+        "followups" in [str(c) for c in index.columns] for index in turns.indexes
+    )
 
 
 def test_turns_indexes():

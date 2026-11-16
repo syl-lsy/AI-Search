@@ -138,3 +138,143 @@ def test_turn_deadline_budget_gates_retry_attempts() -> None:
     now = 200.0  # 超时后：剩余下限 0
     assert deadline.remaining_s() == 0.0
     assert deadline.can_attempt(0.0) is True  # 零成本尝试不受阻（降级收尾路径可用）
+
+
+# ---- B11 P1a：错误三档分级 + 连接类长窗策略 + 重试总窗（nacos-config §3 v1.24）----
+
+
+def _connection_node(**overrides: Any) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "max_attempts": 5,
+        "initial_interval_s": 1.0,
+        "backoff_factor": 2.0,
+        "max_interval_s": 8.0,
+        "total_window_s": 20.0,
+    }
+    node.update(overrides)
+    return node
+
+
+def test_classify_retry_tier_connection_tier_exhaustive() -> None:
+    """连接类判据（决策 1）：httpx transport 族 / 单调用包络超时 / openai 连接形态 /
+    ExceptionGroup 解包——任一叶命中即 connection。"""
+    import asyncio
+
+    from app.agent.guards import classify_retry_tier
+
+    for exc in (
+        httpx.ConnectError("connect"),
+        httpx.ConnectTimeout("connect timeout"),
+        httpx.ReadError("read"),
+        httpx.WriteError("write"),
+        httpx.PoolTimeout("pool"),
+        httpx.ReadTimeout("read timeout"),
+        asyncio.TimeoutError(),
+        ConnectionError("reset"),
+    ):
+        assert classify_retry_tier(exc) == "connection", type(exc)
+    grouped = ExceptionGroup(
+        "mcp transport", [RuntimeError("wrap"), httpx.ConnectError("inner")]
+    )
+    assert classify_retry_tier(grouped) == "connection"  # 解包任一叶命中
+
+
+def test_classify_retry_tier_transient_and_non_retryable() -> None:
+    """5xx 走短窗（transient）；4xx/ValueError/TypeError/OutputParserException 不重试。"""
+    from langchain_core.exceptions import OutputParserException
+
+    from app.agent.guards import classify_retry_tier
+
+    request = httpx.Request("POST", "https://litellm.local/v1/chat/completions")
+    five_xx = httpx.HTTPStatusError(
+        "5xx", request=request, response=httpx.Response(503, request=request)
+    )
+    four_xx = httpx.HTTPStatusError(
+        "4xx", request=request, response=httpx.Response(401, request=request)
+    )
+    assert classify_retry_tier(five_xx) == "transient"  # 现状短窗口径不变
+    assert classify_retry_tier(four_xx) == "non_retryable"  # 凭证/参数类
+    assert classify_retry_tier(ValueError("bad")) == "non_retryable"
+    assert classify_retry_tier(TypeError("bad")) == "non_retryable"
+    assert classify_retry_tier(OutputParserException("parse")) == "non_retryable"
+    assert classify_retry_tier(RuntimeError("unknown")) == "transient"  # 现状默认重试
+
+
+def test_connection_retry_policy_from_spec_reads_node() -> None:
+    """五键读取 + 退避序列 1/2/4/8（cap max_interval_s）。"""
+    from app.agent.guards import ConnectionRetryPolicy, connection_retry_policy_from_spec
+
+    spec = {"fast": {"retry": {"connection": _connection_node()}}}
+    policy = connection_retry_policy_from_spec(spec, "fast")
+    assert policy == ConnectionRetryPolicy(
+        max_attempts=5,
+        initial_interval_s=1.0,
+        backoff_factor=2.0,
+        max_interval_s=8.0,
+        total_window_s=20.0,
+    )
+    assert [policy.delay_for(i) for i in (1, 2, 3, 4, 5, 6)] == [
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        8.0,
+        8.0,
+    ]
+
+
+def test_connection_retry_policy_falls_back_to_main_retry() -> None:
+    """节缺失/形态非法/任一键缺失或越界 → None（=回落 retry 主节，现状行为零变化）。"""
+    from app.agent.guards import connection_retry_policy_from_spec
+
+    assert connection_retry_policy_from_spec({"fast": {"retry": {}}}, "fast") is None
+    assert connection_retry_policy_from_spec({"fast": {}}, "fast") is None
+    assert connection_retry_policy_from_spec(None, "fast") is None
+    assert (
+        connection_retry_policy_from_spec(
+            {"fast": {"retry": {"connection": "not-a-map"}}}, "fast"
+        )
+        is None
+    )
+    partial = _connection_node()
+    partial.pop("total_window_s")
+    assert (
+        connection_retry_policy_from_spec(
+            {"fast": {"retry": {"connection": partial}}}, "fast"
+        )
+        is None
+    )
+    for key, bad in (
+        ("max_attempts", 0),
+        ("initial_interval_s", 0),
+        ("backoff_factor", 0.5),
+        ("max_interval_s", -1),
+        ("total_window_s", 0),
+    ):
+        assert (
+            connection_retry_policy_from_spec(
+                {"fast": {"retry": {"connection": _connection_node(**{key: bad})}}},
+                "fast",
+            )
+            is None
+        ), key
+
+
+def test_retry_window_gates_by_elapsed_clock() -> None:
+    """重试总窗硬闸：can_wait 依剩余窗裁决（clock 注入确定性；先到先放弃）。"""
+    from app.agent.guards import RetryWindow
+
+    now = 1000.0
+
+    def clock() -> float:
+        return now
+
+    window = RetryWindow(20.0, clock=clock)
+    assert window.remaining_s() == 20.0
+    assert window.can_wait(8.0) is True
+    now = 1015.0  # 已耗 15s：再退避 8s 超窗
+    assert window.can_wait(4.0) is True
+    assert window.can_wait(8.0) is False
+    now = 1030.0  # 窗满：剩余 0，任何退避都放弃
+    assert window.can_wait(0.0) is True
+    assert window.can_wait(0.5) is False

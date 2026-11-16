@@ -1,10 +1,12 @@
 /**
- * src/types/api.d.ts — api.md（v1.14）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.19）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.14（REST + SSE 协议唯一事实源；§7.4 direct 形态留痕键 StageExtra.strategy 随本批镜像同步）
+ *   - docs/contract/api.md v1.19（REST + SSE 协议唯一事实源；§2.12 POST
+ *     /turns/{turn_id}/regenerate（REQ-063/A47）+ §0 错误码 409006 + §7.2/§2.5
+ *     stages[].extra 可选键 source_retries 随本批镜像同步——frontend-api.md §8.5 v1.26，F5 工单）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
- *   - frontend-api.md v1.15 §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
+ *   - frontend-api.md §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
  *
  * 铁律：契约变更必须同步本文件（评审 diff 核对）；本文件是静态镜像、非运行时校验器——
@@ -28,10 +30,13 @@ export type ErrorCode =
   | '403001' // 记忆功能已关闭
   | '404001' // 资源不存在
   | '404002' // 该来源无快照 → 404
+  | '404004' // 轮次不存在（反馈端点，api.md §0 v1.16；语义同 404001 turn 维度，独立码便于反馈面埋点区分）
   | '409001' // 线程已有进行中轮次
   | '409002' // 轮次已处于终态，不可取消
   | '409003' // 不满足导出条件
   | '409004' // 该线程已有进行中的记忆抽取任务
+  | '409005' // 线程有进行中轮次，不可删除（api.md §0 v1.18，REQ-059）
+  | '409006' // 轮次不支持重新生成（api.md §0 v1.19，REQ-063——非 {degraded,failed} 终态/零来源/deep 轮/regenerate 进行中重复点击单码覆盖）
   | '413001' // 文件超过大小上限
   | '415001' // 不支持的文件类型
   | '422001' // URL 非法
@@ -134,6 +139,8 @@ export interface StageExtra {
   sections?: number
   /** api.md §7.4 v1.14 direct 形态留痕：rewrite 输出 search_strategy=direct 时携带（前端不消费不展示） */
   strategy?: string
+  /** api.md §7.2/§2.5 v1.19 P1b 留痕：源名→同源延迟重试次数映射（stage(search,done) extra，形如 {"tavily": 1}；无重试零键，前端零渲染义务） */
+  source_retries?: Record<string, number>
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */
@@ -230,6 +237,12 @@ export interface ThreadListQuery {
   offset?: number
   /** mode 缺省=全部 */
   mode?: ThreadModeSummary
+  /** v1.18：标题模糊搜索（ILIKE 包含、大小写不敏感；trim 后空串=不过滤；1~200 字符） */
+  q?: string
+  /** v1.18：缺省 false=活跃集；true=仅归档 */
+  archived?: boolean
+  /** v1.18：缺省 false；true=仅未读（read_at IS NULL）；与 archived 正交 */
+  unread?: boolean
 }
 
 export interface ThreadListItem {
@@ -237,11 +250,40 @@ export interface ThreadListItem {
   title: string
   mode_summary: ThreadModeSummary
   turn_count: number
+  /** v1.18：置顶（活跃视图排序首位；归档视图不消费） */
+  pinned: boolean
+  /** v1.18：未读投影（read_at IS NULL） */
+  is_unread: boolean
+  /** v1.18：归档投影（archived_at IS NOT NULL） */
+  archived: boolean
   created_at: IsoTimestamp
   updated_at: IsoTimestamp
 }
 
 export type ThreadListData = Paginated<ThreadListItem>
+
+/* -------------------------------------------------------------
+ * 2.10/2.11 —— 线程管理（PATCH 部分更新 / DELETE 物理删除，v1.18 增）
+ * ----------------------------------------------------------- */
+
+/** §2.10 PATCH 请求体（任意组合、至少一项——空对象 400001；title trim 后 1~120 字符） */
+export interface ThreadPatchRequest {
+  /** 1~120 字符（trim 后非空；空串/纯空白/超长 400001） */
+  title?: string
+  pinned?: boolean
+  /** true=标记为未读（read_at 置 NULL）/ false=置已读 */
+  is_unread?: boolean
+  /** true=归档 / false=取消归档 */
+  archived?: boolean
+}
+
+/** §2.10 响应 data：更新后的线程投影（与 §2.2 items[] 条目同构） */
+export type ThreadPatchData = ThreadListItem
+
+/** §2.11 DELETE 响应 data（§4.5 KbDeleteData 同构） */
+export interface ThreadDeleteData {
+  deleted: boolean
+}
 
 /* -------------------------------------------------------------
  * 2.3 GET /api/v1/threads/{thread_id} —— 线程详情（答案页骨架）
@@ -287,6 +329,19 @@ export interface StageRecord {
   extra?: StageExtra
 }
 
+/**
+ * §2.5 error 字段载荷（镜像勘误 2026-11-15，随审计修复落地）——data-model.md §1.3 冻结口径
+ * `turns.error: jsonb {code, message, stage_key} 终态错误；成功为 null`（后端 app/schemas/
+ * turn.py TurnError 同构：code/message 必填、stage_key 可空可省）；api.md §2.5 仅给 null 示例
+ * 未钉型——本镜像此前误落 `string | null`，failed/进程重启中断轮直写会渲染 [object Object]。
+ */
+export interface TurnError {
+  code: string
+  message: string
+  /** 可空可省（pydantic 序列化形态两种均兼容；前端不消费不展示——失败定位在 SSE error 事件） */
+  stage_key?: string | null
+}
+
 /** §2.5 响应 data（进行中调用同样合法：返回已持久化部分） */
 export interface TurnDetail {
   turn_id: Uuid
@@ -305,8 +360,8 @@ export interface TurnDetail {
   stages: StageRecord[]
   degraded: boolean
   degraded_reason: DegradedReason | null
-  /** 失败信息（示例恒 null；failed 终态经本字段对账） */
-  error: string | null
+  /** 失败信息（TurnError 对象载荷或 null；示例恒 null；failed/进程重启中断轮经本字段对账） */
+  error: TurnError | null
   usage: TokenUsage
   duration_ms: number
   /** mode=deep 且 answer_md 非空 且 status ∈ {completed, degraded}（v1.10 同源化判据） */
@@ -322,8 +377,34 @@ export interface TurnDetail {
    * REST 为事实源（SSE followups 事件仅为通知通道）。
    */
   followups: string[] | null
+  /**
+   * v1.16（REQ-057/A41）：该轮用户反馈现值（true=有帮助 / false=没有帮助 / null=未反馈）。
+   * M2 起返回、此前无此字段（可选字段语义，前端按可空处理）——A41 刷新/回看还原读通道。
+   */
+  feedback_helpful?: boolean | null
   /** M6（记忆 P1）起返回——M5 及之前无此字段，故可省（memory-api.md 镜像） */
   memory_hits?: MemoryHits
+}
+
+/* -------------------------------------------------------------
+ * 2.9 POST /api/v1/turns/{turn_id}/feedback —— 轮次有帮助反馈
+ * ----------------------------------------------------------- */
+
+/** §2.9 请求体（v1.17：helpful 为 boolean | null 必填——true/false=upsert 改判语义不变；
+ * null = 清除反馈（删除该轮 turn_feedback 行）；缺失/非 boolean/null 一律 400001，strict 保留） */
+export interface TurnFeedbackRequest {
+  helpful: boolean | null
+}
+
+/**
+ * §2.9 响应 data（v1.16 / REQ-057；v1.17 取消语义——true/false=upsert 改判后的现值；
+ * null=已清除（反馈行已删除，updated_at 同为 null）。每轮一条 upsert 改判，
+ * 两按钮互斥单击即改判/同钮再点即取消）。
+ */
+export interface FeedbackResponse {
+  turn_id: Uuid
+  helpful: boolean | null
+  updated_at: IsoTimestamp | null
 }
 
 /* -------------------------------------------------------------
@@ -334,6 +415,21 @@ export interface TurnDetail {
 export interface CancelTurnData {
   turn_id: Uuid
   status: 'canceling'
+}
+
+/* -------------------------------------------------------------
+ * 2.12 POST /api/v1/turns/{turn_id}/regenerate —— degraded 轮仅重新生成（v1.19 增）
+ * ----------------------------------------------------------- */
+
+/**
+ * §2.12 响应 data（v1.19 增，REQ-063/A47）：degraded/failed-with-sources fast 轮「仅重新生成」
+ * ——复用既有 sources 只重跑 synthesis（sources/[n] 映射稳定、images 不动不重发），请求体空、
+ * 无参数。轮已置 running、SSE 续发同一 turn 既有通道（前端重订阅 + 清空重渲约定，
+ * frontend-api.md §3 生命周期 14）；错误 404001/409006/500001。
+ */
+export interface RegenerateTurnData {
+  turn_id: Uuid
+  status: 'running'
 }
 
 /** §2.8 export 响应 data（与 §5.2 artifacts 条目同构） */

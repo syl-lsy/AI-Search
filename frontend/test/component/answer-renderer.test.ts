@@ -1,7 +1,9 @@
 /**
  * test/component/answer-renderer.test.ts — AnswerRenderer 组件层（渲染 + 事件上抛）。
  * 纯渲染逻辑（净化/[n]/标题 id）归 unit/markdown-render.test.ts；本层断言装配行为：
- * v-html 注入、cite 点击/键盘上抛、headings 事件（OutlineAnchor 数据源）。
+ * v-html 注入、cite 点击/键盘上抛、标题 id 生成（renderer.ts 契约保留）。
+ * 【2026-11-14 修复项③】headings 上抛事件已移除（锚点只保留用户问题）——标题 id 生成
+ * 本身保留（锚点 scrollIntoView 定位目标），组件不再向父级上抛标题集。
  */
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
@@ -16,16 +18,12 @@ describe('AnswerRenderer（组件层）', () => {
     expect(w.text()).toContain('正文段落')
   })
 
-  it('headings 事件上抛（immediate）——OutlineAnchor 数据源（标题 id 机制）', () => {
+  it('标题 id 生成保留（锚点定位目标）；headings 事件不再上抛（修复项③）', () => {
     const w = mount(AnswerRenderer, {
       props: { markdown: '## 分层关系\n\n正文', headingPrefix: 't9' },
     })
-    const emitted = w.emitted('headings')
-    expect(emitted).toHaveLength(1)
-    const items = emitted![0]![0] as { id: string; text: string }[]
-    expect(items).toHaveLength(1)
-    expect(items[0]).toMatchObject({ id: 't9-h-0', text: '分层关系' })
     expect(w.find('h2').attributes('id')).toBe('t9-h-0')
+    expect(w.emitted('headings')).toBeUndefined()
   })
 
   it('点击 sup.cite → cite(refNo) 上抛（[n] 与 sources 联动入口）', async () => {
@@ -48,14 +46,14 @@ describe('AnswerRenderer（组件层）', () => {
     expect(w.emitted('cite')).toHaveLength(2)
   })
 
-  it('markdown 增量更新（流式 token 追加）→ 内容与 headings 跟随刷新', async () => {
+  it('markdown 增量更新（流式 token 追加）→ 内容跟随刷新且无 headings 上抛', async () => {
     const w = mount(AnswerRenderer, {
       props: { markdown: '第一段', headingPrefix: 't1' },
     })
     await w.setProps({ markdown: '第一段\n\n## 新章节' })
     expect(w.text()).toContain('第一段')
-    expect(w.emitted('headings')!.length).toBeGreaterThanOrEqual(2)
-    const latest = w.emitted('headings')!.at(-1)![0] as { text: string }[]
-    expect(latest[0]?.text).toBe('新章节')
+    expect(w.text()).toContain('新章节')
+    expect(w.find('h2').attributes('id')).toBe('t1-h-0')
+    expect(w.emitted('headings')).toBeUndefined()
   })
 })

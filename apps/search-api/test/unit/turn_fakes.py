@@ -115,6 +115,7 @@ class _TurnRow:
         self.cancel_reason: str | None = None
         self.timing: dict[str, Any] = {}
         self.usage: dict[str, Any] = {}
+        self.followups: list[str] | None = None  # 0009 列：图外钩子异步回填（REQ-046）
 
 
 class _FakeGraph:
@@ -179,6 +180,16 @@ _SPEC_PAYLOAD: dict[str, Any] = {
     "turn": {"default_on_conflict": "reject"},
     "fast": {"turn_timeout_s": 5},
     "deep": {"turn_timeout_s": 8},
+    # followups 默认关闭（REQ-046）：本文件是**事件翻译/调度/取消**等面的共享假体，
+    # 关闭后既保留「无 sections 时零钩子」的确定性（不触发真 LLM），也让 followups
+    # 专项（test_followups.py）显式覆盖 enabled=true 自证开关面；spec 节缺失时的
+    # 内置默认 enabled=true 由 test_followups.py 单测锁定（nacos-config v1.22）。
+    "followups": {
+        "enabled": False,
+        "count": 5,
+        "generate_timeout_ms": 8000,
+        "sse_hold_window_ms": 10000,
+    },
 }
 
 _MAPPING_PAYLOAD: dict[str, Any] = {
@@ -228,7 +239,8 @@ class _R14FakeRegistry(ToolRegistry):
         return SearchChain(sources=["tavily"], backup=None, degraded=False, detail="tavily")
 
     async def search(
-        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+            retry_sink: dict[str, int] | None = None
     ) -> list[dict[str, Any]]:
         self.search_calls += 1
         if self._on_search is not None:

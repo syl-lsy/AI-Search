@@ -456,3 +456,206 @@ async def test_synthesis_llm_generation_metadata_carries_strategy(
     metadata = (model.configs[0] or {}).get("metadata") or {}
     assert metadata.get("search_strategy") == "direct"
     assert metadata.get("query_type") == "other"
+
+
+# ---- B11 P1a：连接类长窗重试（nacos-config §3 v1.24 / 决策 4）----
+
+
+def _connection_spec(**overrides: Any) -> dict[str, Any]:
+    """带 connection 节的 fast spec（退避/窗闸断言用；与既有主节 max_attempts=2 区分）。"""
+    connection: dict[str, Any] = {
+        "max_attempts": 5,
+        "initial_interval_s": 1.0,
+        "backoff_factor": 2.0,
+        "max_interval_s": 8.0,
+        "total_window_s": 20.0,
+    }
+    connection.update(overrides)
+    return {"fast": {**_SPEC["fast"], "retry": {**_SPEC["fast"]["retry"], "connection": connection}}}
+
+
+def _install_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """替换节点退避等待为记录桩（返回延迟序列；不真实 sleep）。"""
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(synthesis_module, "_sleep", fake_sleep)
+    return delays
+
+
+async def test_synthesis_connection_retry_backoff_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """连接类失败走长窗：退避序列 1/2/4/8（首试 + 4 重试，第 5 次成功）。"""
+    delays = _install_sleeps(monkeypatch)
+    model, _, _ = _install(
+        monkeypatch,
+        [[ConnectionError("瞬断")] for _ in range(4)] + [_text_chunks("答案[1]。")],
+    )
+    state = _state()
+    state["spec"] = _connection_spec()
+
+    update = await synthesis(state, _config())
+
+    assert update["answer_md"] == "答案[1]。"
+    assert delays == [1.0, 2.0, 4.0, 8.0]
+    assert len(model.prompts) == 5  # 首试 + 4 重试
+
+
+async def test_synthesis_connection_retry_total_window_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """总窗硬闸（total_window_s=3）：退避 1+2 后窗满 → 放弃 → 既有 SynthesisError 语义。"""
+    delays = _install_sleeps(monkeypatch)
+    now = [0.0]
+
+    def clock() -> float:
+        return now[0]
+
+    async def advancing_sleep(delay: float) -> None:
+        delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(synthesis_module, "_clock", clock)
+    monkeypatch.setattr(synthesis_module, "_sleep", advancing_sleep)
+    model, _, _ = _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(5)])
+    state = _state()
+    state["spec"] = _connection_spec(total_window_s=3.0)
+
+    with pytest.raises(SynthesisError):
+        await synthesis(state, _config())
+
+    assert delays == [1.0, 2.0]  # 第三次退避 4s 超剩余窗（0s）→ 放弃
+    assert len(model.prompts) == 2
+
+
+async def test_synthesis_connection_retry_deadline_double_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TurnDeadline 双闸：轮预算不足一次 LLM 调用（turn_timeout_s=1 < llm_timeout_s=30）
+    → 首次连接类失败即放弃重试（零退避）。"""
+    delays = _install_sleeps(monkeypatch)
+    model, _, _ = _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(5)])
+    state = _state()
+    state["spec"] = _connection_spec()
+    state["spec"]["fast"]["turn_timeout_s"] = 1
+
+    with pytest.raises(SynthesisError):
+        await synthesis(state, _config())
+
+    assert delays == []
+    assert len(model.prompts) == 1
+
+
+async def test_synthesis_connection_retry_exhausted_after_max_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """长窗 max_attempts=2（首试 + 1 重试）耗尽 → SynthesisError；退避仅 1 次。"""
+    delays = _install_sleeps(monkeypatch)
+    model, _, _ = _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(3)])
+    state = _state()
+    state["spec"] = _connection_spec(max_attempts=2)
+
+    with pytest.raises(SynthesisError):
+        await synthesis(state, _config())
+
+    assert delays == [1.0]
+    assert len(model.prompts) == 2
+
+
+async def test_synthesis_business_error_skips_long_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """业务类（OutputParserException）不进长窗：即时 SynthesisError、零退避、零重试。"""
+    from langchain_core.exceptions import OutputParserException
+
+    delays = _install_sleeps(monkeypatch)
+    model, _, _ = _install(monkeypatch, [[OutputParserException("解析失败")]])
+    state = _state()
+    state["spec"] = _connection_spec()
+
+    with pytest.raises(SynthesisError):
+        await synthesis(state, _config())
+
+    assert delays == []
+    assert len(model.prompts) == 1
+
+
+async def test_synthesis_transient_5xx_keeps_short_window_with_connection_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5xx 短窗（决策 1）：有 connection 节仍按 retry 主节 max_attempts=2 收口，不享长窗。"""
+    delays = _install_sleeps(monkeypatch)
+    request = httpx.Request("POST", "https://litellm.local/v1/chat/completions")
+    error_5xx = httpx.HTTPStatusError(
+        "503", request=request, response=httpx.Response(503, request=request)
+    )
+    model, _, _ = _install(monkeypatch, [[error_5xx], [error_5xx], [error_5xx]])
+    state = _state()
+    state["spec"] = _connection_spec()
+
+    with pytest.raises(SynthesisError):
+        await synthesis(state, _config())
+
+    assert len(delays) == 1  # 主节 max_attempts=2 → 一次退避后耗尽
+    assert len(model.prompts) == 2
+
+
+async def test_synthesis_per_call_timeout_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """单调用超时包络（决策 4）：astream 挂起超 llm_timeout_s → asyncio.TimeoutError
+    归连接类 → 长窗重试；第二次成功。"""
+    delays = _install_sleeps(monkeypatch)
+    attempts: list[int] = []
+
+    class _HangingThenOkModel:
+        def astream(self, messages: Any, config: Any = None, **kw: Any) -> Any:
+            attempts.append(1)
+            hang = len(attempts) == 1
+
+            async def gen():
+                if hang:
+                    await asyncio.sleep(5)  # 远超 llm_timeout_s=0.05
+                yield _FakeChunk("答案[1]。")
+
+            return gen()
+
+    monkeypatch.setattr(
+        synthesis_module, "build_chat_model", lambda alias: _HangingThenOkModel()
+    )
+    monkeypatch.setattr(synthesis_module, "emit_stage", lambda *a, **k: None)
+    state = _state()
+    state["spec"] = _connection_spec(initial_interval_s=0.01)
+    state["spec"]["fast"]["llm_timeout_s"] = 0.05
+
+    update = await synthesis(state, _config())
+
+    assert update["answer_md"] == "答案[1]。"
+    assert len(attempts) == 2
+    assert delays == [0.01]
+
+
+async def test_synthesis_mixed_tiers_share_total_attempt_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """评审 P2-3：短窗/长窗交替失败共享总尝试上限——connection 节在场时
+    总物理尝试 ≤ connection.max_attempts（不再叠加成 1+4+2=7 次）。"""
+    delays = _install_sleeps(monkeypatch)
+    request = httpx.Request("POST", "https://litellm.local/v1/chat/completions")
+    error_5xx = httpx.HTTPStatusError(
+        "503", request=request, response=httpx.Response(503, request=request)
+    )
+    script = []
+    for _ in range(5):
+        script.append([error_5xx])
+        script.append([ConnectionError("瞬断")])
+    model, _, _ = _install(monkeypatch, script)
+    state = _state()
+    spec = _connection_spec()
+    spec["fast"]["retry"] = {**spec["fast"]["retry"], "max_attempts": 5}  # 主节也放到 5
+    state["spec"] = spec
+
+    with pytest.raises(SynthesisError):
+        await synthesis(state, _config())
+
+    assert len(model.prompts) == 5  # 交替失败被总上限截断（非 7 次）
+    assert len(delays) == 4  # 第 5 次尝试后达总上限即放弃

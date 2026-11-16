@@ -8,8 +8,14 @@ from fastapi.exceptions import RequestValidationError
 
 from app.exception.bad_request import BadRequestException
 from app.exception.config_center import ConfigCenterException
-from app.exception.conflict import ConflictException, TurnTerminalException
+from app.exception.conflict import (
+    ConflictException,
+    ThreadBusyException,
+    TurnNotRegenerableException,
+    TurnTerminalException,
+)
 from app.exception.database import DatabaseException
+from app.exception.feedback import FeedbackTurnNotFoundException
 from app.exception.not_found import NotFoundException
 
 ERROR_MAP: dict[type, tuple[str, int, str]] = {
@@ -20,9 +26,17 @@ ERROR_MAP: dict[type, tuple[str, int, str]] = {
     # 数据库故障=内部错误（api.md §0 500001；422001 让位给「URL 非法」M3 口径，本批不实现 KB）
     DatabaseException: ("500001", 500, "内部错误"),
     NotFoundException: ("404001", 404, "资源不存在"),
+    # 轮反馈端点专属（api.md §0 v1.16 增：语义同 404001 turn 维度，独立码便于反馈面
+    # 埋点/客户端区分——轮被删或失效时的单独处置）
+    FeedbackTurnNotFoundException: ("404004", 404, "轮次不存在"),
     # REQ-042 同线程并发策略（api.md §0 / ARCHITECTURE ADR-010）
     ConflictException: ("409001", 409, "线程已有进行中轮次"),
     TurnTerminalException: ("409002", 409, "轮次已处于终态，不可取消"),
+    # 线程删除撞进行中轮（api.md §0 v1.18 增 / §2.11 / D-11：独立码不复用 409001）
+    ThreadBusyException: ("409005", 409, "线程有进行中轮次，不可删除"),
+    # regenerate 前置不满足（api.md §0 v1.19 增 / §2.12：单码覆盖非 {degraded,failed}
+    # 终态 / 零来源 / deep 轮 / 进行中重复点击——沿 409005 独立码先例不拆码）
+    TurnNotRegenerableException: ("409006", 409, "轮次不支持重新生成"),
     ConfigCenterException: ("503001", 503, "配置中心不可达且无缓存"),
     Exception: ("500001", 500, "服务器内部错误"),
 }

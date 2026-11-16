@@ -4,8 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!--
-      CSP 最小集（评审留档 P3；2026-11-13 批次 9 专项③：img-src 放宽对齐契约——用户裁决）：
-      - style-src 'unsafe-inline'：index.html 内联防白闪 <style> + Tailwind 内联样式（必需）；
+      CSP 最小集（评审留档 P3；2026-11-13 批次 9 专项③：img-src 放宽对齐契约——用户裁决；
+      2026-11-15 评审修复 P2-1：script-src 'self' 新增服务对象 theme-init.js 首帧主题预置，
+      内联脚本仍被禁止，预置逻辑走外部文件）：
+      - script-src 'self'：theme-init.js（首帧写 data-theme 防主题闪变——下方同步阻塞脚本，
+        必须先于样式与内联基座色执行；应用其余代码为 vite 产物模块脚本，同受 'self' 管辖）；
+      - style-src 'unsafe-inline'：index.html 内联双值基座色 <style> + Tailwind 内联样式（必需）；
       - img-src 'self' http: https:：对齐现行 http/https 契约口径（PRD REQ-004「图片地址仅允许
         http/https」docs/PRD.md:165 + PRD §5.3 第 4 条「引用与图片链接仅允许 http/https 协议」
         docs/PRD.md:518）——来源卡/回答内图片为外部 http(s) 直链（vite proxy 下同源外全是外域）。
@@ -20,8 +24,16 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; img-src 'self' http: https:; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'self'; form-action 'self'"
     />
-    <!-- 暗色基座防白闪（值 = tokens.css --color-bg-primary） -->
-    <style>html { background: #191a1a; }</style>
+    <!-- 首帧主题预置（评审修复 P2-1）：head 内同步阻塞、置于内联基座色样式之前——
+         首帧前读 ai-search.theme + matchMedia 写 data-theme（语义同构 prefs store，
+         详见 public/theme-init.js 头注），浅色用户刷新不再经历暗→白闪变 -->
+    <script src="/theme-init.js"></script>
+    <!-- 首帧基座色随主题双值（值 = tokens.css --color-bg-primary 两态；data-theme 已由
+         上方 theme-init.js 写好——原单值暗底硬编码在浅色档下即闪变源，评审修复 P2-1） -->
+    <style>
+      html { background: #191a1a; }
+      html[data-theme='light'] { background: #ffffff; }
+    </style>
     <title>AI Search</title>
   </head>
   <body>

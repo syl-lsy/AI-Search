@@ -38,7 +38,8 @@ class _FakeRegistry:
         self.calls: list[tuple[str, str, str | None]] = []
 
     async def search(
-        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+            retry_sink: dict[str, int] | None = None
     ) -> list[dict[str, Any]]:
         self.calls.append((query, source, time_range))
         item = self._results.get(source)
@@ -333,3 +334,89 @@ async def test_fanout_illegal_strategy_falls_back_to_search_path() -> None:
         {"search_strategy": "offline", "rewritten_queries": ["q1"]}
     )
     assert result != "synthesis"
+
+
+# ---- B11 P1b：stage(search,done).extra.source_retries 可选键（api.md §7.2 v1.19）----
+
+
+class _RetryFakeRegistry(_FakeRegistry):
+    """在基假体上模拟 registry 侧重试留痕：retry_sink 汇入预设计数。"""
+
+    def __init__(self, results: dict[str, Any], retries: dict[str, int]) -> None:
+        super().__init__(results)
+        self._retries = dict(retries)
+
+    async def search(
+        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+        retry_sink: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        if retry_sink is not None:
+            for name, count in self._retries.items():
+                retry_sink[name] = retry_sink.get(name, 0) + count
+        return await super().search(
+            query, source, time_range=time_range, top_k=top_k
+        )
+
+
+async def test_web_search_emits_source_retries_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """发生同源重试 → done.extra.source_retries = {源名: 次数}。"""
+    registry = _RetryFakeRegistry({"tavily": [_cand("https://a/1")]}, {"tavily": 1})
+    stages = _stages(monkeypatch, ws_module)
+
+    await web_search(_payload("q1"), _ws_config(registry, _chain(["tavily"])))
+
+    done = stages[-1]
+    assert done["status"] == "done"
+    assert done["extra"] == {"source_retries": {"tavily": 1}}
+
+
+async def test_web_search_no_retries_omits_extra_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """无重试零键（同 images 缺键省略先例）：extra 不透传。"""
+    registry = _FakeRegistry({"tavily": [_cand("https://a/1")]})
+    stages = _stages(monkeypatch, ws_module)
+
+    await web_search(_payload("q1"), _ws_config(registry, _chain(["tavily"])))
+
+    done = stages[-1]
+    assert "extra" not in done or done["extra"] is None
+
+
+class _PerCopyRetryRegistry(_FakeRegistry):
+    """按 query 区分重试留痕：验证多副本 source_retries 各自独立（不聚合）。"""
+
+    def __init__(self, retries_by_query: dict[str, int]) -> None:
+        super().__init__({"tavily": [_cand("https://a/1")]})
+        self._retries_by_query = dict(retries_by_query)
+
+    async def search(
+        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+        retry_sink: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        retry_count = self._retries_by_query.get(query, 0)
+        if retry_sink is not None and retry_count > 0:  # 生产 sink 只累加 ≥1，零重试零键
+            retry_sink[source] = retry_count
+        return await super().search(query, source, time_range=time_range, top_k=top_k)
+
+
+async def test_web_search_multi_copy_source_retries_are_per_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """评审 P2-2（选口径 B）：stage(search,done) 按副本发——每个副本的 extra 只反映
+    本副本重试（副本间不聚合、无跨副本串扰）；无重试副本零键。"""
+    registry = _PerCopyRetryRegistry({"q0": 1, "q1": 0})
+    stages: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        ws_module,
+        "emit_stage",
+        lambda key, status, **kw: stages.append({"stage_key": key, "status": status, **kw}),
+    )
+
+    for index in (0, 1):
+        await web_search(
+            _payload(f"q{index}", index=index, total=2),
+            _ws_config(registry, _chain(["tavily"])),
+        )
+
+    dones = [s for s in stages if s["status"] == "done"]
+    assert dones[0]["extra"] == {"source_retries": {"tavily": 1}}
+    assert "extra" not in dones[1] or dones[1]["extra"] is None  # 副本 2 无重试零键

@@ -33,6 +33,16 @@ export function isOnConflictStrategy(value: unknown): value is OnConflictStrateg
   return typeof value === 'string' && ON_CONFLICT_STRATEGIES.some((s) => s === value)
 }
 
+/** 界面主题三档（frontend-api.md §2 v1.18 / REQ-054：ai-search.theme 取值） */
+export type ThemePreference = 'light' | 'dark' | 'system'
+
+const THEME_PREFERENCES: readonly ThemePreference[] = ['light', 'dark', 'system']
+
+/** localStorage `ai-search.theme` 守卫（REQ-054：三档枚举，缺省 system） */
+export function isThemePreference(value: unknown): value is ThemePreference {
+  return typeof value === 'string' && THEME_PREFERENCES.some((t) => t === value)
+}
+
 /**
  * localStorage 布尔键读值守卫（`ai-search.incognito`）：仅接受字符串 'true'/'false'，
  * 其余（null/任意他值）返回 null = 无有效值，由调用方落默认值。

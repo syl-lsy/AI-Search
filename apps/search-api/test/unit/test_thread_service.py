@@ -24,9 +24,9 @@ import pytest
 from sqlalchemy.sql.selectable import Select
 
 from app.db.models import Thread, Turn
-from app.exception import NotFoundException
+from app.exception import NotFoundException, ThreadBusyException
 from app.exception.handler.errors import ERROR_MAP
-from app.schemas.thread import ThreadCreate, ThreadListQuery, TurnSkeleton
+from app.schemas.thread import ThreadCreate, ThreadListQuery, ThreadPatchRequest, TurnSkeleton
 from app.schemas.turn import TurnCreate
 from app.services.thread_service import ThreadService
 
@@ -59,6 +59,7 @@ class _FakeSession:
     def __init__(self) -> None:
         self.added: list[object] = []
         self.statements: list[Select] = []
+        self.executed: list[object] = []  # Core DML（DELETE …）语句面
         self.flushes = 0
         self.commits = 0
         self.closed = False
@@ -70,6 +71,9 @@ class _FakeSession:
 
     def add_all(self, objs: Sequence[object]) -> None:
         self.added.extend(objs)
+
+    async def execute(self, statement: object) -> None:
+        self.executed.append(statement)
 
     async def flush(self) -> None:
         self.flushes += 1
@@ -90,16 +94,30 @@ class _FakeSession:
         return self.scalar_queue.pop(0) if self.scalar_queue else None
 
 
-def _make_thread(user_id: str = USER_ID) -> Thread:
+_UNSET = object()  # 缺省哨兵：区分「未传」（视为已读）与显式 None（未读）
+
+
+def _make_thread(
+    user_id: str = USER_ID,
+    *,
+    pinned: bool = False,
+    read_at: object = _UNSET,
+    archived_at: datetime | None = None,
+    title: str = "首问标题",
+    updated_at: datetime | None = None,
+) -> Thread:
     now = datetime.now(UTC)
     return Thread(
         id=uuid.UUID(THREAD_ID),
         user_id=uuid.UUID(user_id),
-        title="首问标题",
+        title=title,
         mode_summary="deep",
         turn_count=1,
+        pinned=pinned,
+        read_at=now if read_at is _UNSET else read_at,
+        archived_at=archived_at,
         created_at=now,
-        updated_at=now,
+        updated_at=updated_at or now,
     )
 
 
@@ -480,3 +498,326 @@ async def test_get_thread_detail_unknown_thread_raises_not_found():
     service = ThreadService(fake)
     with pytest.raises(NotFoundException):
         await service.get_thread_detail(THREAD_ID, user_id=USER_ID)
+
+
+# ---- v1.18 线程管理（B10）：列表参数/排序/投影（api.md §2.2）----
+
+
+class _FakePurger:
+    """对象清理假体（MinIO best-effort 前缀删除的注入缝）：记录调用面/按需抛错。"""
+
+    def __init__(self, *, exc: Exception | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._exc = exc
+
+    async def purge_thread_objects(self, *, user_id: str, thread_id: str) -> None:
+        self.calls.append((user_id, thread_id))
+        if self._exc is not None:
+            raise self._exc
+
+
+async def test_list_threads_default_active_view_filters_and_order():
+    """active 缺省：archived_at IS NULL + (pinned DESC, updated_at DESC)（§2.2 v1.18）。"""
+    fake = _FakeSession()
+    fake.scalar_queue = [0]
+    fake.scalars_queue = [[]]
+    service = ThreadService(fake)
+
+    await service.list_threads(ThreadListQuery(), user_id=USER_ID)
+
+    page_stmt = str(fake.statements[1])
+    assert "archived_at IS NULL" in page_stmt  # 缺省=活跃集（D-05）
+    assert "pinned DESC" in page_stmt  # 活跃视图置顶优先（D-07）
+    assert "updated_at DESC" in page_stmt
+    assert "read_at IS NULL" not in page_stmt  # unread 缺省 false → 无未读过滤
+
+
+async def test_list_threads_archived_view_orders_updated_only():
+    """archived=true：仅归档集 + updated_at DESC（pinned 不参与，D-07）。"""
+    fake = _FakeSession()
+    fake.scalar_queue = [0]
+    fake.scalars_queue = [[]]
+    service = ThreadService(fake)
+
+    await service.list_threads(ThreadListQuery(archived=True), user_id=USER_ID)
+
+    page_stmt = str(fake.statements[1])
+    assert "archived_at IS NOT NULL" in page_stmt
+    assert "pinned DESC" not in page_stmt  # 归档视图无置顶语义
+
+
+async def test_list_threads_unread_filter_is_orthogonal_to_archived():
+    """unread=true=read_at IS NULL；与 archived 正交（服务端无组合特判，D-05/B-4）。"""
+    fake = _FakeSession()
+    fake.scalar_queue = [0]
+    fake.scalars_queue = [[]]
+    service = ThreadService(fake)
+
+    await service.list_threads(ThreadListQuery(unread=True), user_id=USER_ID)
+    unread_stmt = str(fake.statements[1])
+    assert "read_at IS NULL" in unread_stmt
+    assert "archived_at IS NULL" in unread_stmt  # 未读视图=活跃集内过滤
+
+    fake.scalar_queue = [0]
+    fake.scalars_queue = [[]]
+    await service.list_threads(
+        ThreadListQuery(archived=True, unread=True), user_id=USER_ID
+    )
+    both_stmt = str(fake.statements[3])
+    assert "archived_at IS NOT NULL" in both_stmt and "read_at IS NULL" in both_stmt
+
+
+async def test_list_threads_q_is_escaped_ilike_bind_param():
+    """q：标题 ILIKE 包含匹配；%/_/\\ 通配转义（用户输入不得放大匹配面）。"""
+    fake = _FakeSession()
+    fake.scalar_queue = [0]
+    fake.scalars_queue = [[]]
+    service = ThreadService(fake)
+
+    await service.list_threads(ThreadListQuery(q="Lang%_Graph\\x"), user_id=USER_ID)
+
+    stmt = fake.statements[1]
+    compiled = stmt.compile()
+    assert "%Lang\\%\\_Graph\\\\x%" in set(compiled.params.values())
+    assert "ESCAPE" in str(stmt).upper()
+
+
+async def test_list_threads_q_and_mode_and_view_are_and_combined():
+    """q 与 mode/archived/unread AND 叠加（三者各自独立条件，D-05）。"""
+    fake = _FakeSession()
+    fake.scalar_queue = [0]
+    fake.scalars_queue = [[]]
+    service = ThreadService(fake)
+
+    await service.list_threads(
+        ThreadListQuery(q="LangGraph", mode="fast", archived=True, unread=True),
+        user_id=USER_ID,
+    )
+    where_text = str(fake.statements[1])
+    assert "mode_summary" in where_text
+    assert "archived_at IS NOT NULL" in where_text  # archived=true 独立条件
+    assert "read_at IS NULL" in where_text
+    assert "lower(threads.title) LIKE lower" in where_text  # ilike 走 lower 比较（大小写不敏感）
+
+
+async def test_list_threads_brief_projection_three_booleans_four_quadrants():
+    """ThreadBrief 三布尔投影四象限（D-06/B-6）：read_at/archived_at NULL 与非 NULL。"""
+    fake = _FakeSession()
+    now = datetime.now(UTC)
+    read_active = _make_thread()
+    unread_active = _make_thread(read_at=None)
+    pinned_read_archived = _make_thread(pinned=True, archived_at=now)
+    unread_archived = _make_thread(read_at=None, archived_at=now)
+    fake.scalar_queue = [4]
+    fake.scalars_queue = [[read_active, unread_active, pinned_read_archived, unread_archived]]
+    service = ThreadService(fake)
+
+    page = await service.list_threads(ThreadListQuery(archived=True), user_id=USER_ID)
+
+    assert [(i.pinned, i.is_unread, i.archived) for i in page.items] == [
+        (False, False, False),
+        (False, True, False),
+        (True, False, True),
+        (False, True, True),
+    ]
+
+
+# ---- v1.18 详情置已读写副作用（api.md §2.3 v1.18 注 / D-12）----
+
+
+async def test_get_thread_detail_marks_unread_thread_read():
+    fake = _FakeSession()
+    thread = _make_thread(read_at=None)  # 未读
+    fake.scalars_queue = [[thread], []]
+    service = ThreadService(fake)
+
+    before = datetime.now(UTC)
+    detail = await service.get_thread_detail(THREAD_ID, user_id=USER_ID)
+
+    assert detail.thread_id == THREAD_ID
+    assert thread.read_at is not None and thread.read_at >= before  # 同事务置 now()
+    assert fake.flushes == 1
+    assert fake.commits == 0  # 写副作用仍在 get_db 事务边界内
+
+
+async def test_get_thread_detail_already_read_is_idempotent_zero_write():
+    fake = _FakeSession()
+    thread = _make_thread()
+    original = thread.read_at
+    fake.scalars_queue = [[thread], []]
+    service = ThreadService(fake)
+
+    await service.get_thread_detail(THREAD_ID, user_id=USER_ID)
+
+    assert thread.read_at == original  # 已读零写（幂等）
+    assert fake.flushes == 0
+
+
+# ---- v1.18 PATCH /threads/{id}（api.md §2.10 / D-08/D-09）----
+
+
+async def test_patch_thread_updates_all_fields_without_touching_updated_at():
+    fake = _FakeSession()
+    thread = _make_thread()
+    original_updated_at = thread.updated_at
+    fake.scalars_queue = [[thread]]
+    service = ThreadService(fake)
+
+    brief = await service.patch_thread(
+        THREAD_ID,
+        ThreadPatchRequest(title="  新标题  ", pinned=True, is_unread=True, archived=True),
+        user_id=USER_ID,
+    )
+
+    assert thread.title == "新标题"  # trim 后落库
+    assert thread.pinned is True
+    assert thread.read_at is None  # is_unread=true → read_at NULL
+    assert thread.archived_at is not None
+    assert thread.updated_at == original_updated_at  # D-09 冻结语义：管理动作不推 updated_at
+    assert (brief.title, brief.pinned, brief.is_unread, brief.archived) == (
+        "新标题",
+        True,
+        True,
+        True,
+    )
+    assert fake.flushes == 1
+    assert fake.commits == 0
+
+
+async def test_patch_thread_mark_read_and_unarchive():
+    fake = _FakeSession()
+    thread = _make_thread(read_at=None, archived_at=datetime.now(UTC))
+    fake.scalars_queue = [[thread]]
+    service = ThreadService(fake)
+
+    brief = await service.patch_thread(
+        THREAD_ID, ThreadPatchRequest(is_unread=False, archived=False), user_id=USER_ID
+    )
+
+    assert thread.read_at is not None and thread.read_at <= datetime.now(UTC)
+    assert thread.archived_at is None
+    assert brief.is_unread is False and brief.archived is False
+
+
+async def test_patch_thread_unknown_or_foreign_thread_raises_not_found():
+    fake = _FakeSession()
+    fake.scalars_queue = [[]]  # id+user 双条件无行（不存在/越权同码）
+    service = ThreadService(fake)
+
+    with pytest.raises(NotFoundException):
+        await service.patch_thread(
+            THREAD_ID, ThreadPatchRequest(pinned=True), user_id=OTHER_USER_ID
+        )
+    # 归属语句同时绑定 thread_id 与 user_id（全参数绑定）
+    params = _uuid_params(fake.statements[0])
+    assert uuid.UUID(THREAD_ID) in params and uuid.UUID(OTHER_USER_ID) in params
+
+
+# ---- v1.18 DELETE /threads/{id}（api.md §2.11 / D-03/D-04/D-10/D-11）----
+
+
+async def test_delete_thread_rejects_running_turn_with_409005():
+    fake = _FakeSession()
+    thread = _make_thread()
+    fake.scalars_queue = [[thread]]
+    fake.scalar_queue = [1]  # 存在 running/queued 轮
+    service = ThreadService(fake)
+
+    with pytest.raises(ThreadBusyException) as excinfo:
+        await service.delete_thread(THREAD_ID, user_id=USER_ID)
+
+    assert ERROR_MAP[ThreadBusyException][0] == "409005"  # MRO 精确命中（非 500001 兜底）
+    assert "进行中" in excinfo.value.message
+    assert fake.executed == []  # 拒绝时零删除
+    # 判定状态集与 409001 同源（pending/running/queued）——走绑定参数
+    flat_params: set[object] = set()
+    for value in fake.statements[1].compile().params.values():
+        if isinstance(value, (list, tuple, set)):
+            flat_params.update(value)
+        else:
+            flat_params.add(value)
+    assert {"pending", "running", "queued"} <= flat_params
+
+
+async def test_delete_thread_cascades_turns_then_thread_and_purges_objects():
+    fake = _FakeSession()
+    thread = _make_thread(archived_at=datetime.now(UTC))  # 归档态可直接删除
+    fake.scalars_queue = [[thread]]
+    fake.scalar_queue = [0]
+    purger = _FakePurger()
+    service = ThreadService(fake, object_purger=purger)
+
+    result = await service.delete_thread(THREAD_ID, user_id=USER_ID)
+
+    assert result.deleted is True
+    assert len(fake.executed) == 2
+    assert "DELETE FROM turns" in str(fake.executed[0])  # 先删 turns（借 FK CASCADE 清从属）
+    assert "DELETE FROM threads" in str(fake.executed[1])  # 再删 threads（借 artifacts 链）
+    assert purger.calls == [(USER_ID, THREAD_ID)]  # 对象键含 user_id/thread_id 前缀
+    assert fake.commits == 0
+
+
+async def test_delete_thread_object_purge_failure_is_best_effort(log_records):
+    """D-04：快照对象清理失败只 WARN 不回滚（DB 删除照常成功）。"""
+    fake = _FakeSession()
+    thread = _make_thread()
+    fake.scalars_queue = [[thread]]
+    fake.scalar_queue = [0]
+    purger = _FakePurger(exc=RuntimeError("minio down"))
+    service = ThreadService(fake, object_purger=purger)
+
+    result = await service.delete_thread(THREAD_ID, user_id=USER_ID)
+
+    assert result.deleted is True
+    assert len(fake.executed) == 2
+    warnings = [r for r in log_records if r["level"].name == "WARNING"]
+    assert warnings, "对象清理失败必须落 WARN 日志（可观测）"
+
+
+async def test_delete_thread_unknown_or_foreign_thread_raises_not_found():
+    fake = _FakeSession()
+    fake.scalars_queue = [[]]
+    purger = _FakePurger()
+    service = ThreadService(fake, object_purger=purger)
+
+    with pytest.raises(NotFoundException):
+        await service.delete_thread(THREAD_ID, user_id=USER_ID)
+    assert fake.executed == [] and purger.calls == []
+
+
+# ---- v1.18 追问自动取消归档（api.md §2.4 v1.18 注 / D-13）----
+
+
+async def test_create_turn_on_archived_thread_unarchives():
+    fake = _FakeSession()
+    thread = _make_thread(archived_at=datetime.now(UTC))
+    fake.scalars_queue = [[thread], [], ["deep"]]
+    service = ThreadService(fake)
+
+    await service.create_turn(
+        THREAD_ID,
+        TurnCreate(query="追问", mode="fast"),
+        user_id=USER_ID,
+        chat_model_key="qwen",
+        model_name="m",
+    )
+
+    assert thread.archived_at is None  # 对话活动解除归档（回到活跃列表）
+    assert thread.turn_count == 2
+
+
+async def test_create_turn_on_active_thread_leaves_archived_at_none():
+    fake = _FakeSession()
+    thread = _make_thread()
+    fake.scalars_queue = [[thread], [], ["deep"]]
+    service = ThreadService(fake)
+
+    await service.create_turn(
+        THREAD_ID,
+        TurnCreate(query="追问", mode="fast"),
+        user_id=USER_ID,
+        chat_model_key="qwen",
+        model_name="m",
+    )
+    assert thread.archived_at is None
+

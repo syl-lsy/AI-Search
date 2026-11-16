@@ -13,13 +13,16 @@ from app.schemas.common import (
     SearchMode,
     TurnStatus,
 )
+from app.schemas.feedback import FeedbackRequest, FeedbackResponse
 from app.schemas.model import ModelListResponse, ModelOption
 from app.schemas.thread import (
     ThreadBrief,
     ThreadCreate,
     ThreadCreateResult,
+    ThreadDeleteData,
     ThreadDetail,
     ThreadListQuery,
+    ThreadPatchRequest,
     TurnSkeleton,
 )
 from app.schemas.turn import (
@@ -30,11 +33,14 @@ from app.schemas.turn import (
     TurnCancelResult,
     TurnCreate,
     TurnDetail,
+    TurnRegenerateResult,
     TurnError,
     UsageBrief,
 )
 
 __all__ = [
+    "FeedbackRequest",
+    "FeedbackResponse",
     "ImageBrief",
     "MemoryHits",
     "ModelListResponse",
@@ -48,11 +54,14 @@ __all__ = [
     "ThreadBrief",
     "ThreadCreate",
     "ThreadCreateResult",
+    "ThreadDeleteData",
     "ThreadDetail",
     "ThreadListQuery",
+    "ThreadPatchRequest",
     "TurnCancelResult",
     "TurnCreate",
     "TurnDetail",
+    "TurnRegenerateResult",
     "TurnError",
     "TurnSkeleton",
     "TurnStatus",

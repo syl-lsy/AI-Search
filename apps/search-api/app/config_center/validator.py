@@ -235,13 +235,91 @@ class TypeQueryPair(BaseModel):
 
 
 class RetrySpec(BaseModel):
-    """§3 v1.3：initial_interval_s × backoff_factor + jitter 退避写法。"""
+    """§3 v1.3：initial_interval_s × backoff_factor + jitter 退避写法。
+
+    v1.24 起嵌套 `connection` 节由 `connection_retry_warnings` 软校验（extra="allow"
+    收下原样，非法不拒收——运行期整节回落主节，灰度安全）。
+    """
 
     model_config = ConfigDict(extra="allow")
     max_attempts: int = Field(ge=1)
     initial_interval_s: float = Field(gt=0)
     backoff_factor: float = Field(ge=1)
     jitter: bool = True
+
+
+#: 连接类长窗重试节五键（§3 v1.24，nacos-config.md）
+CONNECTION_RETRY_KEYS: tuple[str, ...] = (
+    "max_attempts",
+    "initial_interval_s",
+    "backoff_factor",
+    "max_interval_s",
+    "total_window_s",
+)
+#: 联动约束软校验的固定量（决策 4 预算推导：前置预估 10s + 单次成功调用 8s）
+CONNECTION_RETRY_PREFIX_S = 10.0
+CONNECTION_RETRY_SINGLE_CALL_S = 8.0
+
+
+def _connection_key_valid(key: str, value: Any) -> bool:
+    """单键边界（§3 v1.24）：max_attempts 为 ≥1 整数、backoff_factor ≥1、其余三键 >0。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if key == "max_attempts":
+        return float(value).is_integer() and value >= 1
+    if key == "backoff_factor":
+        return value >= 1
+    return value > 0
+
+
+def connection_retry_warnings(fast_section: Mapping[str, Any]) -> list[str]:
+    """`retry.connection` 节软校验（B11 P1a；**告警不拒收**——灰度安全）。
+
+    返回告警文案列表（空 = 无告警）；调用方（FastSpec 校验钩子）逐条落 ConfigLog
+    WARNING。三类告警：
+    ① 节点形态非法（非对象）→ 运行期整节回落 retry 主节；
+    ② 任一键缺失/类型或越界非法 → 同上（整节回落，不做半新半旧混合）；
+    ③ 联动约束 `前置预估 10s + total_window_s + 单次成功调用 8s > turn_timeout_s`
+       → 提示同步评估 turn_timeout_s（用户裁决「总窗 ~30s」量级意图由
+       total_window_s 承载，放宽时须复核预算）。
+    """
+    retry = fast_section.get("retry")
+    if not isinstance(retry, Mapping):
+        return []
+    node = retry.get("connection")
+    if node is None:
+        return []  # 节缺失 = 现状行为（零告警零拒收）
+    if not isinstance(node, Mapping):
+        return ["retry.connection：节点形态非法（非对象）——运行期整节回落 retry 主节"]
+    warnings: list[str] = []
+    invalid = [
+        key
+        for key in CONNECTION_RETRY_KEYS
+        if key not in node or not _connection_key_valid(key, node.get(key))
+    ]
+    if invalid:
+        warnings.append(
+            f"retry.connection：键非法 {invalid}——运行期整节回落 retry 主节（=现状行为）"
+        )
+        return warnings  # 键层面校验失败时联动约束无意义
+    total_window = node.get("total_window_s")
+    turn_timeout = fast_section.get("turn_timeout_s")
+    if isinstance(total_window, (int, float)) and isinstance(turn_timeout, (int, float)):
+        required = (
+            CONNECTION_RETRY_PREFIX_S
+            + float(total_window)
+            + CONNECTION_RETRY_SINGLE_CALL_S
+        )
+        if required > float(turn_timeout):
+            warnings.append(
+                "retry.connection：联动约束告警（软校验不拒收）——"
+                f"前置预估 {CONNECTION_RETRY_PREFIX_S:g}s + total_window_s "
+                f"{float(total_window):g}s + 单次成功调用 "
+                f"{CONNECTION_RETRY_SINGLE_CALL_S:g}s = {required:g}s > "
+                f"fast.turn_timeout_s {float(turn_timeout):g}s；"
+                "建议同步评估 turn_timeout_s"
+            )
+    return warnings
 
 
 class FastSpec(BaseModel):
@@ -265,6 +343,15 @@ class FastSpec(BaseModel):
         if missing:
             raise ValueError(f"type_query_map 须覆盖 7 类枚举，缺 {missing}")
         return value
+
+    @model_validator(mode="after")
+    def _warn_connection_retry(self) -> "FastSpec":
+        """§3 v1.24：`retry.connection` 软校验（告警不拒收；运行期整节回落主节）。"""
+        from app.core.logger import ConfigLog  # 局部导入：校验层不拖重启动链
+
+        for message in connection_retry_warnings(self.model_dump()):
+            ConfigLog(message=message, data_id="ai_search.agent.spec.json").warning()
+        return self
 
 
 class CompactSpec(BaseModel):

@@ -124,7 +124,8 @@ class _FakeRegistry(ToolRegistry):
         self.calls: list[tuple[str, str, str | None]] = []
 
     async def search(
-        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+        self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+            retry_sink: dict[str, int] | None = None
     ) -> list[dict[str, Any]]:
         self.calls.append((query, source, time_range))
         if source == "tavily":

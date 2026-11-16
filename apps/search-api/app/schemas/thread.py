@@ -1,21 +1,27 @@
-"""线程域 DTO（api.md §2.1~§2.3）：请求/响应模型，与 db/models/（ORM）严格分离。
+"""线程域 DTO（api.md §2.1~§2.3、§2.10/§2.11 v1.18）：请求/响应模型，与 db/models/（ORM）
+严格分离。
 
 - ThreadCreate（§2.1 首问建线程请求体）与 TurnCreate（§2.4 追问，turn.py）请求体同构；
 - `model` 键不做静态 Literal——取值集合来自 Nacos chat.options 热更键（api.md §2.1
   「以 GET /models 返回为准」），静态枚举会与热更口径漂移；缺省解析与非法键的
   400001 归模型解析层（B2 下游任务）；
-- 分期口径字段（用户裁决 2026-11-08）在字段注释标注真实值启用批次。
+- 分期口径字段（用户裁决 2026-11-08）在字段注释标注真实值启用批次；
+- 线程管理（v1.18，REQ-058~060）：ThreadListQuery 增 q/archived/unread，ThreadBrief
+  增 pinned/is_unread/archived 三布尔投影；ThreadPatchRequest（§2.10 部分更新）与
+  ThreadDeleteData（§2.11 删除响应）。
 """
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
 from app.schemas.common import OnConflict, PageRequest, SearchMode, TurnStatus
 
 _QUERY_MAX_CHARS = 2000  # api.md §2.1：query 1~2000 字符（超长 → 400001）
 _TITLE_MAX_CHARS = 50  # REQ-006：线程 title=首问前 50 字符（落位在 service 层）
 _IMAGES_MAX_COUNT = 3  # api.md §2.1：images ≤3 张（M4 预留，REQ-025）
+_TITLE_PATCH_MAX_CHARS = 120  # api.md §2.10：重命名 1~120 字符（对齐 threads.title varchar(120)）
+_Q_MAX_CHARS = 200  # api.md §2.2：标题搜索 1~200 字符（超长 → 400001）
 
 SummaryMode = Literal["fast", "deep", "mixed"]  # 线程模式聚合值（§2.2：写入时计算）
 
@@ -65,20 +71,105 @@ class ThreadCreateResult(BaseModel):
 
 
 class ThreadListQuery(PageRequest):
-    """GET /threads 查询参数（§2.2）：分页 + mode 过滤（缺省=全部；一期无归档概念）。"""
+    """GET /threads 查询参数（§2.2 v1.18）：分页 + mode + 标题搜索 + 视图过滤。
+
+    - `q`：标题 ILIKE 包含匹配（trim 后空串=不过滤；1~200 字符，超长 400001）；
+    - `archived`：缺省 false=活跃集；true=仅归档。视图三态映射（前端 radio）：
+      全部/未读=活跃集、已归档=archived=true；
+    - `unread`：缺省 false；true=仅未读（read_at IS NULL）；与 archived 正交（服务端
+      无组合特判，D-05）——三者为 AND 叠加。
+    """
 
     mode: SummaryMode | None = Field(default=None, description="按线程模式聚合值过滤")
+    q: str | None = Field(
+        default=None, description="标题模糊搜索（ILIKE 包含、大小写不敏感；1~200 字符）"
+    )
+    archived: bool = Field(default=False, description="true=仅归档线程（缺省 false=活跃集）")
+    unread: bool = Field(default=False, description="true=仅未读（read_at IS NULL）")
+
+    @field_validator("q")
+    @classmethod
+    def _normalize_q(cls, value: str | None) -> str | None:
+        """trim 后空串=不过滤；超长按 400001（RequestValidationError → 400001）。"""
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if len(stripped) > _Q_MAX_CHARS:
+            raise ValueError(f"q 长度不得超过 {_Q_MAX_CHARS} 字符")
+        return stripped
 
 
 class ThreadBrief(BaseModel):
-    """线程列表项（§2.2 data.items[]）：侧栏最近/Threads 页骨架。"""
+    """线程列表项（§2.2 data.items[]）：侧栏最近/Threads 页骨架。
+
+    v1.18 增三布尔投影（REQ-058~060）：`pinned`=threads.pinned；`is_unread`=
+    read_at IS NULL；`archived`=archived_at IS NOT NULL——推导落在 service 层映射处。
+    """
 
     thread_id: str
     title: str
     mode_summary: SummaryMode
     turn_count: int
+    pinned: bool = Field(description="置顶（活跃视图排序首位；归档视图不消费）")
+    is_unread: bool = Field(description="未读投影（read_at IS NULL）")
+    archived: bool = Field(description="归档投影（archived_at IS NOT NULL）")
     created_at: datetime
     updated_at: datetime
+
+
+class ThreadPatchRequest(BaseModel):
+    """PATCH /threads/{thread_id} 部分更新请求体（§2.10 v1.18）。
+
+    任意字段组合、**至少一项**（空对象 400001）；字段间无互斥。语义映射：
+    - title：trim 后 1~120 字符（空串/纯空白/超长 400001）；
+    - pinned：直写；
+    - is_unread：true→read_at=NULL / false→read_at=now()；
+    - archived：true→archived_at=now() / false→archived_at=NULL。
+    `updated_at` 不随本端点变化（冻结语义，data-model §1.2 v1.14 / D-09）——落位在
+    service 层（本类只管形状与边界校验）。
+    """
+
+    title: str | None = Field(
+        default=None, description="重命名（trim 后 1~120 字符；空串/纯空白/超长 400001）"
+    )
+    pinned: StrictBool | None = Field(default=None, description="true=置顶 / false=取消置顶")
+    is_unread: StrictBool | None = Field(
+        default=None, description="true=标记为未读（read_at 置 NULL）/ false=置已读"
+    )
+    archived: StrictBool | None = Field(
+        default=None, description="true=归档 / false=取消归档"
+    )
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("title 不得为空串或纯空白")
+        if len(stripped) > _TITLE_PATCH_MAX_CHARS:
+            raise ValueError(f"title 长度不得超过 {_TITLE_PATCH_MAX_CHARS} 字符")
+        return stripped
+
+    @model_validator(mode="after")
+    def _require_at_least_one_field(self) -> "ThreadPatchRequest":
+        """至少一项（空对象 400001）；显式 null 不构成合法更新（布尔/字符串均非 null 类型）。"""
+        provided = self.model_fields_set
+        if not provided:
+            raise ValueError("至少提供 title/pinned/is_unread/archived 之一")
+        for name in ("title", "pinned", "is_unread", "archived"):
+            if name in provided and getattr(self, name) is None:
+                raise ValueError(f"{name} 不得为 null")
+        return self
+
+
+class ThreadDeleteData(BaseModel):
+    """DELETE /threads/{thread_id} 响应 data（§2.11 v1.18）：`{"deleted": true}`。"""
+
+    deleted: bool = Field(default=True, description="删除成功恒 true（物理删除、不可恢复）")
 
 
 class TurnSkeleton(BaseModel):

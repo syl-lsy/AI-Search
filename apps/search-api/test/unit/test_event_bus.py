@@ -412,3 +412,55 @@ async def test_terminal_done_does_not_end_subscription():
         await _next(gen, timeout=0.1)  # done 后订阅保持挂起（不自动结束）
     await gen.aclose()
 
+
+
+# ---- B11 P2：regenerate 通道重开（api.md §7.1 v1.19 / §2.12 决策 11）----
+
+
+async def test_reopen_channel_clears_terminal_and_preserves_buffer() -> None:
+    """done 后 reopen：terminal_seq 解除短路、历史缓冲保留、第二次 done 重新终态。"""
+    clock = FakeClock()
+    bus = _bus(clock)
+    turn_id = "t-regen"
+    await bus.publish(turn_id, _ev(event_type="stage", k="old"))
+    await bus.publish(turn_id, _ev(event_type="done", finish="degraded", source_count=2))
+    assert bus.terminal_seq(turn_id) is not None
+
+    assert bus.reopen_channel(turn_id) is True
+
+    assert bus.terminal_seq(turn_id) is None  # 短路解除
+    assert bus.followups_hold_remaining(turn_id) is None
+    assert bus.followups_seq(turn_id) is None
+    # 历史缓冲保留：首连（last_seq=0）重放完整旧序列
+    gen = bus.subscribe(turn_id, 0)
+    replayed = [await _next(gen), await _next(gen)]
+    await gen.aclose()
+    assert [e.event_type for e in replayed] == ["stage", "done"]
+    assert replayed[0].data["k"] == "old"
+
+    # 续推：新 done seq 更大 → 通道重新终态，terminal 指向最新 done
+    stamped = await bus.publish(turn_id, _ev(event_type="done", finish="completed"))
+    assert bus.terminal_seq(turn_id) == stamped.seq
+
+
+async def test_reopen_channel_uncloses_failed_channel() -> None:
+    """close_channel 关过的通道（零内容 failed 路径）重开后订阅可继续跟随新事件。"""
+    clock = FakeClock()
+    bus = _bus(clock)
+    turn_id = "t-regen-failed"
+    await bus.publish(turn_id, _ev(event_type="stage", k="old"))
+    await bus.close_channel(turn_id)
+
+    assert bus.reopen_channel(turn_id) is True
+    gen = bus.subscribe(turn_id, 0)
+    assert (await _next(gen)).data["k"] == "old"  # 旧事件照常重放
+    await bus.publish(turn_id, _ev(event_type="stage", k="new"))
+    assert (await _next(gen, timeout=0.5)).data["k"] == "new"  # 不因 closed 立即结束
+    await gen.aclose()
+
+
+async def test_reopen_channel_missing_turn_is_noop() -> None:
+    """通道不存在（regenerate 前从未发布事件）→ False，不建空通道。"""
+    bus = _bus(FakeClock())
+    assert bus.reopen_channel("never-seen") is False
+    assert bus.terminal_seq("never-seen") is None

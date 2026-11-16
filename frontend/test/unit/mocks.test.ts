@@ -9,6 +9,7 @@ import {
   turnDetailDirectCompleted,
   turnDetailDirectWithFollowups,
   turnDetailFastCompleted,
+  turnDetailFastHelpful,
   turnDetailFastWithFollowups,
   turnDetailQueued,
 } from '@/mocks/turnDetails'
@@ -177,6 +178,12 @@ describe('轮次终态 fixture（api.md §2.5 镜像形态）', () => {
   it('达标 fast 轮：followups 非空（§9 v1.9 fixture③ 回看渲染样例）', () => {
     expect(turnDetailFastWithFollowups.followups?.length).toBe(3)
     expect(turnDetailFastWithFollowups.turn_id).toBe(TURN_ID_FAST)
+  })
+
+  it('达标 fast 轮 + 已反馈：feedback_helpful=true（§9 反馈判定点 v1.17——A41 回看还原样例）；基线 fixture 字段缺席（M2 前端点）', () => {
+    expect(turnDetailFastHelpful.feedback_helpful).toBe(true)
+    expect(turnDetailFastHelpful.turn_id).toBe(TURN_ID_FAST)
+    expect('feedback_helpful' in turnDetailFastCompleted).toBe(false) // 字段缺席 = 可选字段语义
   })
 
   it('深度完成态：export_available=true（mode=deep 且 answer 非空且 completed）', () => {

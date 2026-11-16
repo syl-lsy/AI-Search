@@ -45,19 +45,26 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, cast
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.graphs.main import graph as main_graph
+from app.agent.graphs.regenerate import graph as regenerate_graph
 from app.agent.guards import TurnCanceledSignal
 from app.agent.nodes.synthesis import SynthesisError
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
 from app.core.observability import build_turn_callbacks
-from app.db.models import Source, Thread, Turn, TurnEvent
+from app.db.models import Source, Thread, Turn, TurnEvent, TurnFeedback
 from app.db.session import get_session_factory
-from app.exception import BadRequestException, ConflictException, NotFoundException, TurnTerminalException
+from app.exception import (
+    BadRequestException,
+    ConflictException,
+    NotFoundException,
+    TurnNotRegenerableException,
+    TurnTerminalException,
+)
 from app.schemas.common import SearchMode, TurnStatus
 from pydantic import ValidationError
 
@@ -75,12 +82,20 @@ from app.schemas.turn import (
     UsageBrief,
 )
 from app.services.event_bus import EventBus, SseEvent, get_event_bus
+from app.services.followups_service import (
+    FOLLOWUPS_SOURCES_MAX,
+    FollowupsSettings,
+    generate_followups,
+    resolve_followups_settings,
+    should_generate_followups,
+)
 
 __all__ = [
     "ACTIVE_STATUSES",
     "FINAL_STATUSES",
     "HISTORY_WINDOW_TURNS",
     "QUEUE_DEPTH_LIMIT",
+    "REGENERABLE_STATUSES",
     "SubmitDecision",
     "ThreadScheduler",
     "decide_on_submit",
@@ -98,6 +113,11 @@ __all__ = [
 ACTIVE_STATUSES = ("pending", "running")  # 运行占用判定：pending 瞬时态并入 running（api.md §0）
 QUEUED_STATUS = "queued"
 FINAL_STATUSES = ("completed", "degraded", "failed", "canceled")
+
+# regenerate 可进状态（api.md §2.12 v1.19 决策 12）：failed 且有来源同可重生成——
+# 「degraded→running(regenerate)→进程崩溃→孤儿清理置 failed」使 failed-with-sources
+# 可达，且语义安全（有来源即可只重跑 synthesis）；零源 failed 被 sources 条件拦截。
+REGENERABLE_STATUSES = ("degraded", "failed")
 
 # per-thread 排队深度上限（PRD OQ-20，代码常量）：queued 存在即「排队位已满」→ 409001
 QUEUE_DEPTH_LIMIT = 1
@@ -277,9 +297,12 @@ async def get_turn_detail(
     - 推导字段（TurnDetail docstring 口径）：degraded=status==degraded；
       export_available=mode=deep 且 answer_md 非空 且 status∈{completed,degraded}
       （api.md v1.10 §2.5——判据与 §2.3 has_report 同源化）；
-    - 分期口径（用户裁决 2026-11-08）：incognito 恒 false（M5 列）、followups 恒 null
-      （0009+B7）、snapshot_available 恒 false / kb_doc_id 恒 null（M2/M3 增列后接真实值）；
-      memory_hits 不返回（api.md §2.5「M5 及之前无此字段」，M6 随迁移再增）。
+    - 分期口径（用户裁决 2026-11-08）：incognito 恒 false（M5 列）、snapshot_available
+      恒 false / kb_doc_id 恒 null（M2/M3 增列后接真实值）；memory_hits 不返回
+      （api.md §2.5「M5 及之前无此字段」，M6 随迁移再增）。
+    - followups（REQ-046）与 feedback_helpful（REQ-057）：M2 批次 2 起真实值——
+      前者直读 turns.followups（图外钩子异步回填，done 时刻可能仍 null）；后者查
+      turn_feedback（UNIQUE(turn_id) 一轮一行，无行 = null = 未反馈）。
     - images：自该轮 turn_events 的 images 事件 payload 重建（api.md §2.5 v1.12——
       A6 批次 7 前置小修起真实值；轮内至多一次，防御多行取 seq 首见；条目键可省形态
       透传（缺值键不置 null，ImageBrief 序列化省略），历史畸形条目跳过不拖垮回看面；
@@ -311,6 +334,13 @@ async def get_turn_detail(
             .order_by(TurnEvent.seq.asc())
         )
     ).first()  # 契约轮内至多一次（§7.2）；防御多行取 seq 首见
+    # 轮反馈现值（§2.5 feedback_helpful）：UNIQUE(turn_id) 一轮一行 → 至多一行；
+    # 无行 = null（未反馈）。独立小查询而非 join（回看面单查口径不受影响）
+    feedback_helpful = (
+        await session.scalars(
+            select(TurnFeedback.helpful).where(TurnFeedback.turn_id == turn_uuid)
+        )
+    ).first()
     status = cast(TurnStatus, turn.status)
     mode = cast(SearchMode, turn.mode)
     timing = turn.timing if isinstance(turn.timing, dict) else {}
@@ -366,6 +396,14 @@ async def get_turn_detail(
         and bool(turn.answer_md)
         and status in ("completed", "degraded"),
         cancel_reason=cast(CancelReason | None, turn.cancel_reason),
+        followups=(
+            [str(item) for item in turn.followups]
+            if isinstance(turn.followups, list)
+            else None
+        ),
+        feedback_helpful=(
+            bool(feedback_helpful) if feedback_helpful is not None else None
+        ),
         created_at=turn.created_at,
         finished_at=turn.finished_at,
     )
@@ -449,11 +487,16 @@ class _RunContext:
 
     `spec_payload` / `mapping_payload`：运行开始时一次性捕获的资产快照 payload
     （OQ-11——轮内全部读取走该快照，热更仅对后续轮生效；ARCH §4.0/§6.1）。
+    `mode`/`query`/`query_lang`：图外钩子（followups）判定与提示词装配的输入面
+    （触发条件含 mode=fast；语言跟随 query_lang——与图内注入值同源）。
     """
 
     turn_id: str
     thread_id: str
     user_id: Any = None
+    mode: str = "fast"
+    query: str = ""
+    query_lang: str = "en"
     spec_payload: Mapping[str, Any] = field(default_factory=dict)
     mapping_payload: Mapping[str, Any] = field(default_factory=dict)
     mcp_payload: Mapping[str, Any] = field(default_factory=dict)
@@ -461,6 +504,12 @@ class _RunContext:
     stage_started: dict[str, datetime] = field(default_factory=dict)
     stage_label: dict[str, str] = field(default_factory=dict)
     sources_count: int = 0
+    # regenerate 微图（api.md §2.12 v1.19）：True = 只重跑 synthesis——终态落库走
+    # stages 追加/duration_ms 不覆写/成功后清 error+degraded_reason（决策 14）；
+    # fused/search_strategy 为重建输入（不重检索；synthesis 变体选择与 followups 来源面）
+    regenerate: bool = False
+    fused: list[dict[str, Any]] = field(default_factory=list)
+    search_strategy: str = "web"
 
 
 class ThreadScheduler:
@@ -481,12 +530,16 @@ class ThreadScheduler:
         spec_snapshot: AssetSnapshot | None = None,
         mapping_snapshot: AssetSnapshot | None = None,
         tools_registry: ToolRegistry | None = None,
+        regenerate_graph_override: Any = None,
     ) -> None:
         self._bus = bus
         self._session_factory = (
             session_factory if session_factory is not None else get_session_factory()
         )
         self._graph: Any = graph if graph is not None else main_graph
+        # regenerate 微图（api.md §2.12 / 决策 10）：None = 用模块级单例（import 一次
+        # 编译一次）；单测/联装可注入假体
+        self._regenerate_graph = regenerate_graph_override
         self._spec_snapshot = spec_snapshot
         self._mapping_snapshot = mapping_snapshot
         self._tools_registry = tools_registry
@@ -714,6 +767,422 @@ class ThreadScheduler:
             self._cancel_flags[turn_id] = reason  # pending/running：节点边界感知
         return {"turn_id": turn_id, "status": "canceling"}
 
+    # ---- regenerate（api.md §2.12 v1.19 / REQ-063：degraded|failed-with-sources 仅重生成）----
+
+    async def regenerate_turn(self, turn_id: str, *, user_id: str) -> dict[str, str]:
+        """regenerate 请求面：归属校验（404001）+ 前置裁决 + 条件推进 + 通道重开。
+
+        - 归属：id+user 双条件（不存在/越权/非法 UUID 一律 404001，不泄漏存在性）；
+        - 前置（全满足才 200，任一不满足 `409006`，§2.12 三条）：`status ∈
+          {degraded, failed}`、`mode=fast`、sources 非空（显式校验——degraded 蕴含
+          非空的实现不变式之外，failed-with-sources 仅崩溃孤儿路径可达故显式兜住）；
+        - **线程行锁串行化**：进会话后 `select(Thread).with_for_update()`（与
+          resolve_conflict_on_submit 同型、锁序 Thread→Turn 一致）再查活跃轮——
+          否则并发 ask 未提交的 running 轮在 READ COMMITTED 下对预检与条件 UPDATE
+          均不可见，同线程会两轮并行（不变式破坏 + 双份 LLM 成本）；
+        - **条件 UPDATE 防双击**：`WHERE status IN ('degraded','failed') AND mode='fast'
+          AND EXISTS(sources) AND NOT EXISTS(同线程其他 pending/running/queued)`——
+          并发双击落败方 rowcount=0 → 409006（与 `_promote_running` 同型）；推进同时
+          清 `error`/`degraded_reason`/`finished_at`（running 期不携带上一轮终态留痕）
+          并刷 started_at；
+        - **通道重开先于响应**（§7.1 regenerate 注）：客户端收到 200 后立即重订阅——
+          若等 BackgroundTask 再 reopen，重订阅可能撞 terminal_seq 短路被零帧关闭；
+          reopen 幂等、历史缓冲保留。
+        """
+        try:
+            turn_uuid = uuid.UUID(turn_id)
+            user_uuid = uuid.UUID(user_id)
+        except ValueError as exc:
+            raise NotFoundException(
+                "轮次不存在", detail=f"非法 turn/user id：{turn_id!r}"
+            ) from exc
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(Turn.id, Turn.thread_id, Turn.status, Turn.mode).where(
+                        Turn.id == turn_uuid, Turn.user_id == user_uuid
+                    )
+                )
+            ).first()
+            if row is None:
+                raise NotFoundException(
+                    "轮次不存在",
+                    detail=f"turn_id={turn_id} 不存在或不属于当前用户",
+                )
+            has_sources = (
+                await session.scalars(
+                    select(Source.id).where(Source.turn_id == turn_uuid).limit(1)
+                )
+            ).first() is not None
+            if row.status not in REGENERABLE_STATUSES or row.mode != "fast" or not has_sources:
+                raise TurnNotRegenerableException(
+                    "轮次不支持重新生成",
+                    detail=(
+                        f"turn {turn_id} status={row.status} mode={row.mode} "
+                        f"has_sources={has_sources}（前置：degraded/failed + fast + 有来源）"
+                    ),
+                )
+            # 线程级单轮不变式（api.md §0「每线程同时一轮」）：同线程另有进行中/排队轮时
+            # regenerate 不得把本轮再置 running——否则两轮并行破坏调度不变式。归 409006
+            # 语义族（「不支持重新生成」）以保持 §2.12 错误面零扩展（见交付说明的契约
+            # 缺口注记：§2.12 前置列表未列本条件，属不变式兜底）。
+            # **先锁 Thread 行再查活跃轮**（同 resolve_conflict_on_submit 的 FOR UPDATE
+            # 串行化，锁序 Thread→Turn 一致无死锁）：READ COMMITTED 下并发 ask 未提交的
+            # running 轮对普通 SELECT 不可见——不锁则「预检看不到 + UPDATE 的 NOT EXISTS
+            # 也看不到」双双漏判，同线程两轮并行（双份 LLM 成本）。锁串行后：ask 先持锁
+            # → 本方法阻塞至其提交后读到 running；本方法先持锁 → ask 的 resolve 阻塞至
+            # 提交后读到本轮的 running（其决策矩阵拒绝/排队，语义自洽）。
+            await session.execute(
+                select(Thread).where(Thread.id == row.thread_id).with_for_update()
+            )
+            busy_turn = (
+                await session.execute(
+                    select(Turn.id)
+                    .where(
+                        Turn.thread_id == row.thread_id,
+                        Turn.id != turn_uuid,
+                        Turn.status.in_([*ACTIVE_STATUSES, QUEUED_STATUS]),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if busy_turn is not None:
+                raise TurnNotRegenerableException(
+                    "轮次不支持重新生成",
+                    detail=(
+                        f"thread {row.thread_id} 另有进行中/排队轮 {busy_turn[0]}"
+                        "（每线程同时一轮——待其终态后重试）"
+                    ),
+                )
+            stmt = (
+                update(Turn)
+                .where(
+                    Turn.id == turn_uuid,
+                    Turn.user_id == user_uuid,
+                    Turn.mode == "fast",
+                    Turn.status.in_(REGENERABLE_STATUSES),
+                    select(Source.id).where(Source.turn_id == turn_uuid).exists(),
+                    # 线程级单轮不变式（并发面兜底：预检与推进之间他轮已被推进）
+                    ~select(Turn.id)
+                    .where(
+                        Turn.thread_id == row.thread_id,
+                        Turn.id != turn_uuid,
+                        Turn.status.in_([*ACTIVE_STATUSES, QUEUED_STATUS]),
+                    )
+                    .exists(),
+                )
+                .values(
+                    status="running",
+                    started_at=datetime.now(UTC),
+                    # 重新进入 running：旧终态时刻作废（否则 running 期呈现上一轮
+                    # finished_at；duration_ms 仍按 §2.12 不覆写口径保留）
+                    finished_at=None,
+                    error=None,
+                    degraded_reason=None,
+                )
+            )
+            # UPDATE 的 CursorResult 面（rowcount 判定条件推进成败）；async session
+            # 的 execute 静态类型为 Result[Any]，运行期实为 CursorResult
+            result = cast(Any, await session.execute(stmt))
+            if result.rowcount == 0:
+                # 并发双击 / 状态在预检后变化：条件推进落败即同码（§2.12 决策 13）
+                raise TurnNotRegenerableException(
+                    "轮次不支持重新生成",
+                    detail=f"turn {turn_id} 条件推进落败（并发 regenerate 或状态已变化）",
+                )
+            await session.commit()
+        self._bus.reopen_channel(turn_id)
+        return {"turn_id": turn_id, "status": "running"}
+
+    async def execute_regenerate(self, turn_id: str) -> None:
+        """regenerate 执行体（BackgroundTask 入口）：微图只重跑 synthesis，同通道续推。
+
+        - 输入重建（不重新检索，§2.12）：`query/query_lang/chat_model_key` 读 turns 列；
+          `fused` 自 sources 行重建（url/title/snippet/score）；`search_strategy` 自
+          turn_events 的 `stage(rewrite,done).extra.strategy`（缺省 web）；
+          `answerable_from_knowledge` 缺省 false（保守）；`spec/mapping` 捕获**当次
+          新快照**（「重新生成」用热更后的提示词/模型映射）；
+        - 事件面：custom(stage)+messages(token/thinking) 走既有翻译器；updates 仅用于
+          取 synthesis 最终 `answer_md`（不发布——事件面与常规轮零差异）；
+        - 终态：成功 → completed（stages 追加 write 段、duration_ms 不覆写、清旧
+          error）；再失败 → error(500101)/500301/500001 + done(degraded)（sources 保留，
+          可再次 regenerate）；取消 → canceled（merge stages）；
+        - 竞态：推进后被取消/删除（status≠running）→ 零事件退出（canceled 已由
+          cancel_turn 收口）。
+        - **加载段同在异常收口面**（评审 P3）：`_load_turn` 的 DB 瞬断若在 try 外会
+          让轮永卡 running（只剩进程重启孤儿清理）——挪入 try 后统一走
+          `_finish_regenerate_failure`（失败收束内对 None 行做一次重载重试）。
+        """
+        turn: Any = None
+        ctx: _RunContext | None = None
+        try:
+            turn = await self._load_turn(turn_id)
+            if turn is None or str(turn.status) != "running":
+                return
+            ctx = await self._build_regenerate_context(turn)
+            await self._run_regenerate_graph(turn, ctx)
+        except TimeoutError as exc:
+            await self._finish_regenerate_failure(
+                turn_id, turn, ctx, code="500301", message="轮次执行超时，请稍后重试",
+                exc=exc, degraded_reason="timeout",
+            )
+        except SynthesisError as exc:
+            # 再失败照旧 500101 降级收束（sources 保留，可再次 regenerate）
+            await self._finish_regenerate_failure(
+                turn_id, turn, ctx, code="500101", message="综合生成失败，已保留检索来源",
+                exc=exc, degraded_reason=None,
+            )
+        except TurnCanceledSignal as exc:
+            turn = await self._reload_turn_for_failure(turn_id, turn)
+            if turn is None:
+                return
+            await self._finish_canceled(
+                turn_id,
+                str(turn.thread_id),
+                reason=exc.reason,
+                source_count=await self._count_sources(turn_id),
+                stages=ctx.stages if ctx is not None else None,
+                merge_stages=True,
+            )
+            self._nudge_thread(str(turn.thread_id))
+        except Exception as exc:  # noqa: BLE001 —— 组装/执行面兜底：不永卡 running
+            await self._finish_regenerate_failure(
+                turn_id, turn, ctx, code="500001", message="内部错误", exc=exc,
+                degraded_reason=None,
+            )
+
+    async def _run_regenerate_graph(self, turn: Any, ctx: _RunContext) -> None:
+        """微图 astream 消费：翻译器复用 + 终态收尾（success / canceled）。"""
+        turn_id = ctx.turn_id
+        thread_id = ctx.thread_id
+        timeout_s = self._turn_timeout_s(ctx.spec_payload, "fast")
+        cancel_reason = self._cancel_flags.pop(turn_id, None)
+        if cancel_reason is not None:  # 推进后、开跑前已取消
+            await self._finish_canceled(
+                turn_id, thread_id, reason=cancel_reason,
+                source_count=ctx.sources_count, merge_stages=True,
+            )
+            self._nudge_thread(thread_id)
+            return
+        chat_model_key, _ = resolve_chat_model(
+            str(turn.chat_model_key), ctx.mapping_payload
+        )
+        initial_state: dict[str, Any] = {
+            "turn_id": turn_id,
+            "thread_id": thread_id,
+            "user_id": str(turn.user_id),
+            "mode": "fast",
+            "query": ctx.query,
+            "chat_model_key": chat_model_key,
+            "history": [],  # synthesis 不消费历史（不重检索、不改写）
+            "query_lang": ctx.query_lang,
+            "spec": dict(ctx.spec_payload),
+            "images": [],  # images 不重发（§2.12）
+            "fused": ctx.fused,
+            "search_strategy": ctx.search_strategy,
+            "answerable_from_knowledge": False,  # 保守缺省（决策 10）
+        }
+        final_state: dict[str, Any] = {
+            "search_strategy": ctx.search_strategy,
+            "fused": ctx.fused,
+        }
+        graph = (
+            self._regenerate_graph
+            if self._regenerate_graph is not None
+            else regenerate_graph
+        )
+        async with asyncio.timeout(timeout_s):
+            graph_stream = graph.astream(
+                initial_state,
+                config={
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "cancel_flags": self._cancel_flags,  # 同一进程级标志引用
+                        "model_mapping": dict(ctx.mapping_payload),
+                    },
+                    # 观测面与常规轮同构（ARCH §6.6：trace root=turn、session=thread）
+                    "callbacks": build_turn_callbacks(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        user_id=str(turn.user_id),
+                        mode="fast",
+                    ),
+                    "metadata": {
+                        "langfuse_session_id": thread_id,
+                        "langfuse_user_id": str(turn.user_id),
+                        "langfuse_tags": ["mode:fast", "regenerate"],
+                        "turn_id": turn_id,
+                        "mode": "fast",
+                    },
+                },
+                stream_mode=["messages", "updates", "custom"],
+                subgraphs=True,
+            )
+            async for namespace, stream_mode, chunk in graph_stream:
+                cancel_reason = self._cancel_flags.pop(turn_id, None)
+                if cancel_reason is not None:
+                    try:  # 显式收口（同 VR-2 口径：取消即停，不等 GC）
+                        await graph_stream.aclose()
+                    except Exception as close_exc:  # noqa: BLE001 —— 仅告警不吞取消语义
+                        AgentLog(
+                            message=f"regenerate 取消收口 aclose 异常（忽略）：{close_exc!r}",
+                            graph="turn_runner",
+                        ).warning()
+                    break
+                if stream_mode == "custom":
+                    await self._translate_custom(ctx, chunk)
+                elif stream_mode == "messages" and _is_fast_synthesis_messages(
+                    namespace, chunk
+                ):
+                    await self._translate_message_chunk(ctx, chunk)
+                elif stream_mode == "updates" and not namespace:
+                    for update in chunk.values():
+                        if isinstance(update, Mapping):
+                            final_state.update(update)
+        self._cancel_flags.pop(turn_id, None)  # 防御：清理残留标志
+        if cancel_reason is not None:
+            await self._finish_canceled(
+                turn_id, thread_id, reason=cancel_reason,
+                source_count=ctx.sources_count, stages=ctx.stages, merge_stages=True,
+            )
+            self._nudge_thread(thread_id)
+            return
+        await self._finish_completed(ctx, final_state)
+
+    async def _reload_turn_for_failure(self, turn_id: str, turn: Any | None) -> Any | None:
+        """失败收束的行获取：已加载即用；加载段失败（DB 瞬断）时重载一次。
+
+        重载仍失败属不可恢复（收束本身也要写库）——记 ERROR 后交由进程重启的
+        孤儿清理兜底，不在此处再抛（避免 BackgroundTask 未处理异常）。
+        """
+        if turn is not None:
+            return turn
+        try:
+            return await self._load_turn(turn_id)
+        except Exception as reload_exc:  # noqa: BLE001
+            AgentLog(
+                message=(
+                    "regenerate 失败收束重载轮行异常（放弃收束，孤儿清理兜底）："
+                    f"{type(reload_exc).__name__}: {str(reload_exc)[:200]}"
+                ),
+                graph="turn_runner",
+            ).error(reload_exc)
+            return None
+
+    async def _finish_regenerate_failure(
+        self,
+        turn_id: str,
+        turn: Any | None,
+        ctx: _RunContext | None,
+        *,
+        code: str,
+        message: str,
+        exc: Exception | None = None,
+        degraded_reason: str | None = None,
+    ) -> None:
+        """regenerate 失败收束（sources 必有 → 恒降级形态；零内容分支不可达）。
+
+        组装/加载段异常（ctx 未建成，turn 可能为 None）回落最小 ctx：turn 缺失时
+        先重载一次（DB 瞬断恢复路径），仍不可得则记 ERROR 放弃（孤儿清理兜底）；
+        sources_count 现场补查（done.source_count 沿该轮累计不变，§7.2 regenerate 注），
+        stages 空表（无新增时间线段）。
+        """
+        if turn is None:
+            turn = await self._reload_turn_for_failure(turn_id, turn)
+        if turn is None:
+            return
+        if ctx is None:
+            ctx = _RunContext(
+                turn_id=str(turn.id),
+                thread_id=str(turn.thread_id),
+                user_id=turn.user_id,
+                mode="fast",
+                query=str(turn.query),
+                query_lang=str(turn.query_lang or "en"),
+                regenerate=True,
+            )
+            ctx.sources_count = await self._count_sources(str(turn.id))
+        await self._finish_degraded_with_error(
+            ctx, code=code, message=message, exc=exc, degraded_reason=degraded_reason
+        )
+
+    async def _build_regenerate_context(self, turn: Any) -> _RunContext:
+        """regenerate 输入重建（§2.12 决策 10）：sources 行 → fused；spec/mapping 新快照。"""
+        turn_uuid = uuid.UUID(str(turn.id))
+        async with self._session_factory() as session:
+            source_rows = (
+                await session.scalars(
+                    select(Source)
+                    .where(Source.turn_id == turn_uuid)
+                    .order_by(Source.ref_no.asc())
+                )
+            ).all()
+            strategy = await self._load_search_strategy(session, turn_uuid)
+        ctx = _RunContext(
+            turn_id=str(turn.id),
+            thread_id=str(turn.thread_id),
+            user_id=turn.user_id,
+            mode="fast",
+            query=str(turn.query),
+            query_lang=str(turn.query_lang or "en"),
+            spec_payload=self._capture_spec_payload(),  # 当次新快照（热更后的提示词/映射）
+            mapping_payload=self._capture_mapping_payload(),
+            regenerate=True,
+        )
+        ctx.sources_count = len(source_rows)
+        ctx.fused = [
+            {
+                "url": row.url,
+                "title": row.title,
+                "snippet": row.snippet or "",
+                "score": float(row.score) if row.score is not None else 0.0,
+            }
+            for row in source_rows
+        ]
+        ctx.search_strategy = strategy
+        return ctx
+
+    @staticmethod
+    async def _load_search_strategy(
+        session: AsyncSession, turn_uuid: uuid.UUID
+    ) -> str:
+        """自 turn_events 的 `stage(rewrite,done).extra.strategy` 重建检索策略（缺省 web）。
+
+        §2.12 决策 10：direct 轮零来源天然不可 regenerate；verify/web 轮按原值切
+        synthesis 变体；事件缺行/畸形一律回落 web（灰度安全，同 state 侧归一）。
+        """
+        rows = (
+            await session.scalars(
+                select(TurnEvent)
+                .where(
+                    TurnEvent.turn_id == turn_uuid,
+                    TurnEvent.event_type == "stage",
+                )
+                .order_by(TurnEvent.seq.asc())
+            )
+        ).all()
+        for row in rows:
+            payload = row.payload if isinstance(row.payload, dict) else {}
+            if payload.get("stage_key") != "rewrite" or payload.get("status") != "done":
+                continue
+            extra = payload.get("extra")
+            if isinstance(extra, Mapping):
+                strategy = extra.get("strategy")
+                if strategy in ("direct", "verify", "web"):
+                    return str(strategy)
+        return "web"
+
+    async def _count_sources(self, turn_id: str) -> int:
+        """该轮 sources 行数（regenerate 失败兜底路径的 done.source_count 来源）。"""
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(Source.id).where(Source.turn_id == uuid.UUID(turn_id))
+                )
+            ).all()
+        return len(rows)
+
     # ---- 短事务持久化（TurnRunner 例外：写入即 commit 即归还连接）----
 
     async def _persist_terminal(
@@ -727,6 +1196,9 @@ class ThreadScheduler:
         stages: list[dict[str, Any]] | None = None,
         degraded_reason: str | None = None,
         rewritten_queries: list[str] | None = None,
+        merge_stages: bool = False,
+        preserve_duration: bool = False,
+        clear_error: bool = False,
     ) -> tuple[datetime, int] | None:
         """终态落 turns（条件收口：行锁 + 终态重查，终态绝不被覆写）。
 
@@ -736,6 +1208,15 @@ class ThreadScheduler:
         调用方必须跳过 done/error 发布，杜绝双终态事件（winner 已发布其一）。
         行锁（FOR UPDATE）+ 锁内终态重查与「UPDATE ... WHERE status NOT IN final
         0 行命中跳过」语义等价：锁持有期内无并发写者，重查即裁决。
+
+        regenerate 口径（api.md §2.5/§2.12 v1.19，决策 14）：
+        - `merge_stages=True`：保留原 `timing.stages` 并**追加**新 write 段（不覆写——
+          回看时间线呈现两段 write 即完整轨迹）；
+        - `preserve_duration=True`：`duration_ms` 不覆写（保持「提交→首次 done」口径，
+          P50 采样排除 regenerate 轮）；`finished_at` 仍刷到本次终态时刻（最新 done
+          语义，§7.1 通道重开注）；
+        - `clear_error=True`：成功路径清旧 `error`/`degraded_reason`（旧值属上一轮
+          失败留痕，成功后 §2.5 不应再呈现 degraded/error）。
         """
         async with self._session_factory() as session:
             row = await session.get(Turn, uuid.UUID(turn_id), with_for_update=True)
@@ -752,20 +1233,29 @@ class ThreadScheduler:
             row.status = status
             if answer_md is not None:
                 row.answer_md = answer_md
-            row.timing = {"stages": stages or []}
+            if merge_stages:
+                existing = row.timing.get("stages") if isinstance(row.timing, dict) else []
+                row.timing = {"stages": [*(existing or []), *(stages or [])]}
+            else:
+                row.timing = {"stages": stages or []}
             row.usage = {}
             row.finished_at = now
             if row.started_at is None:  # 失败/取消路径可能未经 promote（防御）
                 row.started_at = now
-            row.duration_ms = max(
-                0, int((now - row.created_at).total_seconds() * 1000)
-            )
+            if not preserve_duration or row.duration_ms is None:
+                row.duration_ms = max(
+                    0, int((now - row.created_at).total_seconds() * 1000)
+                )
             if error is not None:
                 row.error = error
+            elif clear_error:
+                row.error = None
             if cancel_reason is not None:
                 row.cancel_reason = cancel_reason
             if degraded_reason is not None:
                 row.degraded_reason = degraded_reason
+            elif clear_error:
+                row.degraded_reason = None
             if rewritten_queries is not None:
                 row.rewritten_queries = rewritten_queries
             await session.commit()
@@ -849,16 +1339,41 @@ class ThreadScheduler:
             if isinstance(raw_queries, list)
             else None
         )
+        persisted_answer = answer_md if isinstance(answer_md, str) else None
+        # 图外钩子判定（api.md §7.1/§7.2 四条件，全部读轮发起时的 spec 快照——OQ-11）：
+        # 达标才在 done 发布**之前**向 EventBus 登记保活窗口（登记晚于 done 会让
+        # 晚订阅/重放路径判定不到「应等待」，形成窗口悬挂）
+        followups_settings = resolve_followups_settings(ctx.spec_payload)
+        followups_expected = should_generate_followups(
+            settings=followups_settings,
+            mode=ctx.mode,
+            status="completed",
+            answer_md=persisted_answer,
+        )
+        if followups_expected:
+            self._bus.expect_followups(
+                ctx.turn_id, window_ms=followups_settings.sse_hold_window_ms
+            )
         outcome = await self._persist_terminal(
             ctx.turn_id,
             status="completed",
-            answer_md=answer_md if isinstance(answer_md, str) else None,
+            answer_md=persisted_answer,
             stages=ctx.stages,
             degraded_reason="source_failure" if degraded else None,
             rewritten_queries=rewritten,
+            # regenerate 口径（§2.12 v1.19）：stages 追加、duration_ms 不覆写、
+            # 成功后清旧 error/degraded_reason（旧值属上一轮失败留痕）
+            merge_stages=ctx.regenerate,
+            preserve_duration=ctx.regenerate,
+            clear_error=ctx.regenerate,
         )
         if outcome is None:
-            return  # 终态竞态落败（并发取消已收口）：跳过 done 发布，防双终态
+            # 终态竞态落败（并发取消已收口）：跳过 done 发布，防双终态；竞态 winner
+            # （canceled）不会产生 followups——已登记的保活窗口必须撤销，否则 SSE
+            # 客户端白等满窗口再被静默关闭
+            if followups_expected:
+                self._bus.abandon_followups(ctx.turn_id)
+            return
         _, duration_ms = outcome
         await self._publish_and_persist(
             ctx,
@@ -872,7 +1387,81 @@ class ThreadScheduler:
                 "usage": {},
             },
         )
-        self._nudge_thread(ctx.thread_id)
+        self._nudge_thread(ctx.thread_id)  # 先放行同线程排队轮（followups 不挡队列）
+        if followups_expected and persisted_answer is not None:
+            await self._run_followups(
+                ctx,
+                answer_md=persisted_answer,
+                settings=followups_settings,
+                final_state=final_state,
+            )
+
+    async def _run_followups(
+        self,
+        ctx: _RunContext,
+        *,
+        answer_md: str,
+        settings: FollowupsSettings,
+        final_state: dict[str, Any],
+    ) -> None:
+        """图外钩子（ADR-011：非图节点、不入两图拓扑）：done 之后生成 → 落库 → 发事件。
+
+        不变式（api.md §7.2 / data-model §1.3）：
+        - **先落 turns.followups（短事务）再发布 followups 事件**——「事件到达时 2.5
+          已可对账」；
+        - 生成失败/超时（`generate_timeout_ms`）→ 静默：不发事件、不落库、不发 error
+          （generate_followups 已内建静默与 WARN 留痕，此处零分支）；
+        - 不入 turn_events（ADR-003 第 4 条落库子集不变）；usage/duration_ms 不含本段
+          （生成在 done 之后，天然不计入 P50）。
+        """
+        fused = final_state.get("fused") or ctx.fused  # regenerate 轮 final_state 无 fused
+        sources = [
+            {"url": item.get("url"), "title": item.get("title")}
+            for item in (fused if isinstance(fused, list) else [])
+            if isinstance(item, Mapping)
+        ][:FOLLOWUPS_SOURCES_MAX]
+        try:
+            items = await generate_followups(
+                query=ctx.query,
+                answer=answer_md,
+                sources=sources,
+                settings=settings,
+                query_lang=ctx.query_lang,
+                mapping=ctx.mapping_payload,
+            )
+            if not items:
+                # 静默放弃（含空列表防御）：提前收口保活窗口（api.md §7.1「生成已静默
+                # 放弃 → 静默关闭」——客户端不必白等满窗口）
+                self._bus.abandon_followups(ctx.turn_id)
+                return
+            if not await self._persist_followups(ctx.turn_id, items):
+                # 落库失败/轮行已消失：不发事件（先落库后发布不变式不可破）+ 撤销窗口
+                # （与 None/异常路径同口径——事件永不到来，不能让客户端白等满 ≤10s）
+                self._bus.abandon_followups(ctx.turn_id)
+                return
+            await self._publish_only(ctx, "followups", {"items": items})
+        except Exception as exc:  # noqa: BLE001 —— 增强层铁律：任何失败都不外泄、不打断主链路
+            AgentLog(
+                message=(
+                    "followups 钩子异常（静默放弃，主链路已 done）："
+                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                ),
+                graph="turn_runner",
+            ).warning()
+            self._bus.abandon_followups(ctx.turn_id)
+
+    async def _persist_followups(self, turn_id: str, items: list[str]) -> bool:
+        """回填 turns.followups（短事务；TurnRunner 事务例外同口径：写入即 commit）。"""
+        async with self._session_factory() as session:
+            row = await session.get(Turn, uuid.UUID(turn_id))
+            if row is None:
+                AgentLog(
+                    message="followups 回填跳过：轮行不存在", graph="turn_runner"
+                ).warning()
+                return False
+            row.followups = items
+            await session.commit()
+            return True
 
     @staticmethod
     def _log_search_strategy(
@@ -912,12 +1501,23 @@ class ThreadScheduler:
         reason: str,
         source_count: int = 0,
         stages: list[dict[str, Any]] | None = None,
+        merge_stages: bool = False,
     ) -> None:
         """canceled 收尾：queued 轮立即出队（user）与运行中轮节点边界收尾（superseded/
-        rolled_back/user）共用；保留已产出（sources 已随事件即时落库）。"""
+        rolled_back/user）共用；保留已产出（sources 已随事件即时落库）。
+
+        `merge_stages=True`（regenerate 取消路径）：保留原 stages 并追加本次段
+        （§2.12「regenerate 期间可取消」——时间线不因取消丢失历史），duration_ms
+        不覆写。
+        """
         ctx_like = _RunContext(turn_id=turn_id, thread_id=thread_id)
         outcome = await self._persist_terminal(
-            turn_id, status="canceled", cancel_reason=reason, stages=stages or []
+            turn_id,
+            status="canceled",
+            cancel_reason=reason,
+            stages=stages or [],
+            merge_stages=merge_stages,
+            preserve_duration=merge_stages,
         )
         if outcome is None:
             return  # 终态竞态落败（图收尾已完成）：跳过 done 发布，防双终态
@@ -962,6 +1562,10 @@ class ThreadScheduler:
             error=error_payload,
             stages=ctx.stages,
             degraded_reason=degraded_reason,
+            # regenerate 再失败：stages 追加 / duration_ms 不覆写（§2.12「再失败照旧
+            # error(500101)+done(degraded)，可再次 regenerate」）
+            merge_stages=ctx.regenerate,
+            preserve_duration=ctx.regenerate,
         )
         if outcome is None:
             return
@@ -1154,6 +1758,8 @@ class ThreadScheduler:
                 turn_id=turn_id,
                 thread_id=thread_id,
                 user_id=turn.user_id,
+                mode=str(turn.mode),  # 图外钩子触发条件（deep 永不触发）
+                query=str(turn.query),
                 spec_payload=self._capture_spec_payload(),
                 mapping_payload=self._capture_mapping_payload(),
                 mcp_payload=self._capture_mcp_payload(),
@@ -1165,6 +1771,7 @@ class ThreadScheduler:
                 self._nudge_thread(thread_id)
                 return
             query_lang = detect_query_lang(str(turn.query))
+            ctx.query_lang = query_lang  # 图外钩子提示词的语言跟随源（与图内注入同值）
             await self._persist_query_lang(turn_id, query_lang)
             # 搜索链轮启动冻结（nacos-config §2：装载决策读熔断实时态一次，轮内中途熔断不切换）
             tools_registry = (

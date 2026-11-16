@@ -1,5 +1,5 @@
 /**
- * src/mocks/threads.ts — 线程列表静态 fixture（api.md §2.2 镜像形态；§9 fixture 优先）。
+ * src/mocks/threads.ts — 线程列表静态 fixture（api.md §2.2 v1.18 镜像形态；§9 fixture 优先）。
  */
 import type { ThreadListData, ThreadListItem } from '@/types/api'
 
@@ -9,6 +9,9 @@ export const threadItems: ThreadListItem[] = [
     title: 'LangGraph 的 Send API 和 Router 的区别？',
     mode_summary: 'mixed',
     turn_count: 3,
+    pinned: false,
+    is_unread: false,
+    archived: false,
     created_at: '2026-11-01T08:12:00Z',
     updated_at: '2026-11-01T09:40:11Z',
   },
@@ -17,6 +20,9 @@ export const threadItems: ThreadListItem[] = [
     title: '对比 pgvector 与 Milvus，个人知识库场景怎么选？',
     mode_summary: 'fast',
     turn_count: 1,
+    pinned: false,
+    is_unread: false,
+    archived: false,
     created_at: '2026-10-30T10:00:00Z',
     updated_at: '2026-10-30T10:03:21Z',
   },
@@ -25,6 +31,9 @@ export const threadItems: ThreadListItem[] = [
     title: 'RAG 检索增强生成有哪些主流优化手段？',
     mode_summary: 'deep',
     turn_count: 2,
+    pinned: false,
+    is_unread: false,
+    archived: false,
     created_at: '2026-09-15T02:30:00Z',
     updated_at: '2026-09-15T02:41:07Z',
   },

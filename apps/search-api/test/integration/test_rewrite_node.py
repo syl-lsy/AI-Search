@@ -72,7 +72,8 @@ async def test_rewrite_real_llm_structure_via_fast_graph() -> None:
             return True
 
         async def search(
-            self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5
+            self, query: str, source: str, *, time_range: str | None = None, top_k: int = 5,
+            retry_sink: dict[str, int] | None = None
         ) -> list[dict[str, Any]]:
             return [{"url": "https://stub.example/1", "title": "stub", "snippet": "s", "score": 0.9, "origin": source}]
 

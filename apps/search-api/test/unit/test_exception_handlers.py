@@ -32,6 +32,7 @@ from app.exception import (
     ConflictException,
     DatabaseException,
     NotFoundException,
+    ThreadBusyException,
     TurnTerminalException,
 )
 from app.exception.handler import exception_handler, generate_error_docs
@@ -76,6 +77,29 @@ def test_lookup_conflict_exceptions_use_409_codes():
         "409002",
         409,
         "轮次已处于终态，不可取消",
+    )
+
+
+def test_lookup_thread_busy_hits_409005_not_fallback():
+    """B-11（api.md §0 v1.18）：删除进行中线程的独立码 409005——MRO 精确命中，
+    不得回退到 ConflictException 的 409001、更不得兜底 500001。"""
+    assert _lookup(ThreadBusyException(message="线程有进行中轮次，不可删除")) == (
+        "409005",
+        409,
+        "线程有进行中轮次，不可删除",
+    )
+    assert ERROR_MAP[ConflictException][0] == "409001"  # 409001 语义面不被复用（D-11）
+
+
+def test_lookup_turn_not_regenerable_hits_409006():
+    """B11（api.md §0 v1.19 / §2.12）：regenerate 前置不满足的独立码 409006——
+    MRO 精确命中，不回退 ConflictException 的 409001、不兜底 500001。"""
+    from app.exception import TurnNotRegenerableException
+
+    assert _lookup(TurnNotRegenerableException(message="轮次不支持重新生成")) == (
+        "409006",
+        409,
+        "轮次不支持重新生成",
     )
 
 
@@ -184,6 +208,18 @@ async def test_handler_conflict_exceptions_return_409():
     assert json.loads(resp.body) == {
         "code": "409002",
         "message": "轮次已处于终态，不可取消",
+    }
+
+
+async def test_handler_thread_busy_returns_409005():
+    """B-11：409005 错误信封 {"code","message"} 由统一处理器出口（message 面向用户）。"""
+    resp = await exception_handler(
+        _request_with_log(), ThreadBusyException(message="线程有进行中轮次，不可删除")
+    )
+    assert resp.status_code == 409
+    assert json.loads(resp.body) == {
+        "code": "409005",
+        "message": "线程有进行中轮次，不可删除",
     }
 
 

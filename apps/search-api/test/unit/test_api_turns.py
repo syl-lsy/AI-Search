@@ -23,9 +23,9 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.db.models import Source, Turn, TurnEvent
+from app.db.models import Source, Turn, TurnEvent, TurnFeedback
 from app.dependencies import get_current_user, get_db
-from app.exception import NotFoundException, TurnTerminalException
+from app.exception import NotFoundException, TurnNotRegenerableException, TurnTerminalException
 from app.main import app
 from app.services.turn_service import get_thread_scheduler
 
@@ -49,8 +49,8 @@ class _FakeResult:
 
 
 class _FakeSession:
-    """按 select 实体类型分流：Turn 主行 / Source 来源行 / TurnEvent images 行
-    （get_turn_detail 的三段查询——A6 P1 评审修复起含 §2.5 images[] 重建查询）。
+    """按 select 实体类型分流：Turn 主行 / Source 来源行 / TurnEvent images 行 /
+    TurnFeedback 反馈现值（get_turn_detail 的四段查询——反馈读回 REQ-057 起增）。
 
     expect_user_id 模拟真实 SQL 的归属过滤（WHERE user_id = <当前用户>）——行为
     同语义：行 user_id 与期望不符即查无此行（越权 404001 的假体侧依据）。
@@ -62,11 +62,13 @@ class _FakeSession:
         sources: list[Any] | None = None,
         *,
         images_events: list[Any] | None = None,
+        feedback_rows: list[Any] | None = None,
         expect_user_id: uuid.UUID | None = None,
     ) -> None:
         self._turn = turn
         self._sources = sources if sources is not None else []
         self._images_events = images_events if images_events is not None else []
+        self._feedback_rows = feedback_rows if feedback_rows is not None else []
         self._expect_user_id = expect_user_id
 
     async def scalars(self, stmt: Any) -> _FakeResult:
@@ -84,6 +86,8 @@ class _FakeSession:
             return _FakeResult(list(self._sources))
         if entity is TurnEvent:
             return _FakeResult(list(self._images_events))
+        if entity is TurnFeedback:
+            return _FakeResult(list(self._feedback_rows))
         raise AssertionError(f"未预期的查询实体：{entity}")
 
 
@@ -120,6 +124,7 @@ def _turn_row(**overrides: Any) -> SimpleNamespace:
         duration_ms=152300,
         created_at=datetime(2026, 11, 1, 8, 12, tzinfo=UTC),
         finished_at=datetime(2026, 11, 1, 8, 14, 32, tzinfo=UTC),
+        followups=None,  # 0009 列：未生成/非 fast 达成轮为 null（REQ-046）
     )
     for key, value in overrides.items():
         setattr(row, key, value)
@@ -143,12 +148,14 @@ def _source_row(**overrides: Any) -> SimpleNamespace:
 
 
 class _FakeScheduler:
-    """调度器假体：cancel_turn 记录调用面，按预设返回/抛异常。"""
+    """调度器假体：cancel/regenerate 记录调用面，按预设返回/抛异常。"""
 
     def __init__(
         self, *, result: dict[str, str] | None = None, exc: Exception | None = None
     ) -> None:
         self.cancel_calls: list[dict[str, Any]] = []
+        self.regenerate_calls: list[dict[str, Any]] = []
+        self.execute_regenerate_calls: list[str] = []
         self._result = result
         self._exc = exc
 
@@ -161,6 +168,15 @@ class _FakeScheduler:
         if self._exc is not None:
             raise self._exc
         return self._result or {"turn_id": turn_id, "status": "canceling"}
+
+    async def regenerate_turn(self, turn_id: str, *, user_id: str) -> dict[str, str]:
+        self.regenerate_calls.append({"turn_id": turn_id, "user_id": user_id})
+        if self._exc is not None:
+            raise self._exc
+        return {"turn_id": turn_id, "status": "running"}
+
+    async def execute_regenerate(self, turn_id: str) -> None:
+        self.execute_regenerate_calls.append(turn_id)
 
 
 @pytest.fixture
@@ -226,6 +242,7 @@ async def test_get_turn_completed_deep_full_shape(overrides: dict) -> None:
     # （api.md §2.5「M5 及之前无此字段」，评审 P2 勘误——预置字段已移除）
     assert data["incognito"] is False
     assert data["followups"] is None
+    assert data["feedback_helpful"] is None  # 未反馈 = null（§2.5 v1.16，REQ-057）
     assert "memory_hits" not in data
     assert data["images"] == []  # 零 images 行→§2.5 重建空数组（turn_service._rebuild_images_briefs）
     assert data["error"] is None
@@ -234,6 +251,32 @@ async def test_get_turn_completed_deep_full_shape(overrides: dict) -> None:
     assert data["cancel_reason"] is None
     assert data["created_at"].startswith("2026-11-01T08:12:00")
     assert data["finished_at"].startswith("2026-11-01T08:14:32")
+
+
+async def test_get_turn_reads_back_followups_and_feedback(overrides: dict) -> None:
+    """§2.5 v1.16 读回双源（M2 批次 2）：followups 直读 turns.followups（异步回填值）；
+    feedback_helpful 查 turn_feedback（有行=现值，无行=null）。"""
+    session = _FakeSession(
+        turn=_turn_row(
+            mode="fast", followups=["追问一？", "追问二？"], answer_md="答案正文"
+        ),
+        feedback_rows=[False],
+    )
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    async with _client() as client:
+        response = await client.get(f"/api/v1/turns/{_TURN_ID}")
+    data = response.json()["data"]
+    assert data["followups"] == ["追问一？", "追问二？"]
+    assert data["feedback_helpful"] is False
+
+    # 无反馈行 → null（未反馈，非 false）；无 followups 列值 → null
+    session_none = _FakeSession(turn=_turn_row(mode="fast"))
+    app.dependency_overrides[get_db] = lambda: session_none
+    async with _client() as client:
+        payload = (await client.get(f"/api/v1/turns/{_TURN_ID}")).json()["data"]
+    assert payload["feedback_helpful"] is None
+    assert payload["followups"] is None
 
 
 async def test_get_turn_running_returns_persisted_partial(overrides: dict) -> None:
@@ -466,3 +509,46 @@ async def test_get_turn_skips_malformed_image_entries(overrides: dict) -> None:
         response = await client.get(f"/api/v1/turns/{_TURN_ID}")
     assert response.status_code == 200
     assert response.json()["data"]["images"] == [{"url": "https://example.com/good.png"}]
+
+
+# ---- POST /api/v1/turns/{turn_id}/regenerate（§2.12 v1.19 / REQ-063）----
+
+
+async def test_regenerate_success_returns_running_and_schedules_task(
+    overrides: dict,
+) -> None:
+    """200 + data={turn_id,status:"running"}；前置裁决与微图执行分属 service/BackgroundTask。"""
+    scheduler = _FakeScheduler()
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    app.dependency_overrides[get_thread_scheduler] = lambda: scheduler
+    async with _client() as client:
+        response = await client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == "0" and body["message"] == "ok"
+    assert body["data"] == {"turn_id": _TURN_ID, "status": "running"}
+    assert scheduler.regenerate_calls == [{"turn_id": _TURN_ID, "user_id": _USER_ID}]
+    assert scheduler.execute_regenerate_calls == [_TURN_ID]  # BackgroundTask 已排程
+
+
+async def test_regenerate_not_found_404001(overrides: dict) -> None:
+    scheduler = _FakeScheduler(exc=NotFoundException("轮次不存在"))
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    app.dependency_overrides[get_thread_scheduler] = lambda: scheduler
+    async with _client() as client:
+        response = await client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
+    assert response.status_code == 404
+    body = response.json()
+    assert body["code"] == "404001" and body["message"] == "轮次不存在"
+    assert scheduler.execute_regenerate_calls == []  # 前置失败不排程
+
+
+async def test_regenerate_not_regenerable_409006(overrides: dict) -> None:
+    scheduler = _FakeScheduler(exc=TurnNotRegenerableException("轮次不支持重新生成"))
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    app.dependency_overrides[get_thread_scheduler] = lambda: scheduler
+    async with _client() as client:
+        response = await client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "409006" and body["message"] == "轮次不支持重新生成"

@@ -457,3 +457,59 @@ class TestPromptsSearchStrategyRules:
         """内置默认（v1.20 文本）过新校验——校验面与契约文本同源。"""
         payload = _mutated(PROMPTS_DATA_ID, lambda p: None)
         assert validate_asset(PROMPTS_DATA_ID, payload) == payload
+
+
+class TestConnectionRetryNode:
+    """§3 v1.24（B11 P1a）：`retry.connection` 五键——**告警不拒收**（软校验）。"""
+
+    def test_defaults_include_connection_node(self):
+        """L4 内置默认含五键连接类节（生产 floor 与运行态同源）。"""
+        node = BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["retry"]["connection"]
+        assert node == {
+            "max_attempts": 5,
+            "initial_interval_s": 1.0,
+            "backoff_factor": 2.0,
+            "max_interval_s": 8.0,
+            "total_window_s": 20.0,
+        }
+
+    def test_invalid_connection_node_not_rejected(self):
+        """任一键非法/节点形态非法 → 不拒收（运行期整节回落 retry 主节，灰度安全）。"""
+        for mutate in (
+            lambda p: p["fast"]["retry"]["connection"].update({"max_attempts": 0}),
+            lambda p: p["fast"]["retry"]["connection"].update({"initial_interval_s": 0}),
+            lambda p: p["fast"]["retry"]["connection"].update({"backoff_factor": 0.5}),
+            lambda p: p["fast"]["retry"]["connection"].pop("total_window_s"),
+            lambda p: p["fast"]["retry"].update({"connection": "not-a-map"}),
+        ):
+            payload = _mutated(SPEC_DATA_ID, mutate)
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_connection_warnings_cover_invalid_and_linkage(self):
+        """软校验文案：键非法告警 + 联动约束告警（10s + total_window_s + 8s > turn_timeout_s）。"""
+        from app.config_center.validator import connection_retry_warnings
+
+        assert connection_retry_warnings(
+            {"retry": {"connection": BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["retry"]["connection"]},
+             "turn_timeout_s": 60}
+        ) == []
+
+        invalid = connection_retry_warnings({"retry": {"connection": {"max_attempts": 0}},
+                                            "turn_timeout_s": 60})
+        assert len(invalid) == 1 and "回落 retry 主节" in invalid[0]
+
+        relaxed = connection_retry_warnings(
+            {"retry": {"connection": {
+                "max_attempts": 5, "initial_interval_s": 1.0, "backoff_factor": 2.0,
+                "max_interval_s": 8.0, "total_window_s": 45.0,
+            }}, "turn_timeout_s": 60}
+        )
+        assert len(relaxed) == 1 and "turn_timeout_s" in relaxed[0]
+
+    def test_missing_connection_node_is_silent(self):
+        """节缺失 = 现状行为：零告警零拒收（回退门 = 单键热更删节）。"""
+        from app.config_center.validator import connection_retry_warnings
+
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["fast"]["retry"].pop("connection"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+        assert connection_retry_warnings(payload["fast"]) == []

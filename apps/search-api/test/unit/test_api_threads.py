@@ -26,14 +26,16 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api.v1 import threads
 from app.dependencies import get_current_user, get_db, get_model_mapping
-from app.exception import ConflictException, NotFoundException
+from app.exception import ConflictException, NotFoundException, ThreadBusyException
 from app.main import app
 from app.schemas import (
     PageResponse,
     ThreadBrief,
     ThreadCreateResult,
+    ThreadDeleteData,
     ThreadDetail,
     ThreadListQuery,
+    ThreadPatchRequest,
     TurnSkeleton,
 )
 from app.services.turn_service import SubmitDecision, get_thread_scheduler
@@ -66,15 +68,21 @@ class _FakeThreadService:
         detail_exc: Exception | None = None,
         list_result: PageResponse[ThreadBrief] | None = None,
         detail_result: ThreadDetail | None = None,
+        patch_exc: Exception | None = None,
+        delete_exc: Exception | None = None,
     ) -> None:
         self.create_thread_calls: list[dict[str, Any]] = []
         self.create_turn_calls: list[dict[str, Any]] = []
         self.list_calls: list[ThreadListQuery] = []
         self.detail_calls: list[str] = []
+        self.patch_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[str] = []
         self._create_exc = create_exc
         self._detail_exc = detail_exc
         self._list_result = list_result
         self._detail_result = detail_result
+        self._patch_exc = patch_exc
+        self._delete_exc = delete_exc
 
     async def create_thread_with_turn(
         self,
@@ -143,6 +151,29 @@ class _FakeThreadService:
             return self._detail_result
         raise NotFoundException("线程不存在")
 
+    async def patch_thread(
+        self, thread_id: str, payload: ThreadPatchRequest, *, user_id: str
+    ) -> ThreadBrief:
+        self.patch_calls.append(
+            {
+                "thread_id": thread_id,
+                "title": payload.title,
+                "pinned": payload.pinned,
+                "is_unread": payload.is_unread,
+                "archived": payload.archived,
+                "user_id": user_id,
+            }
+        )
+        if self._patch_exc is not None:
+            raise self._patch_exc
+        return _brief()
+
+    async def delete_thread(self, thread_id: str, *, user_id: str) -> ThreadDeleteData:
+        self.delete_calls.append(thread_id)
+        if self._delete_exc is not None:
+            raise self._delete_exc
+        return ThreadDeleteData(deleted=True)
+
 
 class _FakeScheduler:
     """调度器假体：resolve_conflict_on_submit 按预设返回决策/抛 409001；
@@ -205,6 +236,9 @@ def _brief() -> ThreadBrief:
         title="LangGraph 的 Send API 和 Router 的区别？",
         mode_summary="mixed",
         turn_count=3,
+        pinned=True,
+        is_unread=False,
+        archived=False,
         created_at=moment,
         updated_at=moment,
     )
@@ -536,3 +570,183 @@ async def test_post_turns_conflict_409001(overrides: dict) -> None:
     body = response.json()
     assert body["code"] == "409001" and body["message"] == "线程已有进行中轮次"
     assert scheduler.schedule_calls == []
+
+
+# ---- GET /threads v1.18 参数增量（§2.2：q/archived/unread）----
+
+
+async def test_get_threads_list_v118_params_parsed(overrides: dict) -> None:
+    service = _FakeThreadService(list_result=PageResponse(total=1, items=[_brief()]))
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.get(
+            "/api/v1/threads",
+            params={"q": "  LangGraph  ", "archived": "true", "unread": "true"},
+        )
+    assert response.status_code == 200
+    query = service.list_calls[0]
+    assert query.q == "LangGraph"  # trim 后下发（D-05）
+    assert query.archived is True and query.unread is True
+    item = response.json()["data"]["items"][0]
+    assert (item["pinned"], item["is_unread"], item["archived"]) == (True, False, False)
+
+
+async def test_get_threads_list_v118_param_defaults(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        await client.get("/api/v1/threads")
+    query = service.list_calls[0]
+    assert query.q is None  # 缺省不过滤
+    assert query.archived is False  # 缺省=活跃集（D-05）
+    assert query.unread is False
+
+
+async def test_get_threads_list_q_blank_or_whitespace_means_no_filter(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        await client.get("/api/v1/threads", params={"q": "   "})
+    assert service.list_calls[0].q is None  # trim 后空串=不过滤（§2.2）
+
+
+async def test_get_threads_list_q_over_200_chars_400001(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        ok = await client.get("/api/v1/threads", params={"q": "长" * 200})
+        over = await client.get("/api/v1/threads", params={"q": "长" * 201})
+        bad_bool = await client.get("/api/v1/threads", params={"archived": "maybe"})
+    assert ok.status_code == 200
+    assert len(service.list_calls[0].q or "") == 200
+    assert over.status_code == 400 and over.json()["code"] == "400001"
+    assert bad_bool.status_code == 400 and bad_bool.json()["code"] == "400001"
+
+
+# ---- PATCH /api/v1/threads/{thread_id}（§2.10）----
+
+
+async def test_patch_thread_success_returns_updated_projection(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.patch(
+            f"/api/v1/threads/{_THREAD_ID}",
+            json={"title": "  LangGraph Send API 调研  ", "pinned": True},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == "0" and body["message"] == "ok"
+    # 响应=更新后线程投影（与 §2.2 items[] 同构）
+    assert set(body["data"]) == {
+        "thread_id",
+        "title",
+        "mode_summary",
+        "turn_count",
+        "pinned",
+        "is_unread",
+        "archived",
+        "created_at",
+        "updated_at",
+    }
+    call = service.patch_calls[0]
+    assert call["thread_id"] == _THREAD_ID
+    assert call["title"] == "LangGraph Send API 调研"  # trim 后下发
+    assert call["pinned"] is True and call["user_id"] == _USER_ID
+
+
+async def test_patch_thread_empty_body_400001(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.patch(f"/api/v1/threads/{_THREAD_ID}", json={})
+    assert response.status_code == 400
+    assert response.json()["code"] == "400001"
+    assert service.patch_calls == []
+
+
+async def test_patch_thread_title_validation_400001(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        for bad_title in ("", "   ", "长" * 121):
+            response = await client.patch(
+                f"/api/v1/threads/{_THREAD_ID}", json={"title": bad_title}
+            )
+            assert response.status_code == 400, bad_title
+            assert response.json()["code"] == "400001"
+    assert service.patch_calls == []  # 校验前置：零业务调用
+
+
+async def test_patch_thread_invalid_boolean_400001(overrides: dict) -> None:
+    """非法布尔一律拒（strict 口径：字符串 "true" 不算布尔）。"""
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.patch(
+            f"/api/v1/threads/{_THREAD_ID}", json={"pinned": "true"}
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "400001"
+    assert service.patch_calls == []
+
+
+async def test_patch_thread_not_found_404001(overrides: dict) -> None:
+    service = _FakeThreadService(patch_exc=NotFoundException("线程不存在"))
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.patch(
+            f"/api/v1/threads/{uuid.uuid4()}", json={"archived": True}
+        )
+    assert response.status_code == 404
+    assert response.json()["code"] == "404001"
+
+
+# ---- DELETE /api/v1/threads/{thread_id}（§2.11）----
+
+
+async def test_delete_thread_success(overrides: dict) -> None:
+    service = _FakeThreadService()
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.delete(f"/api/v1/threads/{_THREAD_ID}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == "0" and body["message"] == "ok"
+    assert body["data"] == {"deleted": True}  # §2.11 响应（§4.5 同构）
+    assert service.delete_calls == [_THREAD_ID]
+
+
+async def test_delete_thread_busy_409005(overrides: dict) -> None:
+    service = _FakeThreadService(
+        delete_exc=ThreadBusyException("线程有进行中轮次，不可删除")
+    )
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.delete(f"/api/v1/threads/{_THREAD_ID}")
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "409005"  # 独立码（不复用 409001，D-11）
+    assert body["message"] == "线程有进行中轮次，不可删除"
+    assert "data" not in body
+
+
+async def test_delete_thread_not_found_404001(overrides: dict) -> None:
+    service = _FakeThreadService(delete_exc=NotFoundException("线程不存在"))
+    scheduler = _FakeScheduler()
+    _wire(service, scheduler)
+    async with _client() as client:
+        response = await client.delete(f"/api/v1/threads/{uuid.uuid4()}")
+    assert response.status_code == 404
+    assert response.json()["code"] == "404001"

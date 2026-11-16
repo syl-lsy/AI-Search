@@ -40,9 +40,19 @@
       <symbol id="i-upload" viewBox="0 0 24 24"><path class="stroke" d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" /></symbol>
       <symbol id="i-trash" viewBox="0 0 24 24"><path class="stroke" d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /></symbol>
       <symbol id="i-alert" viewBox="0 0 24 24"><path class="stroke" d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path class="stroke" d="M12 9v4M12 17h.01" /></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path class="stroke" d="M18 6L6 18M6 6l12 12" /></symbol>
       <symbol id="i-refresh" viewBox="0 0 24 24"><path class="stroke" d="M20 12a8 8 0 1 1-2.3-5.6M20 3v4h-4" /></symbol>
       <symbol id="i-filter" viewBox="0 0 24 24"><path class="stroke" d="M4 6h16M7 12h10M10 18h4" /></symbol>
       <symbol id="i-archive" viewBox="0 0 24 24"><rect class="stroke" x="3" y="4" width="18" height="5" rx="1" /><path class="stroke" d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4" /></symbol>
+      <!-- 批次 4 线程管理（REQ-058~060，v1.21）：置顶图钉 -->
+      <symbol id="i-pin" viewBox="0 0 24 24"><path class="stroke" d="M9 3.5h6l-.6 6.2 2.9 2.6v1.7H6.7v-1.7l2.9-2.6L9 3.5z" /><path class="stroke" d="M12 14v6.5" /></symbol>
+      <!-- 批次 2「Perplexity 交互对齐」（REQ-054~057，v1.18）：hover 操作 / 底部操作行图标 -->
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect class="stroke" x="9" y="9" width="12" height="12" rx="2" /><path class="stroke" d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></symbol>
+      <symbol id="i-pencil" viewBox="0 0 24 24"><path class="stroke" d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" /></symbol>
+      <symbol id="i-thumb-up" viewBox="0 0 24 24"><path class="stroke" d="M7 10v11" /><path class="stroke" d="M15 5.88L14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H7v-12l4.55-7.94A3.13 3.13 0 0 1 15 5.88z" /></symbol>
+      <symbol id="i-thumb-down" viewBox="0 0 24 24"><path class="stroke" d="M17 14V3" /><path class="stroke" d="M9 18.12L10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H17v12l-4.55 7.94A3.13 3.13 0 0 1 9 18.12z" /></symbol>
+      <symbol id="i-replay" viewBox="0 0 24 24"><path class="stroke" d="M4 12a8 8 0 1 0 2.34-5.66" /><path class="stroke" d="M4 4v4h4" /></symbol>
+      <symbol id="i-source" viewBox="0 0 24 24"><path class="stroke" d="M12 2l9 5-9 5-9-5 9-5z" /><path class="stroke" d="M3 12l9 5 9-5" /><path class="stroke" d="M3 17l9 5 9-5" /></symbol>
     </defs>
   </svg>
 </template>
