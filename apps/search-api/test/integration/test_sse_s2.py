@@ -22,6 +22,7 @@ import pytest
 from sqlalchemy import select
 
 from test.integration import stub_flow
+from test.integration.conftest import TURN_COMPLETION_TIMEOUT_S
 from test.integration.test_sse import (
     _assert_sse_envelope,
     _assert_stream_headers,
@@ -270,7 +271,7 @@ async def test_enqueue_queued_turn_stream_silent_until_first_stage(
             await asyncio.wait_for(post2, timeout=30)
 
         try:
-            await b2_rest.wait_turn_status(turn2, {"completed"}, timeout_s=45.0)
+            await b2_rest.wait_turn_status(turn2, {"completed"}, timeout_s=TURN_COMPLETION_TIMEOUT_S)
             stream = await asyncio.wait_for(stream_task, timeout=45)
         finally:
             stream_task.cancel()
@@ -319,7 +320,7 @@ async def test_break_strategy_old_turn_stream_tail_and_new_turn_stream(
         turn2 = resp2.json()["data"]["turn_id"]
         detail1 = await b2_rest.wait_turn_status(turn1, {"canceled"})
         assert detail1["cancel_reason"] == expected_reason
-        detail2 = await b2_rest.wait_turn_status(turn2, {"completed"}, timeout_s=45.0)
+        detail2 = await b2_rest.wait_turn_status(turn2, {"completed"}, timeout_s=TURN_COMPLETION_TIMEOUT_S)
     finally:
         await asyncio.gather(post1, return_exceptions=True)
 

@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from test.integration import stub_flow
+from test.integration.conftest import TURN_COMPLETION_TIMEOUT_S
 from app.core.config import sse_settings
 from app.db.models import TurnEvent
 from app.db.session import get_session_factory
@@ -89,7 +90,11 @@ async def _create_completed_turn(async_client, wait_for) -> str:
         r = await async_client.get(f"/api/v1/turns/{turn_id}")
         return r.status_code == 200 and r.json()["data"]["status"] == "completed"
 
-    await wait_for(_completed, timeout_s=30.0, description="桩轮到达 completed")
+    await wait_for(
+        _completed,
+        timeout_s=TURN_COMPLETION_TIMEOUT_S,
+        description="桩轮到达 completed",
+    )
     return turn_id
 
 

@@ -1,16 +1,17 @@
 """rewrite 节点（B3 节点 1/5——ARCH §4.1 rewrite 行 / DEV §5.1 五步闭环）。
 
 职责五合一（light 模型，S14/S15 基元）：
-① 指代消解 ② 顺带分类（6+1）③ 参数可答判定 ④ 检索 query 集（type_query_map 夹取）
-⑤ 检索策略判定（v1.44 B9：`search_strategy ∈ {direct,verify,web}`，nacos-config.md
-§1 v1.20——「搜不搜」与「答案形态」两维正交，QueryType 枚举零变更）。
+① 指代消解 ② 顺带分类（7+1）③ 参数可答判定 ④ 检索 query 集（type_query_map 夹取）
+⑤ 检索策略判定（v1.44 B9：`search_strategy ∈ {direct,verify,web}`；v1.51 +recall——
+nacos-config.md §1 v1.27，「搜不搜」与「答案形态」两维正交）。
 语言判定已前置纯代码（TurnRunner 注入 `query_lang`，改写不改判——PRD OQ-2）。
 
-**策略灰度安全（v1.20 硬约束）**：字段缺失（旧提示词 v1.18）/ 值非法 / 两兜底路径一律
-`web`——pydantic 缺省 `web` + 修复回喂失败走机制兜底（strategy=web, answerable=false），
-旧提示词 + 新代码 = 全量轮零行为变化。对齐纪律（nacos §1「两字段必须一致」）：
-`verify → answerable=True`；`direct → answerable=False`；`web → 保留模型原值`
-（回滚态 answerable 驱动的 synthesis 变体不变——ARCH §8 B9①）。
+**策略灰度安全（v1.20 硬约束，v1.51 沿用）**：字段缺失（旧提示词 v1.18）/ 值非法 / 两兜底
+路径一律 `web`——pydantic 缺省 `web` + 修复回喂失败走机制兜底（strategy=web,
+answerable=false），旧提示词 + 新代码 = 全量轮零行为变化。对齐纪律（nacos §1「两字段必须
+一致」）：`verify → answerable=True`；`direct`/`recall → answerable=False`；`web → 保留模型
+原值`（回滚态 answerable 驱动的 synthesis 变体不变——ARCH §8 B9①）。recall 强制 false 的
+理由=**历史 ≠ 知识**（线程私有内容非模型通用稳定知识，ARCH §4.1 v1.51）。
 
 失败语义（ARCH §4.1/§6.2，不终止两路径）：
 - **校验失败**（结构化输出解析/校验不过）→ 修复回喂 1 次（§6.2 P1：校验错误文本回喂）
@@ -76,11 +77,20 @@ TRANSPORT_FALLBACK_QUERY_TYPE: str = "other"
 FALLBACK_SEARCH_STRATEGY: str = "web"
 
 QueryType = Literal[
-    "factoid", "list", "comparison", "multi_facet", "temporal", "how_to", "other"
+    "factoid",
+    "list",
+    "comparison",
+    "multi_facet",
+    "temporal",
+    "how_to",
+    "navigational",  # v1.51：导航查询（官网/下载/入口/登录页类——结论单一，clamp 1 query）
+    "other",
 ]
 
-#: 检索策略三值（v1.44 B9 / nacos-config.md §1 v1.20——「搜不搜」正交维度）
-SearchStrategy = Literal["direct", "verify", "web"]
+#: 检索策略四值（v1.44 B9 三值 / v1.51 +recall——「搜不搜」正交维度）
+#: - direct：免检索直答轮（零事实面）；recall：回顾整理轮（历史重新生成，免检索直达）；
+#: - verify ≡ answerable=true；web 默认全管道。
+SearchStrategy = Literal["direct", "verify", "web", "recall"]
 
 
 class RewriteOutput(BaseModel):
@@ -294,12 +304,14 @@ def _aligned_answerable(strategy: str, answerable: bool) -> bool:
 
     - `verify`：强制 True（模型判 verify 但答 false 时以 strategy 为准修正）；
     - `direct`：强制 False（零事实面轮；synthesis 变体消费 strategy，不读该位）；
+    - `recall`：强制 False（v1.51——**历史 ≠ 知识**：线程私有内容不属模型通用稳定知识，
+      不宣称「参数可答」；即使模型误置 true 亦对齐到 false）；
     - `web`：**保留原值**——回滚态（web + answerable=true）仍切「先知识后取证」段，
       旧提示词 + 新代码的合成行为零变化（ARCH §8 B9① 明文）。
     """
     if strategy == "verify":
         return True
-    if strategy == "direct":
+    if strategy in ("direct", "recall"):
         return False
     return answerable
 

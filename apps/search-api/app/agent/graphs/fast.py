@@ -7,9 +7,11 @@
     → sources(归并终态集) → images(可选，≤3 张) → stage(write,running,label=综合中)
     → token…token（messages 流） → stage(write,done)
 
-- rewrite（1/5）出条件边三目标（v1.44 B9③）：`search_strategy=direct` → synthesis
-  （免检索直答，绕过检索段；判定先于空 queries）/ 空 queries → merge_dedupe /
-  其余 → Send 扇出 web_search×N；merge_dedupe（2/5）/web_search（3/5 Send 扇出）/
+- rewrite（1/5）出条件边四目标（v1.44 B9③ direct / v1.51 recall——**目标复用**）：
+  `search_strategy ∈ {direct, recall}` → synthesis（免检索直达，绕过检索段；direct 零事实面轮
+  / recall 回顾整理轮〔历史经 `history_recall` 注入 synthesis〕；判定先于空 queries）/
+  空 queries → merge_dedupe / 其余 → Send 扇出 web_search×N；merge_dedupe（2/5）/
+  web_search（3/5 Send 扇出）/
   fuse_rerank（4/5 KB 命中 rerank+topN+snippet≤500+sources 发射点+images 选图发射
   （A6——沿 fused 序 ≤3 张，紧邻 sources 之后）/synthesis（5/5——chat 模型流式，
   token/thinking 经 messages 流，节点只累积 answer_md）全部接真；
@@ -33,6 +35,10 @@ from app.agent.nodes.synthesis import synthesis
 from app.agent.nodes.web_search import search_fanout, web_search
 from app.agent.state import FastState
 
+#: rewrite 条件边目标表（v1.51 四目标映射的目标侧——recall 与 direct 共用 synthesis，
+#: 目标列表本批零改动；单测锁结构 `search_fanout_targets`）
+search_fanout_targets: list[str] = ["web_search", "merge_dedupe", "synthesis"]
+
 
 def build_fast_graph() -> Any:
     """编译 fast 子图（B3 五节点拓扑完备；kb_search 于 B5/M3 插入）。"""
@@ -44,10 +50,9 @@ def build_fast_graph() -> Any:
     builder.add_node("synthesis", synthesis)  # 节点名=节点语义（§6.1 messages 过滤判定面）；stage_key=write 在节点内发射
     builder.add_edge(START, "rewrite")
     # Send 扇出：rewrite 出边按 rewritten_queries 产 Send("web_search")×N（§4.1 拓扑）
-    # v1.44 B9③：三目标条件边——direct 免检索直答轮直达 synthesis（子图内改，主图拓扑零改动）
-    builder.add_conditional_edges(
-        "rewrite", search_fanout, ["web_search", "merge_dedupe", "synthesis"]
-    )
+    # v1.44 B9③ / v1.51：四目标条件边——direct/recall 免检索直达轮直达 synthesis（目标复用，
+    # 子图内改、主图拓扑零改动）
+    builder.add_conditional_edges("rewrite", search_fanout, search_fanout_targets)
     builder.add_edge("web_search", "merge_dedupe")
     builder.add_edge("merge_dedupe", "fuse_rerank")
     builder.add_edge("fuse_rerank", "synthesis")

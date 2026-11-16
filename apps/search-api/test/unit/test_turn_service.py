@@ -698,7 +698,7 @@ async def test_search_chain_unavailable_short_circuits_500201() -> None:
 async def test_assembly_load_history_failure_fails_turn_closes_channel_nudges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """组装段 _load_history DB 故障（此前位于 try 之外 → 异常外泄、turn 永卡 running：
+    """组装段 _load_history_rows DB 故障（此前位于 try 之外 → 异常外泄、turn 永卡 running：
     无终态落库、无 SSE 终态、队头不被 nudge）：现须 failed 终态落库 + error 事件
     （500001）+ close_channel（api.md §7.1 v1.10 零内容例外——error 后直接关闭、
     无 done）+ thread 队列 nudge；异常不外泄（外泄即本用例在 await 行抛错变红）。"""
@@ -712,7 +712,7 @@ async def test_assembly_load_history_failure_fails_turn_closes_channel_nudges(
     async def boom(thread_id: str, turn_id: str) -> list[dict[str, str]]:
         raise RuntimeError("历史装配 DB 故障")
 
-    monkeypatch.setattr(scheduler, "_load_history", boom)
+    monkeypatch.setattr(scheduler, "_load_history_rows", boom)
 
     await scheduler._execute_turn(turn)  # 异常不得外泄为未处理栈
 
@@ -1137,6 +1137,7 @@ async def test_execute_turn_injects_full_fast_state_input() -> None:
         "query",
         "chat_model_key",
         "history",
+        "history_recall",  # v1.51：回顾装配第二通道（与 history 同 SQL、骨架形态）
         "query_lang",
         "spec",
         "images",
@@ -1176,6 +1177,47 @@ async def test_execute_turn_injects_full_fast_state_input() -> None:
     # langfuse_* 契约键全量（langfuse 4.18.0 实证）：user=发起者、tags=模式标签（Langfuse 侧过滤维度）
     assert config["metadata"]["langfuse_user_id"] == str(turn.user_id)
     assert config["metadata"]["langfuse_tags"] == [f"mode:{turn.mode}"]
+
+
+async def test_execute_turn_assembles_history_recall_skeleton_channel() -> None:
+    """v1.51 装配双通道：`history_recall` = 问题全文 + 答案首段/标题骨架（时间正序），
+    `history` 通道形态零变化（{q, a_head≤200}）——同一 statement 各自成形（ARCH §6.5）。
+
+    断言价值：`history_recall` 键存在≠装配正确——骨架配方（首段保结论 + 标题保「知道
+    丢了什么」+ 每节首句 + 中段细节不搬运）在 TurnRunner 装配层必须如实呈现，否则
+    synthesis recall 变体拿到的是全文或空块（R18 配方锁的装配侧锚点）。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", query="你之前聊了什么？")
+    answer_md = (
+        "先说结论：用 StateGraph 编排。\n\n"
+        "## 架构设计\n\n"
+        "节点即函数，边决定流转顺序。后续中段细节不应搬运。\n"
+    )
+    session = _FakeSession(
+        turn=turn,
+        execute_rows=[  # 历史查询返回（created_at desc 形态：新→旧）
+            ("最近一问", answer_md),
+            ("更早一问", "更早答案。"),
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert [item["q"] for item in payload["history_recall"]] == ["更早一问", "最近一问"]  # 时间正序
+    recent = payload["history_recall"][-1]
+    assert recent["a"].startswith("先说结论：用 StateGraph 编排。")  # 首段（结论先行）
+    assert "## 架构设计" in recent["a"]  # 标题骨架
+    assert "节点即函数，边决定流转顺序。" in recent["a"]  # 每节首句
+    assert "后续中段细节不应搬运" not in recent["a"]  # 中段细节不搬运（骨架语义）
+    # 第一通道形态回归：键名与截断口径零变化（{q, a_head≤200}）
+    assert payload["history"] == [
+        {"q": "更早一问", "a_head": "更早答案。"},
+        {"q": "最近一问", "a_head": answer_md[:200]},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1559,3 +1601,62 @@ async def test_emit_context_compact_helper_payload_shape(monkeypatch: pytest.Mon
         "offloaded_files": [{"ref": "/x.md", "url": "https://e.com/p"}],
     }]
 
+
+
+# ---- 历史装配单查合一 + deep 轮门控（评审 P2-2）----
+
+
+async def test_assembly_history_rows_loaded_once_for_two_channels() -> None:
+    """双通道共用一次 SQL：`_load_history_rows` 每轮查一次，两通道进程内各自成形。
+
+    修复前 `_load_history` / `_load_history_recall` 各执行一遍逐字相同的 statement
+    （同一窗口/同一纳入口径）——白付一次往返与一次全量 answer_md 传输。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="回顾一下")
+    session = _FakeSession(
+        turn=turn,
+        execute_rows=[("上一问二", "答" * 250), ("上一问一", "更早答案")],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    calls: list[tuple[str, str]] = []
+    original = scheduler._load_history_rows
+
+    async def _spy(thread_id: str, turn_id: str) -> list[Any]:
+        calls.append((thread_id, turn_id))
+        return await original(thread_id, turn_id)
+
+    scheduler._load_history_rows = _spy  # type: ignore[method-assign]
+
+    await scheduler._execute_turn(turn)
+
+    assert len(calls) == 1, f"历史装配应只查一次，实测 {len(calls)} 次"
+    payload = graph.payloads[0]
+    # 通道一（rewrite 消费）：{q, a_head≤200}，时间正序
+    assert payload["history"] == [
+        {"q": "上一问一", "a_head": "更早答案"},
+        {"q": "上一问二", "a_head": "答" * 200},
+    ]
+    # 通道二（recall 消费）：{q, a(骨架)}，时间正序
+    assert [item["q"] for item in payload["history_recall"]] == ["上一问一", "上一问二"]
+
+
+async def test_assembly_deep_turn_skips_recall_channel() -> None:
+    """deep 轮不装配 history_recall（DeepState 不消费；total=False 缺键合法）。
+
+    门控意义：骨架解析与 character 预算属纯 CPU 成本，deep 轮白付无收益
+    （deep 上下文由 planner/子代理摘要管理，ARCH §4.2/§6.5）。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="deep", query="深度研究题")
+    session = _FakeSession(turn=turn, execute_rows=[("上一问", "答案")])
+    graph = _FakeGraph([_updates({"write": {"answer_md": "报告"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert "history" in payload  # 通道一照旧（planner 指代消解）
+    assert "history_recall" not in payload  # 通道二 deep 轮不装配

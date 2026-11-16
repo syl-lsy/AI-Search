@@ -33,9 +33,25 @@ def content_md5(raw: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
+def canonical_text(payload: Mapping[str, Any]) -> str:
+    """配置内容的唯一规范化序列化口径（`indent=2` 缩进 + 中文不转义）。
+
+    Nacos 发布端（scripts/nacos_init.py）与本文防抖 md5 / 磁盘快照共用此口径：发布端为
+    独立标准库脚本不 import 本包，两侧一致性由 test/unit/test_canonical_serialization.py
+    的跨端护栏锁定。缩进形态只为控制台可读（解析侧 json.loads 对空白不敏感，内容语义与
+    紧凑形态等价）；口径分裂会让「内容等价但字节不同」在每次启动触发一次假换版 +
+    落盘 + INFO 噪音，违背 §6 md5 防抖的设计意图。
+    """
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def payload_md5(payload: Mapping[str, Any]) -> str:
-    """payload 的确定性 md5（内置默认/磁盘快照无原始推送文本时的等价口径）。"""
-    return content_md5(json.dumps(payload, ensure_ascii=False))
+    """payload 的确定性 md5（内置默认/磁盘快照无原始推送文本时的等价口径）。
+
+    口径 = canonical_text 的字节（与 Nacos 发布端同一序列化形式），否则发布内容送达后
+    与内置默认的 md5 不等，防抖恒失效（见 canonical_text docstring）。
+    """
+    return content_md5(canonical_text(payload))
 
 
 @dataclass(frozen=True)
@@ -108,7 +124,7 @@ def write_disk_snapshot(snapshot_dir: Path, data_id: str, payload: Mapping[str, 
     """
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     target = snapshot_dir / data_id
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    text = canonical_text(payload)
     fd, tmp_path = tempfile.mkstemp(dir=snapshot_dir, prefix=f".{data_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:

@@ -137,7 +137,7 @@ export interface StageExtra {
   subagents?: SubAgent[]
   subtopics?: number
   sections?: number
-  /** api.md §7.4 v1.14 direct 形态留痕：rewrite 输出 search_strategy=direct 时携带（前端不消费不展示） */
+  /** api.md §7.4 v1.14 direct / v1.22 recall 形态留痕：rewrite 输出 search_strategy=direct|recall 时携带（前端不消费不展示；类型保持宽松 string——B9 先例，枚举扩容零类型形状变更） */
   strategy?: string
   /** api.md §7.2/§2.5 v1.19 P1b 留痕：源名→同源延迟重试次数映射（stage(search,done) extra，形如 {"tavily": 1}；无重试零键，前端零渲染义务） */
   source_retries?: Record<string, number>

@@ -43,6 +43,7 @@ import re
 import time
 
 import httpx
+import pytest
 
 from test.integration.test_sse import _assert_sse_envelope, _assert_stream_headers
 
@@ -436,3 +437,123 @@ def test_e2e_fast_direct_round_contract(base_url):
     assert detail["duration_ms"] < 60_000, (
         f"direct 轮应远快于常规轮预算（<60s 观测上限），实测 {detail['duration_ms']}ms"
     )
+
+
+# ---- recall 回顾整理轮 + navigational 导航题契约用例（v1.51 / api.md §7.4 v1.22）----
+
+#: 回顾型问题（nacos-config.md §1 v1.27 判例原文「之前聊了什么」的同义形态）
+ZH_RECALL_QUERY = "你之前聊了什么？"
+#: 回顾轮前的历史铺垫（两轮实质问答——答案关键词用于回顾覆盖断言）
+ZH_RECALL_SEED_QUERIES = (
+    "TCP 三次握手的过程是什么？",
+    "HTTP/2 和 HTTP/3 有什么区别？",
+)
+#: 回顾轮答案应覆盖的历史主题词（任一命中即视为回顾到历史内容）
+ZH_RECALL_HISTORY_KEYWORDS = ("TCP", "握手", "HTTP", "QUIC", "三次")
+
+
+def _create_followup_turn(base_url: str, thread_id: str, query: str) -> str:
+    """POST /api/v1/threads/{id}/turns 同线程追问（§2.2），返回 turn_id。"""
+    resp = httpx.post(
+        f"{base_url}/api/v1/threads/{thread_id}/turns",
+        json={"query": query, "mode": "fast"},
+        timeout=30.0,
+    )
+    assert resp.status_code == 200, f"追问建轮失败：{resp.status_code} {resp.text}"
+    body = resp.json()
+    assert body["code"] == "0"
+    return body["data"]["turn_id"]
+
+
+def test_e2e_fast_recall_round_contract(base_url):
+    """回顾整理轮端到端（A48 第一条 GWT）：零 stage(search)/sources/images + 无 [n] +
+    source_count=0 + 答案含历史轮关键词。
+
+    严格断言、无 skip 门（沿 B9 direct 用例纪律）：判例题来自 nacos §1 v1.27 判据，
+    若实测非 recall 说明提示词/模型判定面回归或漂移——用例红，不用环境理由掩盖。
+    """
+    # 同线程两轮实质问答（历史铺垫；各自完成后再问回顾型问题）
+    first = _create_turn(base_url, ZH_RECALL_SEED_QUERIES[0])
+    thread_id = httpx.get(f"{base_url}/api/v1/turns/{first}", timeout=30.0).json()["data"][
+        "thread_id"
+    ]
+    _collect_stream(base_url, first)
+    assert _get_detail(base_url, first)["status"] in {"completed", "degraded"}
+
+    second = _create_followup_turn(base_url, thread_id, ZH_RECALL_SEED_QUERIES[1])
+    _collect_stream(base_url, second)
+    assert _get_detail(base_url, second)["status"] in {"completed", "degraded"}
+
+    recall_turn = _create_followup_turn(base_url, thread_id, ZH_RECALL_QUERY)
+    frames, _heartbeats = _collect_stream(base_url, recall_turn)
+    detail = _get_detail(base_url, recall_turn)
+
+    strategy = _rewrite_strategy(frames)
+    assert strategy == "recall", (
+        f"回顾型判例题应判 recall（nacos §1 v1.27 判例），实测 strategy={strategy}——"
+        "检查 rewrite 提示词策略段与 light 模型判定"
+    )
+
+    for frame in frames:
+        _assert_sse_envelope(frame, recall_turn)
+
+    done = frames[-1]
+    assert done["event"] == "done"
+    assert done["data"]["finish"] == "completed"
+    assert done["data"]["source_count"] == 0, "recall 轮 source_count 恒 0（零检索）"
+    assert done["data"]["degraded"] is False
+    assert done["data"]["duration_ms"] == detail["duration_ms"]
+
+    # 零源抑制（与 direct 同款）：无 sources/images 事件 + stages 恰两段
+    assert not [f for f in frames if f["event"] in ("sources", "images")]
+    stage_keys = [
+        f["data"]["stage_key"] for f in frames if f["event"] == "stage"
+    ]
+    assert "search" not in stage_keys
+    assert {stage["stage_key"] for stage in detail["stages"]} == {"rewrite", "write"}
+    assert detail["sources"] == []
+
+    # 答案：非空、≤3000 字、无 [n] 引用（零源轮无引用义务）、覆盖历史主题词
+    answer_md = detail["answer_md"]
+    assert answer_md, "recall 轮答案为空"
+    _assert_zh_char_cap(answer_md)
+    assert not _CITATION_RE.findall(answer_md), (
+        f"recall 轮答案不得带 [n]（零来源可引）：{_CITATION_RE.findall(answer_md)}"
+    )
+    assert any(keyword in answer_md for keyword in ZH_RECALL_HISTORY_KEYWORDS), (
+        "回顾答案未覆盖历史轮主题（应含 "
+        f"{ZH_RECALL_HISTORY_KEYWORDS} 任一）：{answer_md[:200]}"
+    )
+
+
+#: 导航型问题（nacos-config.md §1 v1.27 判例「Vue 官网」的同义形态）
+ZH_NAVIGATIONAL_QUERY = "Vue 官网地址是什么？"
+
+
+def test_e2e_fast_navigational_round(base_url):
+    """导航查询题型（A49）：走完整检索形态（search/sources 在场、答案带 [n]）+
+    改写 query 钳制 1 条（type_query_map navigational:[1,1] 表驱动）。
+
+    外网环境性失败口径（沿 B9）：整轮 degraded（源全断/网络不可达）时 skip 挂牌——
+    题型判定面（query 数钳制）与引用义务归确定性用例（unit/integration）承担。
+    """
+    turn_id = _create_turn(base_url, ZH_NAVIGATIONAL_QUERY)
+    frames, _heartbeats = _collect_stream(base_url, turn_id)
+    detail = _get_detail(base_url, turn_id)
+
+    if detail["status"] == "degraded" and not detail["answer_md"]:
+        pytest.skip(
+            "导航题整轮 degraded（外网搜索源不可达）——环境性失败挂牌，"
+            "题型判定与 clamp 1 由 integration test_navigational_round_full_search_chain 锁定"
+        )
+
+    for frame in frames:
+        _assert_sse_envelope(frame, turn_id)
+
+    _assert_fast_trunk_order(frames)  # 完整检索形态（rewrite→search→write）
+    assert [f for f in frames if f["event"] == "sources"], "导航题应发 sources 事件"
+    assert len(detail["rewritten_queries"]) == 1, (
+        f"navigational 题型 query 应钳制 1 条，实测 {detail['rewritten_queries']}"
+    )
+    assert detail["sources"], "导航题应有来源卡片"
+    _assert_citations_align(detail["answer_md"], detail["sources"])

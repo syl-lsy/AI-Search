@@ -30,6 +30,7 @@ from app.core.config import common_settings
 from app.services.event_bus import SseEvent
 from app.services.turn_service import seed_seq_from_db
 from test.integration import stub_flow
+from test.integration.conftest import TURN_COMPLETION_TIMEOUT_S
 from test.integration.test_sse import _assert_sse_envelope, parse_sse_frames
 
 pytestmark = pytest.mark.requires_db
@@ -371,7 +372,9 @@ async def test_regenerate_double_click_while_running_409006(
     finally:
         if not first_task.done():
             first_task.cancel()
-    await b2_rest.wait_turn_status(str(_TURN_ID), {"completed"}, timeout_s=30)
+    await b2_rest.wait_turn_status(
+        str(_TURN_ID), {"completed"}, timeout_s=TURN_COMPLETION_TIMEOUT_S
+    )
 
 
 # ---- 取消联动 ----

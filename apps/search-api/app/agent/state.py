@@ -11,8 +11,20 @@
 from operator import add, or_
 from typing import Annotated, Any, Literal, TypedDict
 
-#: rewrite/planner 顺带分类的 6+1 枚举（other 兜底；nacos-config.md §3 common.type_rules）
-QueryType = Literal["factoid", "list", "comparison", "multi_facet", "temporal", "how_to", "other"]
+#: rewrite/planner 顺带分类的 7+1 枚举（other 兜底；nacos-config.md §3 common.type_rules
+#: v1.27 +navigational——**必须与 `nodes/fast_rewrite.QueryType` 逐字一致**，
+#: 单测 test_stub_graphs 锁双源（deep.planner 判导航型仍输出 factoid，故 state 注解
+#: 的 8 值面不改变 deep 行为）
+QueryType = Literal[
+    "factoid",
+    "list",
+    "comparison",
+    "multi_facet",
+    "temporal",
+    "how_to",
+    "navigational",
+    "other",
+]
 
 #: 时效信号（rewrite/planner 产出，透传 Tavily time_range）
 TimeRange = Literal["day", "week", "month", "year"] | None
@@ -44,13 +56,15 @@ class MainState(TypedDict, total=False):
     query: str
     chat_model_key: str
     history: list[HistoryItem]
+    history_recall: list[HistoryItem]  # v1.51：回顾装配第二通道（recall 轮 synthesis 消费，
+    #                                   骨架配方见 utils/history_recall.py + ARCH §6.5）
     images: list[str]
     query_lang: Literal["zh", "en"]
     # 子图产出回填（顶层 updates 同名键合并）
     answer_md: str
     query_type: QueryType
     answerable_from_knowledge: bool
-    search_strategy: Literal["direct", "verify", "web"]
+    search_strategy: Literal["direct", "verify", "web", "recall"]  # v1.51 四值（与 fast_rewrite.SearchStrategy 逐字一致）
     time_range: TimeRange
     rewritten_queries: list[str]
     candidates: list[Candidate]
@@ -94,13 +108,15 @@ class FastState(TypedDict, total=False):
     mode: Literal["fast"]
     chat_model_key: str  # qwen | glm | deepseek（快照内解析 LiteLLM 别名；M4 视觉轮 vision）
     history: list[HistoryItem]
+    history_recall: list[HistoryItem]  # v1.51 回顾装配第二通道（仅 fast recall 轮消费；
+    #                                    deep 侧声明保持「输入字段同构」契约，deep 不消费——P1 裁决）
     images: list[str]  # M4 预留：data URL ≤3，触发 vision 模型（本批恒空）
     spec: dict[str, Any]
     query_lang: Literal["zh", "en"]
     # rewrite 产出（light 模型结构化输出，S14/S15）
     query_type: QueryType
     answerable_from_knowledge: bool
-    search_strategy: Literal["direct", "verify", "web"]  # v1.44 B9②：direct 条件边 + synthesis 变体消费（缺省/非法=web）
+    search_strategy: Literal["direct", "verify", "web", "recall"]  # v1.44 B9② 三值 + v1.51 recall 第四值：direct/recall 条件边 + synthesis 变体消费（缺省/非法=web）
     time_range: TimeRange
     rewritten_queries: list[str]
     # 检索产出（Send 扇出并行写入 → merge_dedupe 消费）
@@ -130,6 +146,7 @@ class DeepState(TypedDict, total=False):
     mode: Literal["deep"]
     chat_model_key: str
     history: list[HistoryItem]
+    history_recall: list[HistoryItem]  # v1.51 声明保「输入字段同构」（deep 不消费——P1 裁决）
     images: list[str]
     spec: dict[str, Any]
     query_lang: Literal["zh", "en"]

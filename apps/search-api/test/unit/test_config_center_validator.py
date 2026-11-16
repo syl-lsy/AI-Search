@@ -15,6 +15,7 @@ import pytest
 from app.config_center.defaults import BUILTIN_DEFAULTS
 from app.config_center.validator import (
     AssetValidationError,
+    SYNTHESIS_VARIANT_PREFIXES,
     sniff_secret_violations,
     validate_asset,
 )
@@ -105,13 +106,20 @@ class TestSecretSniffing:
     def test_mid_string_dash_not_false_positive(self):
         """非开头子串（如 task-xxx）不误伤——契约正则为开头锚定。
 
-        注：v1.20 起 fast.rewrite 覆盖值须含 `"search_strategy"`（§3 校验条 1），
-        故本用例取值带上该 token（本用例只验密钥嗅探不误伤，与内容规则正交）。
+        注：v1.20 起 fast.rewrite 覆盖值须含 `"search_strategy"`（§3 校验条 1）、v1.27 起
+        还须含**枚举串本体**（`"search_strategy":"direct|verify|web|recall"` 与
+        `|navigational|other"`，散文提及不算），故本用例取值带上两处契约形态
+        （本用例只验密钥嗅探不误伤，与内容规则正交）。
         """
         payload = _mutated(
             PROMPTS_DATA_ID,
             lambda p: p["prompts"].update(
-                {"fast.rewrite": '前缀 task-123 "search_strategy":"direct|verify|web" 后缀'}
+                {
+                    "fast.rewrite": (
+                        '前缀 task-123 "search_strategy":"direct|verify|web|recall" '
+                        '"query_type":"factoid|how_to|navigational|other" 后缀'
+                    )
+                }
             ),
         )
         assert validate_asset(PROMPTS_DATA_ID, payload) == payload
@@ -423,7 +431,7 @@ class TestPromptsSearchStrategyRules:
             lambda p: p["prompts"].update(
                 {
                     "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
-                        '"search_strategy":"direct|verify|web",', ""
+                        '"search_strategy":"direct|verify|web|recall",', ""
                     )
                 }
             ),
@@ -513,3 +521,135 @@ class TestConnectionRetryNode:
         payload = _mutated(SPEC_DATA_ID, lambda p: p["fast"]["retry"].pop("connection"))
         assert validate_asset(SPEC_DATA_ID, payload) == payload
         assert connection_retry_warnings(payload["fast"]) == []
+
+
+class TestRecallNavigationalRules:
+    """§3 v1.27 校验扩容（recall/navigational 防热更漂移）。"""
+
+    def test_type_query_map_missing_navigational_rejected(self):
+        """§3 v1.27：type_query_map 须覆盖 8 类枚举（缺 navigational 拒收）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p: p["fast"]["type_query_map"].pop("navigational")
+        )
+        with pytest.raises(AssetValidationError, match="navigational"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_synthesis_template_missing_recall_prefix_rejected(self):
+        """fast.synthesis 缺「回顾整理路径」行前缀 → 整版拒收（四段结构性校验扩容）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.synthesis": p["prompts"]["fast.synthesis"].replace(
+                        "- 回顾整理路径", "- 其他路径"
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="回顾整理路径"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_rewrite_template_enum_without_recall_rejected(self):
+        """fast.rewrite 全文缺 recall 字样 → 整版拒收（沿 v1.20 防漂移先例；模拟漂移回
+        v1.20 文本形态——schema 枚举串与判定正文同时回退）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {"fast.rewrite": p["prompts"]["fast.rewrite"].replace("recall", "")}
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="recall"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_rewrite_template_enum_without_navigational_rejected(self):
+        """fast.rewrite 枚举串缺 navigational 字样 → 整版拒收。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
+                        "how_to|navigational|other", "how_to|other"
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="navigational"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    @pytest.mark.parametrize("prefix", SYNTHESIS_VARIANT_PREFIXES)
+    def test_synthesis_any_variant_prefix_missing_rejected(self, prefix):
+        """四段行前缀完整性（§3 v1.27）：任一段缺失（含既有三段）一律整版拒收。
+
+        既有用例只覆盖「常规路径」/「免检索直答路径」缺失 + 本批新增「回顾整理路径」，
+        「最小检索路径」此前无拒收用例——本参数据逐段回归常量与提示词的四段对齐
+        （该校验器按 `SYNTHESIS_VARIANT_PREFIXES` 遍历，是行级切分的唯一锚点）。
+        """
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {"fast.synthesis": p["prompts"]["fast.synthesis"].replace(prefix, "- 其他路径")}
+            ),
+        )
+        with pytest.raises(AssetValidationError, match=prefix[2:]):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+
+class TestValidatorProseBypassHardening:
+    """评审修复轮（security P3②/③ + 评审 P3④）：枚举串精确形态 + history_block 占位符。"""
+
+    def test_enum_recall_removed_but_prose_mentions_recall_still_rejected(self):
+        """散文绕过探针：枚举串删 recall、正文仍多处提及 recall → 必须拒收。
+
+        修复前 token 匹配全文子串（`"recall" in rewrite`）——散文提及即可蒙混，
+        热更漂移回三值枚举时静默放过（recall 边永不触发）。
+        """
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
+                        '"search_strategy":"direct|verify|web|recall"',
+                        '"search_strategy":"direct|verify|web"',
+                        # 正文保留 recall 字样（④ 检索策略判定句 = 散文面）
+                    )
+                }
+            ),
+        )
+        text = payload["prompts"]["fast.rewrite"]
+        assert "recall" in text  # 前置：散文面确实还提到 recall
+        with pytest.raises(AssetValidationError, match="recall"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_enum_navigational_removed_but_prose_mentions_it_still_rejected(self):
+        """散文绕过探针（题型侧）：枚举串删 navigational、正文仍提及 → 必须拒收。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
+                        "how_to|navigational|other", "how_to|other"
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="navigational"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_synthesis_template_without_history_block_placeholder_rejected(self):
+        """fast.synthesis 缺 `{{history_block}}` 占位符 → 拒收（security P3③）。
+
+        实证风险：热更删占位符仍过校验 → recall 轮静默丢历史注入（模板无占位符时
+        render_prompt 不报错，历史块被无提示地弃用）——无占位符即无 recall 能力。
+        """
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.synthesis": p["prompts"]["fast.synthesis"].replace(
+                        "{{history_block}}", ""
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="history_block"):
+            validate_asset(PROMPTS_DATA_ID, payload)

@@ -83,6 +83,7 @@ from app.schemas.turn import (
     UsageBrief,
 )
 from app.services.event_bus import EventBus, SseEvent, get_event_bus
+from app.utils.history_recall import assemble_history_recall
 from app.services.followups_service import (
     FOLLOWUPS_SOURCES_MAX,
     FollowupsSettings,
@@ -1697,21 +1698,35 @@ class ThreadScheduler:
                 row.query_lang = query_lang
                 await session.commit()
 
-    async def _load_history(self, thread_id: str, turn_id: str) -> list[dict[str, str]]:
-        """最近 N 轮历史装配（ARCH §6.5：{q, a_head≤HISTORY_ANSWER_HEAD_CHARS}）。
+    async def _load_history_rows(self, thread_id: str, turn_id: str) -> list[Any]:
+        """历史行集单查（ARCH §6.5 双通道共享）：最近 N 轮 `(query, answer_md)`，时间正序。
 
-        短事务只读，图启动前完成；纳入/排除口径见 history_statement。返回时间正序
-        （旧→新，提示词装配自然读序）。
+        短事务只读一次、两通道进程内各自成形（`_format_history` / `assemble_history_recall`）
+        ——修复前两通道各执行一遍逐字相同的 statement（评审 P2：白付一次往返与一次全量
+        answer_md 传输）。纳入/排除口径见 `history_statement`（`_HISTORY_STATUSES` /
+        rolled_back 排除，两通道共享零变更）。
         """
         async with self._session_factory() as session:
             rows = (await session.execute(history_statement(thread_id, turn_id))).all()
+        return list(reversed(rows))
+
+    @staticmethod
+    def _format_history(rows: list[Any]) -> list[dict[str, str]]:
+        """通道一（rewrite/planner 消费）：{q, a_head≤HISTORY_ANSWER_HEAD_CHARS}。"""
         return [
             {
                 "q": str(query),
                 "a_head": str(answer_md or "")[:HISTORY_ANSWER_HEAD_CHARS],
             }
-            for query, answer_md in reversed(rows)
+            for query, answer_md in rows
         ]
+
+    @staticmethod
+    def _format_history_recall(rows: list[Any]) -> list[dict[str, str]]:
+        """通道二（recall 轮 synthesis 消费）：{q, a(骨架)}——骨架配方见 utils/history_recall。"""
+        return assemble_history_recall(
+            [(str(query), str(answer_md or "")) for query, answer_md in rows]
+        )
 
     async def _can_start(self, row: Any) -> bool:
         """启动条件（每线程同时一轮）：无其他 ACTIVE 轮 + 抢占/FIFO 次序约束。
@@ -1811,7 +1826,7 @@ class ThreadScheduler:
         turn_id = str(turn.id)
         thread_id = str(turn.thread_id)
         # 组装段（快照捕获→首个 stage 发布）异常收口（评审 P2）：此前该段位于 try 之外，
-        # 任一异常（_load_history DB 故障 / bind·resolve 装载失败 / resolve_chat_model
+        # 任一异常（_load_history_rows DB 故障 / bind·resolve 装载失败 / resolve_chat_model
         # 键漂移 / first_stage 发布失败）外泄为未处理栈 → turn 永卡 running（无终态
         # 落库、无 SSE 终态、队头不被 nudge）。整段纳入 try 后复用既有 failed 收尾
         # 路径 _fail_turn（与 astream 段异常处理同语义：SearchChainUnavailable→500201、
@@ -1864,6 +1879,11 @@ class ThreadScheduler:
             chat_model_key, _ = resolve_chat_model(
                 str(turn.chat_model_key), ctx.mapping_payload
             )
+            # 历史装配双通道（ARCH §6.5 v1.51）：**单查共享行集**——通道一（rewrite/planner
+            # 指代消解）恒装配；通道二（recall 轮 synthesis 消费）仅 fast 轮装配（deep 轮
+            # DeepState 不消费、total=False 缺键合法——不白付骨架解析成本，评审 P2-2 门控）。
+            history_rows = await self._load_history_rows(thread_id, turn_id)
+            is_fast_mode = str(turn.mode) != "deep"
             initial_state: dict[str, Any] = {
                 "turn_id": turn_id,
                 "thread_id": thread_id,
@@ -1871,11 +1891,13 @@ class ThreadScheduler:
                 "mode": str(turn.mode),
                 "query": str(turn.query),
                 "chat_model_key": chat_model_key,
-                "history": await self._load_history(thread_id, turn_id),
+                "history": self._format_history(history_rows),
                 "query_lang": query_lang,
                 "spec": dict(ctx.spec_payload),  # MappingProxyType → 可序列化 dict 随 state 进图
                 "images": [],  # M4 视觉轮预留（REQ 视觉面），本批恒空
             }
+            if is_fast_mode:
+                initial_state["history_recall"] = self._format_history_recall(history_rows)
             # 首 stage 图前同步发布（ARCH §4.3「首个 stage ≤1s」的结构性保证：不等 LLM/
             # 图首帧——rewrite/plan 节点内不再发 running，避免重复 seq）。M2 批次 1：
             # 首 stage 按 mode——deep=plan（api.md §7.4 深度序列首事件 + §7.4 v1.4 注

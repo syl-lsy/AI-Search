@@ -50,6 +50,16 @@ if ENV_TEST_PATH.exists():
 # 日志文件目录：错误日志不落仓库根 logs/（tmp/ 已 gitignore）。
 os.environ.setdefault("LOG_FILE_DIR", "tmp/logs")
 
+#: 轮次终态等待窗口（秒）——**等待的是「物理完成事实」，放宽不损断言语义**。
+#: 30s → 60s 依据（2026-11-16 实证，非功能回归）：type_rules 变长 ~200 字符（+7%）后
+#: light 模型 prefill 变慢，真实轮次耗时由「20s 有余量」变为 28~32s 贴边——全量跑时
+#: `test_threads_turns` 的「等待轮次到达 completed」用例成批贴边超时（形态＝
+#: 「等待超时（30.0s）：轮次 … 到达 ['completed']」）；`test_reject_strategy_409001`
+#: 的 turn_count==2 红为前序轮未终态的连带时序污染（单跑复验绿）。
+#: 语义纪律：本常量只放大 **完成等待** 的物理窗口，测试断言（状态集合/字段对账/
+#: 时序不变量）一字不动。
+TURN_COMPLETION_TIMEOUT_S = 60.0
+
 from app.main import app  # noqa: E402 —— 必须在 DB_ 强注入之后导入，让 settings 单例取到测试库连接
 
 
@@ -463,7 +473,12 @@ async def await_until(
     interval_s: float = 0.05,
     description: str = "条件成立",
 ) -> None:
-    """轮询等待谓词成立（桩图运行窗口/终态到达的通用等待；超时 AssertionError）。"""
+    """轮询等待谓词成立（桩图运行窗口/终态到达的通用等待；超时 AssertionError）。
+
+    通用谓词默认 30s（行可见/状态跃迁等快速条件）；**轮次终态等待**走
+    `TURN_COMPLETION_TIMEOUT_S`（60s）——见该常量注（等待的是物理完成事实，
+    放宽不损断言语义）。
+    """
     deadline = _time.monotonic() + timeout_s
     while True:
         result = predicate()
@@ -510,9 +525,13 @@ class B2Rest:
         return resp.json()["data"]
 
     async def wait_turn_status(
-        self, turn_id: str, statuses: set[str], *, timeout_s: float = 30.0
+        self, turn_id: str, statuses: set[str], *, timeout_s: float = TURN_COMPLETION_TIMEOUT_S
     ) -> dict[str, Any]:
-        """轮询至轮次到达给定状态集，返回最终 §2.5 详情 data。"""
+        """轮询至轮次到达给定状态集，返回最终 §2.5 详情 data。
+
+        缺省窗口 = `TURN_COMPLETION_TIMEOUT_S`（60s，物理完成事实等待——见常量注）；
+        调用方可显式传更短窗口（如 `{"running"}` 状态跃迁 10s）。
+        """
 
         async def _reached() -> bool:
             payload = await self.turn_payload(turn_id)

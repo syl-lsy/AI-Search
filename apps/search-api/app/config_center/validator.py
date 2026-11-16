@@ -89,12 +89,27 @@ class _Envelope(BaseModel):
 
 # ---- §1 prompts ----
 
-#: fast.synthesis 三段变体行前缀（v1.20 校验条 2——行级切分锚点，任一缺失拒收）
+#: fast.synthesis 四段变体行前缀（v1.20 三条 + v1.27「- 回顾整理路径」——行级切分锚点，
+#: 任一缺失拒收）
 SYNTHESIS_VARIANT_PREFIXES: tuple[str, ...] = (
     "- 常规路径",
     "- 最小检索路径",
     "- 免检索直答路径",
+    "- 回顾整理路径",
 )
+
+#: fast.rewrite 输出 schema 串须含的**枚举串本体**（v1.27 扩容——精确形态防散文绕过，
+#: 沿 v1.20 `"search_strategy"` 带引号纪律）：strategy 四值枚举串 + 题型枚举串的
+#: navigational 尾段。修复前用裸词 token（`"recall" in value`），正文散文提及即可蒙混，
+#: 热更漂移回旧枚举时静默放过（security P3②/评审 P3④）。
+REWRITE_SCHEMA_REQUIRED_TOKENS: tuple[str, ...] = (
+    '"search_strategy":"direct|verify|web|recall"',
+    '|navigational|other"',
+)
+
+#: fast.synthesis 必须保留的历史注入占位符（v1.27 / security P3③）：缺失则 recall 轮
+#: 静默丢历史注入（`render_prompt` 无该变量时不报错，历史块被无提示弃用）——拒收。
+SYNTHESIS_REQUIRED_PLACEHOLDERS: tuple[str, ...] = ("{{history_block}}",)
 
 
 class PromptsPayload(_Envelope):
@@ -103,10 +118,16 @@ class PromptsPayload(_Envelope):
     值为 Jinja2 子集模板字符串；home.suggest_pool 为运营内容数组（§1 v1.11）。
     键缺失不拒收（§1「Nacos 键缺失时回落默认」），键集不锁定（新增键不改结构）。
 
-    v1.20 两条结构性校验（检索策略增量防热更漂移，§3 校验规则）：键存在即校验——
+    v1.20 结构性校验（检索策略增量防热更漂移，§3 校验规则）：键存在即校验——
     ① `fast.rewrite` 模板值的输出 schema 串须含 `search_strategy`（缺则模型按旧契约
-    产出，direct 边永不触发）；② `fast.synthesis` 模板值须含三段行前缀（行级变体
-    切分的锚点，任一缺失 synthesis 会渲染出错的变体合体）。
+    产出，direct/recall 边永不触发）；② `fast.synthesis` 模板值须含四段行前缀（行级
+    变体切分的锚点，任一缺失 synthesis 会渲染出错的变体合体）。
+
+    v1.27 扩容（recall 回顾分支 + navigational 题型）：① `fast.rewrite` 枚举串须含
+    四值策略串（`"search_strategy":"direct|verify|web|recall"`）与 navigational 尾段
+    （`|navigational|other"`）——**精确形态，散文提及不算**（security P3②）；
+    ② 四段行前缀校验 +「- 回顾整理路径」；③ `{{history_block}}` 占位符必在
+    （缺失则 recall 轮静默丢历史注入——security P3③）。
     """
 
     model_config = ConfigDict(extra="allow")
@@ -130,22 +151,37 @@ class PromptsPayload(_Envelope):
             if not isinstance(item, str):
                 raise ValueError(f"{key}：模板值必须是字符串")
 
-        # §3 v1.20 条 1：fast.rewrite 输出 schema 串须含 search_strategy 键（缺键拒收）。
-        # 判据取带引号的键形态 `"search_strategy"`——只认 JSON schema 串内的字段声明，
-        # 防止散文提及该词即蒙混过关（schema 串缺失则模型按旧契约产出、direct 边永不触发）。
+        # §3 v1.20 条 1 + v1.27 扩容：fast.rewrite 输出 schema 串须含 search_strategy 键与
+        # **枚举串本体**（四值策略串 + navigational 尾段）。判据取带引号的契约形态——
+        # 只认 schema 串内的字段声明，散文提及该词即蒙混的路径被封（schema 串缺失则
+        # 模型按旧契约产出、direct/recall 边永不触发）。
         rewrite = value.get("fast.rewrite")
-        if isinstance(rewrite, str) and '"search_strategy"' not in rewrite:
-            raise ValueError(
-                "fast.rewrite：输出 schema 串须含 search_strategy 键（v1.20 检索策略契约）"
-            )
-        # §3 v1.20 条 2：fast.synthesis 须含三段行前缀，任一缺失拒收
+        if isinstance(rewrite, str):
+            if '"search_strategy"' not in rewrite:
+                raise ValueError(
+                    "fast.rewrite：输出 schema 串须含 search_strategy 键（v1.20 检索策略契约）"
+                )
+            for token in REWRITE_SCHEMA_REQUIRED_TOKENS:
+                if token not in rewrite:
+                    raise ValueError(
+                        f"fast.rewrite：输出 schema 枚举串须含 {token}（v1.27 recall/"
+                        "navigational 契约——裸词出现在散文里不算）"
+                    )
+        # §3 v1.20 条 2 + v1.27 扩容：fast.synthesis 须含四段行前缀与 history_block 占位符
         synthesis = value.get("fast.synthesis")
         if isinstance(synthesis, str):
             lines = synthesis.splitlines()
             for prefix in SYNTHESIS_VARIANT_PREFIXES:
                 if not any(line.startswith(prefix) for line in lines):
                     raise ValueError(
-                        f"fast.synthesis：缺变体行前缀 {prefix}（v1.20 三段模板）"
+                        f"fast.synthesis：缺变体行前缀 {prefix}（v1.27 四段模板）"
+                    )
+            # security P3③：缺占位符时 recall 轮静默丢历史注入（render 不报错）——拒收
+            for placeholder in SYNTHESIS_REQUIRED_PLACEHOLDERS:
+                if placeholder not in synthesis:
+                    raise ValueError(
+                        f"fast.synthesis：缺历史注入占位符 {placeholder}"
+                        "（v1.27 recall 变体契约）"
                     )
         return value
 
@@ -210,7 +246,16 @@ class McpPayload(_Envelope):
 
 # ---- §3 spec ----
 
-QUERY_TYPES = ("factoid", "list", "comparison", "multi_facet", "temporal", "how_to", "other")
+QUERY_TYPES = (
+    "factoid",
+    "list",
+    "comparison",
+    "multi_facet",
+    "temporal",
+    "how_to",
+    "navigational",  # §3 v1.27：导航查询第八类（fast.rewrite 输出；deep.planner 判 factoid）
+    "other",
+)
 
 
 class TypeQueryPair(BaseModel):
@@ -325,7 +370,16 @@ def connection_retry_warnings(fast_section: Mapping[str, Any]) -> list[str]:
 class FastSpec(BaseModel):
     model_config = ConfigDict(extra="allow")
     type_query_map: dict[
-        Literal["factoid", "list", "comparison", "multi_facet", "temporal", "how_to", "other"],
+        Literal[
+            "factoid",
+            "list",
+            "comparison",
+            "multi_facet",
+            "temporal",
+            "how_to",
+            "navigational",
+            "other",
+        ],
         TypeQueryPair,
     ]
     fuse_top_n: int = Field(ge=1)
@@ -338,10 +392,10 @@ class FastSpec(BaseModel):
 
     @field_validator("type_query_map")
     @classmethod
-    def _check_seven_types_covered(cls, value: dict) -> dict:
+    def _check_eight_types_covered(cls, value: dict) -> dict:
         missing = [t for t in QUERY_TYPES if t not in value]
         if missing:
-            raise ValueError(f"type_query_map 须覆盖 7 类枚举，缺 {missing}")
+            raise ValueError(f"type_query_map 须覆盖 8 类枚举，缺 {missing}")
         return value
 
     @model_validator(mode="after")

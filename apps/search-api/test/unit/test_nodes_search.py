@@ -420,3 +420,44 @@ async def test_web_search_multi_copy_source_retries_are_per_copy(
     dones = [s for s in stages if s["status"] == "done"]
     assert dones[0]["extra"] == {"source_retries": {"tavily": 1}}
     assert "extra" not in dones[1] or dones[1]["extra"] is None  # 副本 2 无重试零键
+
+
+# ---- 扇出四目标路由（v1.51 recall：目标复用，拓扑零改动）----
+
+
+async def test_fanout_recall_routes_to_synthesis_without_search() -> None:
+    """strategy=recall → 条件边返回 "synthesis"（回顾整理轮免检索直达，零 Send）。"""
+    result = ws_module.search_fanout(
+        {
+            "search_strategy": "recall",
+            "rewritten_queries": ["你之前聊了什么"],
+            "query_lang": "zh",
+        }
+    )
+    assert result == "synthesis"
+
+
+async def test_fanout_recall_takes_precedence_over_empty_queries() -> None:
+    """recall 判定同样先于空 queries（与 direct 同构——零源轮不落 merge_dedupe）。"""
+    result = ws_module.search_fanout(
+        {"search_strategy": "recall", "rewritten_queries": []}
+    )
+    assert result == "synthesis"
+
+
+async def test_fanout_four_target_map_structure() -> None:
+    """四目标映射表结构锁死：direct/recall → synthesis，空 queries → merge_dedupe，
+    其余 → Send 扇出（fast 子图条件边目标列表 ["web_search","merge_dedupe","synthesis"]
+    零改动——目标复用）。"""
+    from langgraph.types import Send
+
+    from app.agent.graphs.fast import search_fanout_targets
+
+    assert search_fanout_targets == ["web_search", "merge_dedupe", "synthesis"]
+    assert ws_module.search_fanout({"search_strategy": "direct"}) == "synthesis"
+    assert ws_module.search_fanout({"search_strategy": "recall"}) == "synthesis"
+    assert ws_module.search_fanout({"rewritten_queries": []}) == "merge_dedupe"
+    sends = ws_module.search_fanout(
+        {"search_strategy": "web", "rewritten_queries": ["q1"], "query_lang": "zh"}
+    )
+    assert [type(s) for s in sends] == [Send]

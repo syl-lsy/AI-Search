@@ -592,3 +592,151 @@ def test_rewrite_output_search_strategy_rejects_illegal_literal() -> None:
             answerable_from_knowledge=False,
             search_strategy="offline",
         )
+
+
+# ==== recall 回顾分支 + navigational 题型增量（v1.51，nacos-config.md §1 v1.27）====
+#
+# 契约口径（逐条红锁）：
+# - `SearchStrategy` 四值（direct|verify|web|recall）、`QueryType` 八值（+navigational）；
+# - `recall → answerable_from_knowledge=False`（历史 ≠ 知识——即使模型误置 true 也强制对齐）；
+# - 两兜底路径仍恒 `web`（灰度安全硬约束不变——旧提示词 + 新代码零行为变化）；
+# - `type_query_map` 加 `navigational: [1,1]`（clamp 1 伴生规则，表驱动自动生效）。
+
+
+def test_search_strategy_literal_has_four_values() -> None:
+    """SearchStrategy 四值形状锁死（v1.51 +recall；顺序即契约枚举串顺序）。"""
+    import typing
+
+    from app.agent.nodes.fast_rewrite import SearchStrategy
+
+    assert typing.get_args(SearchStrategy) == ("direct", "verify", "web", "recall")
+
+
+def test_query_type_literal_has_eight_values_with_navigational() -> None:
+    """QueryType 八值形状锁死（v1.51 +navigational；other 恒兜底位）。"""
+    import typing
+
+    from app.agent.nodes.fast_rewrite import QueryType
+
+    args = typing.get_args(QueryType)
+    assert len(args) == 8
+    assert "navigational" in args
+    assert args[-1] == "other"
+
+
+async def test_recall_output_forces_answerable_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recall 合法输出：strategy 透传，answerable 强制 false（历史 ≠ 知识——对齐纪律扩句）。"""
+    chain = _FakeChain([
+        {**_OK_OUTPUT, "search_strategy": "recall", "answerable_from_knowledge": True}
+    ])
+    _, emitted = _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "recall"
+    assert update["answerable_from_knowledge"] is False  # 模型误置 true 亦被对齐
+    assert emitted[-1][2]["extra"]["strategy"] == "recall"  # api.md §7.4 v1.22 recall 形态
+
+
+async def test_recall_with_answerable_false_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recall + answerable=false（模型正确产出）→ 原样透传。"""
+    chain = _FakeChain([
+        {**_OK_OUTPUT, "search_strategy": "recall", "answerable_from_knowledge": False}
+    ])
+    _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())
+
+    assert update["search_strategy"] == "recall"
+    assert update["answerable_from_knowledge"] is False
+
+
+def test_aligned_answerable_recall_branch() -> None:
+    """`_aligned_answerable("recall", True/False)` 恒 False；既有三分支零回归。"""
+    from app.agent.nodes.fast_rewrite import _aligned_answerable
+
+    assert _aligned_answerable("recall", True) is False
+    assert _aligned_answerable("recall", False) is False
+    # 既有三分支回归（v1.20 纪律不变）
+    assert _aligned_answerable("verify", False) is True
+    assert _aligned_answerable("direct", True) is False
+    assert _aligned_answerable("web", True) is True  # web 保留原值（回滚态零行为变化）
+    assert _aligned_answerable("web", False) is False
+
+
+async def test_navigational_query_type_clamped_to_one_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """navigational 题型：查询类型透传 + query 钳制 1 条（type_query_map navigational:[1,1]）。"""
+    spec = {
+        **_SPEC,
+        "fast": {
+            **_SPEC["fast"],
+            "type_query_map": {**_TYPE_QUERY_MAP, "navigational": [1, 1]},
+        },
+    }
+    chain = _FakeChain([
+        {
+            **_OK_OUTPUT,
+            "queries": ["Vue 官网", "Vue3 官网地址", "Vue 下载页"],
+            "query_type": "navigational",
+            "search_strategy": "web",
+        }
+    ])
+    _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE, "spec": spec}, _config())
+
+    assert update["query_type"] == "navigational"
+    assert update["rewritten_queries"] == ["Vue 官网"]  # clamp 1（导航题信息面单一）
+    assert update["search_strategy"] == "web"  # 导航题为检索路径轮（非 recall/direct）
+
+
+async def test_navigational_missing_key_falls_back_to_other_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """迁移兼容：spec 无 navigational 键 → 回落 other 档上限（[2,3] → 3 条）+ 不抛。"""
+    chain = _FakeChain([
+        {
+            **_OK_OUTPUT,
+            "queries": ["q1", "q2", "q3", "q4"],
+            "query_type": "navigational",
+        }
+    ])
+    _install(monkeypatch, chain)
+
+    update = await rewrite({**_STATE}, _config())  # _TYPE_QUERY_MAP 无 navigational 键
+
+    assert update["rewritten_queries"] == ["q1", "q2", "q3"]
+
+
+def test_rewrite_output_accepts_recall_and_navigational_literals() -> None:
+    """schema 枚举扩容锁死：recall / navigational 合法通过，枚举外值仍拒收。"""
+    from pydantic import ValidationError
+
+    from app.agent.nodes.fast_rewrite import RewriteOutput
+
+    recall = RewriteOutput(
+        queries=["回顾一下刚才聊了什么"],
+        query_type="other",
+        answerable_from_knowledge=False,
+        search_strategy="recall",
+    )
+    assert recall.search_strategy == "recall"
+    nav = RewriteOutput(
+        queries=["Vue 官网"],
+        query_type="navigational",
+        answerable_from_knowledge=False,
+        search_strategy="web",
+    )
+    assert nav.query_type == "navigational"
+    with pytest.raises(ValidationError):
+        RewriteOutput(
+            queries=["q"],
+            query_type="navigation",  # 非枚举值（坏例警示保留词）
+            answerable_from_knowledge=False,
+        )

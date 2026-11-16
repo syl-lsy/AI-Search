@@ -41,14 +41,19 @@ WEB_SEARCH_TOP_K = 5
 
 
 def search_fanout(state: Any) -> list[Send] | str:
-    """rewrite 出边三目标路由（v1.44 B9③ / api.md §7.4 direct 形态）。
+    """rewrite 出边四目标路由（v1.44 B9③ direct / v1.51 recall / api.md §7.4 两形态）。
 
-    判定顺序（契约钉死）：① `search_strategy=direct` → `"synthesis"`（免检索直答，
-    绕过检索段；**先于空 queries 判定**——direct 轮 queries 内容不参与路由）；
-    ② 空 queries → `"merge_dedupe"`（不悬挂，既有逻辑）；③ 其余 → `Send("web_search")×N`。
-    缺省/非法 strategy（旧提示词形态、state 侧未声明值）一律走 ③——灰度安全。
+    判定顺序（契约钉死）：① `search_strategy ∈ {direct, recall}` → `"synthesis"`
+    （免检索直达——direct 零事实面轮 / recall 回顾整理轮；**先于空 queries 判定**，
+    两轮 queries 内容不参与路由）；② 空 queries → `"merge_dedupe"`（不悬挂，既有逻辑）；
+    ③ 其余 → `Send("web_search")×N`。缺省/非法 strategy（旧提示词形态、state 侧未声明值）
+    一律走 ③——灰度安全。
+
+    **目标复用**：recall 与 direct 共用 `"synthesis"` 目标（fast 子图条件边目标列表
+    `["web_search", "merge_dedupe", "synthesis"]` 零改动——子图内扩展、主图拓扑零改动，
+    ADR-012 子图内扩展第二例）。
     """
-    if state.get("search_strategy") == "direct":
+    if state.get("search_strategy") in ("direct", "recall"):
         return "synthesis"
     queries = state.get("rewritten_queries") or []
     if not queries:

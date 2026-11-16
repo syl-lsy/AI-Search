@@ -14,8 +14,13 @@ synthesis 节点放行，§6.1/R14③），节点只累积 text → answer_md。
   （无 sources_block、无 [n] 义务、含误判兜底句；空 fused 不触发 500201 防御短路，
   [n] 经越界剔除全量清空——nacos-config.md §1 v1.20）；verify/web 轮沿用 answerable
   两段切换（回滚态行为零变化）；
+- **回顾整理分支（v1.51）**：search_strategy=recall → 切「- 回顾整理路径」段（行级
+  第四段），`{{history_block}}` 注入 `history_recall` 骨架块（ARCH §6.5 双通道）——
+  **仅本变体非空**（direct/verify/web 恒空串，token 纪律）；零 sources 场景同 direct
+  （越界剔除全量清空 [n]）；模板缺该段时回落 direct 形态（灰度安全）；
 - **外部内容包裹**（§6.4.3 铁律）：来源逐条 `<external_content source="{url}" type="web">`
-  包裹（声明行在提示词内）；memory_block M5 前恒空串；
+  包裹（声明行在提示词内）；历史块/memory_block 为**声明行软防线**（模型转述产物，
+  低风险层级——P2 裁决）；memory_block M5 前恒空串；
 - **失败语义**：全源失败防御性短路（主短路在 merge_dedupe）；LLM 失败按**错误三档
   分级**重试（B11 P1a / ARCH §6.2 v1.49）——连接类（httpx transport / 单调用包络超时 /
   openai 连接形态）走 `spec.fast.retry.connection` 长窗指数退避（1/2/4/8，总窗
@@ -55,6 +60,7 @@ from app.agent.graphs.signals import emit_stage
 from app.agent.llm import build_chat_model, resolve_chat_alias
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.agent.tools.registry import SearchChainUnavailable
+from app.utils.history_recall import render_history_recall
 
 __all__ = ["SynthesisError", "build_chat_model", "synthesis"]
 
@@ -64,9 +70,10 @@ _CITATION_RE = re.compile(r"\[(\d+)\]")
 _REGULAR_LINE_PREFIX = "- 常规路径"
 _KNOWLEDGE_FIRST_LINE_PREFIX = "- 最小检索路径"
 _DIRECT_LINE_PREFIX = "- 免检索直答路径"  # v1.20 第三变体段（direct 免检索直答轮）
+_RECALL_LINE_PREFIX = "- 回顾整理路径"  # v1.51 第四变体段（recall 回顾整理轮）
 
-#: 检索策略三值（v1.44 B9——缺省/非法一律按 web 处理，灰度安全）
-_SEARCH_STRATEGIES = ("direct", "verify", "web")
+#: 检索策略四值（v1.44 B9 三值 / v1.51 +recall——缺省/非法一律按 web 处理，灰度安全）
+_SEARCH_STRATEGIES = ("direct", "verify", "web", "recall")
 
 #: 单调用超时包络下限（秒）：剩余轮预算为 0 时仍留一次极短尝试，让重试闸门裁决
 _MIN_CALL_TIMEOUT_S = 0.001
@@ -91,14 +98,28 @@ def _resolve_strategy(state: Mapping[str, Any]) -> str:
 def _apply_answerable_variant(
     template: str, answerable: bool, strategy: str = "web"
 ) -> str:
-    """组织方式段确定性三态切分（行级过滤，键位与占位符集零变更）。
+    """组织方式段确定性四态切分（行级过滤，键位与占位符集零变更）。
 
-    消费面（nacos-config.md §1 v1.20 钉死）：`direct` 按 strategy 切「免检索直答」
-    段（该轮零来源，无 [n] 义务）；`verify`/`web` 沿用既有 answerable 两段切换——
-    回滚态（web + answerable=true）仍切「先知识后取证」段=现行行为零变化。
+    消费面（nacos-config.md §1 v1.27 钉死）：
+    - `direct` 按 strategy 切「免检索直答」段（该轮零来源，无 [n] 义务）；
+    - `recall` 切「回顾整理」段（该轮零来源、历史经 history_block 注入）；
+      **变体缺段兜底（灰度安全）**：旧模板无「- 回顾整理路径」时回落 direct 形态切分
+      （零 sources 场景 direct 段语义安全可用，行为退化不中断）；
+    - `verify`/`web` 沿用既有 answerable 两段切换——回滚态（web + answerable=true）仍切
+      「先知识后取证」段=现行行为零变化。
     """
+    prefixes = (
+        _REGULAR_LINE_PREFIX,
+        _KNOWLEDGE_FIRST_LINE_PREFIX,
+        _DIRECT_LINE_PREFIX,
+        _RECALL_LINE_PREFIX,
+    )
     if strategy == "direct":
         keep_prefix = _DIRECT_LINE_PREFIX
+    elif strategy == "recall":
+        keep_prefix = _RECALL_LINE_PREFIX
+        if not any(line.startswith(_RECALL_LINE_PREFIX) for line in template.splitlines()):
+            keep_prefix = _DIRECT_LINE_PREFIX  # 旧模板缺 recall 段 → 回落 direct 形态
     elif answerable:
         keep_prefix = _KNOWLEDGE_FIRST_LINE_PREFIX
     else:
@@ -107,10 +128,7 @@ def _apply_answerable_variant(
     kept = [
         line
         for line in lines
-        if not line.startswith(
-            (_REGULAR_LINE_PREFIX, _KNOWLEDGE_FIRST_LINE_PREFIX, _DIRECT_LINE_PREFIX)
-        )
-        or line.startswith(keep_prefix)
+        if not line.startswith(prefixes) or line.startswith(keep_prefix)
     ]
     return "\n".join(kept)
 
@@ -229,6 +247,14 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
             "max_answer_chars": str(max_chars),
             "query_lang": str(state.get("query_lang") or "en"),
             "cite_rules": resolve_prompt("common.citation_rules"),
+            # 回顾装配第二通道（ARCH §6.5 v1.51）：**仅 recall 变体注入非空**，
+            # direct/verify/web 恒空串（token 纪律——非 recall 轮零增量）。
+            # 模板缺 recall 段时回落 direct 形态，历史仍注入（历史在场则可见——D4）。
+            "history_block": (
+                render_history_recall(state.get("history_recall"))
+                if _resolve_strategy(state) == "recall"
+                else ""
+            ),
             "memory_block": "",  # M5 记忆→prompt 通道；启用前恒空（memory-api.md §2）
             "sources_block": _sources_block(fused),
             "query": query,

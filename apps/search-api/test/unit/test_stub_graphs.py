@@ -216,6 +216,7 @@ _FAST_INPUT_KEYS = {
     "query",
     "chat_model_key",
     "history",
+    "history_recall",  # v1.51：回顾装配第二通道（recall 轮 synthesis 消费）
     "images",
     "spec",
     "query_lang",
@@ -266,6 +267,23 @@ def test_main_state_projects_all_fast_inputs() -> None:
     assert _FAST_INPUT_KEYS <= set(FastState.__annotations__)
 
 
+def test_history_recall_projection_type_aligned_across_three_states() -> None:
+    """R14①（v1.51）：`history_recall` 在主图壳与两张子图**同注解**——投影映射零类型
+    漂移（键集归属已由上一条覆盖，本条补类型面：一处改注解另一处不跟 → 回填形态漂移）。
+
+    DeepState 侧为「输入字段同构」契约声明，deep 不消费（P1 裁决：navigational/recall
+    均只走 fast）。
+    """
+    annotations = {
+        "MainState": MainState.__annotations__["history_recall"],
+        "FastState": FastState.__annotations__["history_recall"],
+        "DeepState": DeepState.__annotations__["history_recall"],
+    }
+
+    assert len(set(annotations.values())) == 1, annotations
+    assert next(iter(annotations.values())) == list[dict[str, str]]  # HistoryItem 形态
+
+
 def test_main_state_backfills_all_fast_outputs() -> None:
     """R14①：FastState 产出键在主图壳同名声明——子图更新经顶层 updates 回填。"""
     assert _FAST_OUTPUT_KEYS <= set(MainState.__annotations__)
@@ -287,6 +305,39 @@ def test_main_state_deep_output_types_align_with_deep_state() -> None:
         assert (
             MainState.__annotations__[key] == DeepState.__annotations__[key]
         ), f"MainState.{key} 类型与 DeepState.{key} 不一致"
+
+
+def test_state_query_type_literal_matches_rewrite_node() -> None:
+    """state 层 QueryType 与 fast_rewrite 层逐字一致（v1.51 +navigational）。
+
+    双源漂移防线（code-reviewer P1）：state 的 Literal 是图内 state 契约注解，node 侧
+    Schema 是 LLM 输出校验面——两者任一缺失新枚举都会让「能产出但标注不认」或反之
+    静默偏差；deep 批次按 state 注解对齐时尤易漏语义（navigational 仅 fast 输出）。
+    """
+    import typing as _typing
+
+    from app.agent.nodes.fast_rewrite import QueryType as NodeQueryType
+    from app.agent.state import QueryType as StateQueryType
+
+    assert _typing.get_args(StateQueryType) == _typing.get_args(NodeQueryType)
+    assert "navigational" in _typing.get_args(StateQueryType)
+
+
+def test_state_search_strategy_literal_matches_rewrite_node() -> None:
+    """MainState/FastState 的 search_strategy Literal 与 fast_rewrite 四值逐字一致。
+
+    v1.51 +recall：state 侧缺值会让「rewrite 产出 recall、state 注解三值」的漂移
+    在静态检查面静默（runtime 仍走得通，故必须单测锁死）。
+    """
+    import typing as _typing
+
+    from app.agent.nodes.fast_rewrite import SearchStrategy
+    from app.agent.state import FastState, MainState
+
+    expected = _typing.get_args(SearchStrategy)
+    assert _typing.get_args(MainState.__annotations__["search_strategy"]) == expected
+    assert _typing.get_args(FastState.__annotations__["search_strategy"]) == expected
+    assert "recall" in expected
 
 
 def test_fast_candidates_channel_uses_add_reducer() -> None:

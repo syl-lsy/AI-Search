@@ -21,7 +21,7 @@ from app.config_center import (
     get_asset_center,
     start_asset_center,
 )
-from app.config_center.cache import read_disk_snapshot, write_disk_snapshot
+from app.config_center.cache import canonical_text, read_disk_snapshot, write_disk_snapshot
 from app.config_center.defaults import BUILTIN_DEFAULTS, DATA_IDS
 from app.core.config import NacosSettings
 from app.exception import ConfigCenterException
@@ -69,8 +69,10 @@ class FakeClient:
 
 
 def _raw(payload: dict) -> str:
-    # indent=2 模拟 Nacos 发布格式（与内置默认的紧凑序列化不同字节 → md5 不同，走真实换版路径）
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    # 紧凑形态模拟「格式与规范口径（cache.canonical_text，indent=2）不同」的历史/外部内容：
+    # 空白不同 → md5 不同 → 走真实换版路径（version+1）。规范口径命中 md5 防抖的用例见
+    # TestDiskSnapshotInvariant.test_initial_pull_identical_to_defaults_still_persists_disk
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _messages(log_records) -> list[str]:
@@ -186,12 +188,15 @@ class TestDiskSnapshotInvariant:
         """初始拉取内容与内置默认逐字相同（md5 防抖旁路）也必须落盘。
 
         生产实证（2026-11-08 真凭证首跑）：defaults.py 内置默认 = 契约初值逐字投影，
-        scripts/nacos_init.py 以 json.dumps(payload, ensure_ascii=False) 紧凑形态发布，
+        scripts/nacos_init.py 以同一规范口径（cache.canonical_text，indent=2）发布，
         与 payload_md5 同一口径——Nacos 现值 == 初值时 digest 恒等，防抖分支直接置 L1
         返回；旧实现不写磁盘快照，稳态下 L3 永不落盘，重启+断网即跌 L4（production 拒启动）。
+
+        口径分裂的代价（正则边界）：发布端若改缩进/空白而不联动 payload_md5，内容等价但
+        md5 不等 → 每次启动都走换成版路径（version+1 + 落盘 + INFO 噪音），本用例即变红。
         """
         raws = {
-            data_id: json.dumps(payload, ensure_ascii=False)  # 与 payload_md5 同口径
+            data_id: canonical_text(payload)  # 与 payload_md5 同口径（唯一序列化出口）
             for data_id, payload in BUILTIN_DEFAULTS.items()
         }
         center = AssetCenter(
