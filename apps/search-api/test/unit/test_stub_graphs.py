@@ -16,7 +16,10 @@
 - deep 桩序列不变（B4 实装）；
 - 状态契约（R14①）：MainState 投影薄壳 ⊇ FastState 输入字段（TurnRunner 注入面），
   产出键同名声明经顶层 updates 回填；candidates/errors 带 add、degraded 带或 reducer
-  （Send 扇出并行副本正确合并——键集不变）。
+  （Send 扇出并行副本正确合并——键集不变）；
+- deep 产出投影（M2 批次 1，R14①）：MainState 同名声明 DeepState 全部产出键且类型
+  逐键对齐（deep 子图产出→主图回填不丢失）；degraded/errors 沿用既有横切声明，
+  deep 扇出 reducer 留批次 2 research 接入时再定。
 """
 
 import operator
@@ -31,7 +34,6 @@ from app.agent.graphs.main import DEFAULT_GRAPH, graph as main_graph, route_by_m
 from app.agent.graphs.registry import GRAPH_REGISTRY
 from app.agent.nodes import fuse_rerank as fuse_module
 from app.agent.nodes import merge_dedupe as merge_module
-from app.agent.nodes import web_search as ws_module
 from app.agent.state import DeepState, FastState, MainState
 from app.agent.tools.registry import SearchChain, ToolRegistry
 
@@ -232,6 +234,30 @@ _FAST_OUTPUT_KEYS = {
     "errors",
     "degraded",
 }
+#: DeepState 产出键（M2 批次 1 投影扩展：deep 子图产出 → 主图同名回填不丢失——
+#: planner/research/reflect/writer 产出 + 横切，api.md §7.4 深度序列的状态面）。
+#: degraded/errors 在 MainState 沿用既有横切声明（fast 扇出 add/or reducer 语义不变，
+#: DeepState 侧为普通类型）——deep 扇出 reducer 留批次 2 research 接入时再定（不预设计）。
+_DEEP_OUTPUT_KEYS = {
+    "subtopics",
+    "outline",
+    "subagent_reports",
+    "visited_urls",
+    "searched_queries",
+    "snapshots",
+    "collected_sources",
+    "reflect_round",
+    "gaps",
+    "report_md",
+    "answer_md",
+    "usage_total",
+    "degraded",
+    "degraded_reason",
+    "errors",
+}
+#: 本批新增的 deep 投影键（普通类型逐键对齐 DeepState）；errors/degraded 不在内——
+#: 两侧横切声明形态本批有意不同（见 _DEEP_OUTPUT_KEYS 注）。
+_DEEP_TYPE_ALIGNED_KEYS = _DEEP_OUTPUT_KEYS - {"errors", "degraded"}
 
 
 def test_main_state_projects_all_fast_inputs() -> None:
@@ -244,6 +270,23 @@ def test_main_state_backfills_all_fast_outputs() -> None:
     """R14①：FastState 产出键在主图壳同名声明——子图更新经顶层 updates 回填。"""
     assert _FAST_OUTPUT_KEYS <= set(MainState.__annotations__)
     assert _FAST_OUTPUT_KEYS <= set(FastState.__annotations__)
+
+
+def test_main_state_backfills_all_deep_outputs() -> None:
+    """R14①（M2 批次 1）：DeepState 产出键在主图壳同名声明——deep 子图产出经顶层
+    updates 回填不丢失（report_md/usage_total/degraded_reason 等 TurnRunner 终态消费面）。"""
+    assert _DEEP_OUTPUT_KEYS <= set(MainState.__annotations__)
+    assert _DEEP_OUTPUT_KEYS <= set(DeepState.__annotations__)
+
+
+def test_main_state_deep_output_types_align_with_deep_state() -> None:
+    """deep 产出投影类型逐键对齐 DeepState（M2 批次 1）：本批新增投影键注解一致——
+    回填值类型零漂移。errors/degraded 两侧横切形态本批有意不同（MainState 带 fast 扇出
+    add/or reducer、DeepState 普通类型），不在对齐域——deep 扇出 reducer 批次 2 再定。"""
+    for key in _DEEP_TYPE_ALIGNED_KEYS:
+        assert (
+            MainState.__annotations__[key] == DeepState.__annotations__[key]
+        ), f"MainState.{key} 类型与 DeepState.{key} 不一致"
 
 
 def test_fast_candidates_channel_uses_add_reducer() -> None:
@@ -261,12 +304,14 @@ def test_deep_state_skeleton_inputs_isomorphic_with_fast() -> None:
 
 
 def test_compiled_graphs_expose_projected_channels() -> None:
-    """编译产物投影通道：主图壳与 fast 子图均建有 FastState 全字段 channel（R14① 物理通道）。"""
+    """编译产物投影通道：主图壳与 fast 子图均建有 FastState 全字段 channel（R14① 物理通道）；
+    deep 产出键在主图壳建有同名 channel（M2 批次 1——deep 回填的物理通道面）。"""
     fast_keys = _FAST_INPUT_KEYS | _FAST_OUTPUT_KEYS
     assert fast_keys <= set(main_graph.channels)
     from app.agent.graphs.fast import graph as fast_compiled
 
     assert fast_keys <= set(fast_compiled.channels)
+    assert _DEEP_OUTPUT_KEYS <= set(main_graph.channels)
 
 
 async def test_main_graph_accepts_full_fast_state_input() -> None:
@@ -508,9 +553,14 @@ async def test_sources_payload_matches_api_contract() -> None:
 
 
 def _deep_expected() -> list[dict[str, Any]]:
-    """api.md §7.4 深度模式主干（701-708 行）的桩展开：plan/write 两阶段。"""
+    """api.md §7.4 深度模式主干（701-708 行）的桩展开：plan/write 两阶段。
+
+    M2 批次 1：plan running 归 TurnRunner 图前发布（同 fast rewrite 先例——§7.4
+    序列的 stage(plan,running) 仍在，但发射源改为 TurnRunner，图内 plan 只发 done，
+    避免双 running；本函数只覆盖图内信号面，TurnRunner 图前 running 由
+    test_first_stage.py 锁定）。
+    """
     return [
-        {"type": "stage", "stage_key": "plan", "status": "running"},
         {"type": "stage", "stage_key": "plan", "status": "done"},
         {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"},
         *({"type": "token", "delta": d} for d in STUB_DEEP_TOKEN_DELTAS),

@@ -518,26 +518,35 @@ async def test_fuse_rerank_still_writes_only_faststate_keys(
 
 #: registry 公共导出集字面量快照（显式枚举现有导出；sorted 后相等断言——修正原
 #: 「registry_all == registry_module.__all__」恒真断言：registry_module 即被测模块
-#: 自身，两边引用同一列表对象、比较永真，锁不住导出面漂移，评审 P3）
+#: 自身，两边引用同一列表对象、比较永真，锁不住导出面漂移，评审 P3）。
+#: M2 批次 1（2026-11-16）：读取链面有意增量——READ_SOURCE_NAMES/READ_PRIMARY_SOURCES/
+#: READ_BACKUP_CHAIN/READ_TOOL_NAMES/ReadChain/resolve_read_chain（firecrawl_read
+#: 工具面配套，url_reader.py 消费）；搜索面既有导出零删减零改名。
 EXPECTED_REGISTRY_ALL = sorted(
     [
         "BACKUP_SEARCH_CHAIN",
         "CircuitBreaker",
+        "READ_BACKUP_CHAIN",
+        "READ_PRIMARY_SOURCES",
+        "READ_SOURCE_NAMES",
+        "READ_TOOL_NAMES",
         "SEARCH_SOURCE_NAMES",
         "SOURCE_RETRY_DELAY_S",
+        "ReadChain",
         "SearchChain",
         "SearchChainUnavailable",
         "SourceCallError",
         "ToolRegistry",
         "guarded_source_call",
+        "resolve_read_chain",
         "resolve_search_chain",
     ]
 )
 
 
 def test_registry_module_exports_unchanged_surface() -> None:
-    """registry 公共面零新增（透传为出参字典键增量，不改函数签名/导出集）——
-    字面量快照断言：导出面漂移（新增/删减/改名）即红。"""
+    """registry 公共面字面量快照断言：导出面漂移（新增/删减/改名）即红——
+    增量必须伴随本清单显式更新（M2 批次 1 读取链增量已随批登记）。"""
     from app.agent.tools.registry import __all__ as registry_all
 
     assert sorted(registry_all) == EXPECTED_REGISTRY_ALL

@@ -40,6 +40,11 @@ BUILTIN_PROMPT_FILES: dict[str, str] = {
     "common.type_rules": "common/type_rules.txt",
     "common.citation_rules": "common/citation_rules.txt",
     "fast.followups": "fast/followups.txt",
+    # deep 四键（M2 批次 1 骨架终稿；占位符集按契约锁死，文案随批次 2~4 节点打磨）
+    "deep.planner": "deep/planner.txt",
+    "deep.subagent.system": "deep/subagent_system.txt",
+    "deep.reflect": "deep/reflect.txt",
+    "deep.report_writer": "deep/report_writer.txt",
 }
 
 _BUILTIN_DIR = Path(__file__).resolve().parent

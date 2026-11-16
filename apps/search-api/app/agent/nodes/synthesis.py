@@ -40,8 +40,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from pydantic import SecretStr
 
+from app.agent.external_content import external_content
 from app.agent.guards import (
     RetryWindow,
     TurnDeadline,
@@ -52,10 +52,9 @@ from app.agent.guards import (
     retry_policy_from_spec,
 )
 from app.agent.graphs.signals import emit_stage
+from app.agent.llm import build_chat_model, resolve_chat_alias
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.agent.tools.registry import SearchChainUnavailable
-from app.config_center.defaults import MODEL_MAPPING_CONFIG
-from app.core.config import litellm_settings
 
 __all__ = ["SynthesisError", "build_chat_model", "synthesis"]
 
@@ -81,32 +80,6 @@ _clock = time.monotonic
 
 class SynthesisError(Exception):
     """综合生成失败（LLM 重试耗尽/流中断）——TurnRunner 捕获 → error 500101 + 降级收束。"""
-
-
-def build_chat_model(alias: str) -> Any:
-    """chat 模型实例：别名经映射解析后的 LiteLLM 别名（Standard/Speed 档）。
-
-    import reasoning_chat_model 即注册 openai_reasoning provider（R8）——GLM/DeepSeek
-    思维链经 messages 流透传（§6.1 thinking 事件面）；采样参数不写死（§6.7）。
-
-    `extra_body={"enable_thinking": False}`（专项① 2026-11-13 synthesis 提速）：
-    chat-standard 通道（百炼 qwen3.7-plus，DashScope OpenAI 兼容端点）生效键形态经
-    网关探针钉死——`enable_thinking: false` 流式 delta 零 reasoning_content（1.0~1.7s），
-    rewrite 先例的 `think: false`（ollama 原生形态）被该通道上游忽略（思维链仍在，
-    ~4.3~5.1s ≈ 基线）。仅关思维链不关流式（disable_streaming 为 rewrite 结构化输出
-    通道专属，不外溢）；透传 reasoning_content 的 R8 补丁保持不变——GLM/DeepSeek 等未
-    受该键影响的通道若有思维链仍正常透出。
-    """
-    import app.utils.reasoning_chat_model  # noqa: F401 —— 注册副作用（幂等）
-    from langchain.chat_models import init_chat_model
-
-    return init_chat_model(
-        model=alias,
-        model_provider="openai_reasoning",
-        base_url=str(litellm_settings.base_url),
-        api_key=SecretStr(litellm_settings.api_key.get_secret_value()),
-        extra_body={"enable_thinking": False},
-    )
 
 
 def _resolve_strategy(state: Mapping[str, Any]) -> str:
@@ -172,17 +145,22 @@ def _sources_block(fused: list[dict[str, Any]]) -> str:
     """来源块装配（§6.4.3）：逐条 <external_content source="{url}" type="web"> 包裹，
     编号 [i] 可见（[n] 对应来源列表第 n 条）。
 
-    **转义硬边界（P1 修复）**：url/title/snippet 经 html.escape(quote=True) 转义后插值——
-    搜索内容含 `</external_content>`/引号/尖括号时被实体化为惰性文本，隔离边界不可被
-    内容击穿（提前闭合包裹→指令文本抬升为提示词正文）。声明行（软防线）在提示词内。
+    开闭标记/属性经共享 helper（`app/agent/external_content.py`，M2 批次 1 收敛——与
+    followups_service 同源，格式漂移风险收口）；**转义硬边界（P1 修复）**：title/snippet
+    （content 侧）与 url（属性侧）均经 html.escape(quote=True) 转义——搜索内容含
+    `</external_content>`/引号/尖括号时被实体化为惰性文本，隔离边界不可被内容击穿
+    （提前闭合包裹→指令文本抬升为提示词正文）。声明行（软防线）在提示词内。
     """
     blocks: list[str] = []
     for index, item in enumerate(fused, start=1):
-        url = html.escape(str(item.get("url") or ""), quote=True)
         title = html.escape(str(item.get("title") or ""), quote=True)
         snippet = html.escape(str(item.get("snippet") or ""), quote=True)
         blocks.append(
-            f'<external_content source="{url}" type="web">\n[{index}] {title}\n{snippet}\n</external_content>'
+            external_content(
+                f"[{index}] {title}\n{snippet}",
+                source=str(item.get("url") or ""),
+                kind="web",
+            )
         )
     return "\n".join(blocks)
 
@@ -195,20 +173,6 @@ def _strip_out_of_range_citations(text: str, source_count: int) -> str:
         return match.group(0) if 1 <= n <= source_count else ""
 
     return _CITATION_RE.sub(_replace, text)
-
-
-def _chat_alias(state: Mapping[str, Any], config: RunnableConfig | None) -> str:
-    """chat 别名解析：chat_model_key → 轮内映射快照 chat.options（缺省 chat.default）。"""
-    configurable = (config or {}).get("configurable") or {}
-    mapping = configurable.get("model_mapping")
-    mapping = mapping if isinstance(mapping, Mapping) else MODEL_MAPPING_CONFIG
-    chat = mapping.get("chat") or {}
-    options: dict[str, str] = dict(chat.get("options") or {})
-    key = str(state.get("chat_model_key") or "") or str(chat.get("default") or "")
-    alias = options.get(key) or (options.get(str(chat.get("default"))) if chat.get("default") else None)
-    if not alias:
-        alias = str(MODEL_MAPPING_CONFIG["chat"]["options"]["qwen"])
-    return alias
 
 
 def _text_of(chunk: Any) -> str:
@@ -252,7 +216,7 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
         if isinstance(fast_section, Mapping)
         else 120.0
     )
-    model = build_chat_model(_chat_alias(state, config))
+    model = build_chat_model(resolve_chat_alias(state, config))
 
     template = _apply_answerable_variant(
         resolve_prompt("fast.synthesis"),

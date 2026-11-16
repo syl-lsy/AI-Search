@@ -1,7 +1,8 @@
 """integration 层：迁移链（0001_m1_core → 0008_m1_turn_scheduler → 0009_m1_turn_followups
-→ 0010_m2_turn_feedback → 0011_m2_thread_mgmt）真库验证（requires_db；跑在 .env.test 测试库）。
+→ 0010_m2_turn_feedback → 0011_m2_thread_mgmt → 0012_m2_deep）真库验证（requires_db；
+跑在 .env.test 测试库）。
 
-链路：upgrade head → 断言核心表 + alembic_version=head(0011) + vector 扩展；downgrade
+链路：upgrade head → 断言核心表 + alembic_version=head(0012) + vector 扩展；downgrade
 base → 断言表与 alembic_version 清除、vector 扩展保留（0001 契约：downgrade
 不删 extension）；再 upgrade head → 全链可重复；末尾 `alembic check` 零漂移
 （迁移产物 == ORM metadata，即 autogenerate 闭环的运行时验证）。
@@ -20,6 +21,16 @@ false / read_at / archived_at）+ **存量行 read_at 回填 created_at** 的
 upgrade→downgrade→upgrade 逐段断言（回填必须在 0010 态的存量行上验证——先降级造行
 再升级）。零新索引断言（§1.2 v1.14 取舍注）。
 
+0012（M2 deep 底座：契约逻辑名 0002_m2_deep → 实际编号 0012——迁移链实际为
+0001→0008→…→0011，与 §4 迁移表逻辑名编号错位，交付说明留映射）专段：
+snapshots 表（§1.6：url_hash char(64)、唯一键 uq_snapshots_turn_url (turn_id,url_hash)、
+idx_snapshots_thread、turn_id FK CASCADE、content_type 默认 'text/markdown'、
+fetched_at 无服务端默认）+ artifacts 表（§1.9：thread_id FK CASCADE / turn_id 可空
+FK 无动作 / idx_artifacts_thread (thread_id, created_at DESC)）+ sources.snapshot_id
+增列（§1.5 M2：可空 FK→snapshots.id 无动作）的 upgrade→downgrade→upgrade 逐段断言
+（列事实 information_schema / 索引 pg_indexes / FK 级联 pg_constraint.confdeltype：
+'c'=CASCADE 'a'=NO ACTION）。
+
 默认用户 seed 断言（0001 已落地——2026-11-07 评审解锁，经 app/db/seed.py 的 ORM
 形态，见迁移文件 docstring）：upgrade 后 users 恰一行且 id/name == 配置值；
 链路用例末段补 seed 在全新 users 表上的再建断言（downgrade→upgrade 循环幂等）。
@@ -37,7 +48,7 @@ from app.core.config import common_settings
 
 pytestmark = pytest.mark.requires_db
 
-#: 测试库应有的 public 表全集（M1 五表 + §1.16 turn_feedback）
+#: 测试库应有的 public 表全集（M1 五表 + §1.16 turn_feedback + §1.6/§1.9 M2 deep 底座）
 CORE_TABLES = (
     "users",
     "threads",
@@ -45,10 +56,12 @@ CORE_TABLES = (
     "turn_events",
     "sources",
     "turn_feedback",
+    "snapshots",
+    "artifacts",
 )
 
-#: 链尾 revision（data-model.md §4：0010 turn_feedback → 0011 thread_mgmt）
-CHAIN_HEAD = "0011"
+#: 链尾 revision（data-model.md §4 迁移表：0011 thread_mgmt → 0012 m2_deep）
+CHAIN_HEAD = "0012"
 
 
 def _connect(info):
@@ -368,4 +381,145 @@ def test_0011_thread_mgmt_upgrade_downgrade_upgrade(alembic, test_db, db_truncat
             (str(legacy_id),),
         )
         assert cursor.fetchall() == [(False, True)]
+    alembic(["check"])
+
+
+# ---- 0012（M2 deep 底座，契约逻辑名 0002_m2_deep → 实际 0012）：
+#      snapshots / artifacts 两表 + sources.snapshot_id 增列 ----
+
+
+def _table_columns(cursor, table: str) -> list[tuple]:
+    """整表列事实（列名/类型/长度/可空/默认），按 DDL 顺序返回。"""
+    cursor.execute(
+        "SELECT column_name, data_type, character_maximum_length, is_nullable, "
+        "column_default FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s "
+        "ORDER BY ordinal_position",
+        (table,),
+    )
+    return cursor.fetchall()
+
+
+def _sources_snapshot_id(cursor) -> list[tuple]:
+    cursor.execute(
+        "SELECT data_type, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'sources' "
+        "AND column_name = 'snapshot_id'"
+    )
+    return cursor.fetchall()
+
+
+def _indexdef(cursor, indexname: str) -> str:
+    cursor.execute(
+        "SELECT indexdef FROM pg_indexes "
+        "WHERE schemaname = 'public' AND indexname = %s",
+        (indexname,),
+    )
+    rows = cursor.fetchall()
+    assert len(rows) == 1, f"{indexname} 应恰一个，得到 {len(rows)}"
+    return rows[0][0]
+
+
+def _fk_delete_types(cursor, table: str) -> list[tuple]:
+    """表上全部 FK 的 (被引用表, confdeltype)：'c'=CASCADE、'a'=NO ACTION。"""
+    cursor.execute(
+        "SELECT confrelid::regclass::text, confdeltype FROM pg_constraint "
+        "WHERE conrelid = %s::regclass AND contype = 'f' ORDER BY 1",
+        (table,),
+    )
+    return cursor.fetchall()
+
+
+def _snapshot_id_fk_delete_type(cursor) -> str:
+    """sources.snapshot_id → snapshots FK 的 confdeltype（唯一 FK 指向 snapshots）。"""
+    cursor.execute(
+        "SELECT confdeltype FROM pg_constraint "
+        "WHERE conrelid = 'sources'::regclass AND contype = 'f' "
+        "AND confrelid = 'snapshots'::regclass"
+    )
+    rows = cursor.fetchall()
+    assert len(rows) == 1, f"sources→snapshots FK 应恰一个，得到 {len(rows)}"
+    return rows[0][0]
+
+
+def test_0012_snapshots_artifacts_upgrade_downgrade_upgrade(
+    alembic, test_db, db_truncate
+) -> None:
+    """0012 三段真库验证：升级建两表+增列 → 降级全量可逆 → 再升级可重复 + 零漂移。
+
+    降级顺序敏感：sources.snapshot_id FK 引用 snapshots——drop 列必须先于 drop 表
+    （否则 NO ACTION 依赖拒删）；本断言即该顺序的真库实证。
+    """
+    alembic(["upgrade", "head"])
+    alembic(["downgrade", "0011"])
+
+    # ── 段 1：upgrade 0011→0012（两表 + 索引 + sources.snapshot_id）──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [(CHAIN_HEAD,)]
+
+        # snapshots（§1.6 契约 SQL 原文逐列）
+        assert _table_columns(cursor, "snapshots") == [
+            ("id", "uuid", None, "NO", None),
+            ("user_id", "uuid", None, "NO", None),
+            ("thread_id", "uuid", None, "NO", None),
+            ("turn_id", "uuid", None, "NO", None),
+            ("url", "text", None, "NO", None),
+            ("url_hash", "character", 64, "NO", None),
+            ("object_key", "text", None, "NO", None),
+            # PG information_schema 对 varchar 默认值带 ::character varying 规范化后缀
+            ("content_type", "character varying", 64, "NO", "'text/markdown'::character varying"),
+            ("size_bytes", "bigint", None, "NO", None),
+            ("fetched_at", "timestamp with time zone", None, "NO", None),
+            ("created_at", "timestamp with time zone", None, "NO", "now()"),
+        ]
+        # 唯一键 (turn_id, url_hash) + 线程索引
+        uq = _indexdef(cursor, "uq_snapshots_turn_url")
+        assert "UNIQUE INDEX" in uq.upper() and "(turn_id, url_hash)" in uq
+        idx_thread = _indexdef(cursor, "idx_snapshots_thread")
+        assert "(thread_id)" in idx_thread
+        assert _fk_delete_types(cursor, "snapshots") == [("turns", "c")]
+
+        # artifacts（§1.9 契约 SQL 原文逐列）
+        assert _table_columns(cursor, "artifacts") == [
+            ("id", "uuid", None, "NO", None),
+            ("user_id", "uuid", None, "NO", None),
+            ("thread_id", "uuid", None, "NO", None),
+            ("turn_id", "uuid", None, "YES", None),
+            ("artifact_type", "character varying", 16, "NO", None),
+            ("filename", "character varying", 256, "NO", None),
+            ("rel_path", "text", None, "NO", None),
+            ("size_bytes", "bigint", None, "NO", None),
+            ("content_type", "character varying", 64, "NO", None),
+            ("created_at", "timestamp with time zone", None, "NO", "now()"),
+        ]
+        idx_art = _indexdef(cursor, "idx_artifacts_thread")
+        assert "(thread_id, created_at DESC)" in idx_art
+        # thread_id CASCADE（线程删除链 REQ-024）；turn_id 无动作（NO ACTION）
+        assert _fk_delete_types(cursor, "artifacts") == [
+            ("threads", "c"),
+            ("turns", "a"),
+        ]
+
+        # sources.snapshot_id（§1.5 M2 增列）：uuid 可空、无默认、FK 无动作
+        assert _sources_snapshot_id(cursor) == [("uuid", "YES", None)]
+        assert _snapshot_id_fk_delete_type(cursor) == "a"
+
+    # ── 段 2：downgrade 0012→0011（drop 列先于 drop 表——全量可逆）──
+    alembic(["downgrade", "0011"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [("0011",)]
+        tables = _public_tables(cursor)
+        assert "snapshots" not in tables and "artifacts" not in tables
+        assert _sources_snapshot_id(cursor) == []
+
+    # ── 段 3：再 upgrade head（可重复）+ 零漂移（ORM metadata 对齐）──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        assert _sources_snapshot_id(cursor) == [("uuid", "YES", None)]
+        assert _table_columns(cursor, "snapshots")[0] == ("id", "uuid", None, "NO", None)
+        assert _table_columns(cursor, "artifacts")[0] == ("id", "uuid", None, "NO", None)
     alembic(["check"])

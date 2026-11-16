@@ -104,6 +104,12 @@ def build_light_model(mapping: Mapping[str, Any] | None = None) -> Any:
     映射缺省（Studio 直跑/无注入面）回落 config_center 内置默认。import
     reasoning_chat_model 即注册 openai_reasoning provider（R8）——qwen 同形 reasoning
     字段自动并入、普通路径零扰动；采样参数不写死（§6.7：由网关模型配置注入）。
+
+    `stream_usage=True`（M2 批次 1 usage 方案 A，docs/m2-usage-probe-batch0.md §4）：
+    显式 base_url 下 langchain-openai 不自动置位（probe §2.2 因果链 2）——本通道现走
+    disable_streaming 非流式（usage 由响应体自带，不受此参数影响）；若 light 通道未来
+    被流式消费（如批次 2 子代理档位探针），流式调用的 `AIMessageChunk.usage_metadata`
+    即有填充源（网关 ollama 通道透传已活体探针实证）。
     """
     import app.utils.reasoning_chat_model  # noqa: F401 —— 注册副作用（幂等）
     from langchain.chat_models import init_chat_model
@@ -133,6 +139,7 @@ def build_light_model(mapping: Mapping[str, Any] | None = None) -> Any:
         #    （resolve_chat_model），不受本参数影响；R14③ 本就只放行 synthesis token 事件。
         temperature=0,
         max_tokens=8192,
+        stream_usage=True,  # usage 方案 A（M2 批次 1）：见本函数 docstring——非流式通道不受影响
         extra_body={"think": False},
         disable_streaming=True,
     )

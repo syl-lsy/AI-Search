@@ -1,4 +1,4 @@
-"""unit 层：五表 ORM metadata 对照 data-model.md §1.1~§1.5 DDL 契约（零网络）。
+"""unit 层：核心表 ORM metadata 对照 data-model.md §1.1~§1.6/§1.9 DDL 契约（零网络）。
 
 models/ 未落地或列漂移时本文件先红（TDD 红绿循环的契约锚点）；真库行为
 （迁移链 upgrade/downgrade/seed/扩展）由 integration 层 test_migrations.py 兜住。
@@ -6,13 +6,15 @@ models/ 未落地或列漂移时本文件先红（TDD 红绿循环的契约锚�
 索引（唯一/DESC/部分索引 WHERE）/identity。
 
 0001 范围护栏：后续迁移的增列（turns.incognito/memory_hits、
-sources.snapshot_id/kb_doc_id/kb_chunk_ids）在 0001 不得提前出现（turns.cancel_reason
-已随 0008、turns.followups 已随 0009 落地，移出护栏、纳入 §1.3 逐列断言）。
+sources.kb_doc_id/kb_chunk_ids）在 0001 不得提前出现（turns.cancel_reason
+已随 0008、turns.followups 已随 0009 落地，移出护栏、纳入 §1.3 逐列断言；
+sources.snapshot_id 已随 0012/m2_deep 落地，移出护栏、纳入 §1.5 逐列断言）。
 """
 import uuid
 
 import pytest
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     Boolean,
     DateTime,
@@ -85,8 +87,9 @@ def _assert_uuid_pk(col, *, client_default_uuid4: bool) -> None:
 # ---- 表清单（0001 范围 = 恰好五表）----
 
 
-def test_metadata_contains_exactly_five_core_tables():
-    """M1 五表 + M2 增量表（§1.16 turn_feedback，0010）——不得有多余/漏登表。"""
+def test_metadata_contains_exactly_core_tables():
+    """M1 五表 + M2 增量表（§1.16 turn_feedback，0010 / §1.6 snapshots、§1.9
+    artifacts，0012）——不得有多余/漏登表。"""
     assert set(Base.metadata.tables) == {
         "users",
         "threads",
@@ -94,6 +97,8 @@ def test_metadata_contains_exactly_five_core_tables():
         "turn_events",
         "sources",
         "turn_feedback",
+        "snapshots",
+        "artifacts",
     }
 
 
@@ -380,7 +385,7 @@ def test_turn_events_indexes():
     assert [str(e).split(".")[-1] for e in ix_turn.expressions] == ["turn_id", "seq"]
 
 
-# ---- §1.5 sources（M1 基础列）----
+# ---- §1.5 sources（M1 基础列 + 0012/m2_deep 增 snapshot_id）----
 
 
 def test_sources_columns():
@@ -395,6 +400,7 @@ def test_sources_columns():
         "url",
         "snippet",
         "score",
+        "snapshot_id",  # M2 增列（0012），kb_doc_id/kb_chunk_ids（M3）不提前
         "created_at",
     ]
 
@@ -430,10 +436,164 @@ def test_sources_columns():
 
 
 def test_sources_excludes_later_migration_columns():
-    """snapshot_id（M2）/kb_doc_id/kb_chunk_ids（M3）属后续迁移增列。"""
+    """kb_doc_id/kb_chunk_ids（M3）属后续迁移增列（snapshot_id 已随 0012/m2_deep
+    落地，移出护栏、由 test_sources_snapshot_id_column 逐列断言）。"""
     sources = _table("sources")
-    for name in ("snapshot_id", "kb_doc_id", "kb_chunk_ids"):
+    for name in ("kb_doc_id", "kb_chunk_ids"):
         assert name not in sources.columns, f"{name} 属后续迁移增列，0001 不应包含"
+
+
+def test_sources_snapshot_id_column():
+    """snapshot_id（§1.5 M2 增列，0012）：uuid 可空、FK→snapshots.id、无级联动作。
+
+    契约 SQL「ALTER TABLE sources ADD COLUMN snapshot_id uuid REFERENCES
+    snapshots(id)」未带 ON DELETE——保持默认 NO ACTION，零私改；行级清理沿
+    线程删除链（先删 turns → sources/snapshots 随 CASCADE 清空，§1.2 v1.14 注）。
+    """
+    sources = _table("sources")
+    col = _col(sources, "snapshot_id")
+    assert col.nullable is True
+    fk = _fk(sources, "snapshot_id")
+    assert fk.target_fullname == "snapshots.id"
+    assert fk.ondelete is None
+
+
+# ---- §1.6 snapshots（M2，0012；仅深度模式，存档不参与检索）----
+
+
+def test_snapshots_columns():
+    """snapshots 逐列 DDL（§1.6 契约 SQL 原文）：uuid PK（应用侧 uuid4）/
+    user_id·thread_id 裸 uuid 无 FK / turn_id FK CASCADE / url_hash char(64) /
+    content_type 默认 'text/markdown' / fetched_at 无服务端默认（写入方定值）。"""
+    snapshots = _table("snapshots")
+    assert [c.name for c in snapshots.columns] == [
+        "id",
+        "user_id",
+        "thread_id",
+        "turn_id",
+        "url",
+        "url_hash",
+        "object_key",
+        "content_type",
+        "size_bytes",
+        "fetched_at",
+        "created_at",
+    ]
+
+    _assert_uuid_pk(_col(snapshots, "id"), client_default_uuid4=True)
+
+    # user_id/thread_id：裸 uuid（无 FK，随 DDL 契约；对象键含 user_id 前缀 REQ-011）
+    for name in ("user_id", "thread_id"):
+        col = _col(snapshots, name)
+        assert col.nullable is False and not col.foreign_keys
+
+    fk_turn = _fk(snapshots, "turn_id")
+    assert fk_turn.target_fullname == "turns.id" and fk_turn.ondelete == "CASCADE"
+    assert _col(snapshots, "turn_id").nullable is False
+
+    assert isinstance(_col(snapshots, "url").type, Text)
+    assert _col(snapshots, "url").nullable is False
+
+    url_hash = _col(snapshots, "url_hash")
+    assert isinstance(url_hash.type, CHAR) and url_hash.type.length == 64
+    assert url_hash.nullable is False  # sha256(url)（唯一键用，URL 可能超长）
+
+    assert isinstance(_col(snapshots, "object_key").type, Text)
+    assert _col(snapshots, "object_key").nullable is False
+
+    content_type = _col(snapshots, "content_type")
+    assert isinstance(content_type.type, String) and content_type.type.length == 64
+    assert content_type.nullable is False
+    _assert_server_default(content_type, "text/markdown")
+
+    size_bytes = _col(snapshots, "size_bytes")
+    assert isinstance(size_bytes.type, BigInteger) and size_bytes.nullable is False
+
+    fetched_at = _col(snapshots, "fetched_at")
+    assert isinstance(fetched_at.type, DateTime) and fetched_at.type.timezone is True
+    assert fetched_at.nullable is False and fetched_at.server_default is None
+
+    _assert_tz_now(_col(snapshots, "created_at"))
+
+
+def test_snapshots_indexes():
+    """唯一键 uq_snapshots_turn_url (turn_id, url_hash) + idx_snapshots_thread。"""
+    snapshots = _table("snapshots")
+    uq = _index(snapshots, "uq_snapshots_turn_url")
+    assert uq.unique is True
+    assert [str(e).split(".")[-1] for e in uq.expressions] == ["turn_id", "url_hash"]
+
+    idx = _index(snapshots, "idx_snapshots_thread")
+    assert idx.unique is False
+    assert [str(e).split(".")[-1] for e in idx.expressions] == ["thread_id"]
+
+
+# ---- §1.9 artifacts（M2 建表先承载 report；M4 扩 code_output）----
+
+
+def test_artifacts_columns():
+    """artifacts 逐列 DDL（§1.9 契约 SQL 原文）：thread_id FK CASCADE（产物按线程
+    组织 REQ-024）/ turn_id 可空 FK 无动作（report 导出关联轮次）。"""
+    artifacts = _table("artifacts")
+    assert [c.name for c in artifacts.columns] == [
+        "id",
+        "user_id",
+        "thread_id",
+        "turn_id",
+        "artifact_type",
+        "filename",
+        "rel_path",
+        "size_bytes",
+        "content_type",
+        "created_at",
+    ]
+
+    _assert_uuid_pk(_col(artifacts, "id"), client_default_uuid4=True)
+
+    user_id = _col(artifacts, "user_id")
+    assert user_id.nullable is False and not user_id.foreign_keys
+
+    fk_thread = _fk(artifacts, "thread_id")
+    assert fk_thread.target_fullname == "threads.id" and fk_thread.ondelete == "CASCADE"
+    assert _col(artifacts, "thread_id").nullable is False
+
+    fk_turn = _fk(artifacts, "turn_id")
+    assert fk_turn.target_fullname == "turns.id" and fk_turn.ondelete is None
+    assert _col(artifacts, "turn_id").nullable is True
+
+    artifact_type = _col(artifacts, "artifact_type")
+    assert isinstance(artifact_type.type, String) and artifact_type.type.length == 16
+    assert artifact_type.nullable is False  # report | code_output（M2 先承载 report）
+
+    filename = _col(artifacts, "filename")
+    assert isinstance(filename.type, String) and filename.type.length == 256
+    assert filename.nullable is False
+
+    assert isinstance(_col(artifacts, "rel_path").type, Text)
+    assert _col(artifacts, "rel_path").nullable is False
+
+    size_bytes = _col(artifacts, "size_bytes")
+    assert isinstance(size_bytes.type, BigInteger) and size_bytes.nullable is False
+
+    content_type = _col(artifacts, "content_type")
+    assert isinstance(content_type.type, String) and content_type.type.length == 64
+    assert content_type.nullable is False and content_type.server_default is None
+
+    _assert_tz_now(_col(artifacts, "created_at"))
+
+
+def test_artifacts_thread_index_desc():
+    """idx_artifacts_thread (thread_id, created_at DESC)——线程产物列表按新在前。
+
+    DESC 为 TextClause 表达式（str 原样保留「created_at DESC」），与迁移侧
+    sa.literal_column 渲染一致（idx_threads_user_updated 同款先例）。
+    """
+    idx = _index(_table("artifacts"), "idx_artifacts_thread")
+    assert idx.unique is False
+    assert [str(e).split(".")[-1] for e in idx.expressions] == [
+        "thread_id",
+        "created_at DESC",
+    ]
 
 
 def test_sources_unique_index_turn_ref():

@@ -1,9 +1,11 @@
 """deep 模式桩子图（B2 桩，B4 起 deepagents 子代理实装——ARCH §4.2）。
 
 节点序列 plan → write（桩节点名 = api.md §7.2 stage_key），发射的 custom 信号
-序列对齐 api.md §7.4 深度主干（701-708 行）的桩期子集：
+序列对齐 api.md §7.4 深度主干（701-708 行）的桩期子集。M2 批次 1 起 plan 的
+running 归 TurnRunner 图前发布（同 fast rewrite 先例——§4.3「首个 stage ≤1s」，
+图内不再自发 running 避免重复 seq），图内信号序列：
 
-    stage(plan,r) → stage(plan,d) → stage(write,running,label=撰写报告)
+    stage(plan,d) → stage(write,running,label=撰写报告)
     → token…token → stage(write,d)
 
 - search/read/reflect 阶段、sources 批次、extra.subagents/subtopics 均为 B4
@@ -29,8 +31,8 @@ STUB_DEEP_ANSWER_MD: str = "".join(STUB_DEEP_TOKEN_DELTAS)
 
 
 def plan(state: DeepState) -> dict[str, Any]:
-    """研究规划桩：stage(plan, running→done)，无 LLM、无子代理（B4 实装）。"""
-    emit_stage("plan", "running")
+    """研究规划桩：stage(plan, done)（running 归 TurnRunner 图前发布——M2 批次 1，
+    同 fast rewrite 先例），无 LLM、无子代理（B4 实装）。"""
     emit_stage("plan", "done")
     return {}
 

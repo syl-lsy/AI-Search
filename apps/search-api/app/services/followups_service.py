@@ -30,6 +30,7 @@ from typing import Any, cast
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, ValidationError
 
+from app.agent.external_content import external_content
 from app.agent.nodes.fast_rewrite import build_light_model
 from app.agent.prompts import resolve_prompt, render_prompt
 from app.core.logger import AgentLog
@@ -197,22 +198,11 @@ def normalize_followups(raw: Any, *, count: int) -> list[str] | None:
     return out[:cap]
 
 
-def _external_content(content: str, *, source: str, kind: str | None = None) -> str:
-    """`<external_content>` 包裹体在**本模块**的唯一构造点（§6.4.3）：属性值转义，内容由调用方转义。
-
-    来源块（`type="web"`）与答案块（`source="answer"`）完全同构——本模块两条装配路径
-    共用这一处开闭标记实现，转义口径不会漂移。synthesis 图节点另有独立实现
-    （`app/agent/nodes/synthesis.py::_sources_block`，多 snippet 段、图内消费），两处
-    不共享本函数；改包裹格式须双侧同步（§6.4.3 契约面）。
-    """
-    attrs = f' source="{html.escape(source, quote=True)}"'
-    if kind is not None:
-        attrs += f' type="{html.escape(kind, quote=True)}"'
-    return f"<external_content{attrs}>\n{content}\n</external_content>"
-
-
 def _wrap_sources(sources: Sequence[Mapping[str, Any]]) -> str:
     """来源块装配（§6.4.3）：逐条 `<external_content source=url type=web>` 包裹 + 转义。
+
+    开闭标记/属性走共享 helper（`app/agent/external_content.py`，M2 批次 1 收敛——与
+    synthesis `_sources_block` 同源单一实现，改包裹格式只动一处）。
 
     仅标题/URL（控 token——api.md §7.2「fused sources 标题/域名清单」）；空来源返回
     空串（direct 轮零检索，模板既有支持）。
@@ -221,7 +211,7 @@ def _wrap_sources(sources: Sequence[Mapping[str, Any]]) -> str:
     for index, item in enumerate(list(sources)[:FOLLOWUPS_SOURCES_MAX], start=1):
         title = html.escape(str(item.get("title") or ""), quote=True)
         blocks.append(
-            _external_content(
+            external_content(
                 f"[{index}] {title}",
                 source=str(item.get("url") or ""),
                 kind="web",
@@ -238,7 +228,7 @@ def _wrap_answer(answer: str) -> str:
     答案内闭标记/引号被实体化。空答案仍产空包裹体（条件矩阵已保证 answer_md 非空，
     此处保持既有输入容错形态）。
     """
-    return _external_content(
+    return external_content(
         html.escape(answer[:FOLLOWUPS_ANSWER_MAX_CHARS], quote=True), source="answer"
     )
 

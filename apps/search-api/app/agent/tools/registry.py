@@ -1,4 +1,4 @@
-"""tools/registry：MCP 源注册表 + 搜索链解析 + 熔断器（ARCH §3.1/§6.2、nacos-config §2）。
+"""tools/registry：MCP 源注册表 + 搜索链/读取链解析 + 熔断器（ARCH §3.1/§6.2/§6.3、nacos-config §2）。
 
 职责三层：
 - **熔断器**（进程内状态）：连续 failure_threshold 次失败 → open cooldown_s → 冷却期满
@@ -8,13 +8,19 @@
   按链序取第一个可用者（searxng 链首 → anysearch 次级，v1.18）；备位全断 → 空链（该轮
   search 失败，节点侧抛 SearchChainUnavailable → TurnRunner 500201）。enabled=false ≡
   熔断 open ≡ 凭证缺失（*_env 指针为空）。轮内中途熔断不切换备位（下一轮 resolve 反映）。
+- **读取链解析**（M2 批次 1，url_reader 组同语义复用三条件）：主位 firecrawl
+  （role=url_reader）→ 备位 crawl4ai（role=url_reader_backup）按链序条件装载
+  （nacos-config §2 v1.8：「Firecrawl 断→Crawl4AI 顶替→双断跳过读原文」——空链
+  不等价搜索链 500201，跳过语义由调用方消费）；`ToolRegistry.read` 为 guarded
+  单源读取调用（返回正文全量文本——head 窗口在 url_reader 工具面做，快照全量
+  口径依赖此处不截断）。
 - **guarded 源调用**（schema_guard 双向，§6.2）：入参 pydantic 校验后发调用（编程错误
   不进熔断）；出参归一失败计该源一次失败（进熔断）、异常上抛由节点记 errors——不产
   state 写入、不污染上下文。
 
 **fast 工具面白名单**：SEARCH_SOURCE_NAMES 物理不含 firecrawl/crawl4ai（url_reader 组
-属 deep/读取链——共识约束的代码级保证）。凭证只经 .env（settings 单例 / 子进程 env 指针
-注入），绝不进日志/断言/配置字面量（ADR-005）。
+属 deep/读取链——共识约束的代码级保证）；READ_SOURCE_NAMES 与搜索源集互斥。凭证只经
+.env（settings 单例 / 子进程 env 指针注入），绝不进日志/断言/配置字面量（ADR-005）。
 """
 
 import asyncio
@@ -37,12 +43,18 @@ __all__ = [
     "SEARCH_SOURCE_NAMES",
     "BACKUP_SEARCH_CHAIN",
     "SOURCE_RETRY_DELAY_S",
+    "READ_SOURCE_NAMES",
+    "READ_PRIMARY_SOURCES",
+    "READ_BACKUP_CHAIN",
+    "READ_TOOL_NAMES",
     "CircuitBreaker",
+    "ReadChain",
     "SearchChain",
     "SearchChainUnavailable",
     "SourceCallError",
     "ToolRegistry",
     "guarded_source_call",
+    "resolve_read_chain",
     "resolve_search_chain",
 ]
 
@@ -51,6 +63,23 @@ SEARCH_SOURCE_NAMES = {"tavily", "bocha", "searxng", "anysearch"}
 
 #: 搜索备位链（v1.18 链式：链首 searxng → 次级 anysearch，按链序取第一个可用者）
 BACKUP_SEARCH_CHAIN: tuple[str, ...] = ("searxng", "anysearch")
+
+#: 读取链源白名单（M2 批次 1：url_reader 组；与搜索源集互斥——物理隔离双链）
+READ_SOURCE_NAMES = frozenset({"firecrawl", "crawl4ai"})
+
+#: 读取链主位（本轮适用主位源集=Firecrawl，nacos-config §2 v1.8 备位条件装载口径）
+READ_PRIMARY_SOURCES: tuple[str, ...] = ("firecrawl",)
+
+#: 读取备位链（Firecrawl 断 → Crawl4AI 顶替；双断 → 空链跳过读原文）
+READ_BACKUP_CHAIN: tuple[str, ...] = ("crawl4ai",)
+
+#: 读取源工具名（代码常量同 SEARCH_TOOL_NAMES 先例；firecrawl_scrape=Firecrawl 官方
+#: MCP 抓页工具、crawl4ai md=自部署 markdown 抽取（S0 R12 实抓实证工具面）——
+#: 工具名不进 mcp.json 键位（§2 键位不含工具名），批次 2 形态探针若实测漂移改此处）
+READ_TOOL_NAMES: dict[str, str] = {
+    "firecrawl": "firecrawl_scrape",
+    "crawl4ai": "md",
+}
 
 #: 语言门控主位源集（REQ-002：zh 双源并行；非 zh 仅 Tavily——BoCha 不跨语言兜用）
 ZH_PRIMARY_SOURCES: tuple[str, ...] = ("tavily", "bocha")
@@ -64,6 +93,9 @@ SEARCH_TOOL_NAMES: dict[str, str] = {
     "searxng": "searxng_search",
     "anysearch": "search",
 }
+
+#: 全源期望工具名表（_acquire_tool 消费：搜索 + 读取双链统一装载面）
+_EXPECTED_TOOL_NAMES: dict[str, str] = {**SEARCH_TOOL_NAMES, **READ_TOOL_NAMES}
 
 #: 凭证/连接 env 指针（searxng = wrapper 子进程三件套；其余 = API key）
 _SOURCE_ENV_POINTERS: dict[str, tuple[str, ...]] = {
@@ -203,6 +235,62 @@ def resolve_search_chain(
                 ),
             )
     return SearchChain(sources=[], backup=None, degraded=True, detail="主位与备位链全部不可用")
+
+
+@dataclass(frozen=True)
+class ReadChain:
+    """轮内冻结的读取链（url_reader 组，M2 批次 1；解析语义同 SearchChain）。
+
+    sources=本轮可用读取源（主位 firecrawl → 备位 crawl4ai 条件装载后）；backup=备位
+    源名（无则 None）；degraded=True 表示发生了备位装载（stage detail 标注）；detail=
+    stage(read, running) 的链摘要。**空链 ≠ 搜索链的 500201**：读取链全断语义为「跳过
+    读原文」（nacos-config §2 v1.8），由调用方（deep 节点）消费。
+    """
+
+    sources: list[str]
+    backup: str | None
+    degraded: bool
+    detail: str
+
+
+def resolve_read_chain(
+    mcp_payload: Mapping[str, Any] | None,
+    registry: "ToolRegistry",
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> ReadChain:
+    """读取链解析（纯决策函数，零网络；三条件判定与搜索链 usable 同型）。"""
+    now = clock()
+    servers = mcp_payload.get("servers") if isinstance(mcp_payload, Mapping) else None
+
+    def usable(name: str) -> bool:
+        entry = servers.get(name) if isinstance(servers, Mapping) else None
+        if not isinstance(entry, Mapping) or entry.get("enabled") is not True:
+            return False  # enabled=false ≡ 缺条目 ≡ 不装载（A10 口径）
+        breaker = registry.breakers.get(name)
+        if breaker is not None and breaker.is_open(now):
+            return False  # 熔断 open
+        return registry.credential_ready(name)
+
+    available = [name for name in READ_PRIMARY_SOURCES if usable(name)]
+    if available:
+        return ReadChain(
+            sources=available, backup=None, degraded=False, detail="+".join(available)
+        )
+    for name in READ_BACKUP_CHAIN:  # 链序：crawl4ai（url_reader_backup，R12）
+        if usable(name):
+            return ReadChain(
+                sources=[name],
+                backup=name,
+                degraded=True,
+                detail=(
+                    f"{name}（备位装载：主位 {'/'.join(READ_PRIMARY_SOURCES)} 不可用；"
+                    f"备位链序 {'→'.join(READ_BACKUP_CHAIN)}）"
+                ),
+            )
+    return ReadChain(
+        sources=[], backup=None, degraded=True, detail="主位与备位链全部不可用（跳过读原文）"
+    )
 
 
 class _SearchArgs(BaseModel):
@@ -384,12 +472,57 @@ def _search_args(source: str, query: str, time_range: str | None, top_k: int) ->
     return {"query": query}  # anysearch：最小面
 
 
+class _ReadArgs(BaseModel):
+    """读取调用入参边界（url_reader 组——本节点构造的编程面）。"""
+
+    url: str
+
+    @model_validator(mode="after")
+    def _url_present(self) -> "_ReadArgs":
+        if not self.url.strip():
+            raise ValueError("url 必填（非空白）")
+        return self
+
+
+def _read_args(source: str, url: str) -> dict[str, Any]:
+    """读取源调用参数（offset/limit 是工具面本地窗口，不透传上游）。
+
+    firecrawl 附带 `formats: ["markdown"]`（抓取正文形态契约——快照/窗口共用该形态）；
+    crawl4ai `md` 工具最小面 {"url": …}（S0 R12 实抓形态）。
+    """
+    if source == "firecrawl":
+        return {"url": url, "formats": ["markdown"]}
+    return {"url": url}  # crawl4ai：最小面
+
+
+def _normalize_read_output(source: str, raw: Any) -> str:
+    """读取源 MCP 出参 → 正文全量文本（head 窗口在 url_reader 工具面做，此处不截断）。
+
+    兼容形态：str 直返；MCP content 块解包（_unwrap_mcp_content）；顶层映射优先取
+    markdown → content → text → description 首个非空 str。无正文 → ValueError
+    （schema_guard 计该源一次失败）。
+    """
+    data = _unwrap_mcp_content(raw)
+    text: str | None = None
+    if isinstance(data, str):
+        text = data
+    elif isinstance(data, Mapping):
+        for key in ("markdown", "content", "text", "description"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value
+                break
+    if text is None or not text.strip():
+        raise ValueError(f"{source} 出参缺正文（markdown/content/text 均无）")
+    return text
+
+
 def guarded_source_call(
     *,
     invoke: Callable[[dict[str, Any]], Any],
     args_model: type[BaseModel],
     args: dict[str, Any],
-    normalize: Callable[[Any], list[dict[str, Any]]],
+    normalize: Callable[[Any], Any],
     breaker: CircuitBreaker,
     timeout_s: float,
     clock: Callable[[], float] = time.monotonic,
@@ -399,12 +532,13 @@ def guarded_source_call(
 
     入参校验失败=编程错误 → ValueError（熔断计数不动、不发调用）；出参归一失败/调用
     异常/超时 → SourceCallError（携带 `retryable` 连接类分类与原始异常）。
+    normalize 返回形态由调用面定（搜索=候选列表；读取=正文 str，M2 批次 1）。
 
     `record_circuit=False`（B11 P1b 逻辑调用计账）：本函数不改熔断状态——由调用方
     （`ToolRegistry.search`）在一次**逻辑调用**（首试+同源重试）收口时统一记一次
     success/failure，防两次物理失败打穿 `failure_threshold=3`（决策 7）。
     """
-    async def _run() -> list[dict[str, Any]]:
+    async def _run() -> Any:
         try:
             args_model.model_validate(args)
         except ValidationError as exc:
@@ -449,7 +583,8 @@ class ToolRegistry:
 
         有意设计（装载门窄于解析面，安全方向）：searxng 等连接指针类走
         _resolve_pointer 双渠道（settings 空值回落 os.environ）；tavily/bocha/
-        anysearch 等 API-key 密钥类只信 settings 单例——密钥语义不进进程环境。
+        anysearch/firecrawl/crawl4ai 等 API-key 密钥类只信 settings 单例——密钥
+        语义不进进程环境。
         """
         from app.core.config import mcp_settings
 
@@ -459,6 +594,12 @@ class ToolRegistry:
             return bool(mcp_settings.bocha_api_key.get_secret_value())
         if server == "anysearch":
             return bool(mcp_settings.anysearch_api_key.get_secret_value())
+        if server == "firecrawl":
+            # 读取链主位（M2 批次 1 修复：原实现直接 return False——凭证真实检查）
+            return bool(mcp_settings.firecrawl_api_key.get_secret_value())
+        if server == "crawl4ai":
+            # 读取链备位（M2 批次 1 修复同上；url 指针有内置默认，凭证=token 在场性）
+            return bool(mcp_settings.crawl4ai_api_token.get_secret_value())
         if server == "searxng":
             # wrapper 三件套走统一指针渠道（settings 单例优先 → 空值/未声明回落进程
             # 环境）：.env + make dev 形态值在 settings 单例（B3 R12 注遗留②修复——
@@ -493,6 +634,10 @@ class ToolRegistry:
     def resolve(self, mcp_payload: Mapping[str, Any] | None, query_lang: str) -> SearchChain:
         """搜索链解析（轮启动一次；见 resolve_search_chain）。"""
         return resolve_search_chain(mcp_payload, query_lang, self)
+
+    def resolve_read(self, mcp_payload: Mapping[str, Any] | None) -> ReadChain:
+        """读取链解析（轮启动一次；见 resolve_read_chain——M2 deep 消费面）。"""
+        return resolve_read_chain(mcp_payload, self)
 
     # ---- guarded 搜索调用（web_search 节点消费面）----
 
@@ -571,6 +716,44 @@ class ToolRegistry:
                 ).info()
             return candidates
 
+    async def read(
+        self,
+        url: str,
+        source: str,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> str:
+        """单源 guarded 读取（url_reader 组，M2 批次 1）：timeout 包络 + schema_guard。
+
+        返回**正文全量文本**（head 窗口在 url_reader.firecrawl_read 工具面做——快照
+        「对象全量存 MinIO」口径依赖此处不截断）。失败计该源一次熔断（无同源重试——
+        读取失败语义为节点侧换源/跳过，nacos §2 v1.8）。
+        """
+        if source not in READ_SOURCE_NAMES:
+            raise SearchChainUnavailable(
+                f"{source} 不在读取链源白名单（{sorted(READ_SOURCE_NAMES)}）"
+            )
+        entry = self._entries.get(source) or {}
+        timeout_s = float(entry.get("timeout_s", 30))
+        breaker = self.breakers.setdefault(
+            source, CircuitBreaker(failure_threshold=3, cooldown_s=60.0)
+        )
+        tool = await self._acquire_tool(source)
+        args = _read_args(source, url)
+
+        async def _invoke(call_args: dict[str, Any]) -> Any:
+            return await tool.ainvoke(call_args)
+
+        return await guarded_source_call(
+            invoke=_invoke,
+            args_model=_ReadArgs,
+            args=args,
+            normalize=lambda raw: _normalize_read_output(source, raw),
+            breaker=breaker,
+            timeout_s=timeout_s,
+            clock=clock,
+        )
+
     @staticmethod
     def _resolve_pointer(name: str) -> str:
         """*_env 指针解析：settings 字段（大小写不敏感同名）非空优先，空值/未声明回落进程环境。
@@ -645,7 +828,7 @@ class ToolRegistry:
         client = MultiServerMCPClient({source: connection})  # type: ignore[arg-type]
         tools = await client.get_tools()
         by_name = {tool.name: tool for tool in tools}
-        tool_name = SEARCH_TOOL_NAMES[source]
+        tool_name = _EXPECTED_TOOL_NAMES[source]
         if tool_name not in by_name:
             raise SearchChainUnavailable(
                 f"{source} 未暴露搜索工具 {tool_name}（实测清单：{sorted(by_name)}）"

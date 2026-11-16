@@ -1159,14 +1159,19 @@ async def test_execute_turn_injects_full_fast_state_input() -> None:
     assert config["configurable"]["thread_id"] == turn.thread_id
     assert config["configurable"]["turn_id"] == str(turn.id)
     assert config["configurable"]["model_mapping"] == _MAPPING_PAYLOAD
-    # 观测注入随 LANGFUSE_ 配置形态（有键 → 1 个 handler；无键 → 空表）
+    # 观测注入随 LANGFUSE_ 配置形态（有键 → 1 个 handler；无键 → 空表）；
+    # M2 批次 1 起轮级 UsageCollector 恒并列注入（usage 方案 A——fast/deep 通用）
     from app.core.config import langfuse_settings as _lf
+    from app.core.observability import UsageCollector as _UC
 
     _lf_configured = bool(
         _lf.public_key and _lf.secret_key.get_secret_value()
     )
     callbacks = config.get("callbacks", [])
-    assert (len(callbacks) == 1) if _lf_configured else (callbacks == [])
+    collectors = [c for c in callbacks if isinstance(c, _UC)]
+    others = [c for c in callbacks if not isinstance(c, _UC)]
+    assert len(collectors) == 1  # 轮级 usage collector 恰一
+    assert (len(others) == 1) if _lf_configured else (others == [])
     assert config["metadata"]["langfuse_session_id"] == turn.thread_id
     # langfuse_* 契约键全量（langfuse 4.18.0 实证）：user=发起者、tags=模式标签（Langfuse 侧过滤维度）
     assert config["metadata"]["langfuse_user_id"] == str(turn.user_id)
@@ -1263,4 +1268,294 @@ def test_history_statement_filters_and_binds_params() -> None:
     assert any("degraded" in v for v in bound_values)
     assert any("canceled" in v for v in bound_values)
     assert str(HISTORY_WINDOW_TURNS) in [v for v in bound_values]  # LIMIT 6
+
+
+# ---- M2 批次 1（TurnRunner deep 化五件）----
+
+
+def _deep_scheduler(bus: EventBus, factory: _FakeSessionFactory, graph: Any,
+                    spec: dict[str, Any] | None = None) -> ThreadScheduler:
+    """deep 轮调度器构造（mode=deep 的 _TurnRow 由用例自建）。"""
+    return _scheduler(bus, factory, graph, spec=spec)
+
+
+class _FakeLLMResult:
+    """LLMResult 假体（on_llm_end 形态，langchain-core 1.x：response.generations
+    为嵌套 list[list[ChatGeneration]]）：message 挂 usage_metadata（键值对构造，零网络）。"""
+
+    def __init__(self, pairs: list[tuple[str, int]]) -> None:
+        from types import SimpleNamespace
+
+        message = SimpleNamespace(usage_metadata=dict(pairs))
+        self.generations = [[SimpleNamespace(message=message)]]
+
+
+async def test_deep_degraded_reason_timeout_finishes_degraded() -> None:
+    """件3（api.md §7.2 degraded_reason 枚举）：deep 成功收束读 final_state.degraded_reason
+    ——timeout → turns.status=degraded + done(finish=degraded, degraded=True,
+    degraded_reason=timeout)；成功收束面零 error 事件（降级报告已由图内产出）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="deep")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({"write": {"answer_md": "降级报告（研究未完成）", "degraded_reason": "timeout"}}),
+    ])
+    scheduler = _deep_scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert not [e for e in published if e.event_type == "error"]  # 成功收束面：零 error
+    done = published[-1]
+    assert done.event_type == "done"
+    assert done.data["finish"] == "degraded"
+    assert done.data["degraded"] is True
+    assert done.data["degraded_reason"] == "timeout"
+    assert turn.status == "degraded" and turn.degraded_reason == "timeout"
+    assert turn.answer_md == "降级报告（研究未完成）"  # 降级报告保留
+
+
+async def test_deep_degraded_reason_budget_finishes_degraded() -> None:
+    """件3：budget 同形态——turns.status=degraded + done(finish=degraded, 同值)。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="deep")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({"write": {"answer_md": "降级报告（预算熔断）", "degraded_reason": "budget"}}),
+    ])
+    scheduler = _deep_scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = published[-1]
+    assert done.data["finish"] == "degraded"
+    assert done.data["degraded_reason"] == "budget"
+    assert turn.status == "degraded" and turn.degraded_reason == "budget"
+
+
+async def test_deep_degraded_reason_absent_completes_normally() -> None:
+    """件3：deep 轮 state 无 degraded_reason → 既有 completed 口径零回退（桩轮现状）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="deep")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({"write": {"answer_md": "深度报告"}}),
+    ])
+    scheduler = _deep_scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = published[-1]
+    assert done.data["finish"] == "completed"
+    assert done.data["degraded"] is False
+    assert done.data["degraded_reason"] is None
+    assert turn.status == "completed"
+
+
+async def test_fast_turn_ignores_state_degraded_reason_zero_regression() -> None:
+    """件3 fast 零回退：fast 轮不消费 final_state.degraded_reason（FastState 无该键，
+    mode 门控显式排除）——即便假图 updates 携带该键也维持 status=completed +
+    degraded_reason=None；degraded=True→source_failure 派生口径不变（既有用例锁定）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({"write": {"answer_md": "fast 答案", "degraded_reason": "budget"}}),
+    ])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = published[-1]
+    assert done.data["finish"] == "completed"  # 不被 state 键误置 degraded
+    assert done.data["degraded"] is False
+    assert done.data["degraded_reason"] is None
+    assert turn.status == "completed"
+    assert getattr(turn, "degraded_reason", None) is None
+
+
+async def test_deep_degraded_state_then_cancel_finishes_canceled() -> None:
+    """取消优先于成功收束的组合锁定（deep + degraded_reason + 取消，此前无专项用例）。
+
+    帧 1 顶层 updates 已把 deep 主干终态（answer_md + degraded_reason="timeout"）合入
+    final_state（模拟图已完成 deep 主干）；帧 2 事件边界命中取消标志 → break，
+    TurnCanceledSignal 面直达 _finish_canceled——即便 final_state 带降级标记也产出
+    done(finish=canceled)（degraded=False / degraded_reason=null），而非
+    done(finish=degraded)；零 error 事件（打断非故障），取消轮不落降级报告。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="deep")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({"write": {"answer_md": "降级报告（研究未完成）", "degraded_reason": "timeout"}}),
+        _custom({"type": "stage", "stage_key": "write", "status": "done"}),
+    ], delay=0.03)
+    scheduler = _deep_scheduler(bus, _FakeSessionFactory(session), graph)
+
+    async def register_late() -> None:
+        # 时序同 test_cancel_running_midflight：帧 1 于 0.03s 产出并翻译，帧 2 于
+        # 0.06s 到达；0.045s 登记标志落在帧间隔中点 → 帧 2 边界 pop 命中（15ms 裕量）
+        await asyncio.sleep(0.045)
+        scheduler._cancel_flags[str(turn.id)] = "superseded"
+
+    register_task = asyncio.create_task(register_late())
+    await scheduler._execute_turn(turn)
+    await register_task
+
+    published = await _drain_all(bus, str(turn.id))
+    assert not [e for e in published if e.event_type == "error"]  # 打断非故障
+    assert [e.event_type for e in published] == ["stage", "done"]  # 图前 stage + 取消收尾
+    done = published[-1]
+    assert done.data["finish"] == "canceled"  # 不可被 final_state 降级值翻成 degraded
+    assert done.data["degraded"] is False
+    assert done.data["degraded_reason"] is None
+    assert done.data["cancel_reason"] == "superseded"
+    assert turn.status == "canceled"
+    assert turn.cancel_reason == "superseded"
+    assert turn.error is None
+    assert getattr(turn, "degraded_reason", None) is None  # 取消面不消费降级值
+    assert turn.answer_md is None  # 已合入 final_state 的降级报告不落取消轮
+
+
+async def test_done_usage_filled_from_usage_collector() -> None:
+    """件4（usage 方案 A，docs/m2-usage-probe-batch0.md §3/§4）：_finish_completed 消费
+    轮级 collector 累计——done.usage 与 turns.usage 列同源填真值（零契约变更：
+    UsageBrief 全可空，>0 键才出现）。"""
+    from app.core.observability import UsageCollector
+
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _FakeGraph([]))
+    collector = UsageCollector()
+    # 走真实累计路径（on_llm_end 语义由 test_observability.py 直锁）：
+    # 两次模型调用——第一次 prompt=100/completion=20/total=120，第二次 5/2/7
+    collector.on_llm_end(
+        _FakeLLMResult([("input_tokens", 100), ("output_tokens", 20), ("total_tokens", 120)]), run_id=uuid.uuid4()
+    )
+    collector.on_llm_end(
+        _FakeLLMResult([("input_tokens", 5), ("output_tokens", 2), ("total_tokens", 7)]), run_id=uuid.uuid4()
+    )
+    ctx = turn_service._RunContext(
+        turn_id=str(turn.id),
+        thread_id=str(turn.thread_id),
+        user_id=turn.user_id,
+        mode="fast",
+        spec_payload=dict(_SPEC_PAYLOAD),  # followups.enabled=False——钩子零触发零网络
+    )
+    ctx.usage_collector = collector  # noqa: SLF001
+
+    await scheduler._finish_completed(ctx, {"answer_md": "综合答案"})
+
+    published = await _drain_all(bus, str(turn.id))
+    done = published[-1]
+    assert done.data["usage"] == {
+        "prompt_tokens": 105,
+        "completion_tokens": 22,
+        "total_tokens": 127,
+    }
+    assert turn.usage == {
+        "prompt_tokens": 105,
+        "completion_tokens": 22,
+        "total_tokens": 127,
+    }
+
+
+async def test_execute_turn_wires_usage_collector_into_callbacks() -> None:
+    """件4：_execute_turn 把轮级 UsageCollector 并列注入 astream callbacks（随
+    build_turn_callbacks 并列——方案 A 注入面），ctx 持引用供终态消费。"""
+    from app.core.observability import UsageCollector
+
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    callbacks = graph.configs[0]["callbacks"]
+    collectors = [c for c in callbacks if isinstance(c, UsageCollector)]
+    assert len(collectors) == 1  # 恰一 collector（fast/deep 通用注入面）
+
+
+async def test_zero_usage_round_keeps_empty_usage_payload() -> None:
+    """件4 零用量形态兼容：无 LLM 轮（桩流）collector 全零 → done.usage={} 与
+    turns.usage={}（缺键省略先例；既有 integration 断言 usage=={} 保持绿）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    done = published[-1]
+    assert done.data["usage"] == {}
+    assert turn.usage == {}
+
+
+async def test_context_compact_signal_publishes_without_persistence() -> None:
+    """件5（api.md §7.2 context_compact，v1.3 增）：custom context_compact 信号 →
+    SSE 事件一对一发布（publish-only）——不落 turn_events（ADR-003 第 4 条子集
+    不变，db/models/turn_event.py 注释口径不变）。"""
+    frames = [
+        _custom({"type": "stage", "stage_key": "write", "status": "done"}),
+        _custom({
+            "type": "context_compact",
+            "summarized_messages": 12,
+            "released_tokens": 58000,
+            "retained_tokens": 9000,
+            "offloaded_files": [{"ref": "/large_tool_results/abc.md", "url": "https://example.com/long-page"}],
+        }),
+    ]
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph(frames)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    compacts = [e for e in published if e.event_type == "context_compact"]
+    assert len(compacts) == 1
+    assert compacts[0].data == {
+        "summarized_messages": 12,
+        "released_tokens": 58000,
+        "retained_tokens": 9000,
+        "offloaded_files": [{"ref": "/large_tool_results/abc.md", "url": "https://example.com/long-page"}],
+    }
+    # publish-only：turn_events 无 context_compact 行（first_stage + 图内 stage + done 照常落库）
+    events = [obj for obj in session.added if type(obj).__name__ == "TurnEvent"]
+    assert [e.event_type for e in events] == ["stage", "stage", "done"]
+    assert "context_compact" not in {e.event_type for e in events}
+
+
+async def test_emit_context_compact_helper_payload_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """件5：signals.emit_context_compact 发射形态（键位对齐 api.md §7.2 payload）。"""
+    from app.agent.graphs import signals as signals_module
+
+    captured: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        signals_module, "get_stream_writer", lambda: (lambda p: captured.append(p))
+    )
+    signals_module.emit_context_compact(
+        summarized_messages=12,
+        released_tokens=58000,
+        retained_tokens=9000,
+        offloaded_files=[{"ref": "/x.md", "url": "https://e.com/p"}],
+    )
+
+    assert captured == [{
+        "type": "context_compact",
+        "summarized_messages": 12,
+        "released_tokens": 58000,
+        "retained_tokens": 9000,
+        "offloaded_files": [{"ref": "/x.md", "url": "https://e.com/p"}],
+    }]
 

@@ -56,7 +56,22 @@ class MainState(TypedDict, total=False):
     candidates: list[Candidate]
     images_raw: list[dict[str, Any]]
     fused: list[Candidate]
-    # 横切（reducer 承接 Send 扇出并行副本：errors 追加、degraded 逻辑或——§4.1 键集不变）
+    # deep 产出回填（M2 批次 1 投影扩展 R14①：类型逐键对齐 DeepState——planner/research/
+    # reflect/writer 产出，B4 起逐节点消费；deep 扇出 reducer 留批次 2 research 接入时再定）
+    subtopics: list[str]
+    outline: list[dict[str, Any]]  # [{section, intent}] 报告章节骨架
+    subagent_reports: list[dict[str, Any]]
+    visited_urls: list[str]
+    searched_queries: list[str]
+    snapshots: list[dict[str, Any]]  # [{url, object_key, size}]
+    collected_sources: list[Candidate]
+    reflect_round: int
+    gaps: list[dict[str, Any]]  # [{gap, query, origin: "web"|"kb"}]
+    report_md: str
+    usage_total: int
+    degraded_reason: str | None  # "timeout" | "budget" | "source_failure"（api.md §7.2 枚举）
+    # 横切（reducer 承接 Send 扇出并行副本：errors 追加、degraded 逻辑或——§4.1 键集不变；
+    # deep 侧同名回填共用本通道，DeepState 侧为普通类型——两侧形态批次 2 对齐）
     errors: Annotated[list[dict[str, Any]], add]
     degraded: Annotated[bool, or_]
 

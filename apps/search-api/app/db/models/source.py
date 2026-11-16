@@ -1,7 +1,9 @@
-"""sources 表 ORM（data-model.md §1.5，M1 基础列）。
+"""sources 表 ORM（data-model.md §1.5，M1 基础列 + 0012_m2_deep 增 snapshot_id）。
 
-snapshot_id（M2）/kb_doc_id/kb_chunk_ids（M3）随对应迁移增列，本文件不得提前
-包含（护栏见 test_db_models.py）。id 即 api.md 的 source_id。
+snapshot_id（M2，0012）：深度已读原文指向 snapshots.id——可空、无级联动作
+（随 DDL 契约零私改；REST 投影 snapshot_available=本列非空，turn_service 推导）。
+kb_doc_id/kb_chunk_ids（M3）随对应迁移增列，本文件不得提前包含（护栏见
+test_db_models.py）。id 即 api.md 的 source_id。
 """
 import uuid
 from datetime import datetime
@@ -30,6 +32,10 @@ class Source(Base):
     url: Mapped[str | None] = mapped_column(Text)
     snippet: Mapped[str | None] = mapped_column(Text)  # 摘要/片段（卡片副文本）
     score: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))  # 检索/rerank 得分
+    # 0012/m2_deep 增列（§1.5 M2）：深度已读原文 → snapshots.id（可空、无级联动作）
+    snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("snapshots.id")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

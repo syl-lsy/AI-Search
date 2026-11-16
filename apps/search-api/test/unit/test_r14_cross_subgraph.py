@@ -6,8 +6,13 @@ R14①（messages 过滤，§6.1 v1.20 过滤规则 / api.md §7.2 token/thinkin
 - 真主图 astream(subgraphs=True) 帧形态实测锁死：messages 帧仅产自 fast 子图
   synthesis 节点（namespace=() + metadata.langgraph_node 判定——B3 探针形态），
   rewrite/web_search/merge_dedupe/fuse_rerank 与路由壳零 messages 产出；
-- deep 桩零泄漏：真 deep 子图经主图壳运行零 messages 帧、TurnRunner 侧零
-  token/thinking 事件（R14③ 现状基线，deepagents 实装时收敛）。
+- deep 侧 mode 感知（M2 批次 1）：`_is_deep_writer_messages` 放行 deep 子图**顶层**
+  writer 节点帧（namespace 单段 + metadata.langgraph_node=="writer"），拦截其余——
+  子代理嵌套帧（namespace 多段）与其它节点帧零泄漏（writer 批次 4 实装，先以
+  模拟 namespace 单测锁语义）；
+- deep 桩零泄漏保持：真 deep 子图经主图壳运行零 messages 帧、TurnRunner 侧零
+  token/thinking 事件（桩期基线——writer 放行语义由上面的门控测试锁定，批次 4
+  writer 实装后本基线不动、由 writer 帧形态接通）。
 
 R14②（取消透传，ARCH R14② / guards.py 注入面口径）：
 - guards 节点边界感知：进程级 `_cancel_flags` dict 引用经 astream configurable
@@ -312,9 +317,11 @@ async def test_real_main_graph_messages_frames_only_from_synthesis(
 
 
 async def test_deep_stub_zero_messages_and_runner_zero_token_events() -> None:
-    """deep 桩零泄漏（R14③ 现状基线）：真 deep 子图经主图壳运行——
-    (a) raw 帧面零 messages 帧（桩 token 走 custom、被翻译器丢弃）；
-    (b) TurnRunner 侧零 token/thinking SSE 事件（stage 序列 + done 正常）。"""
+    """deep 桩零泄漏（R14③ 桩期基线，M2 批次 1 修订为 writer 形态语义）：
+    (a) 真 deep 子图经主图壳运行零 messages 帧（桩 token 走 custom、被翻译器丢弃）；
+    (b) TurnRunner 侧零 token/thinking SSE 事件（stage 序列 + done 正常）——
+    桩期零 messages 帧，writer 放行语义由下方模拟 namespace 门控测试单独锁定
+    （批次 4 writer 实装后本基线零改动、由真 writer 帧形态接通）。"""
     # (a) raw 帧面
     payload: dict[str, Any] = {
         "turn_id": "r14-deep",
@@ -329,7 +336,7 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events() -> None:
         "images": [],
     }
     message_count = 0
-    async for _namespace, stream_mode, _chunk in main_graph.astream(
+    async for _namespace, stream_mode, chunk in main_graph.astream(
         payload, config={"configurable": {}}, stream_mode=["messages", "custom"], subgraphs=True
     ):
         if stream_mode == "messages":
@@ -346,6 +353,85 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events() -> None:
     assert [e.event_type for e in published if e.event_type in ("token", "thinking")] == []
     assert published[-1].event_type == "done" and published[-1].data["finish"] == "completed"
     assert turn.status == "completed"  # 桩答案经 updates 回填（custom token 被丢弃不影响终态）
+
+
+class _ScriptedTripleGraph:
+    """产出完整三元组 (namespace, stream_mode, chunk) 的假图（deep 侧门控用例——
+    模拟 namespace 形态：writer 顶层帧单段、子代理嵌套帧多段）。"""
+
+    def __init__(self, frames: list[tuple[tuple[str, ...], str, Any]]) -> None:
+        self._frames = frames
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        frames = list(self._frames)
+
+        async def gen():
+            for ns, stream, chunk in frames:
+                yield (ns, stream, chunk)
+
+        return gen()
+
+
+async def test_deep_writer_gate_predicate_semantics() -> None:
+    """deep 侧 messages 门控判定面直锁（M2 批次 1，writer 批次 4 才实装——先以
+    模拟 namespace 锁语义）：放行 = namespace 单段（deep 子图顶层）且
+    metadata.langgraph_node=="writer"；拦截 = 子代理嵌套帧（namespace 多段）、
+    其它节点帧、无 metadata 帧。"""
+    from app.services.turn_service import _is_deep_writer_messages  # noqa: SLF001
+
+    writer_frame = (_MessageChunk("writer 增量"), {"langgraph_node": "writer"})
+    assert _is_deep_writer_messages(("deep:run",), writer_frame) is True
+    # 子代理嵌套帧：即便内层节点也叫 writer 也拦截（零泄漏语义）
+    assert _is_deep_writer_messages(
+        ("deep:run", "research:1", "subagent"), writer_frame
+    ) is False
+    assert _is_deep_writer_messages((), writer_frame) is False  # 直跑形态零段 namespace 非顶层
+    assert _is_deep_writer_messages(
+        ("deep:run",), (_MessageChunk("planner 泄漏"), {"langgraph_node": "planner"})
+    ) is False
+    assert _is_deep_writer_messages(("deep:run",), (_MessageChunk("x"), None)) is False
+    assert _is_deep_writer_messages(("deep:run",), _MessageChunk("x")) is False
+
+
+async def test_deep_turn_writer_frames_pass_and_subagent_frames_blocked() -> None:
+    """deep 轮 messages 门控全链路（TurnRunner 侧）：writer 顶层帧 → token 事件；
+    子代理嵌套帧 / planner 帧 / 无 metadata 帧零泄漏；custom stage 翻译不受影响。"""
+    from app.services.turn_service import ThreadScheduler
+
+    frames = [
+        (("deep:run",), "custom", {"type": "stage", "stage_key": "plan", "status": "done"}),
+        (("deep:run",), "messages", (_MessageChunk("writer 增量"), {"langgraph_node": "writer"})),
+        (
+            ("deep:run", "research:1", "subagent"),
+            "messages",
+            (_MessageChunk("子代理泄漏"), {"langgraph_node": "writer"}),
+        ),
+        (("deep:run",), "messages", (_MessageChunk("planner 泄漏"), {"langgraph_node": "planner"})),
+        (("deep:run",), "messages", (_MessageChunk("无元数据泄漏"), None)),
+        ((), "updates", {"write": {"answer_md": "深度报告"}}),
+    ]
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="deep")
+    session = _FakeSession(turn=turn)
+    scheduler = ThreadScheduler(
+        bus=bus,
+        session_factory=_FakeSessionFactory(session),
+        graph=_ScriptedTripleGraph(frames),
+        spec_snapshot=_snapshot(_R14_SPEC),
+        mapping_snapshot=_snapshot(_MAPPING_PAYLOAD),
+        tools_registry=ToolRegistry(),
+    )
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    tokens = [e.data["delta"] for e in published if e.event_type == "token"]
+    assert tokens == ["writer 增量"]  # 仅 writer 顶层帧放行；子代理/planner/无 metadata 帧零泄漏
+    stages = [e.data.get("stage_key") for e in published if e.event_type == "stage"]
+    assert "plan" in stages
+    done = published[-1]
+    assert done.event_type == "done" and done.data["finish"] == "completed"
+    assert turn.answer_md == "深度报告"
 
 
 # ==== R14②：取消透传（guards 节点边界感知 + TurnRunner 收尾）====

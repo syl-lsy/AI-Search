@@ -18,6 +18,7 @@ Langfuse 配置缝 monkeypatch langfuse_settings 单例属性（test_trace_clean
 import importlib.metadata
 import os
 import uuid
+from typing import Any
 
 import pytest
 from pydantic import SecretStr
@@ -192,3 +193,109 @@ def test_guard_langchain_callback_handler_importable():
     """API 面护栏：from langfuse.langchain import CallbackHandler 可导入（观测接入面）——
     上游改集成包布局（如拆回独立 langfuse-langchain 包）即此处红，提示改观测模块导入。"""
     from langfuse.langchain import CallbackHandler  # noqa: F401 —— 可导入即通过
+
+
+# ---- UsageCollector（M2 批次 1，usage 方案 A——docs/m2-usage-probe-batch0.md §3/§4）----
+
+
+def _llm_result(pairs_by_gen: list[dict[str, Any] | None]) -> Any:
+    """LLMResult 假体：generations 嵌套形态，每条 generation 的 message 挂
+    usage_metadata（None = 上游无 usage 帧——旧通道/未开 stream_usage 形态）。"""
+    from types import SimpleNamespace
+
+    generations = [
+        SimpleNamespace(
+            message=SimpleNamespace(usage_metadata=dict(pairs) if pairs else None)
+        )
+        for pairs in pairs_by_gen
+    ]
+    return SimpleNamespace(generations=[generations])
+
+
+def test_usage_collector_accumulates_across_model_runs() -> None:
+    """多次模型调用的 on_llm_end 累计求和（轮级 collector 语义：快照内全部 LLM 调用
+    归并——synthesis/rewrite 多次调用与批次 2 deepagents 子代理调用同面覆盖）。"""
+    collector = observability.UsageCollector()
+    collector.on_llm_end(
+        _llm_result([{"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}]),
+        run_id=uuid.uuid4(),
+    )
+    # 单次多 generation（并行候选聚合形态）同样累计
+    collector.on_llm_end(
+        _llm_result([
+            {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+        ]),
+        run_id=uuid.uuid4(),
+    )
+
+    assert collector.total() == {
+        "prompt_tokens": 108,
+        "completion_tokens": 23,
+        "total_tokens": 131,
+    }
+
+
+def test_usage_collector_accepts_provider_key_families() -> None:
+    """键位双形态兼容：langchain-core 归一化键（input_tokens/output_tokens）与
+    provider 原生键（prompt_tokens/completion_tokens）均可读（归并口径：同义取一，
+    同条目同时出现时以归一化键优先，不双计）。"""
+    collector = observability.UsageCollector()
+    collector.on_llm_end(
+        _llm_result([{"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}]),
+        run_id=uuid.uuid4(),
+    )
+
+    assert collector.total() == {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}
+
+
+def test_usage_collector_tolerates_missing_usage_metadata() -> None:
+    """无 usage 帧容忍（零贡献不炸）：usage_metadata 缺失的 generation、response
+    缺 generations 属性均静默跳过（未开 stream_usage 的旧通道形态）。"""
+    from types import SimpleNamespace
+
+    collector = observability.UsageCollector()
+    collector.on_llm_end(_llm_result([None, {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}]), run_id=uuid.uuid4())
+    collector.on_llm_end(SimpleNamespace(), run_id=uuid.uuid4())  # 无 generations
+    collector.on_llm_end(None, run_id=uuid.uuid4())  # 防御：response=None
+
+    assert collector.total() == {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+
+
+def test_usage_collector_total_omits_zero_keys() -> None:
+    """全零累计 → total()={}（缺键省略先例）：桩轮/零 LLM 轮 done.usage 保持 {}
+    旧形态（既有 integration 断言零改动）。"""
+    collector = observability.UsageCollector()
+    collector.on_llm_end(_llm_result([None]), run_id=uuid.uuid4())
+
+    assert collector.total() == {}
+
+
+async def test_usage_collector_receives_streamed_usage_via_callback_machinery() -> None:
+    """真回调机制接线实证（零网络）：流式 chat 假体经 BaseChatModel.astream 的
+    callback 管线——结束事件聚合帧携带 chunk 合并后的 usage_metadata（langchain-core
+    chunk 合并=逐键求和，本仓版本 1.7.6 实证），collector 挂 config callbacks 即收。"""
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+    class _UsageStreamModel(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return "usage-fake-stream"
+
+        async def _astream(self, messages: Any, stop: Any = None, **kwargs: Any) -> Any:
+            yield ChatGenerationChunk(message=AIMessageChunk(
+                content="a", usage_metadata={"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}))
+            yield ChatGenerationChunk(message=AIMessageChunk(
+                content="b", usage_metadata={"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}))
+
+        async def _generate(self, messages: Any, stop: Any = None, **kwargs: Any) -> Any:
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ab"))])
+
+    collector = observability.UsageCollector()
+    model = _UsageStreamModel()
+    chunks = [c async for c in model.astream("hi", config={"callbacks": [collector]})]
+
+    assert [c.content for c in chunks] == ["a", "b", ""]
+    assert collector.total() == {"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20}

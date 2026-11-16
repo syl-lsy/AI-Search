@@ -9,7 +9,11 @@ dict 信号；TurnRunner 统一 `main_graph.astream(stream_mode=["messages","upd
 - `sources` → SSE `sources` 事件 + sources 表落库；
 - `images`  → SSE `images` 事件 + turn_events 落库（A6，REQ-004——轮内至多一次、
   ≤3 张（OQ-6）、无图不发；条目 url 恒在、其余键可省——api.md v1.12）；
-- `token`   → SSE `token` 事件，**不落库**（ADR-003 第 4 条）。
+- `token`   → SSE `token` 事件，**不落库**（ADR-003 第 4 条）；
+- `context_compact` → SSE `context_compact` 事件（api.md §7.2 v1.3，**仅 deep**——
+  深度研究上下文压缩通知；**publish-only 不落 turn_events**，压缩观测走 Langfuse；
+  断线重放边界语义由 EventBus 内存缓冲重放承担；触发面归批次 3/4
+  SummarizationMiddleware/超大工具结果卸载实装）。
 
 演进边界（B3/B4）：done 由 TurnRunner 落库终态后自发布（图不发 done）；
 B4 接真模型后 synthesis/writer 的 token/thinking 增量改经 messages 流
@@ -25,6 +29,7 @@ STAGE = "stage"
 SOURCES = "sources"
 IMAGES = "images"
 TOKEN = "token"
+CONTEXT_COMPACT = "context_compact"
 
 
 def emit_stage(
@@ -69,3 +74,28 @@ def emit_images(images: list[dict[str, Any]]) -> None:
 def emit_token(delta: str) -> None:
     """发射 token 信号（Markdown 增量片段，直接拼接渲染；不入 turn_events）。"""
     get_stream_writer()({"type": TOKEN, "delta": delta})
+
+
+def emit_context_compact(
+    *,
+    summarized_messages: int,
+    released_tokens: int,
+    retained_tokens: int,
+    offloaded_files: list[dict[str, Any]] | None = None,
+) -> None:
+    """发射 context_compact 信号（api.md §7.2 v1.3，仅 deep：深度研究主线程摘要
+    压缩或超大工具结果卸载通知——摘要经独立 run 产生，不混入 thinking/token 流）。
+
+    payload 键位：`summarized_messages`（被摘要消息条数）/ `released_tokens` /
+    `retained_tokens`（释放与保留 token 量级）/ `offloaded_files`（被卸载正文引用与
+    原 URL，可为空数组——缺省 None 归一为 []）。**publish-only**：TurnRunner
+    `_translate_custom` 对本类型只发布不落 turn_events（ADR-003 第 4 条子集不变），
+    本 helper 不承担落库口径。
+    """
+    get_stream_writer()({
+        "type": CONTEXT_COMPACT,
+        "summarized_messages": summarized_messages,
+        "released_tokens": released_tokens,
+        "retained_tokens": retained_tokens,
+        "offloaded_files": offloaded_files if offloaded_files is not None else [],
+    })

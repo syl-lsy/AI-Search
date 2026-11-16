@@ -15,11 +15,12 @@
   持久化开短事务（写入即 commit 即归还连接）；图运行是脱离请求生命周期的独立任务；
 - **事件翻译**（ARCH §6.1 + agent/graphs/signals.py 约定）：
   main_graph.astream(stream_mode=["messages","updates","custom"], subgraphs=True)；
-  custom 通道 payload type ∈ stage/sources/token/images 一对一翻译；token 承载演进：
-  B2 桩无真模型 token 亦走 custom，B4 真模型后 messages 流增量同翻译器归一；
+  custom 通道 payload type ∈ stage/sources/images 一对一翻译，context_compact
+  只发布不落库（M2 批次 1，api.md §7.2 v1.3）；B4 真模型后 token/thinking 走
+  messages 流增量（mode 感知放行门控：fast 仅 synthesis、deep 仅 writer 顶层帧）；
   stage/sources/images/done/error 以**发布盖章的同一 seq** 落 turn_events
-  （payload=去 envelope 冗余字段后的业务字段）；token/thinking 只发布不落库
-  （ADR-003 第 4 条）；done 由 TurnRunner 终态落库后自发布（图不发 done）；
+  （payload=去 envelope 冗余字段后的业务字段）；token/thinking/context_compact
+  只发布不落库（ADR-003 第 4 条）；done 由 TurnRunner 终态落库后自发布（图不发 done）；
 - **终态不变式**：先落 turns（status/answer_md/timing/usage/finished_at/duration_ms/
   error/cancel_reason）再 publish done（「事件到达时 2.5 已可对账」，§7.2）；
   duration 口径=「提交→done」（finished_at − created_at，data-model.md §1.3）；
@@ -55,7 +56,7 @@ from app.agent.nodes.synthesis import SynthesisError
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
-from app.core.observability import build_turn_callbacks
+from app.core.observability import UsageCollector, build_turn_callbacks
 from app.db.models import Source, Thread, Turn, TurnEvent, TurnFeedback
 from app.db.session import get_session_factory
 from app.exception import (
@@ -236,10 +237,31 @@ def _is_fast_synthesis_messages(namespace: Any, chunk_pair: Any) -> bool:
     subgraphs=True）messages 帧 namespace 为子图段 `('fast:<run_id>',)`、节点标识在
     chunk metadata `langgraph_node`（="synthesis"）——按 metadata 判定、与 namespace
     形态无关（B3 探针的「namespace 为空」系子图直跑形态，两形态过滤器行为一致）。
-    deep 桩零 messages 产出（R14③ 现状基线已实测锁死，deepagents 实装时收敛）。
     """
     meta = chunk_pair[1] if isinstance(chunk_pair, tuple) and len(chunk_pair) > 1 else None
     return isinstance(meta, Mapping) and meta.get("langgraph_node") == "synthesis"
+
+
+def _is_deep_writer_messages(namespace: Any, chunk_pair: Any) -> bool:
+    """R14③ deep 侧 messages 过滤（M2 批次 1，§6.1 mode 感知）：放行 deep 子图
+    **顶层** writer 节点帧（namespace 单段 `('deep:<run_id>',)` 且
+    metadata.langgraph_node=="writer"）；拦截其余——子代理嵌套帧（namespace 多段，
+    即便内层节点也叫 writer）与其它节点帧零泄漏（R14③ 子代理 LLM 帧零泄漏）。
+
+    writer 批次 4 才实装，先以模拟 namespace 单测锁语义（test_r14_cross_subgraph）。
+    """
+    if not (isinstance(namespace, tuple) and len(namespace) == 1):
+        return False  # 零段（直跑）/多段（子代理嵌套）namespace 均非顶层帧
+    meta = chunk_pair[1] if isinstance(chunk_pair, tuple) and len(chunk_pair) > 1 else None
+    return isinstance(meta, Mapping) and meta.get("langgraph_node") == "writer"
+
+
+def _messages_gate(mode: str, namespace: Any, chunk_pair: Any) -> bool:
+    """messages 帧放行门控（mode 感知，§6.1）：fast 仅 synthesis（口径不变零回退）；
+    deep 仅 writer 顶层帧（writer 形态基线，M2 批次 1）。"""
+    if mode == "deep":
+        return _is_deep_writer_messages(namespace, chunk_pair)
+    return _is_fast_synthesis_messages(namespace, chunk_pair)
 
 
 def history_statement(thread_id: str, turn_id: str) -> Any:
@@ -299,8 +321,9 @@ async def get_turn_detail(
     - 推导字段（TurnDetail docstring 口径）：degraded=status==degraded；
       export_available=mode=deep 且 answer_md 非空 且 status∈{completed,degraded}
       （api.md v1.10 §2.5——判据与 §2.3 has_report 同源化）；
-    - 分期口径（用户裁决 2026-11-08）：incognito 恒 false（M5 列）、snapshot_available
-      恒 false / kb_doc_id 恒 null（M2/M3 增列后接真实值）；memory_hits 不返回
+    - 分期口径（用户裁决 2026-11-08）：incognito 恒 false（M5 列）、kb_doc_id 恒
+      null（M3 增列后接真实值）；snapshot_available 已随 0012/m2_deep 接真——
+      判据 = source.snapshot_id 非空（§1.5 M2 增列，深度已读原文）；memory_hits 不返回
       （api.md §2.5「M5 及之前无此字段」，M6 随迁移再增）。
     - followups（REQ-046）与 feedback_helpful（REQ-057）：M2 批次 2 起真实值——
       前者直读 turns.followups（图外钩子异步回填，done 时刻可能仍 null）；后者查
@@ -370,7 +393,8 @@ async def get_turn_detail(
                 snippet=row.snippet or "",
                 # 契约 score 必填；来源缺分（异常行）按 0 分呈现
                 score=float(row.score) if row.score is not None else 0.0,
-                snapshot_available=False,  # 分期口径：M2（snapshot_id 列）起真实值
+                # M2（0012/m2_deep）起真实推导：深度已读原文行带 snapshot_id → true
+                snapshot_available=row.snapshot_id is not None,
                 kb_doc_id=None,  # 分期口径：M3（kb_doc_id 列）起真实值
             )
             for row in source_rows
@@ -512,6 +536,11 @@ class _RunContext:
     regenerate: bool = False
     fused: list[dict[str, Any]] = field(default_factory=list)
     search_strategy: str = "web"
+    # 轮级 usage 累计（M2 批次 1 方案 A——docs/m2-usage-probe-batch0.md §3/§4）：
+    # UsageCollector 随 build_turn_callbacks 并列注入 astream callbacks（fast/deep
+    # 通用；随 RunnableConfig 继承传播，deepagents 子代理调用同面覆盖），
+    # _finish_completed 消费 total() 填 done.usage 与 turns.usage。
+    usage_collector: Any = None
 
 
 class ThreadScheduler:
@@ -1003,13 +1032,18 @@ class ThreadScheduler:
                         "cancel_flags": self._cancel_flags,  # 同一进程级标志引用
                         "model_mapping": dict(ctx.mapping_payload),
                     },
-                    # 观测面与常规轮同构（ARCH §6.6：trace root=turn、session=thread）
-                    "callbacks": build_turn_callbacks(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        user_id=str(turn.user_id),
-                        mode="fast",
-                    ),
+                    # 观测面与常规轮同构（ARCH §6.6：trace root=turn、session=thread）；
+                    # usage collector 并列注入（M2 批次 1 方案 A——regenerate 成功收束
+                    # 亦走 _finish_completed 填值）
+                    "callbacks": [
+                        *build_turn_callbacks(
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            user_id=str(turn.user_id),
+                            mode="fast",
+                        ),
+                        ctx.usage_collector,
+                    ],
                     "metadata": {
                         "langfuse_session_id": thread_id,
                         "langfuse_user_id": str(turn.user_id),
@@ -1034,9 +1068,11 @@ class ThreadScheduler:
                     break
                 if stream_mode == "custom":
                     await self._translate_custom(ctx, chunk)
-                elif stream_mode == "messages" and _is_fast_synthesis_messages(
-                    namespace, chunk
+                elif stream_mode == "messages" and _messages_gate(
+                    ctx.mode, namespace, chunk
                 ):
+                    # regenerate 恒 fast（§2.12 mode=fast 前置）——门控分派等价
+                    # _is_fast_synthesis_messages；统一走 mode 感知门控
                     await self._translate_message_chunk(ctx, chunk)
                 elif stream_mode == "updates" and not namespace:
                     for update in chunk.values():
@@ -1132,6 +1168,7 @@ class ThreadScheduler:
             mapping_payload=self._capture_mapping_payload(),
             regenerate=True,
         )
+        ctx.usage_collector = UsageCollector()  # 轮级 usage 累计（M2 批次 1 方案 A）
         ctx.sources_count = len(source_rows)
         ctx.fused = [
             {
@@ -1201,6 +1238,7 @@ class ThreadScheduler:
         merge_stages: bool = False,
         preserve_duration: bool = False,
         clear_error: bool = False,
+        usage: dict[str, Any] | None = None,
     ) -> tuple[datetime, int] | None:
         """终态落 turns（条件收口：行锁 + 终态重查，终态绝不被覆写）。
 
@@ -1240,7 +1278,9 @@ class ThreadScheduler:
                 row.timing = {"stages": [*(existing or []), *(stages or [])]}
             else:
                 row.timing = {"stages": stages or []}
-            row.usage = {}
+            # usage（M2 批次 1 方案 A）：_finish_completed 传轮级 collector 累计值；
+            # 未传（失败/取消/兜底路径，本批口径）保持 {} 旧形态（UsageBrief 全可空）
+            row.usage = usage if usage is not None else {}
             row.finished_at = now
             if row.started_at is None:  # 失败/取消路径可能未经 promote（防御）
                 row.started_at = now
@@ -1331,9 +1371,27 @@ class ThreadScheduler:
 
     async def _finish_completed(self, ctx: _RunContext, final_state: dict[str, Any]) -> None:
         answer_md = final_state.get("answer_md")
+        # deep 熔断降级分流（M2 批次 1，api.md §7.2 degraded_reason 枚举）：deep 成功
+        # 收束读 DeepState.degraded_reason——guards 触发（timeout|budget）→
+        # turns.status=degraded + done(finish=degraded, degraded=True, 同值)；
+        # 成功收束面零 error 事件（降级报告已由图内 degraded_writer 产出，非故障中途
+        # 降级；500301 现行 timeout 映射=TurnRunner 硬超时失败路径，不受影响）。
+        # fast 不读该键（零回退——FastState 无该键且 mode 门控显式排除）；既有
+        # degraded=True→source_failure 派生口径不变（ARCH §6.2 二分）。
+        deep_reason = (
+            final_state.get("degraded_reason") if ctx.mode == "deep" else None
+        )
+        guard_degraded = deep_reason in ("timeout", "budget")
         # 图内降级留痕接线（§6.2）：search 单源失败/备位装载 → FastState.degraded=True
         # → done.degraded=True + degraded_reason=source_failure（turns.degraded_reason 列同步）
-        degraded = bool(final_state.get("degraded"))
+        degraded = bool(final_state.get("degraded")) or guard_degraded
+        if guard_degraded:
+            degraded_reason: str | None = str(deep_reason)
+        elif degraded:
+            degraded_reason = "source_failure"
+        else:
+            degraded_reason = None
+        finish = "degraded" if guard_degraded else "completed"
         self._log_search_strategy(ctx, final_state, degraded=degraded)
         raw_queries = final_state.get("rewritten_queries")
         rewritten = (
@@ -1342,6 +1400,10 @@ class ThreadScheduler:
             else None
         )
         persisted_answer = answer_md if isinstance(answer_md, str) else None
+        # 轮级 usage 累计（M2 批次 1 方案 A，fast/deep 通用）：collector 在 astream
+        # 运行期随 callbacks 累计（on_llm_end），done 时刻原子可得（探针 §3 方案 A
+        # 「done.usage 同轮同事务原子携带」）；零用量轮（桩流）→ {} 旧形态。
+        usage = ctx.usage_collector.total() if ctx.usage_collector is not None else {}
         # 图外钩子判定（api.md §7.1/§7.2 四条件，全部读轮发起时的 spec 快照——OQ-11）：
         # 达标才在 done 发布**之前**向 EventBus 登记保活窗口（登记晚于 done 会让
         # 晚订阅/重放路径判定不到「应等待」，形成窗口悬挂）
@@ -1349,7 +1411,7 @@ class ThreadScheduler:
         followups_expected = should_generate_followups(
             settings=followups_settings,
             mode=ctx.mode,
-            status="completed",
+            status=finish,
             answer_md=persisted_answer,
         )
         if followups_expected:
@@ -1358,16 +1420,17 @@ class ThreadScheduler:
             )
         outcome = await self._persist_terminal(
             ctx.turn_id,
-            status="completed",
+            status=finish,
             answer_md=persisted_answer,
             stages=ctx.stages,
-            degraded_reason="source_failure" if degraded else None,
+            degraded_reason=degraded_reason,
             rewritten_queries=rewritten,
             # regenerate 口径（§2.12 v1.19）：stages 追加、duration_ms 不覆写、
             # 成功后清旧 error/degraded_reason（旧值属上一轮失败留痕）
             merge_stages=ctx.regenerate,
             preserve_duration=ctx.regenerate,
             clear_error=ctx.regenerate,
+            usage=usage,
         )
         if outcome is None:
             # 终态竞态落败（并发取消已收口）：跳过 done 发布，防双终态；竞态 winner
@@ -1381,12 +1444,12 @@ class ThreadScheduler:
             ctx,
             "done",
             {
-                "finish": "completed",
+                "finish": finish,
                 "degraded": degraded,
-                "degraded_reason": "source_failure" if degraded else None,
+                "degraded_reason": degraded_reason,
                 "duration_ms": duration_ms,
                 "source_count": ctx.sources_count,
-                "usage": {},
+                "usage": usage,
             },
         )
         self._nudge_thread(ctx.thread_id)  # 先放行同线程排队轮（followups 不挡队列）
@@ -1766,6 +1829,9 @@ class ThreadScheduler:
                 mapping_payload=self._capture_mapping_payload(),
                 mcp_payload=self._capture_mcp_payload(),
             )
+            # 轮级 usage collector（M2 批次 1 方案 A，fast/deep 通用）：随 callbacks
+            # 并列注入（下方 config），ctx 持引用供 _finish_completed 消费
+            ctx.usage_collector = UsageCollector()
             timeout_s = self._turn_timeout_s(ctx.spec_payload, str(turn.mode))
             cancel_reason = self._cancel_flags.pop(turn_id, None)
             if cancel_reason is not None:  # 启动前已被取消/打断：零业务事件直接收尾
@@ -1811,8 +1877,11 @@ class ThreadScheduler:
                 "images": [],  # M4 视觉轮预留（REQ 视觉面），本批恒空
             }
             # 首 stage 图前同步发布（ARCH §4.3「首个 stage ≤1s」的结构性保证：不等 LLM/
-            # 图首帧——rewrite 节点内不再发 running，避免重复 seq）
-            first_stage: dict[str, Any] = {"stage_key": "rewrite", "status": "running"}
+            # 图首帧——rewrite/plan 节点内不再发 running，避免重复 seq）。M2 批次 1：
+            # 首 stage 按 mode——deep=plan（api.md §7.4 深度序列首事件 + §7.4 v1.4 注
+            # 「首个 stage 事件即执行开始（fast=rewrite、deep=plan）」），fast 维持 rewrite。
+            first_stage_key = "plan" if str(turn.mode) == "deep" else "rewrite"
+            first_stage: dict[str, Any] = {"stage_key": first_stage_key, "status": "running"}
             await self._publish_and_persist(ctx, "stage", first_stage)
             self._absorb_stage(ctx, first_stage)  # timing.stages 配对开档（done 帧到达时合档）
         except SearchChainUnavailable as exc:
@@ -1851,12 +1920,17 @@ class ThreadScheduler:
                         # run 创建（v4 events_only 无事后 trace upsert），留痕走
                         # synthesis 生成 span metadata + stage extra + 轮末结构化日志
                         # （见 _log_search_strategy docstring）。
-                        "callbacks": build_turn_callbacks(
-                            thread_id=thread_id,
-                            turn_id=turn_id,
-                            user_id=str(turn.user_id),
-                            mode=str(turn.mode),
-                        ),
+                        # usage collector 并列注入（M2 批次 1 方案 A——观测 callback 与
+                        # 轮级累计 callback 同面，fast/deep 通用）
+                        "callbacks": [
+                            *build_turn_callbacks(
+                                thread_id=thread_id,
+                                turn_id=turn_id,
+                                user_id=str(turn.user_id),
+                                mode=str(turn.mode),
+                            ),
+                            ctx.usage_collector,
+                        ],
                         "metadata": {
                             "langfuse_session_id": thread_id,
                             "langfuse_user_id": str(turn.user_id),
@@ -1889,11 +1963,13 @@ class ThreadScheduler:
                         break
                     if stream_mode == "custom":
                         await self._translate_custom(ctx, chunk)
-                    elif stream_mode == "messages" and _is_fast_synthesis_messages(
-                        namespace, chunk
+                    elif stream_mode == "messages" and _messages_gate(
+                        ctx.mode, namespace, chunk
                     ):
-                        # R14③ messages 过滤（§6.1）：仅 fast 子图 synthesis 节点增量映射
-                        # token/thinking——rewrite 等其余节点与 deep 侧（批次 5 实测）不放行
+                        # R14③ messages 过滤（§6.1，mode 感知——M2 批次 1）：fast 仅
+                        # synthesis 增量映射 token/thinking（口径不变）；deep 仅子图
+                        # 顶层 writer 帧（writer 批次 4 实装）——子代理嵌套帧与其余
+                        # 节点帧零泄漏（_messages_gate 内 mode 分派）
                         await self._translate_message_chunk(ctx, chunk)
                     elif stream_mode == "updates" and not namespace:
                         # 顶层 updates 合并最终 state（answer_md/sources——子图投影回填）
@@ -1961,8 +2037,10 @@ class ThreadScheduler:
     async def _translate_custom(self, ctx: _RunContext, payload: dict[str, Any]) -> None:
         """custom 信号 → SSE 事件（一对一翻译；未知类型告警忽略）。
 
-        token/thinking 不在 custom 域（§6.1：仅 messages 流映射——B3 节点 5/5 接真后
-        custom 流仅承载 stage/sources/images；桩期 custom-token 路径随桩清理移除）。
+        token/thinking 不在 custom 域（§6.1：仅 messages 流映射）；custom 流承载
+        stage/sources/images（落库）+ context_compact（M2 批次 1——**publish-only
+        不落 turn_events**，api.md §7.2 v1.3「压缩观测走 Langfuse；ADR-003 第 4 条
+        子集不变」，仅 deep 产生；EventBus 内存缓冲重放承担断线重放边界）。
         """
         ptype = payload.get("type")
         business = {k: v for k, v in payload.items() if k != "type"}
@@ -1977,13 +2055,18 @@ class ThreadScheduler:
             ctx.sources_count += len(batch)
         elif ptype == "images":
             await self._publish_and_persist(ctx, "images", business)  # B2 桩不发；翻译面预留
+        elif ptype == "context_compact":
+            # publish-only（api.md §7.2 v1.3）：不入 turn_events 落库子集
+            # （db/models/turn_event.py event_type 注释口径不变）；seq 照常盖章占号
+            # ——重放语义（Last-Event-ID 早于 compact 旧游标失效）由该 seq 承载
+            await self._publish_only(ctx, "context_compact", business)
         else:
             AgentLog(
                 message=f"忽略未知图内信号类型：{ptype!r}", graph="turn_runner"
             ).warning()
 
     async def _translate_message_chunk(self, ctx: _RunContext, chunk_pair: Any) -> None:
-        """messages 帧翻译（调用面已经 _is_fast_synthesis_messages 过滤）。"""
+        """messages 帧翻译（调用面已经 _messages_gate 按 mode 过滤）。"""
 
         """messages 帧 → token/thinking（按帧读 .content——R8：禁止聚合后再过 blocks）。"""
         message = chunk_pair[0] if isinstance(chunk_pair, tuple) else chunk_pair

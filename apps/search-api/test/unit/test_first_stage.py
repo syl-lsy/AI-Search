@@ -92,7 +92,7 @@ class _FakeSessionFactory:
         return self._session
 
 
-def _turn_row() -> Any:
+def _turn_row(*, mode: str = "fast") -> Any:
     import uuid
     from datetime import UTC, datetime
 
@@ -104,7 +104,7 @@ def _turn_row() -> Any:
     row.thread_id = "0b1f3a2e-0000-4000-8000-000000000001"
     row.user_id = "00000000-0000-4000-8000-000000000001"
     row.status = "running"
-    row.mode = "fast"
+    row.mode = mode
     row.query = "q"
     row.chat_model_key = "qwen"
     row.query_lang = None
@@ -171,6 +171,40 @@ def _restore_globals():
     turn_service.get_session_factory, turn_service.get_event_bus = original
 
 
+async def test_first_stage_deep_turn_is_plan_not_rewrite() -> None:
+    """M2 批次 1（api.md §7.2 stage_key 枚举 / §7.4 深度序列 + §7.4 v1.4 注「首个 stage
+    事件即执行开始（fast=rewrite、deep=plan）」）：deep 轮图前首 stage=plan；
+    §4.3「首个 stage ≤1s」的结构性保证对两种 mode 同构（发布仍先于 astream）。"""
+    bus = _bus()
+    turn = _turn_row(mode="deep")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, session, _SlowFirstFrameGraph())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert published, "事件面不应为空"
+    first = published[0]
+    assert first.event_type == "stage"
+    assert first.data["stage_key"] == "plan"
+    assert first.data["status"] == "running"
+    assert first.data["stage_key"] != "rewrite"  # deep 不复用 fast 首 stage 键
+
+
+async def test_first_stage_fast_turn_remains_rewrite() -> None:
+    """fast 路径零回退：首 stage 恒 rewrite（既有口径原样）。"""
+    bus = _bus()
+    turn = _turn_row(mode="fast")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, session, _SlowFirstFrameGraph())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert published[0].event_type == "stage"
+    assert published[0].data["stage_key"] == "rewrite"
+
+
 async def test_first_stage_published_before_astream_even_when_graph_blocks() -> None:
     """图首帧阻塞 0.8s：首个 stage 已在图前发布（ARCH §4.3 ≤1s 结构性保证）。"""
     bus = _bus()
@@ -233,3 +267,20 @@ async def test_rewrite_node_no_longer_emits_running(monkeypatch: pytest.MonkeyPa
 
     assert ("rewrite", "running") not in emitted  # running 归 TurnRunner 图前发布
     assert ("rewrite", "done") in emitted
+
+
+async def test_deep_plan_node_no_longer_emits_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M2 批次 1：deep 桩 plan 节点不再自发 running（避免双 running——running 归
+    TurnRunner 图前发布，同 rewrite 先例）；plan done 发射保持（timing 配对面）。"""
+    from app.agent.graphs import deep as deep_module
+
+    emitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        deep_module, "emit_stage", lambda key, status, **kw: emitted.append((key, status))
+    )
+
+    update = deep_module.plan({"query": "q", "spec": {}, "mode": "deep"})
+
+    assert ("plan", "running") not in emitted  # running 归 TurnRunner 图前发布
+    assert ("plan", "done") in emitted
+    assert update == {}  # 桩节点零 state 增量（B4 planner 实装前的既有口径）

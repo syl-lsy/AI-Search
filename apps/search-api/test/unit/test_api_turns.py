@@ -132,7 +132,7 @@ def _turn_row(**overrides: Any) -> SimpleNamespace:
 
 
 def _source_row(**overrides: Any) -> SimpleNamespace:
-    """sources 行假体：列名对齐 db/models/source.py（M1 基础列）。"""
+    """sources 行假体：列名对齐 db/models/source.py（M1 基础列 + 0012 snapshot_id）。"""
     row = SimpleNamespace(
         id=uuid.uuid4(),
         ref_no=1,
@@ -141,6 +141,7 @@ def _source_row(**overrides: Any) -> SimpleNamespace:
         url="https://docs.langchain.com/...",
         snippet="Send lets you fan out...",
         score=Decimal("0.9123"),
+        snapshot_id=None,  # 0012/m2_deep 增列：None=无快照（fast 轮常态）
     )
     for key, value in overrides.items():
         setattr(row, key, value)
@@ -196,7 +197,8 @@ async def test_get_turn_completed_deep_full_shape(overrides: dict) -> None:
     session = _FakeSession(
         turn=_turn_row(),
         sources=[
-            _source_row(),
+            # 深度轮已读原文：snapshot_id 非空 → snapshot_available 真实推导为 true
+            _source_row(snapshot_id=uuid.uuid4()),
             _source_row(
                 ref_no=2,
                 source_type="kb",
@@ -222,13 +224,15 @@ async def test_get_turn_completed_deep_full_shape(overrides: dict) -> None:
     assert data["rewritten_queries"] == ["LangGraph 调研 agent 架构"]
     assert data["answer_md"].startswith("# 调研报告")
     assert data["parent_turn_id"] is None
-    # sources：§2.5 sources[] 形状；snapshot_available/kb_doc_id 分期口径恒值
+    # sources：§2.5 sources[] 形状；snapshot_available=M2 起真实推导（snapshot_id
+    # 非空，0012/m2_deep）；kb_doc_id 仍分期口径恒 null（M3）
     assert len(data["sources"]) == 2
     first, kb = data["sources"]
     assert first["source_type"] == "web" and first["ref_no"] == 1
     assert first["score"] == pytest.approx(0.9123)
-    assert first["snapshot_available"] is False and first["kb_doc_id"] is None
+    assert first["snapshot_available"] is True and first["kb_doc_id"] is None
     assert kb["source_type"] == "kb" and kb["url"] is None
+    assert kb["snapshot_available"] is False  # snapshot_id=None → 无快照
     # stages：来自 turns.timing.stages（jsonb ISO 字符串 → datetime）
     assert data["stages"][0]["stage_key"] == "plan"
     assert data["stages"][0]["status"] == "done"
@@ -238,7 +242,8 @@ async def test_get_turn_completed_deep_full_shape(overrides: dict) -> None:
     # 推导字段：degraded=status==degraded；export_available=deep 且 completed/degraded
     assert data["degraded"] is False
     assert data["export_available"] is True
-    # 分期口径（用户裁决 2026-11-08）：恒 false / null；memory_hits 不返回
+    # 分期口径（用户裁决 2026-11-08）：incognito 恒 false（M5 列）/ kb_doc_id 恒
+    # null（M3 增列后接真）；memory_hits 不返回
     # （api.md §2.5「M5 及之前无此字段」，评审 P2 勘误——预置字段已移除）
     assert data["incognito"] is False
     assert data["followups"] is None
