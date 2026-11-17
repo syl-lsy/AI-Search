@@ -573,9 +573,9 @@ def test_extract_raises_validation_family_for_invalid() -> None:
 # ==== Layer 2 输入安全拦截（B13，fast_rewrite 对称同构）====
 #
 # 契约口径（逐条红锁，与 test_fast_rewrite 同款）：
-# - `safety` 三值 none|danger|profanity，**缺省 none 灰度安全**——旧提示词（无本字段）
+# - `safety` 四值 none|danger|profanity|privacy，**缺省 none 灰度安全**——旧提示词（无本字段）
 #   + 新代码 → 全量放行，存量轮零行为变化；
-# - 仅成功路径（主调用/修复回喂）判读：初判 ∈ {danger, profanity} 先行短路（none
+# - 仅成功路径（主调用/修复回喂）判读：初判 ∈ {danger, profanity, privacy} 先行短路（none
 #   零判读——不触 load_safety_config，日志面零变化），再验 spec.safety enabled +
 #   mode=hybrid；mode=lexicon / enabled=false 一律忽略 flag 照常返回；
 # - 命中顺序：拒答话术（SafetyConfig + RunnableConfig 透传保观测）→
@@ -638,11 +638,16 @@ def _install_safety_loader_recorder(monkeypatch: pytest.MonkeyPatch) -> list[Any
 
 
 def test_planner_output_safety_default_is_none() -> None:
-    """schema 缺省值锁死：PlannerOutput().safety == "none"（B13 灰度安全底线）；枚举外值拒收。"""
+    """schema 缺省值锁死：PlannerOutput().safety == "none"（B13 灰度安全底线）；
+    privacy 为合法四值之一（v1.31），pii 仍非本通道枚举（归 sanitize 通道）。"""
     from pydantic import ValidationError
 
     parsed = deep_planner.PlannerOutput.model_validate(dict(_OK_OUTPUT))
     assert parsed.safety == "none"
+    accepted = deep_planner.PlannerOutput.model_validate(
+        {**_OK_OUTPUT, "safety": "privacy"}
+    )
+    assert accepted.safety == "privacy"
     with pytest.raises(ValidationError):
         deep_planner.PlannerOutput.model_validate({**_OK_OUTPUT, "safety": "pii"})
 
@@ -667,11 +672,11 @@ async def test_legacy_output_without_safety_field_passes_through(
     assert loader_calls == []  # 缺省 none → 先行短路，零配置判读
 
 
-@pytest.mark.parametrize("category", ["danger", "profanity"])
+@pytest.mark.parametrize("category", ["danger", "profanity", "privacy"])
 async def test_safety_hit_raises_content_rejected_with_stage_failed(
     monkeypatch: pytest.MonkeyPatch, category: str
 ) -> None:
-    """命中（danger/profanity）→ ContentRejectedError 三字段齐备 + stage(plan, failed,
+    """命中（danger/profanity/privacy）→ ContentRejectedError 三字段齐备 + stage(plan, failed,
     detail="安全拦截") 形态钉死 + done 不发 + 透传（SafetyConfig/query_lang/
     RunnableConfig）保观测。"""
     from app.agent.guards import ContentRejectedError

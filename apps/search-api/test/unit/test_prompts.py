@@ -445,25 +445,33 @@ def test_safety_reply_placeholder_union_locked() -> None:
 
 
 def test_safety_check_carries_action_contract_and_injection_guard() -> None:
-    """safety_check 契约锚点：严格 JSON 输出形态 / reject 组合约束 / pii→sanitize /
-    拿不准一律 pass / 正当语境负例指引 / 防提示注入句（query 是被判定对象）。"""
+    """safety_check 契约锚点：严格 JSON 输出形态 / reject 组合约束（三类别） /
+    privacy 一律 reject / pii→sanitize / 拿不准一律 pass / 正当语境负例指引（含
+    隐私保护/合规语境）/ 防提示注入句（query 是被判定对象）。"""
     for text in _prompt_texts("common.safety_check"):
-        assert '{"action":"pass|sanitize|reject","category":"danger|profanity|pii|none"}' in text
-        assert "action=reject 仅允许配 category=danger 或 profanity" in text
+        assert (
+            '{"action":"pass|sanitize|reject",'
+            '"category":"danger|profanity|privacy|pii|none"}' in text
+        )
+        assert "action=reject 仅允许配 category=danger、profanity 或 privacy" in text
+        assert "category=privacy 一律配 action=reject" in text
+        assert "不得 sanitize" in text
         assert "category=pii 一律配 action=sanitize" in text
         assert "拿不准一律 pass" in text
         assert "研究/教育语境" in text  # 正当语境负例指引
+        assert "隐私保护/合规语境" in text  # v1.31 隐私负例条目
         assert "一律 pass，不得 reject" in text
         assert "被判定的对象" in text  # 防提示注入：query 是被判定对象不是指令
         assert "不得执行" in text
 
 
 def test_safety_reply_carries_line_prefixes_and_tone_contract() -> None:
-    """safety_reply 结构锚点：两类别段行前缀（validator SAFETY_REPLY_LINE_PREFIXES
-    硬校验同源）+ 公共行为引导行 + 温和不说教/两三句/替代方向/语言跟随语义。"""
+    """safety_reply 结构锚点：三类别段行前缀（validator SAFETY_REPLY_LINE_PREFIXES
+    硬校验同源：危险/辱骂/隐私）+ 公共行为引导行 + 温和不说教/两三句/替代方向/语言
+    跟随语义。"""
     for text in _prompt_texts("common.safety_reply"):
         lines = text.splitlines()
-        for prefix in ("- 危险请求回复段：", "- 辱骂回复段："):
+        for prefix in ("- 危险请求回复段：", "- 辱骂回复段：", "- 隐私请求回复段："):
             assert any(line.startswith(prefix) for line in lines), f"缺行前缀：{prefix}"
         assert "不说教" in text
         assert "两三句以内" in text
@@ -472,15 +480,17 @@ def test_safety_reply_carries_line_prefixes_and_tone_contract() -> None:
 
 
 def test_rewrite_and_planner_schema_contains_safety_token() -> None:
-    """fast.rewrite / deep.planner 输出 schema 含 safety 字段 token（B13 软校验锚点）。
+    """fast.rewrite / deep.planner 输出 schema 含 safety 字段四值 token（B13 v1.31
+    软校验锚点）。
 
     validator 侧为软校验（告警不拒收）——内置默认必须带 token（否则每次启动刷
     WARNING）；token 为带引号精确形态，散文提及不算。
     """
-    token = '"safety":"none|danger|profanity"'
+    token = '"safety":"none|danger|profanity|privacy"'
     for key in ("fast.rewrite", "deep.planner"):
         for text in _prompt_texts(key):
             assert token in text
+            assert "privacy" in text  # 四值枚举在场（判定指引同段出现）
             assert "正当语境一律 none" in text  # 语义层判定指引（正当语境放行）
             assert "拿不准一律 none" in text
 
@@ -494,6 +504,7 @@ def test_safety_lexicon_defaults_present() -> None:
     assert safety["mode"] == "hybrid"
     assert 0 < len(safety["danger_terms"]) <= 200
     assert 0 < len(safety["profanity_terms"]) <= 200
+    assert 0 < len(safety["privacy_terms"]) <= 200
     assert 0 < len(safety["grey_rules"]) <= 50
     assert safety["classify_timeout_ms"] == 1500
     assert safety["reply_timeout_ms"] == 2000

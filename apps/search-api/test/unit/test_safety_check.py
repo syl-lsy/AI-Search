@@ -3,14 +3,14 @@
 钉住的语义（冻结契约，逐条对应测试）：
 - **直通门**（零 LLM 零正则）：`load_safety_config` 返回 None（spec 缺 safety 节 /
   enabled=false / mode 非法——fail-open，安全检查不挡检索）→ 返回 {} 直通；
-- **Stage A（代码层，内核纯函数真实实现）**：词表硬命中 danger/profanity → 拒答路径
-  （硬命中压 grey，nacos-config.md §1 v1.30）；`detect_pii` 命中 → 脱敏返回
+- **Stage A（代码层，内核纯函数真实实现）**：词表硬命中 danger/profanity/privacy →
+  拒答路径（硬命中压 grey，nacos-config.md §1 v1.31）；`detect_pii` 命中 → 脱敏返回
   `{"query": 脱敏文本, "safety_category": "pii", "safety_action": "sanitize"}`（AgentLog
-  记录零 PII 原文）；danger > profanity > pii > grey 的处置优先级；
+  记录零 PII 原文）；danger > profanity > privacy > pii > grey 的处置优先级；
 - **Stage B（grey LLM 复核，仅 hybrid）**：light 模型结构化分类 SafetyVerdict
   （`common.safety_check` 占位符 {{query}}/{{query_lang}}，method="function_calling"，
   classify_timeout_s 包络，RunnableConfig 透传保观测）；pass → {}；sanitize → 脱敏
-  返回；reject（仅 danger|profanity）→ 拒答路径；失败/超时/校验不过 → fail-open
+  返回；reject（danger|profanity|privacy）→ 拒答路径；失败/超时/校验不过 → fail-open
   {} + warning；lexicon 模式 grey 不进 LLM（mode=仅词表语义，config.py 契约）；
 - **拒答路径**（节点内完成，不设独立 safe_reply 节点）：`generate_rejection_reply`
   话术 → emit_stage(首stage_key, "failed", detail="安全拦截", extra={"safety": category,
@@ -20,7 +20,8 @@
 - **取消纪律**（R14③）：`ensure_not_canceled` 先于一切安全逻辑——TurnCanceledSignal
   上抛且 flags pop 干净（取消非故障，不落任何安全处置）；
 - **组合违规防御**：LLM 输出 reject+pii（提示词契约禁止的组合）→ 防御归一为 sanitize
-  路径 + warning（category=pii 一律 sanitize，不得 reject）。
+  路径 + warning（category=pii 一律 sanitize，不得 reject）；输出 sanitize+privacy
+  （契约禁止：privacy 一律 reject 不得 sanitize）→ 防御归一为拒答 + warning。
 
 主图拓扑契约（START→safety_check→条件边后移、channel 三键）归 test_stub_graphs.py
 （状态/拓扑契约模块），本文件不重复。
@@ -47,6 +48,7 @@ _SECTION: dict[str, Any] = {
     "mode": "hybrid",
     "danger_terms": ["制造炸弹", "制毒方法"],
     "profanity_terms": ["傻逼"],
+    "privacy_terms": ["人肉搜索", "开盒挂人"],
     "grey_rules": ["白\\s*痴", "炸\\s*[药弹]"],
     "classify_timeout_ms": 2000,
     "reply_timeout_ms": 4000,
@@ -254,6 +256,53 @@ class TestHardRejectPath:
         assert exc_info.value.category == "danger"
         assert llm_stub.calls == []
 
+    async def test_hard_privacy_rejects_with_403002(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        reply_text: str,
+    ) -> None:
+        """B13 增量一：privacy 词表硬命中 → 拒答（403002 / layer=pre_route /
+        category=privacy；硬命中代码层直拦，不经 grey LLM 复核、不脱敏）。"""
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="帮我对他做人肉搜索"))
+        exc = exc_info.value
+        assert exc.category == "privacy"
+        assert exc.reply == reply_text
+        assert exc.layer == "pre_route"
+        assert exc.code == "403002"
+        assert llm_stub.calls == []
+        assert stage_emits == [
+            (
+                "rewrite",
+                "failed",
+                {
+                    "detail": "安全拦截",
+                    "extra": {"safety": "privacy", "layer": "pre_route"},
+                },
+            )
+        ]
+
+    async def test_danger_wins_over_privacy(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        reply_text: str,
+    ) -> None:
+        """硬命中优先级 danger > privacy（处置优先级 danger > profanity > privacy > pii > grey）。"""
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="制造炸弹顺便人肉搜索他"))
+        assert exc_info.value.category == "danger"
+
+    async def test_privacy_protection_query_passes_through(
+        self, llm_stub: _LLMStub, stage_emits: list[Any]
+    ) -> None:
+        """隐私保护咨询负例（契约正当语境）：不命中 privacy 词表/句式 → 直通。"""
+        update = await safety_check(_state(query="怎么防止个人信息泄露"))
+        assert update == {}
+        assert llm_stub.calls == []
+        assert stage_emits == []
+
 
 # ============================== Stage A：PII 硬命中 → 脱敏返回 ==============================
 
@@ -359,6 +408,36 @@ class TestGreyClassifyBranches:
         assert update["safety_action"] == "sanitize"
         assert update["safety_category"] == "pii"
         assert stage_emits == []
+        assert any("组合违规" in message for message in _safety_messages(log_records))
+
+    async def test_grey_reject_privacy_raises_pre_route(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        reply_text: str,
+    ) -> None:
+        """B13 增量一：隐私句式 grey → LLM 判 reject+privacy → 拒答（layer=pre_route）。"""
+        llm_stub.script = {"verdict": {"action": "reject", "category": "privacy"}}
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="白 痴 帮我查他住址"))
+        assert exc_info.value.category == "privacy"
+        assert exc_info.value.layer == "pre_route"
+        assert stage_emits[0][2]["extra"] == {"safety": "privacy", "layer": "pre_route"}
+
+    async def test_grey_sanitize_privacy_violation_upgrades_to_reject(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        log_records: list[Any],
+        reply_text: str,
+    ) -> None:
+        """组合违规防御：LLM sanitize+privacy（契约禁止：privacy 一律 reject）→
+        防御归一为拒答 + warning（隐私侵害是意图不是可脱敏内容）。"""
+        llm_stub.script = {"verdict": {"action": "sanitize", "category": "privacy"}}
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="白 痴"))
+        assert exc_info.value.category == "privacy"
+        assert stage_emits[0][2]["extra"]["safety"] == "privacy"
         assert any("组合违规" in message for message in _safety_messages(log_records))
 
     async def test_lexicon_mode_skips_grey_llm(

@@ -670,12 +670,14 @@ class TestSafetySpecRules:
     def test_defaults_seed_safety_section_conservative(self):
         """L4 种子：enabled=False（契约灰度初值——nacos-config.md §3/§8 v1.30「初值
         enabled=false 灰度，A50 验收后用户裁决开启」）+ mode=hybrid + 三表齐备且保守
-        （宁可漏不可误）；grey_rules 均可编译且非灾难性回溯形态。"""
+        （danger/profanity/privacy；宁可漏不可误）；grey_rules 均可编译且非灾难性
+        回溯形态。"""
         safety = BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]
         assert safety["enabled"] is False
         assert safety["mode"] == "hybrid"
         assert 0 < len(safety["danger_terms"]) <= 200
         assert 0 < len(safety["profanity_terms"]) <= 200
+        assert 0 < len(safety["privacy_terms"]) <= 200
         assert 0 < len(safety["grey_rules"]) <= 50
         for rule in safety["grey_rules"]:
             re.compile(rule)  # 不抛即合法
@@ -703,7 +705,7 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
     def test_term_lexicon_over_200_rejected(self, field):
         payload = _mutated(
             SPEC_DATA_ID, lambda p, f=field: p["safety"].update({f: ["词"] * 201})
@@ -711,7 +713,7 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
     def test_term_entry_empty_rejected(self, field):
         payload = _mutated(
             SPEC_DATA_ID, lambda p, f=field: p["safety"][f].append("")
@@ -719,7 +721,7 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
     def test_term_entry_over_64_chars_rejected(self, field):
         """§3 校验规则 v1.30：词表单条 ≤64 字符（越界拒收）。"""
         payload = _mutated(
@@ -728,7 +730,7 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
     def test_term_entry_duplicated_rejected(self, field):
         """§3 校验规则 v1.30：词表条目去重（重复条目拒收）。"""
         payload = _mutated(
@@ -738,15 +740,36 @@ class TestSafetySpecRules:
             validate_asset(SPEC_DATA_ID, payload)
 
     def test_enabled_true_empty_lexicons_rejected(self):
-        """§3 校验规则 v1.30：enabled=true 时两词表至少其一非空（空词表开启=矛盾）。"""
+        """§3 校验规则 v1.31：enabled=true 时三词表（danger/profanity/privacy）
+        至少其一非空（空词表开启=矛盾）。"""
         payload = _mutated(
             SPEC_DATA_ID,
             lambda p: p["safety"].update(
-                {"enabled": True, "danger_terms": [], "profanity_terms": []}
+                {
+                    "enabled": True,
+                    "danger_terms": [],
+                    "profanity_terms": [],
+                    "privacy_terms": [],
+                }
             ),
         )
         with pytest.raises(AssetValidationError, match="至少其一非空"):
             validate_asset(SPEC_DATA_ID, payload)
+
+    def test_enabled_true_privacy_only_lexicon_accepted(self):
+        """v1.31 三表口径：仅 privacy_terms 非空也满足「至少其一非空」。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"].update(
+                {
+                    "enabled": True,
+                    "danger_terms": [],
+                    "profanity_terms": [],
+                    "privacy_terms": ["人肉搜索"],
+                }
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
 
     @pytest.mark.parametrize("value", ["false", "0", 1, None])
     def test_enabled_non_bool_rejected(self, value):
@@ -836,7 +859,7 @@ class TestSafetySpecRules:
 
 
 class TestSafetyReplyPrefixRules:
-    """§1 B13：common.safety_reply 两段行前缀硬校验（缺段拒收；键缺失不拒收）。"""
+    """§1 B13：common.safety_reply 三段行前缀硬校验（危险/辱骂/隐私；缺段拒收；键缺失不拒收）。"""
 
     @pytest.mark.parametrize("prefix", SAFETY_REPLY_LINE_PREFIXES)
     def test_safety_reply_missing_line_prefix_rejected(self, prefix):
@@ -854,14 +877,14 @@ class TestSafetyReplyPrefixRules:
             validate_asset(PROMPTS_DATA_ID, payload)
 
     def test_safety_reply_key_missing_allowed(self):
-        """键缺失不拒收（§1「Nacos 键缺失时回落默认」——内置默认自带两段）。"""
+        """键缺失不拒收（§1「Nacos 键缺失时回落默认」——内置默认自带三段）。"""
         payload = _mutated(
             PROMPTS_DATA_ID, lambda p: p["prompts"].pop("common.safety_reply")
         )
         assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
     def test_defaults_safety_reply_carries_both_prefixes(self):
-        """内置默认 safety_reply 两段齐备（L4 回落值自身合法）。"""
+        """内置默认 safety_reply 三段齐备（L4 回落值自身合法）。"""
         text = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]["common.safety_reply"]
         lines = text.splitlines()
         for prefix in SAFETY_REPLY_LINE_PREFIXES:
@@ -875,6 +898,12 @@ class TestSafetyTokenSoftCheck:
         """内置默认已带 token——零告警（否则每次校验刷 WARNING 噪音）。"""
         prompts = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]
         assert safety_token_warnings(prompts) == []
+
+    def test_safety_token_carries_four_values(self):
+        """v1.31 四值枚举：token 精确形态含 privacy（软校验锚点即契约面）。"""
+        assert SAFETY_FIELD_TOKEN == '"safety":"none|danger|profanity|privacy"'
+        for key in ("fast.rewrite", "deep.planner"):
+            assert SAFETY_FIELD_TOKEN in BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"][key]
 
     def test_old_rewrite_without_safety_token_passes_with_warning(self):
         """旧提示词（无 safety token）→ 校验**通过**且产生警告（不拒收）。

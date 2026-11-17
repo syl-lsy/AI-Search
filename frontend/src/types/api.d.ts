@@ -1,8 +1,8 @@
 /**
- * src/types/api.d.ts — api.md（v1.23）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.24）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.23（REST + SSE 协议唯一事实源；§2.12 POST
+ *   - docs/contract/api.md v1.24（REST + SSE 协议唯一事实源；§2.12 POST
  *     /turns/{turn_id}/regenerate（REQ-063/A47）+ §0 错误码 409006 + §7.2/§2.5
  *     stages[].extra 可选键 source_retries 随本批镜像同步——frontend-api.md §8.5 v1.28，F5 工单）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
@@ -149,7 +149,7 @@ export interface StageExtra {
   strategy?: string
   /** api.md §7.2/§2.5 v1.19 P1b 留痕：源名→同源延迟重试次数映射（stage(search,done) extra，形如 {"tavily": 1}；无重试零键，前端零渲染义务） */
   source_retries?: Record<string, number>
-  /** api.md §7.4/§2.5 v1.23 B13 安全拒绝轮 stage failed extra 留痕（命中类别 danger|profanity（pii 走 sanitize 不产生 failed stage，前端零消费不展示）；宽松 string 同 strategy 先例） */
+  /** api.md §7.4/§2.5 v1.23 B13 安全拒绝轮 stage failed extra 留痕（命中类别 danger|profanity|privacy——privacy=隐私侵害意图轮一律 reject，api.md §7.4 v1.24 值域扩容（pii 走 sanitize 不产生 failed stage，前端零消费不展示）；宽松 string 同 strategy 先例） */
   safety?: string
   /** api.md §7.4/§2.5 v1.23 B13 拦截层标注（pre_route|rewrite|planner，前端零消费不展示） */
   layer?: string

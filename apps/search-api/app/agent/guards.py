@@ -394,7 +394,8 @@ class ContentRejectedError(Exception):
     rewrite|planner：模型 safety 初判命中且 enabled+hybrid）同形上抛——TurnRunner
     捕获后走安全拒绝轮收束（stage(failed, extra.safety+layer) → error(403002) →
     连接直接关闭无 done，api.md §7.4 v1.23）。字段：
-    - `category`：命中类别 ∈ danger|profanity（reject 组合约束，pii 不走本通道）；
+    - `category`：命中类别 ∈ danger|profanity|privacy（reject 组合约束，pii 不走
+      本通道；privacy 为 v1.31 增量——隐私侵害意图一律 reject 不得 sanitize）；
     - `reply`：类别化拒答话术（safety.reply 生成，作为 error.message）；
     - `layer`：拦截层 ∈ pre_route|rewrite|planner（§7.4 两层同形标注）。
     code 与 api.md §0 错误码表对齐（类属性——403002 仅经 SSE error 事件发射）。

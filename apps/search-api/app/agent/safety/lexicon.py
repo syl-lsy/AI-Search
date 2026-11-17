@@ -10,7 +10,7 @@
 - grey 正则按 config.grey_rules（config.py 已编译，原样编译不加 flags——种子规则
   自带 `[Bb]` 等大小写处理）对原文 `search`。
 
-纯函数零 IO；danger 命中在前、profanity 在后（词表配置序，输出确定性）。
+纯函数零 IO；danger 命中在前、profanity 次之、privacy 最后（词表配置序，输出确定性）。
 """
 
 from dataclasses import dataclass, field
@@ -26,7 +26,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class LexHit:
-    """一处词表硬命中（kind ∈ danger|profanity，term 为词表条目原文）。"""
+    """一处词表硬命中（kind ∈ danger|profanity|privacy，term 为词表条目原文）。"""
 
     kind: str
     term: str
@@ -58,6 +58,12 @@ def scan_lexicon(text: str, config: SafetyConfig) -> LexScan:
     for term in config.profanity_terms:
         if term.casefold() in normalized:
             hits.append(LexHit(kind="profanity", term=term))
+    # B13 增量一（nacos-config.md §3 v1.31）：隐私侵害意图词表——命中即代码层直拦
+    # reject（privacy 一律 reject 不得 sanitize，处置优先级 danger > profanity >
+    # privacy > pii > grey）
+    for term in config.privacy_terms:
+        if term.casefold() in normalized:
+            hits.append(LexHit(kind="privacy", term=term))
     grey = (
         config.mode == "hybrid"
         and not hits

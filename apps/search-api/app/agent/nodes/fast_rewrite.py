@@ -28,10 +28,11 @@ answerable=false），旧提示词 + 新代码 = 全量轮零行为变化。对�
 AgentLog 埋点（失败原因可观测——批次 7 披露的零埋点缺口一并修）。
 
 **Layer 2 输入安全拦截（B13，api.md §7.4 v1.23）**：RewriteOutput 增 `safety`
-初判字段（`none|danger|profanity`，**缺省 `none` 灰度安全**——旧提示词无本字段即
+初判字段（`none|danger|profanity|privacy`，**缺省 `none` 灰度安全**——旧提示词无本字段即
 全量 none，存量轮零行为变化，沿 search_strategy v1.20 先例）。仅 LLM 成功路径
 （主调用与修复回喂）判读：`spec.safety` enabled 且 mode=hybrid 且初判 ∈
-{danger, profanity} → 类别化拒答话术 → stage(rewrite, failed, detail="安全拦截")
+{danger, profanity, privacy} → 类别化拒答话术 → stage(rewrite, failed,
+detail="安全拦截")
 → ContentRejectedError（TurnRunner 走安全拒绝轮收束）。**机制兜底/传输兜底路径
 不判 safety**：Layer 1（主图壳 pre_route 词表硬命中 / grey LLM 复核）已对该 query
 前置覆盖，兜底路径本就无可靠 safety 判读面（LLM 输出未成形），不重复拦截。
@@ -104,12 +105,13 @@ QueryType = Literal[
 #: - verify ≡ answerable=true；web 默认全管道。
 SearchStrategy = Literal["direct", "verify", "web", "recall"]
 
-#: 输入安全初判三值（B13：none=正常 / danger=危险意图 / profanity=纯辱骂发泄；
-#: reject 组合约束同 safety.reply——pii 不在本通道，sanitize 面归 sanitizer）
-SafetyFlag = Literal["none", "danger", "profanity"]
+#: 输入安全初判四值（B13：none=正常 / danger=危险意图 / profanity=纯辱骂发泄 /
+#: privacy=隐私侵害意图；reject 组合约束同 safety.reply——pii 不在本通道，
+#: sanitize 面归 sanitizer。v1.31 +privacy）
+SafetyFlag = Literal["none", "danger", "profanity", "privacy"]
 
 #: Layer 2 拦截白名单（safety 初判命中且 enabled+hybrid 才拒；none 一律直通）
-_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity")
+_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity", "privacy")
 
 
 class RewriteOutput(BaseModel):
@@ -370,7 +372,7 @@ async def _safety_gate(
     输出未成形），不重复拦截。
 
     直通三条件（任一命中即放行，判定按灰度安全顺序排布）：初判 ∉ {danger,
-    profanity}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
+    profanity, privacy}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
     不走本通道；旧提示词全量 none → 零配置判读、零告警面，存量轮日志面亦零
     变化）；`load_safety_config` 返回 None（fail-open：spec 缺 safety 节 /
     enabled=false / mode 非法——本分支仅在模型真打出 flag 时可达，缺节告警

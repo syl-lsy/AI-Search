@@ -1,8 +1,8 @@
 """safety.reply：拒答话术生成（B13 reject 通道——安全拒绝轮的 error.message 源头）。
 
-流水线（nacos-config.md §1 v1.30 / api.md §7.4 v1.23）：
+流水线（nacos-config.md §1 v1.31 / api.md §7.4 v1.24）：
 resolve_prompt("common.safety_reply") → 行级类别切分（**沿 synthesis._apply_answerable_variant
-手法：只删另一类别的段行**，公共行为引导保留）→ render `{{query_lang}}` → light 模型
+手法：删其余全部类别段行**，公共行为引导保留）→ render `{{query_lang}}` → light 模型
 非流式单调用（`disable_streaming` 形态由 `build_light_model` 自带，函数内延迟 import
 防循环依赖）→ `asyncio.timeout(reply_timeout_s)` 包络。
 
@@ -22,7 +22,7 @@ from langchain_core.runnables import RunnableConfig
 
 from app.agent.guards import TurnCanceledSignal
 from app.agent.prompts import PromptRenderError, render_prompt, resolve_prompt
-from app.config_center.validator import SAFETY_REPLY_LINE_PREFIXES
+from app.config_center.validator import SAFETY_REPLY_CATEGORY_PREFIXES
 from app.core.logger import AgentLog
 
 __all__ = [
@@ -32,12 +32,10 @@ __all__ = [
 #: 拒答话术模板键（占位符集 = {query_lang}，契约 §1 v1.30 锁死）
 SAFETY_REPLY_PROMPT_KEY = "common.safety_reply"
 
-#: 类别 → 段行前缀（validator 硬校验锚点同源：0=危险 / 1=辱骂；reject 仅允许这两类，
-#: safety_check 契约「category=pii 一律 sanitize 不得 reject」）
-_CATEGORY_LINE_PREFIXES: dict[str, str] = {
-    "danger": SAFETY_REPLY_LINE_PREFIXES[0],
-    "profanity": SAFETY_REPLY_LINE_PREFIXES[1],
-}
+#: 类别 → 段行前缀（与 validator.SAFETY_REPLY_CATEGORY_PREFIXES 是**同一映射**
+#: ——单一事实源，拒绝两处各自硬编码序号；reject 类别 = danger|profanity|privacy，
+#: safety_check 契约「category=pii 一律 sanitize 不得 reject」故 pii 不在本通道）
+_CATEGORY_LINE_PREFIXES: dict[str, str] = SAFETY_REPLY_CATEGORY_PREFIXES
 
 
 def _build_light_model() -> Any:
@@ -52,19 +50,22 @@ def _build_light_model() -> Any:
 
 
 def _keep_category_section(template: str, category: str) -> tuple[str, str]:
-    """行级类别切分：删除另一类别的段行，保留其余全部行（公共引导不丢）。
+    """行级类别切分：删除**其余全部类别**的段行，保留公共引导与本类别段。
+
+    B13 增量一起为三类别（danger/profanity/privacy）——旧实现只删「另一类别」的
+    唯一段行，三类别下会把第二个非目标段原样留给模型（类别串味）。
 
     返回 `(kept, body)`——kept 为切分后模板（送 LLM），body 为本类别段行去前缀去
     空白的段正文（兜底话术源）；段行缺失时 body 为空串（调用方回落 kept）。
     """
     keep_prefix = _CATEGORY_LINE_PREFIXES[category]
-    drop_prefix = next(
+    drop_prefixes = tuple(
         prefix for prefix in _CATEGORY_LINE_PREFIXES.values() if prefix != keep_prefix
     )
     kept_lines: list[str] = []
     body = ""
     for line in template.splitlines():
-        if line.startswith(drop_prefix):
+        if line.startswith(drop_prefixes):
             continue
         if line.startswith(keep_prefix):
             body = line[len(keep_prefix) :].strip()
@@ -94,12 +95,12 @@ async def generate_rejection_reply(
 ) -> str:
     """生成类别化拒答话术（失败/超时/空输出回落模板段文本，恒返回非空尽力话术）。
 
-    category ∈ danger|profanity（ValueError fail-fast——reject 组合约束在
+    category ∈ danger|profanity|privacy（ValueError fail-fast——reject 组合约束在
     safety_check 契约钉死，pii 不走本通道）；query_lang 为代码判定的问题语言。
     config 为 `safety.config.SafetyConfig`（提供 reply_timeout_s / reply_max_chars）。
     """
     if category not in _CATEGORY_LINE_PREFIXES:
-        raise ValueError(f"拒答话术类别非法：{category!r}（仅 danger|profanity）")
+        raise ValueError(f"拒答话术类别非法：{category!r}（仅 danger|profanity|privacy）")
     raw = resolve_prompt(SAFETY_REPLY_PROMPT_KEY)
     kept, body = _keep_category_section(raw, category)
     try:

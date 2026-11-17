@@ -111,17 +111,25 @@ REWRITE_SCHEMA_REQUIRED_TOKENS: tuple[str, ...] = (
 #: 静默丢历史注入（`render_prompt` 无该变量时不报错，历史块被无提示弃用）——拒收。
 SYNTHESIS_REQUIRED_PLACEHOLDERS: tuple[str, ...] = ("{{history_block}}",)
 
-#: common.safety_reply 两段拒答话术行前缀（B13 输入安全工单——行级类别段锚点，沿
-#: SYNTHESIS_VARIANT_PREFIXES 先例：任一缺失拒收；键缺失不拒收，回落内置默认）。
-SAFETY_REPLY_LINE_PREFIXES: tuple[str, ...] = (
-    "- 危险请求回复段：",
-    "- 辱骂回复段：",
+#: common.safety_reply 段行的类别 → 前缀映射（B13 输入安全工单——行级类别段锚点；
+#: v1.31 三类别：danger/profanity/privacy）。**唯一事实源**：validator 据此做前缀
+#: 齐备硬校验（缺段拒收、键缺失不拒收回落内置默认），safety.reply 直接 import 同一
+#: 映射取段切分——两处不再各自按序号取段（避免位置耦合）。
+SAFETY_REPLY_CATEGORY_PREFIXES: dict[str, str] = {
+    "danger": "- 危险请求回复段：",
+    "profanity": "- 辱骂回复段：",
+    "privacy": "- 隐私请求回复段：",
+}
+
+#: 前缀有序元组（校验与测试遍历用；顺序即契约段序，生成自上面的映射）
+SAFETY_REPLY_LINE_PREFIXES: tuple[str, ...] = tuple(
+    SAFETY_REPLY_CATEGORY_PREFIXES.values()
 )
 
 #: fast.rewrite / deep.planner 输出 schema 须含的 safety 字段 token（B13——精确形态
 #: 防散文绕过，沿 REWRITE_SCHEMA_REQUIRED_TOKENS 带引号纪律；软校验见
-#: safety_token_warnings：告警不拒收）。
-SAFETY_FIELD_TOKEN = '"safety":"none|danger|profanity"'
+#: safety_token_warnings：告警不拒收。v1.31 枚举扩四值 +privacy）。
+SAFETY_FIELD_TOKEN = '"safety":"none|danger|profanity|privacy"'
 
 #: safety token 软校验覆盖的两键（B13——rewrite 与 planner 同构产出 safety 初判）
 SAFETY_TOKEN_PROMPT_KEYS: tuple[str, ...] = ("fast.rewrite", "deep.planner")
@@ -163,7 +171,7 @@ class PromptsPayload(_Envelope):
     ② 四段行前缀校验 +「- 回顾整理路径」；③ `{{history_block}}` 占位符必在
     （缺失则 recall 轮静默丢历史注入——security P3③）。
 
-    B13 增量（输入安全）：① `common.safety_reply` 两段行前缀齐备硬校验（缺段拒收，
+    B13 增量（输入安全）：① `common.safety_reply` 三段行前缀齐备硬校验（缺段拒收，
     SAFETY_REPLY_LINE_PREFIXES）；② fast.rewrite / deep.planner 的 safety 字段 token
     软校验（safety_token_warnings——**告警不拒收**，防旧提示词被硬拒后生产回落 L4
     内置默认造成提示词漂移的部署陷阱）。
@@ -222,7 +230,7 @@ class PromptsPayload(_Envelope):
                         f"fast.synthesis：缺历史注入占位符 {placeholder}"
                         "（v1.27 recall 变体契约）"
                     )
-        # §1 B13：common.safety_reply 两段行前缀齐备（拒答话术行级类别段锚点，沿
+        # §1 B13：common.safety_reply 三段行前缀齐备（拒答话术行级类别段锚点，沿
         # fast.synthesis 变体前缀先例——缺段拒收）；键缺失不拒收（回落内置默认）。
         safety_reply = value.get("common.safety_reply")
         if isinstance(safety_reply, str):
@@ -230,7 +238,7 @@ class PromptsPayload(_Envelope):
             for prefix in SAFETY_REPLY_LINE_PREFIXES:
                 if not any(line.startswith(prefix) for line in lines):
                     raise ValueError(
-                        f"common.safety_reply：缺行前缀 {prefix}（B13 拒答话术两段模板）"
+                        f"common.safety_reply：缺行前缀 {prefix}（B13 拒答话术三段模板）"
                     )
         return value
 
@@ -612,8 +620,9 @@ def _has_catastrophic_form(rule: str) -> bool:
 class SafetySpec(BaseModel):
     """§3 B13 输入安全节（fail-open 语义——节缺失=合法 None，安全检查不挡检索）。
 
-    词表纪律（§3 校验规则 v1.30）：danger_terms/profanity_terms ≤200 条、每条非空
-    ≤64 字符且条目去重；enabled=true 时两表至少其一非空；grey_rules ≤50 条、每条
+    词表纪律（§3 校验规则 v1.31）：danger_terms/profanity_terms/privacy_terms
+    ≤200 条、每条非空 ≤64 字符且条目去重；enabled=true 时三表至少其一非空；
+    grey_rules ≤50 条、每条
     ≤120 字符且逐条 re.compile 校验（编译失败=拒收 violation），并做灾难性回溯
     （ReDoS）形态静态拒收——量词分组内嵌量词/交替（如 `(a+)+`、`(a|aa)+`）对短
     payload 即指数级回溯，运行面扫描在 async 节点内执行、可挂死事件循环，必须在
@@ -627,6 +636,8 @@ class SafetySpec(BaseModel):
     mode: Literal["lexicon", "hybrid"] = "hybrid"
     danger_terms: list[str] = Field(default_factory=list, max_length=200)
     profanity_terms: list[str] = Field(default_factory=list, max_length=200)
+    #: B13 增量一（v1.31）：隐私侵害意图词表（规则同 danger_terms）
+    privacy_terms: list[str] = Field(default_factory=list, max_length=200)
     grey_rules: list[str] = Field(default_factory=list, max_length=50)
     classify_timeout_ms: int = Field(default=2000, ge=200, le=10000)
     reply_timeout_ms: int = Field(default=4000, ge=200, le=10000)
@@ -645,7 +656,7 @@ class SafetySpec(BaseModel):
             )
         return value
 
-    @field_validator("danger_terms", "profanity_terms")
+    @field_validator("danger_terms", "profanity_terms", "privacy_terms")
     @classmethod
     def _check_term_entries(cls, value: list[str]) -> list[str]:
         for term in value:
@@ -659,10 +670,16 @@ class SafetySpec(BaseModel):
 
     @model_validator(mode="after")
     def _check_enabled_requires_terms(self) -> "SafetySpec":
-        """§3 校验规则：enabled=true 时两词表至少其一非空（空词表开启=配置矛盾）。"""
-        if self.enabled and not self.danger_terms and not self.profanity_terms:
+        """§3 校验规则 v1.31：enabled=true 时三词表（danger/profanity/privacy）
+        至少其一非空（空词表开启=配置矛盾）。"""
+        if (
+            self.enabled
+            and not self.danger_terms
+            and not self.profanity_terms
+            and not self.privacy_terms
+        ):
             raise ValueError(
-                "enabled=true 时 danger_terms/profanity_terms 至少其一非空"
+                "enabled=true 时 danger_terms/profanity_terms/privacy_terms 至少其一非空"
             )
         return self
 

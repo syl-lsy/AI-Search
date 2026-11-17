@@ -47,6 +47,9 @@ class SafetyConfig:
     mode: str
     danger_terms: tuple[str, ...]
     profanity_terms: tuple[str, ...]
+    #: B13 增量一（nacos-config.md §3 v1.31）：隐私侵害意图词表——code 层直拦后一律
+    #: reject（隐私侵害是意图不是可脱敏内容，与 pii 的 sanitize 语义正交）
+    privacy_terms: tuple[str, ...]
     grey_rules: tuple[re.Pattern[str], ...]
     classify_timeout_s: float
     reply_timeout_s: float
@@ -140,6 +143,7 @@ def load_safety_config(spec: Mapping[str, Any] | None) -> SafetyConfig | None:
         mode=str(mode),
         danger_terms=_coerce_terms(section.get("danger_terms"), "danger_terms"),
         profanity_terms=_coerce_terms(section.get("profanity_terms"), "profanity_terms"),
+        privacy_terms=_coerce_terms(section.get("privacy_terms"), "privacy_terms"),
         grey_rules=_compile_grey_rules(section.get("grey_rules")),
         classify_timeout_s=_timeout_s(
             section.get("classify_timeout_ms"), _DEFAULT_CLASSIFY_TIMEOUT_S

@@ -32,9 +32,9 @@ query_type 7 类枚举（无 navigational——判导航型输出 factoid，深�
 ——命中即抛 TurnCanceledSignal，取消非故障，canceled 收尾归 TurnRunner。
 
 **Layer 2 输入安全拦截（B13，fast_rewrite 对称同构）**：PlannerOutput 增 `safety`
-初判字段（`none|danger|profanity`，**缺省 `none` 灰度安全**——旧提示词无本字段即
+初判字段（`none|danger|profanity|privacy`，**缺省 `none` 灰度安全**——旧提示词无本字段即
 全量 none，存量轮零行为变化）。仅 LLM 成功路径（主调用与修复回喂）判读：
-`spec.safety` enabled 且 mode=hybrid 且初判 ∈ {danger, profanity} → 类别化拒答
+`spec.safety` enabled 且 mode=hybrid 且初判 ∈ {danger, profanity, privacy} → 类别化拒答
 话术 → stage(plan, failed, detail="安全拦截", extra={safety, layer="planner"}) →
 ContentRejectedError（TurnRunner 走安全拒绝轮收束，api.md §7.4 v1.23）。**机制
 兜底/传输兜底路径不判 safety**：Layer 1（主图壳 pre_route）已前置覆盖，兜底路径
@@ -94,12 +94,12 @@ PlannerQueryType = Literal[
     "other",
 ]
 
-#: 输入安全初判三值（B13，fast_rewrite.SafetyFlag 对称同构——模块本地声明防跨节点
-#: import 面；deep 侧字段由提示词 v1.30 增量产出）
-SafetyFlag = Literal["none", "danger", "profanity"]
+#: 输入安全初判四值（B13，fast_rewrite.SafetyFlag 对称同构——模块本地声明防跨节点
+#: import 面；deep 侧字段由提示词 v1.30 增量产出 / v1.31 扩 privacy）
+SafetyFlag = Literal["none", "danger", "profanity", "privacy"]
 
 #: Layer 2 拦截白名单（none 一律直通；pii 不走本通道——reject 组合约束同 safety.reply）
-_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity")
+_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity", "privacy")
 
 
 class OutlineSection(BaseModel):
@@ -253,7 +253,7 @@ async def _safety_gate(
     输出未成形），不重复拦截。
 
     直通三条件（任一命中即放行，判定按灰度安全顺序排布）：初判 ∉ {danger,
-    profanity}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
+    profanity, privacy}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
     不走本通道；旧提示词全量 none → 零配置判读、零告警面，存量轮日志面亦零
     变化）；`load_safety_config` 返回 None（fail-open：spec 缺 safety 节 /
     enabled=false / mode 非法——本分支仅在模型真打出 flag 时可达，缺节告警
