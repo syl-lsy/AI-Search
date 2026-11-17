@@ -88,6 +88,13 @@ class MainState(TypedDict, total=False):
     # deep 侧同名回填共用本通道，DeepState 侧为普通类型——两侧形态批次 2 对齐）
     errors: Annotated[list[dict[str, Any]], add]
     degraded: Annotated[bool, or_]
+    # safety（B13 主图壳 pre_route：safety_check 节点产出——Layer 1 专属；子图 state
+    # 不加——Layer 2 拦截与 Layer 1 reject 均走 ContentRejectedError 异常，由
+    # TurnRunner 收束 403002，不经 state——拒绝语义全在异常通道，无 state 消费面）：
+    # - safety_category/safety_action：脱敏轮标注（safety_check._sanitize_update 写入，
+    #   query 同帧覆写为脱敏文本；pass 直通零更新、reject 走异常不落 state）。
+    safety_category: Literal["danger", "profanity", "pii", "none"]
+    safety_action: Literal["sanitize"]
 
 
 class FastState(TypedDict, total=False):

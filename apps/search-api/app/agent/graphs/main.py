@@ -1,9 +1,15 @@
-"""主图壳（B3 第 0 步接真：ARCH §4.0 / ADR-012 / DEV §5.1）。
+"""主图壳（B3 第 0 步接真：ARCH §4.0 / ADR-012 / DEV §5.1；B13 输入安全增量）。
 
 单入口编译图：按 GRAPH_REGISTRY 迭代挂子图节点（拓扑零改动口径），条件边
 `route_by_mode` 读**轮内 spec.routing 快照**（`state["spec"]`，TurnRunner 发起时
 捕获注入——OQ-11 同源，热更仅对新轮生效）∩ GRAPH_REGISTRY 分发——亚毫秒、零
 LLM·IO、**不发任何 SSE 信号**（api.md §7 stage_key 枚举零变化）。
+
+B13 拓扑增量（输入安全 Layer 1 pre_route，api.md §7.4 v1.23）：START → `safety_check`
+（普通边；直通返回 {} 零信号零 SSE 变化；拒答路径节点内 emit stage(首stage_key,
+failed) 后 raise `guards.ContentRejectedError`，TurnRunner 收束 403002）→
+route_by_mode 条件边原样后移至 safety_check——路由函数、targets 与双层兜底语义
+完全不变，仅入口后移；直通轮的 custom 事件序列与 B3 形态逐字节一致。
 
 双层兜底（ARCH §4.0 / nacos-config.md §3 routing 节 v1.19 键域口径）：
 ① `routing` 整节缺失/读取异常/校验失败 → 代码内置默认表（registry.BUILTIN_ROUTING）
@@ -35,6 +41,7 @@ from app.agent.graphs.registry import (
     DEFAULT_GRAPH,
     GRAPH_REGISTRY,
 )
+from app.agent.nodes.safety_check import safety_check
 from app.agent.state import MainState
 from app.core.logger import AgentLog
 
@@ -111,10 +118,16 @@ def route_by_mode(state: MainState) -> str:
 
 
 def build_main_graph() -> CompiledStateGraph:
-    """编译主图壳：按 registry 迭代挂子图节点 + START 条件边路由（无显式 END 边）。"""
+    """编译主图壳：registry 子图节点 + safety_check 首节点 + 条件边路由（无显式 END 边）。
+
+    B13 拓扑增量：START → safety_check（普通边，输入安全 Layer 1 pre_route——直通
+    返回 {} 零信号；拒答 raise ContentRejectedError）→ route_by_mode 条件边（函数与
+    targets 与 B3 接真形态完全一致，仅入口后移——双层兜底语义不变）。
+    """
     builder = StateGraph(MainState)
     for name, compiled in GRAPH_REGISTRY.items():
         builder.add_node(name, compiled)
+    builder.add_node("safety_check", safety_check)
     # path_map：{mode: graphName} 保形（BUILTIN_ROUTING ∩ registry，value=主图节点名）
     # + registry 键自映（route_by_mode 返回域=图名，直落同名节点）
     targets: dict[Hashable, str] = {
@@ -125,7 +138,8 @@ def build_main_graph() -> CompiledStateGraph:
         },
         **{name: name for name in GRAPH_REGISTRY},
     }
-    builder.add_conditional_edges(START, route_by_mode, targets)
+    builder.add_edge(START, "safety_check")
+    builder.add_conditional_edges("safety_check", route_by_mode, targets)
     return builder.compile()
 
 

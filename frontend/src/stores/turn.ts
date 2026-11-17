@@ -4,8 +4,9 @@
  * 职责：
  *   - 当前线程 turns 映射：每轮 question/answer_md/thinking_md/sources/images/stages/
  *     memory_hits/compactSeq/incognito/cancelReason/followups/feedbackHelpful/status/lastSeq
- *     （§4 逐字段），另附 errorMsg/degradedReason/memorySaved/compactAt 四个派生展示字段
- *     （派发表对应 Banner/错误条/M5 toast/v1.4 瞬态提示的数据形态就绪）。
+ *     （§4 逐字段），另附 errorMsg/errorCode/degradedReason/memorySaved/compactAt/
+ *     refusalPendingClose 六个派生展示/流程字段
+ *     （派发表对应 Banner/错误条·温和卡/M5 toast/v1.4 瞬态提示/B13 拒答轮终态收口的数据形态）。
  *   - SSE 连接编排：ask()/followUp() POST 建轮（两段式第一段，经 client.ts 唯一出口）→
  *     subscribe() GET 订阅（第二段，经 turnStream.ts 唯一出口）；所有事件经 applyEvent()
  *     单入口进状态机（§3 派发表 / §8.7 传输与渲染解耦）。
@@ -25,6 +26,7 @@ import { defineStore } from 'pinia'
 
 import { apiGet, apiPost, normalizeError } from '@/api/client'
 import { regenerateTurn, sendTurnFeedback } from '@/api/turns'
+import { CONTENT_SAFETY_ERROR_CODE } from '@/constants/errors'
 import { toast } from '@/composables/toast'
 import { closeTurnStream, subscribeTurn } from '@/sse/turnStream'
 import type { TurnStreamState } from '@/sse/turnStream'
@@ -115,6 +117,14 @@ export interface TurnState {
   lastSeq: number
   /** error 事件 message（错误条展示；error 非终态，§3 派发表） */
   errorMsg: string | null
+  /** error 码（SSE error.code / 2.5 error.code 双源；B13 温和卡按 403002 分支判定） */
+  errorCode: string | null
+  /**
+   * B13 拒答轮「等待关闭」标记（仅 error code=403002 置位）：流随后关闭且未见 done → 终态收口
+   * （立即移出生成中集合 + REST 对账；传输层已保证该收口不重连）。done 若仍到达则按既有终态
+   * 逻辑走（done 先置终态 → onClosed 的 isTerminalStatus 门拦截，标记不再生效）。
+   */
+  refusalPendingClose: boolean
   /** done(degraded) 携带（DegradedBanner 数据） */
   degradedReason: DegradedReason | null
   /** done.memory_saved（M5「已记住」toast 数据；无痕轮恒无） */
@@ -151,6 +161,8 @@ function seedTurnState(init: {
     feedbackHelpful: null,
     lastSeq: 0,
     errorMsg: null,
+    errorCode: null,
+    refusalPendingClose: false,
     degradedReason: null,
     memorySaved: null,
     durationMs: null,
@@ -359,7 +371,12 @@ export const useTurnStore = defineStore('turn', () => {
       case 'error':
         // error 非终态：保留已生成内容 + 错误条 + 节点标 failed；生成中集合不动（只认 done/对账）
         turn.errorMsg = event.data.message
+        turn.errorCode = event.data.code
         if (event.data.stage_key !== undefined) markStageFailed(turn, event.data.stage_key)
+        // B13 拒答轮：403002 内容安全拒绝 → 置「等待关闭」标记（传输层同步置同款标记）——
+        // 流随后关闭且未见 done → onClosed 终态收口（移出生成中集合 + 对账、无重连无横幅）；
+        // 防御：该 error 后若仍收到 done，按既有终态逻辑走（done 先置终态，本标记失效）。
+        if (event.data.code === CONTENT_SAFETY_ERROR_CODE) turn.refusalPendingClose = true
         break
     }
   }
@@ -444,6 +461,8 @@ export const useTurnStore = defineStore('turn', () => {
     turn.answer_md = ''
     turn.thinking_md = ''
     turn.errorMsg = null
+    turn.errorCode = null
+    turn.refusalPendingClose = false
     turn.degradedReason = null
     turn.durationMs = null
     // 重放幂等门抬升（生命周期 14）：内存 lastSeq 随刷新归零，本标签页曾观测的游标仍在
@@ -510,7 +529,13 @@ export const useTurnStore = defineStore('turn', () => {
           if (liveTurnId.value === turnId && !info.duringHold) sseState.value = 'idle'
           const t = turns.value[turnId]
           // done 之外的非终态关闭（error 后关闭/无 done 的异常收口）→ REST 对账收敛终态
-          if (t && !isTerminalStatus(t.status)) void safeReconcile(turnId)
+          if (t && !isTerminalStatus(t.status)) {
+            // B13 拒答轮终态收口：error(403002) 等待关闭 + 流关闭未见 done → 立即移出生成中
+            // 集合（不等对账回写——REST 慢/失败时指示器不永转）；对账随后收敛 status=failed
+            // 权威终态。重连豁免与 sseState 复位（无 ReconnectBanner）由传输层收口保证。
+            if (t.refusalPendingClose) generatingThreadIds.value.delete(t.threadId)
+            void safeReconcile(turnId)
+          }
         },
       },
     })
@@ -628,7 +653,9 @@ export const useTurnStore = defineStore('turn', () => {
     // 2.5 error 为 TurnError 对象载荷（data-model.md §1.3 {code,message,stage_key?}；镜像勘误
     // 2026-11-15）——只取 message 文本保持 errorMsg: string|null 形状（TurnBlock 渲染零改动，
     // 直写对象会渲染 [object Object]）；SSE error 事件路径（event.data.message）本就是字符串。
+    // errorCode 双源同取（B13 温和卡按 403002 分支——SSE error 与 2.5 回看两路径同款渲染）。
     turn.errorMsg = detail.error?.message ?? null
+    turn.errorCode = detail.error?.code ?? null
     turn.degradedReason = detail.degraded ? detail.degraded_reason : null
     turn.durationMs = detail.duration_ms
     // lastSeq/compactSeq/thinking_md 为传输层/流式域：REST 无对应字段，一律保留

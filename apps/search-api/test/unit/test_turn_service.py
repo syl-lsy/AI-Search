@@ -6,9 +6,10 @@ interrupt/rollback 打断非故障（绝不产生 error 事件）；TurnRunner �
 stage/sources/images/done/error 以发布盖章的同一 seq 落 turn_events（payload=去 envelope
 冗余字段后的业务字段），token/thinking 只发布不落库（ADR-003 第 4 条）；messages 帧按帧
 读 .content → token/thinking（R8 口径）；终态先落 turns 再 publish done；失败路径
-error(500001/500301) + turns.status=failed + close_channel（api.md §7.2「直接关闭」口径，
-修 failed 轮清扫泄漏）；timeout 守卫 spec.turn_timeout_s 包 astream；cancel 两态 +
-409002；resolve_chat_model 非法键 400001。
+error(500001/500301/403002 内容安全拒绝) + turns.status=failed + close_channel（api.md §7.2
+「直接关闭」口径，修 failed 轮清扫泄漏）；timeout 守卫 spec.turn_timeout_s 包 astream；
+cancel 两态 + 409002；resolve_chat_model 非法键 400001；B13 拒绝轮（error.message=AI 话术、
+无 done、日志零 query 原文）+ regenerate 复净（safety 开脱敏/关原文）+ 完成轮 turns.query 恒原文。
 """
 
 import asyncio
@@ -27,6 +28,7 @@ from app.exception import (
     NotFoundException,
     TurnTerminalException,
 )
+from app.agent.guards import ContentRejectedError
 from app.agent.nodes.synthesis import SynthesisError
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry
 from app.services import turn_service
@@ -1226,7 +1228,7 @@ async def test_execute_turn_assembles_history_recall_skeleton_channel() -> None:
         ("今天的天气怎么样", "zh"),  # 全 CJK
         ("langgraph 是什么框架", "zh"),  # CJK 5/14 ≈ 35.7% ≥30%
         ("What is the latest news about langgraph?", "en"),
-        ("hello world 今天", "en"),  # CJK 2/12 ≈ 16.7% <30%
+        ("hello world 今天", "zh"),  # 方案A（2026-11-17）：今天=≥2 连续 CJK 词组——原占比 2/12≈16.7% 判 en，有意翻转
         ("!!!???", "en"),  # 零 CJK（纯标点）
         ("", "en"),  # 空串
         ("   ", "en"),  # 纯空白
@@ -1235,7 +1237,39 @@ async def test_execute_turn_assembles_history_recall_skeleton_channel() -> None:
 def test_detect_query_lang_cjk_ratio_threshold(
     query: str, expected: str
 ) -> None:
-    """OQ-2：CJK 字符占比 ≥30% 判 zh（分母=非空白字符）；空/零有效字符回落 en。"""
+    """OQ-2：CJK 字符占比 ≥30% 判 zh（分母=非空白字符）或存在 ≥2 连续 CJK 字符
+    （方案A，2026-11-17 用户裁决）；空/零有效字符回落 en。"""
+    assert detect_query_lang(query) == expected
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        # 实锤误判案例（混合技术题占比被英文术语稀释）：CJK 8/34 ≈ 23.5% <30%，
+        # 旧纯占比口径误判 en（搜索链丢 BoCha 仅 tavily + synthesis 跟随 en）——
+        # 「如何」「集成」等 ≥2 连续 CJK 词组兜住，锁死判 zh。
+        ("DeepEval 如何具体集成到 Langfuse 的 Python SDK？", "zh"),
+        # 单 CJK 字符引用：无 ≥2 连续段且占比不足 → en 不翻转
+        ("what does 爱 mean in this context?", "en"),
+        # ≥2 连续 CJK 即判 zh（方案A 有意取舍：汉堡=中文词组，占比仅 ~13.3%）
+        ("What does 汉堡 mean?", "zh"),
+        # 占比达标但最长连续段=1：占比条款独立生效（2/5 = 40% ≥30%）
+        ("x汉y文z", "zh"),
+        # 特征化边界（P2-②，2026-11-17 锁死现状行为）：「连续」按原始串相邻计，
+        # 空白/标点打断——两判例 CJK 仅为单字符散点（run 各=1），占比亦不足。
+        # 防的回归：run 扫描对象若从原始串换成「过滤后字符集」（剔除空白/标点后再
+        # 找连续段），两判例会翻转为 zh——扫描口径换轨即测试红。
+        ("hello 汉 堡 world", "en"),  # 空白打断：两段 run 各 1；占比 2/12≈16.7%<30%
+        ("hello 汉·堡 world", "en"),  # 标点打断：·隔断两段 run 各 1；占比 2/13≈15.4%<30%
+    ],
+)
+def test_detect_query_lang_cjk_run_rule(query: str, expected: str) -> None:
+    """方案A：zh ⇔ CJK 占比 ≥30% 或 query 存在 ≥2 连续 CJK 字符。
+
+    产品受众中文，混合技术题（实锤 24% 误判 en）占比被英文术语稀释，出现中文
+    词组即判中文；单 CJK 字符引用（"what does 爱 mean"）占比不足仍判 en；
+    连续按原始串相邻计，空白/标点打断（特征化边界判例，见参数区 P2-② 注）。
+    """
     assert detect_query_lang(query) == expected
 
 
@@ -1660,3 +1694,225 @@ async def test_assembly_deep_turn_skips_recall_channel() -> None:
     payload = graph.payloads[0]
     assert "history" in payload  # 通道一照旧（planner 指代消解）
     assert "history_recall" not in payload  # 通道二 deep 轮不装配
+
+
+# ---- 内容安全拒绝轮收束 + regenerate 复净（B13，api.md §0 v1.23 错误码 403002）----
+
+#: safety 开启的 spec（lexicon 模式、空词表——只驱动 load_safety_config 的门面）
+_SAFETY_ON_SPEC: dict[str, Any] = {
+    **_SPEC_PAYLOAD,
+    "safety": {
+        "enabled": True,
+        "mode": "lexicon",
+        "danger_terms": [],
+        "profanity_terms": [],
+        "grey_rules": [],
+    },
+}
+
+#: CN 手机号正例（sanitizer 检测面单测钉死，此处复用同形串验服务面接线）
+_PII_QUERY = "13812345678 是谁的电话？"
+_PII_QUERY_SANITIZED = "[手机号] 是谁的电话？"
+
+
+class _RejectGraph(_FakeGraph):
+    """内容安全拒绝假图：astream 求值处直抛 ContentRejectedError（B13 拒绝轮收束路径）。
+
+    同步直抛沿 _SearchBoomGraph 先例（astream 调用点在 try 块内——pre_route 为主图壳
+    首节点，拒绝短路本就先于流建立）；勿模仿 _BoomGraph 的「纯 raise 协程」形态：
+    无 yield 的 async def 是协程函数，async for 处先炸 TypeError，预设异常不可达。
+    """
+
+    def __init__(
+        self,
+        *,
+        reply: str = "该请求涉及危险内容，我无法协助。",
+        layer: str = "pre_route",
+    ) -> None:
+        super().__init__([])
+        self._reply = reply
+        self._layer = layer
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+        raise ContentRejectedError(
+            category="danger", reply=self._reply, layer=self._layer
+        )
+
+
+async def test_content_rejected_fails_403002_closes_channel_without_done() -> None:
+    """内容安全拒绝（B13）：ContentRejectedError → error(403002) + turns.status=failed
+    + close_channel、无 done（零 sources 二分：两层拦截均在检索前短路，复用
+    _fail_turn 既有口径）；error.message=类别化拒答话术（AI 话术），stage_key 按契约
+    由 layer 派生 rewrite|plan（api.md §7.2/§7.4 v1.23：pre_route fast 轮=rewrite）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _RejectGraph())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert [e.event_type for e in published] == ["stage", "error"]  # 无 done
+    error_event = published[1]
+    assert error_event.data["code"] == "403002"
+    assert error_event.data["message"] == "该请求涉及危险内容，我无法协助。"
+    assert error_event.data["stage_key"] == "rewrite"
+    assert turn.status == "failed"
+    assert turn.error is not None and turn.error["code"] == "403002"
+    assert turn.error["message"] == "该请求涉及危险内容，我无法协助。"
+    assert turn.error["stage_key"] == "rewrite"  # 2.5 对账复用同一 payload（契约同形）
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True and channel.closed is True
+
+
+async def test_content_rejected_stage_key_derivation_matrix() -> None:
+    """stage_key 派生矩阵（api.md §7.2/§7.4 v1.23 钉死 rewrite|plan）：
+    pre_route 按 mode 取首 stage（deep=plan / fast=rewrite）、Layer 2 同名映射
+    （rewrite→rewrite、planner→plan）；SSE error 与 turns.error 两处同值。"""
+    cases = [
+        ("pre_route", "fast", "rewrite"),
+        ("pre_route", "deep", "plan"),
+        ("rewrite", "fast", "rewrite"),
+        ("planner", "deep", "plan"),
+    ]
+    for layer, mode, expected in cases:
+        bus = _bus()
+        turn = _TurnRow(status="running", mode=mode)
+        session = _FakeSession(turn=turn)
+        scheduler = _scheduler(bus, _FakeSessionFactory(session), _RejectGraph(layer=layer))
+
+        await scheduler._execute_turn(turn)
+
+        published = await _drain_all(bus, str(turn.id))
+        error_event = next(e for e in published if e.event_type == "error")
+        assert error_event.data["stage_key"] == expected, (layer, mode)
+        assert turn.error is not None and turn.error["stage_key"] == expected, (
+            layer,
+            mode,
+        )
+
+
+async def test_content_rejected_empty_reply_falls_back_to_default_message() -> None:
+    """reply 空 → error.message 回落默认文案「内容安全拒绝」（默认文案仅兜底）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _RejectGraph(reply=""))
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    error_event = next(e for e in published if e.event_type == "error")
+    assert error_event.data["code"] == "403002"
+    assert error_event.data["message"] == "内容安全拒绝"
+
+
+async def test_content_rejected_log_records_layer_category_not_query(
+    log_records: list[dict],
+) -> None:
+    """拒绝轮结构化留痕（B13 PII 口径）：日志记 layer/category，不含 query 原文
+    （分支留痕与 _fail_turn 失败日志两面联合断言）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", query=_PII_QUERY)
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _RejectGraph())
+
+    await scheduler._execute_turn(turn)
+
+    joined = "\n".join(str(r["message"]) for r in log_records)
+    assert "layer=pre_route" in joined
+    assert "category=danger" in joined
+    assert "13812345678" not in joined  # query 原文零泄漏
+
+
+async def test_build_regenerate_context_resanitizes_query_when_safety_enabled() -> None:
+    """regenerate 复净（B13）：safety 开 → ctx.query 已脱敏（微图跳过 pre_route，
+    落库原文进 synthesis 前复跑 sanitize）；turns.query 落库原文恒不动（§2.5 事实源）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", query=_PII_QUERY)
+    session = _FakeSession(turn=turn, rows=[])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), spec=_SAFETY_ON_SPEC)
+
+    ctx = await scheduler._build_regenerate_context(turn)
+
+    assert ctx.query == _PII_QUERY_SANITIZED
+    assert turn.query == _PII_QUERY  # 复净只改 ctx 快照，不回写落库行
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(None, id="no_safety_section"),  # 节缺失 → fail-open（告警一次）
+        pytest.param(
+            {**_SPEC_PAYLOAD, "safety": {"enabled": False}}, id="enabled_false"
+        ),  # 回退门合法直通（§1 v1.30）
+    ],
+)
+async def test_build_regenerate_context_keeps_raw_query_when_safety_off(
+    spec: dict[str, Any] | None,
+) -> None:
+    """safety 关（节缺失/enabled=false）→ fail-open 不脱敏：ctx.query 恒原文。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", query=_PII_QUERY)
+    session = _FakeSession(turn=turn, rows=[])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), spec=spec)
+
+    ctx = await scheduler._build_regenerate_context(turn)
+
+    assert ctx.query == _PII_QUERY
+
+
+async def test_completed_turn_query_stays_raw_even_when_graph_sanitizes(
+    log_records: list[dict],
+) -> None:
+    """完成轮 turns.query 恒原文（§2.5 事实源）：图内 sanitize 只改 state.query，
+    updates 帧带回的脱敏 query 不得覆写落库行；安全摘要仅轮末日志留痕、
+    final_state 无 safety 键时零噪音。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", query=_PII_QUERY)
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({
+            "synthesis": {
+                "answer_md": "无法提供机主身份。",
+                "query": _PII_QUERY_SANITIZED,  # 图内脱敏后的 state.query
+            },
+        }),
+    ])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph, spec=_SAFETY_ON_SPEC)
+
+    await scheduler._execute_turn(turn)
+
+    assert turn.status == "completed"
+    assert turn.query == _PII_QUERY  # 恒原文（不回写）
+    joined = "\n".join(str(r["message"]) for r in log_records)
+    assert "13812345678" not in joined
+    assert "轮次安全摘要" not in joined  # final_state 无 safety 键 → 零留痕零噪音
+
+
+async def test_completed_round_logs_safety_summary_when_state_carries_keys(
+    log_records: list[dict],
+) -> None:
+    """完成轮安全摘要（B13，沿 _log_search_strategy 先例）：final_state 带
+    safety_category/safety_action → 轮末 INFO 留痕（枚举摘要，无 query/答案原文）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph([
+        _updates({
+            "synthesis": {
+                "answer_md": "答案",
+                "safety_category": "pii",
+                "safety_action": "sanitize",
+            },
+        }),
+    ])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    joined = "\n".join(str(r["message"]) for r in log_records)
+    assert "轮次安全摘要：category=pii action=sanitize" in joined

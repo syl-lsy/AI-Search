@@ -31,6 +31,15 @@ query_type 7 类枚举（无 navigational——判导航型输出 factoid，深�
 取消感知：ensure_not_canceled 入口接线（R14② 跨子图取消感知，同 fast 五节点先例）
 ——命中即抛 TurnCanceledSignal，取消非故障，canceled 收尾归 TurnRunner。
 
+**Layer 2 输入安全拦截（B13，fast_rewrite 对称同构）**：PlannerOutput 增 `safety`
+初判字段（`none|danger|profanity`，**缺省 `none` 灰度安全**——旧提示词无本字段即
+全量 none，存量轮零行为变化）。仅 LLM 成功路径（主调用与修复回喂）判读：
+`spec.safety` enabled 且 mode=hybrid 且初判 ∈ {danger, profanity} → 类别化拒答
+话术 → stage(plan, failed, detail="安全拦截", extra={safety, layer="planner"}) →
+ContentRejectedError（TurnRunner 走安全拒绝轮收束，api.md §7.4 v1.23）。**机制
+兜底/传输兜底路径不判 safety**：Layer 1（主图壳 pre_route）已前置覆盖，兜底路径
+本就无可靠 safety 判读面（LLM 输出未成形），不重复拦截。
+
 事件：stage(plan, done, extra.subtopics=N)（api.md §7.4 钉死形态）——running 由
 TurnRunner 图前发布（M2 批次 1，§4.3 无重复 seq），节点只发 done。memory_directive
 为 M5 记忆通道：解析但不写 state（DeepState 无该字段），仅经 done.extra 留档。
@@ -48,9 +57,15 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agent.graphs.signals import emit_stage
-from app.agent.guards import TurnDeadline, ensure_not_canceled, llm_timeout_s
+from app.agent.guards import (
+    ContentRejectedError,
+    TurnDeadline,
+    ensure_not_canceled,
+    llm_timeout_s,
+)
 from app.agent.llm import build_chat_model, resolve_chat_alias
 from app.agent.prompts import render_prompt, resolve_prompt
+from app.agent.safety import generate_rejection_reply, load_safety_config
 from app.core.logger import AgentLog
 
 __all__ = [
@@ -58,6 +73,7 @@ __all__ = [
     "FALLBACK_QUERY_TYPE",
     "OutlineSection",
     "PlannerOutput",
+    "SafetyFlag",
     "planner",
 ]
 
@@ -78,6 +94,13 @@ PlannerQueryType = Literal[
     "other",
 ]
 
+#: 输入安全初判三值（B13，fast_rewrite.SafetyFlag 对称同构——模块本地声明防跨节点
+#: import 面；deep 侧字段由提示词 v1.30 增量产出）
+SafetyFlag = Literal["none", "danger", "profanity"]
+
+#: Layer 2 拦截白名单（none 一律直通；pii 不走本通道——reject 组合约束同 safety.reply）
+_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity")
+
 
 class OutlineSection(BaseModel):
     """报告章节骨架单节（ARCH §4.2：[{section, intent}]，writer 按此成文）。"""
@@ -92,11 +115,14 @@ class PlannerOutput(BaseModel):
     deep 零波及：不声明 answerable_from_knowledge / search_strategy（深度模式为用户
     显式选择的重研究形态，无跳过检索语义——ARCH §4.2）；memory_directive 为 M5 记忆
     通道常态 null。
+    `safety` 缺省 `none`（B13 灰度安全，fast_rewrite 同款：旧提示词无本字段即全量
+    放行，存量轮零行为变化；命中拦截面仅成功路径，见 `_safety_gate`）。
     """
 
     subtopics: list[str] = Field(min_length=1)
     outline: list[OutlineSection] = Field(min_length=1)
     query_type: PlannerQueryType
+    safety: SafetyFlag = "none"
     time_range: Literal["day", "week", "month", "year"] | None = None
     memory_directive: str | None = None
 
@@ -213,12 +239,57 @@ def _fallback_update(query: str, *, reason: str) -> dict[str, Any]:
     }
 
 
+async def _safety_gate(
+    parsed: PlannerOutput,
+    spec: Mapping[str, Any],
+    query_lang: str,
+    config: RunnableConfig | None,
+) -> None:
+    """Layer 2 输入安全拦截（B13，fast_rewrite._safety_gate 对称同构）。
+
+    调用时机 = LLM 成功路径拿到 parsed 后（主调用与修复回喂共用）；**机制兜底/
+    传输兜底路径不进本函数**——Layer 1（主图壳 pre_route 词表硬命中 / grey LLM
+    复核 reject）已对该 query 前置覆盖，兜底路径本就无可靠 safety 判读面（LLM
+    输出未成形），不重复拦截。
+
+    直通三条件（任一命中即放行，判定按灰度安全顺序排布）：初判 ∉ {danger,
+    profanity}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
+    不走本通道；旧提示词全量 none → 零配置判读、零告警面，存量轮日志面亦零
+    变化）；`load_safety_config` 返回 None（fail-open：spec 缺 safety 节 /
+    enabled=false / mode 非法——本分支仅在模型真打出 flag 时可达，缺节告警
+    不刷正常轮）；mode=lexicon（词表模式不消费模型初判，Layer 1 词表为准）。
+
+    命中顺序：类别化拒答话术（SafetyConfig 透传保观测 + RunnableConfig 透传挂
+    Langfuse 轮次 trace）→ stage(plan, failed, detail="安全拦截",
+    extra={safety, layer="planner"}) → ContentRejectedError。**raise 点在 planner
+    的 try/except 兜底族之外**——ContentRejectedError 属 Exception 族，若在兜底
+    try 内上抛会被传输兜底 except 吞掉降级，拦截语义即失效；直达 TurnRunner
+    走安全拒绝轮收束（error 403002，reply 作为 error.message）。
+    """
+    if parsed.safety not in _REJECT_CATEGORIES:
+        return
+    safety_config = load_safety_config(spec)
+    if safety_config is None or safety_config.mode != "hybrid":
+        return
+    reply = await generate_rejection_reply(
+        parsed.safety, query_lang, safety_config, config
+    )
+    emit_stage(
+        "plan",
+        "failed",
+        detail="安全拦截",
+        extra={"safety": parsed.safety, "layer": "planner"},
+    )
+    raise ContentRejectedError(parsed.safety, reply, layer="planner")
+
+
 async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """planner 节点（deep 子图）：stage(plan, done, extra.subtopics=N) 收口（running
     由 TurnRunner 图前同步发布——ARCH §4.3 首 stage ≤1s 且无重复 seq）。"""
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
 
     query = str(state.get("query") or "")
+    query_lang = str(state.get("query_lang") or "en")  # Layer 2 拒答话术语言（B13）
     spec = state.get("spec")
     spec = spec if isinstance(spec, Mapping) else {}
     deep_section = spec.get("deep") if isinstance(spec, Mapping) else None
@@ -234,9 +305,12 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
 
     update: dict[str, Any] | None
     extra_parts: dict[str, Any] = {}
+    #: Layer 2 判读对象（B13）——仅成功路径非 None；两兜底路径恒 None 即不判 safety
+    accepted: PlannerOutput | None = None
     try:
         raw = await _invoke(chain, prompt_text, timeout_s=llm_timeout, config=config)
         parsed = _extract(raw)
+        accepted = parsed
         update = _success_update(parsed, max_subagents)
         if parsed.memory_directive:
             extra_parts = {"memory_directive": parsed.memory_directive}
@@ -275,6 +349,7 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
                     node="planner",
                 ).warning()
             if repaired is not None:
+                accepted = repaired  # 修复回喂成功路径同判 safety（B13）
                 update = _success_update(repaired, max_subagents)
                 if repaired.memory_directive:
                     extra_parts = {"memory_directive": repaired.memory_directive}
@@ -301,6 +376,13 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
         ).warning()
         update = _fallback_update(query, reason="llm_call_failed")
         extra_parts = {"fallback": "degraded"}
+
+    # Layer 2 安全拦截门（B13）：仅 LLM 成功路径判 safety；命中即 emit failed +
+    # raise ContentRejectedError——raise 点在上方兜底 except 族之外（该异常属
+    # Exception 族，兜底 try 内上抛会被传输兜底吞掉），直达 TurnRunner 拒绝轮；
+    # 两兜底路径 accepted=None 自然跳过（Layer 1 已前置覆盖，见 _safety_gate）
+    if accepted is not None:
+        await _safety_gate(accepted, spec, query_lang, config)
 
     # subtopics 计数恒随 done.extra 留痕（api.md §7.4 钉死形态 extra.subtopics=N）
     # + 分支标注（fallback / memory_directive）合并

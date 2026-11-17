@@ -24,7 +24,8 @@
 - **终态不变式**：先落 turns（status/answer_md/timing/usage/finished_at/duration_ms/
   error/cancel_reason）再 publish done（「事件到达时 2.5 已可对账」，§7.2）；
   duration 口径=「提交→done」（finished_at − created_at，data-model.md §1.3）；
-- **失败路径**：error 事件（500001 兜底 / 500301 硬超时熔断）+ turns.status=failed +
+- **失败路径**：error 事件（500001 兜底 / 500301 硬超时熔断 / 403002 内容安全拒绝
+  ——B13 两层拦截同形上抛，error.message=类别化拒答话术）+ turns.status=failed +
   EventBus.close_channel（api.md §7.2 error 条目「直接关闭」口径 + 修 failed 轮
   缓冲永不清收的泄漏）；打断/取消不是故障——绝不产生 error 事件；
 - **协作式取消**：cancel 置进程内标志，图循环在每个事件边界感知（B2 桩图节点间
@@ -51,8 +52,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.graphs.main import graph as main_graph
 from app.agent.graphs.regenerate import graph as regenerate_graph
-from app.agent.guards import TurnCanceledSignal
+from app.agent.guards import ContentRejectedError, TurnCanceledSignal
 from app.agent.nodes.synthesis import SynthesisError
+from app.agent.safety import detect_pii, load_safety_config, sanitize
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
@@ -148,6 +150,8 @@ _HISTORY_STATUSES = ("completed", "degraded", "canceled")
 
 # 中文判定阈值（PRD OQ-2：CJK 字符占比 ≥30% 判 zh——实现层常量，不进 Nacos）
 CJK_RATIO_THRESHOLD = 0.30
+# 方案A 词组级信号下限（2026-11-17 用户裁决）：query 存在 ≥2 连续 CJK 字符也判 zh
+CJK_RUN_MIN = 2
 
 
 class SubmitDecision(str, Enum):
@@ -219,16 +223,34 @@ def _is_cjk_char(ch: str) -> bool:
 
 
 def detect_query_lang(query: str) -> str:
-    """图启动前纯代码语言判定（ARCH §4.1 前置口径；PRD OQ-2）：CJK 字符占比 ≥30% → zh。
+    """图启动前纯代码语言判定（ARCH §4.1 前置口径；PRD OQ-2）：
+    zh ⇔ CJK 字符占比 ≥30% 或存在 ≥2 连续 CJK 字符（方案A，2026-11-17 用户裁决）。
 
-    分母为非空白字符（空白不稀释占比）；空串/零有效字符回落 en。改写不改判——
+    占比分母为非空白字符（空白不稀释占比）；空串/零有效字符回落 en。改写不改判——
     rewrite 节点不再判语言，直接消费注入值。
+
+    取舍说明（方案A）：产品受众中文，混合技术题（如「DeepEval 如何具体集成到
+    Langfuse 的 Python SDK？」CJK 占比仅 ~24%）的占比被英文术语稀释，出现中文
+    词组（≥2 连续 CJK）即判中文；单 CJK 字符引用（"what does 爱 mean"）占比不足
+    时仍判 en——「What does 汉堡 mean?」判 zh 是有意取舍。连续按原始串相邻计
+    （任何非 CJK 字符（含空白与标点）都会打断连续段；「连续」字符沿用 _is_cjk_char 类定义）。
     """
     chars = [c for c in query if not c.isspace()]
     if not chars:
         return "en"
     cjk_count = sum(1 for c in chars if _is_cjk_char(c))
-    return "zh" if cjk_count / len(chars) >= CJK_RATIO_THRESHOLD else "en"
+    if cjk_count / len(chars) >= CJK_RATIO_THRESHOLD:
+        return "zh"
+    # 方案A：扫描最长连续 CJK 段，≥2（中文词组级信号）即判 zh——早退等价于取 max
+    run = 0
+    for c in query:
+        if _is_cjk_char(c):
+            run += 1
+            if run >= CJK_RUN_MIN:
+                return "zh"
+        else:
+            run = 0
+    return "en"
 
 
 def _is_fast_synthesis_messages(namespace: Any, chunk_pair: Any) -> bool:
@@ -1147,7 +1169,19 @@ class ThreadScheduler:
         )
 
     async def _build_regenerate_context(self, turn: Any) -> _RunContext:
-        """regenerate 输入重建（§2.12 决策 10）：sources 行 → fused；spec/mapping 新快照。"""
+        """regenerate 输入重建（§2.12 决策 10）：sources 行 → fused；spec/mapping 新快照。
+
+        **regenerate 复净**（B13 sanitize 通道）：常规轮的 query 脱敏发生在图内
+        （sanitize 改写 state.query，落库 turns.query 恒原文）；微图跳过 pre_route
+        直达 synthesis——此处对落库原文复跑同款 sanitize。safety 配置经本路径捕获的
+        spec 快照读取（与主路径同源，OQ-11）；不可用/enabled=false →
+        load_safety_config 返回 None，按契约 fail-open 不脱敏。
+
+        **取舍钉注**：regenerate 仅复跑 sanitize（PII 复净），不复跑 danger/profanity
+        拒绝通道（Layer 1/2 均不经微图）——safety 关闭期完成的轮在其后热更开启后
+        regenerate 会直送 synthesis，该灰度窗口取舍随 M4 R19 裁决（复跑 scan_lexicon
+        或维持现状）。
+        """
         turn_uuid = uuid.UUID(str(turn.id))
         async with self._session_factory() as session:
             source_rows = (
@@ -1158,14 +1192,18 @@ class ThreadScheduler:
                 )
             ).all()
             strategy = await self._load_search_strategy(session, turn_uuid)
+        spec_payload = self._capture_spec_payload()  # 当次新快照（热更后的提示词/映射）
+        query = str(turn.query)
+        if load_safety_config(spec_payload) is not None:
+            query = sanitize(query, detect_pii(query))
         ctx = _RunContext(
             turn_id=str(turn.id),
             thread_id=str(turn.thread_id),
             user_id=turn.user_id,
             mode="fast",
-            query=str(turn.query),
+            query=query,
             query_lang=str(turn.query_lang or "en"),
-            spec_payload=self._capture_spec_payload(),  # 当次新快照（热更后的提示词/映射）
+            spec_payload=spec_payload,
             mapping_payload=self._capture_mapping_payload(),
             regenerate=True,
         )
@@ -1394,6 +1432,7 @@ class ThreadScheduler:
             degraded_reason = None
         finish = "degraded" if guard_degraded else "completed"
         self._log_search_strategy(ctx, final_state, degraded=degraded)
+        self._log_safety(final_state)
         raw_queries = final_state.get("rewritten_queries")
         rewritten = (
             [str(q) for q in raw_queries]
@@ -1559,6 +1598,25 @@ class ThreadScheduler:
             graph="turn_runner",
         ).info()
 
+    @staticmethod
+    def _log_safety(final_state: dict[str, Any]) -> None:
+        """轮末安全留痕（B13，沿 _log_search_strategy 先例）：完成轮记 safety 摘要。
+
+        键位=图内安全通道写入 final_state 的 `safety_category`/`safety_action`
+        （未启用/未命中轮零产出 → 零留痕零噪音，同 _log_search_strategy 非 fast 轮
+        早退口径）。拒绝轮不走本函数——layer/category 在 _execute_turn 的
+        ContentRejectedError 分支内留痕。日志仅含枚举类摘要（category/action），
+        无 query/答案原文——PII 防泄漏口径全局一致。
+        """
+        category = final_state.get("safety_category")
+        action = final_state.get("safety_action")
+        if category is None and action is None:
+            return  # 安全通道未参与本轮：零留痕零噪音
+        AgentLog(
+            message=f"轮次安全摘要：category={category} action={action}",
+            graph="turn_runner",
+        ).info()
+
     async def _finish_canceled(
         self,
         turn_id: str,
@@ -1610,17 +1668,19 @@ class ThreadScheduler:
         message: str,
         exc: Exception | None = None,
         degraded_reason: str | None = None,
+        stage_key: str | None = None,
     ) -> None:
         """部分内容降级收束：error 事件 + turns.status=degraded + done(finish=degraded)。
 
         api.md §7.2 error 收束括注（v1.10 ⑥）：有部分内容（已收集 sources/部分答案）时
         error 后跟 done(finish=degraded)；终态条件落库先行（竞态落败方零事件退出）。
+        `stage_key` 透传语义同 _fail_turn（403002 按契约派生，其余维持 None）。
         """
         AgentLog(message=f"轮次降级收束：{message}", graph="turn_runner").error(exc)
         error_payload: dict[str, Any] = {
             "code": code,
             "message": message,
-            "stage_key": None,
+            "stage_key": stage_key,
         }
         outcome = await self._persist_terminal(
             ctx.turn_id,
@@ -2040,6 +2100,35 @@ class ThreadScheduler:
             )
             self._nudge_thread(thread_id)
             return
+        except ContentRejectedError as exc:
+            # 内容安全拒绝（B13，api.md §0 v1.23 错误码 403002）：Layer 1（主图壳
+            # pre_route）与 Layer 2（rewrite|planner safety 初判）同形上抛——两层均在
+            # 检索发生前短路，拒绝轮恒零 sources → _fail_turn 走零内容二分：failed +
+            # error(403002) + close_channel、无 done（api.md §7.2「直接关闭」口径）。
+            # 拒绝非服务端故障：结构化留痕只记 layer/category（reply 仅记长度），不含
+            # query 原文——被拒内容本身可能携带 PII/敏感词，日志面防二次泄漏；
+            # error.message = 类别化拒答话术（AI 话术），reply 空时任默认文案兜底；
+            # stage_key 按契约钉死 rewrite|plan（api.md §7.2/§7.4 v1.23、data-model
+            # §1.3）：Layer 1 pre_route 按 mode 取首 stage（deep=plan / 其余=rewrite，
+            # 与 safety_check._reject 的 failed 帧合档键同源）、Layer 2 同名映射。
+            stage_key = {"rewrite": "rewrite", "planner": "plan"}.get(exc.layer) or (
+                "plan" if ctx.mode == "deep" else "rewrite"
+            )
+            AgentLog(
+                message=(
+                    f"内容安全拒绝：layer={exc.layer} category={exc.category} "
+                    f"reply_chars={len(exc.reply)}"
+                ),
+                graph="turn_runner",
+            ).warning()
+            await self._fail_turn(
+                ctx,
+                code="403002",
+                message=exc.reply if exc.reply else "内容安全拒绝",
+                exc=exc,
+                stage_key=stage_key,
+            )
+            return
         except Exception as exc:
             await self._fail_turn(ctx, code="500001", message="内部错误", exc=exc)
             return
@@ -2163,12 +2252,17 @@ class ThreadScheduler:
         code: str,
         message: str,
         exc: Exception | None = None,
+        stage_key: str | None = None,
     ) -> None:
         """失败路径（api.md §7.2 v1.10 error 收束两句）：
 
         - **有部分内容**（sources 已发布）→ error + done(finish=degraded) +
           turns.status=degraded（§7.1 例外把 failed 终态限定为「失败且无部分内容」）；
         - **零内容** → error + turns.status=failed + close_channel（「直接关闭」口径）。
+
+        `stage_key`：error 帧定位失败时间线节点（缺省 None 沿既有口径）；403002
+        内容安全拒绝按契约派生 rewrite|plan（api.md §7.2/§7.4 v1.23），其余错误码
+        不传（时间线节点未必有对应失败点，维持 None 不误导前端时间线）。
 
         条件落库先行：终态竞态落败（并发取消已收口）→ 不发 error、不 close——
         winner 的 done 已把流收口，失败方零事件退出。
@@ -2178,14 +2272,19 @@ class ThreadScheduler:
             # LLM 重试耗尽 500101 / 未知异常 500001 同款）——降级收束（同 500101 形态）
             degraded_reason = "timeout" if code == "500301" else None  # 枚举内才上报
             await self._finish_degraded_with_error(
-                ctx, code=code, message=message, exc=exc, degraded_reason=degraded_reason
+                ctx,
+                code=code,
+                message=message,
+                exc=exc,
+                degraded_reason=degraded_reason,
+                stage_key=stage_key,
             )
             return
         AgentLog(message=f"轮次执行失败：{message}", graph="turn_runner").error(exc)
         error_payload: dict[str, Any] = {
             "code": code,
             "message": message,
-            "stage_key": None,
+            "stage_key": stage_key,
         }
         outcome = await self._persist_terminal(
             ctx.turn_id, status="failed", error=error_payload, stages=ctx.stages

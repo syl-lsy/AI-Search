@@ -29,8 +29,12 @@
  *       不进 reconnecting；③ 心跳静默 → 静默 close。前端零常量零计时（窗口权威在服务端）。
  *   —   error 非终态（§7.2）：照常交付；error 后连接关闭（failed 无内容轮，§7.1 v1.10 例外
  *       ——重连只会收到同样的 error+close）→ 不重连，onClosed(afterError) 交由 store REST 对账。
+ *       B13 拒答轮（error code=403002 内容安全拒绝）：置「等待关闭」标记——其后连接关闭/看门狗
+ *       静默均按收口处理（不重连，A13 断线重连在该情形豁免）；防御：该 error 后若仍收到 done，
+ *       按既有终态逻辑走（doneSeen 优先，afterError 归 false）。
  */
 import { API_BASE_URL } from '@/api/client'
+import { CONTENT_SAFETY_ERROR_CODE } from '@/constants/errors'
 import { isRecord, isUuid } from '@/utils/guards'
 import type { SseEventName, SseWireEvent } from '@/types/api'
 
@@ -76,7 +80,7 @@ const ES_CLOSED = 2
 export type TurnStreamState = 'connecting' | 'connected' | 'reconnecting' | 'held' | 'closed'
 
 export interface TurnStreamClosedInfo {
-  /** error 事件后连接关闭（failed 无内容轮）——store 应走 REST 对账 */
+  /** error 事件后连接关闭（failed 无内容轮，含 B13 拒答轮 403002）——store 应走 REST 对账 */
   afterError: boolean
   /** 保活窗口内的收口（②服务端关闭/③静默）——轮已终态，无 banner 语义 */
   duringHold: boolean
@@ -271,6 +275,8 @@ class TurnStream implements TurnStreamController {
   private es: EventSourceLike | null = null
   private seqGate: number
   private errorSeen = false
+  /** B13 拒答轮「等待关闭」标记：error(code=403002) 已见——流随后关闭且未见 done → 终态收口不重连 */
+  private refusalSeen = false
   private doneSeen = false
   private holding = false
   private closeEmitted = false
@@ -374,6 +380,9 @@ class TurnStream implements TurnStreamController {
       this.opts.callbacks.onEvent(wireEvent)
       if (wireEvent.event === 'error') {
         this.errorSeen = true // error 非终态（§7.2）：照常交付；后续收口策略见 handleError
+        if (wireEvent.data.code === CONTENT_SAFETY_ERROR_CODE) {
+          this.refusalSeen = true // B13 拒答轮：等待服务端按契约关闭（无 done）；收口策略见 handleError/onWatchdogFire
+        }
       } else if (wireEvent.event === 'followups' && this.holding) {
         this.closeInternal() // L13 收口①：followups 交付后 close
       }
@@ -472,6 +481,12 @@ class TurnStream implements TurnStreamController {
     if (this.closed) return
     if (this.holding) {
       // L13 收口③：保活期心跳静默（服务端异常悬挂）→ 静默 close、不重连
+      this.closeInternal()
+      return
+    }
+    if (this.refusalSeen) {
+      // B13 拒答轮：error(403002)「等待关闭」期内静默（服务端未按契约主动关闭）→ close 收口
+      // 交 store 终态对账（onClosed(afterError=true)）——不重连（重连只会收到同样的 error+close）
       this.closeInternal()
       return
     }

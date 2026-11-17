@@ -349,6 +349,13 @@ class TestNacosInitScriptParity:
                 "契约变更须两处同步（逐字投影），先修齐再发布"
             )
 
+    def test_spec_safety_section_parity(self):
+        """B13：SPEC_CONFIG safety 节双投影显式一致（整份 equality 已由上一用例覆盖，
+        此处按节单独断言——safety 单侧漂移时给出可读性更好的失败定位）。"""
+        module = self._load_script_module()
+        script_spec = dict(module.DATA_IDS)[SPEC_DATA_ID]
+        assert script_spec["safety"] == BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]
+
 
 class TestProductionFloor:
     async def test_production_l4_refuses_start_503001(self, tmp_path):

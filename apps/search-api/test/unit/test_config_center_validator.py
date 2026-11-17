@@ -9,13 +9,17 @@
 - 单条规则与契约逐条对应（见各用例 docstring 的 § 标注）。
 """
 import copy
+import re
 
 import pytest
 
 from app.config_center.defaults import BUILTIN_DEFAULTS
 from app.config_center.validator import (
+    SAFETY_FIELD_TOKEN,
+    SAFETY_REPLY_LINE_PREFIXES,
     AssetValidationError,
     SYNTHESIS_VARIANT_PREFIXES,
+    safety_token_warnings,
     sniff_secret_violations,
     validate_asset,
 )
@@ -653,3 +657,265 @@ class TestValidatorProseBypassHardening:
         )
         with pytest.raises(AssetValidationError, match="history_block"):
             validate_asset(PROMPTS_DATA_ID, payload)
+
+
+class TestSafetySpecRules:
+    """§3 B13：safety 节——节缺失=合法（fail-open）；词表/正则/边界越界拒收面。"""
+
+    def test_safety_section_missing_allowed(self):
+        """safety 节缺失 = 合法（fail-open：安全检查不挡检索，B13）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p.pop("safety"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_defaults_seed_safety_section_conservative(self):
+        """L4 种子：enabled=False（契约灰度初值——nacos-config.md §3/§8 v1.30「初值
+        enabled=false 灰度，A50 验收后用户裁决开启」）+ mode=hybrid + 三表齐备且保守
+        （宁可漏不可误）；grey_rules 均可编译且非灾难性回溯形态。"""
+        safety = BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]
+        assert safety["enabled"] is False
+        assert safety["mode"] == "hybrid"
+        assert 0 < len(safety["danger_terms"]) <= 200
+        assert 0 < len(safety["profanity_terms"]) <= 200
+        assert 0 < len(safety["grey_rules"]) <= 50
+        for rule in safety["grey_rules"]:
+            re.compile(rule)  # 不抛即合法
+
+    def test_bad_regex_in_grey_rules_rejected(self):
+        """grey_rules 逐条 re.compile 校验：编译失败 = 拒收 violation。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["grey_rules"].append("("),  # 未闭合分组
+        )
+        with pytest.raises(AssetValidationError, match="grey_rules"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_grey_rules_over_fifty_rejected(self):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p: p["safety"].update({"grey_rules": ["x"] * 51})
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_grey_rules_entry_over_120_chars_rejected(self):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p: p["safety"]["grey_rules"].append("x" * 121)
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    def test_term_lexicon_over_200_rejected(self, field):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, f=field: p["safety"].update({f: ["词"] * 201})
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    def test_term_entry_empty_rejected(self, field):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, f=field: p["safety"][f].append("")
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    def test_term_entry_over_64_chars_rejected(self, field):
+        """§3 校验规则 v1.30：词表单条 ≤64 字符（越界拒收）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, f=field: p["safety"][f].append("x" * 65)
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms"])
+    def test_term_entry_duplicated_rejected(self, field):
+        """§3 校验规则 v1.30：词表条目去重（重复条目拒收）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, f=field: p["safety"][f].append(p["safety"][f][0])
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_enabled_true_empty_lexicons_rejected(self):
+        """§3 校验规则 v1.30：enabled=true 时两词表至少其一非空（空词表开启=矛盾）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"].update(
+                {"enabled": True, "danger_terms": [], "profanity_terms": []}
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="至少其一非空"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("value", ["false", "0", 1, None])
+    def test_enabled_non_bool_rejected(self, value):
+        """enabled 严格布尔：字符串/数字/null 形态一律拒收（kill switch 防
+        `"false"` 字符串形态漂移——validator 拒收 + 运行面严格判定双防线之一）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, v=value: p["safety"].update({"enabled": v})
+        )
+        with pytest.raises(AssetValidationError, match="布尔"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "(a+)+$",  # 经典嵌套量词（评审实测：29 字符 payload 单次 0.035s 指数增长）
+            "^(([a-z])+.)+[A-Z]([a-z])+$",  # 量词分组嵌量词分组（评审实测 35 字符 0.637s）
+            "(a|aa)+b",  # 量词分组内交替（前缀重叠族）
+            "(ab?)+c",  # 量词分组内可选量词（每轮两歧义仍指数）
+        ],
+    )
+    def test_grey_rules_catastrophic_form_rejected(self, rule):
+        """ReDoS 兜底第一层：灾难性回溯形态（无限量词分组内嵌量词/交替）静态拒收
+        ——运行面扫描在 async 节点内，恶意正则可挂死整个事件循环（评审 P1）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, r=rule: p["safety"]["grey_rules"].append(r)
+        )
+        with pytest.raises(AssetValidationError, match="灾难性回溯"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_grey_rules_quantified_disjoint_group_accepted(self):
+        """非灾难形态（有限量词/无嵌套交替的非量词分组）不误拒：`(https?|ftp)://`
+        分组未被量词修饰、`自杀.{0,8}(方法|办法)` 分组无外层量词——均在合法面。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["grey_rules"].extend(
+                ["(https?|ftp)://", "自杀.{0,8}(方法|办法|教程)"]
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("classify_timeout_ms", 199),  # < 200（§3 契约下界）
+            ("classify_timeout_ms", 10001),  # > 10000
+            ("reply_timeout_ms", 199),  # < 200
+            ("reply_timeout_ms", 10001),  # > 10000（契约上界收口——12000 旧实现误放行）
+            ("reply_max_chars", 99),  # < 100（§3 契约下界）
+            ("reply_max_chars", 1001),  # > 1000
+        ],
+    )
+    def test_timeout_and_length_bounds_rejected(self, field, value):
+        """§3 校验规则 v1.30：classify/reply_timeout_ms 200≤x≤10000、
+        reply_max_chars 100≤x≤1000（越界拒收）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, f=field, v=value: p["safety"].update({f: v})
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("classify_timeout_ms", 1500),
+            ("reply_timeout_ms", 2000),
+            ("reply_max_chars", 300),
+        ],
+    )
+    def test_timeout_and_length_defaults_legal(self, field, value):
+        """§3 现行示例值在场且合法（B13 种子：classify 1500 / reply 2000 / chars 300
+        ——nacos-config.md §8 v1.30「初值取 §1/§3 现行示例」）。"""
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"][field] == value
+        payload = _mutated(SPEC_DATA_ID, lambda p, f=field, v=value: p["safety"].update({f: v}))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_mode_invalid_rejected(self):
+        """mode 只收 lexicon|hybrid（缺省 hybrid）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["safety"].update({"mode": "ml"}))
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_safety_field_names_avoid_secret_sniff(self):
+        """字段命名纪律：safety 节内不含 key/secret/token/password 字段名
+        （防撞密钥嗅探 §2——B13 硬约束）。"""
+        for field in BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]:
+            assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), field
+
+
+class TestSafetyReplyPrefixRules:
+    """§1 B13：common.safety_reply 两段行前缀硬校验（缺段拒收；键缺失不拒收）。"""
+
+    @pytest.mark.parametrize("prefix", SAFETY_REPLY_LINE_PREFIXES)
+    def test_safety_reply_missing_line_prefix_rejected(self, prefix):
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "common.safety_reply": p["prompts"]["common.safety_reply"].replace(
+                        prefix, "- 其他段："
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match=prefix[2:]):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_safety_reply_key_missing_allowed(self):
+        """键缺失不拒收（§1「Nacos 键缺失时回落默认」——内置默认自带两段）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID, lambda p: p["prompts"].pop("common.safety_reply")
+        )
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
+
+    def test_defaults_safety_reply_carries_both_prefixes(self):
+        """内置默认 safety_reply 两段齐备（L4 回落值自身合法）。"""
+        text = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]["common.safety_reply"]
+        lines = text.splitlines()
+        for prefix in SAFETY_REPLY_LINE_PREFIXES:
+            assert any(line.startswith(prefix) for line in lines)
+
+
+class TestSafetyTokenSoftCheck:
+    """§1 B13：fast.rewrite / deep.planner 的 safety 字段 token 软校验——告警不拒收。"""
+
+    def test_defaults_have_no_safety_warnings(self):
+        """内置默认已带 token——零告警（否则每次校验刷 WARNING 噪音）。"""
+        prompts = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]
+        assert safety_token_warnings(prompts) == []
+
+    def test_old_rewrite_without_safety_token_passes_with_warning(self):
+        """旧提示词（无 safety token）→ 校验**通过**且产生警告（不拒收）。
+
+        硬拒会把生产部署打回 L4 内置默认——运行态提示词被静默替换（提示词漂移陷阱），
+        故沿 retry.connection 软校验先例只告警。
+        """
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
+                        SAFETY_FIELD_TOKEN, ""
+                    )
+                }
+            ),
+        )
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
+        warnings = safety_token_warnings(payload["prompts"])
+        assert len(warnings) == 1
+        assert "fast.rewrite" in warnings[0]
+        assert "不拒收" in warnings[0]
+
+    def test_planner_without_safety_token_passes_with_warning(self):
+        """deep.planner 同构软校验：缺 token → 通过 + 一条告警。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "deep.planner": p["prompts"]["deep.planner"].replace(
+                        SAFETY_FIELD_TOKEN, ""
+                    )
+                }
+            ),
+        )
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
+        warnings = safety_token_warnings(payload["prompts"])
+        assert len(warnings) == 1
+        assert "deep.planner" in warnings[0]
+
+    def test_missing_keys_are_silent(self):
+        """键缺失不告警（回落内置默认由既有键级告警通道覆盖，不重复计数）。"""
+        assert safety_token_warnings({}) == []
+        assert safety_token_warnings({"fast.rewrite": 123}) == []  # 非字符串形态不碰

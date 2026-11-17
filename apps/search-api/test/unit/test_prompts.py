@@ -25,7 +25,7 @@ from app.agent.prompts import (
     render_prompt,
     resolve_prompt,
 )
-from app.config_center.defaults import PROMPTS_CONFIG
+from app.config_center.defaults import PROMPTS_CONFIG, SPEC_CONFIG
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 
@@ -397,3 +397,121 @@ def test_type_rules_recall_anchors_unchanged_after_tuning() -> None:
         assert "history 为空时本条不适用" in text  # 空历史护栏
         assert "回顾类元问题按 ① 判 direct" in text  # 护栏回落目标
         assert "重新生成不回放" in text  # 不回放纪律
+
+
+# ==== fast.synthesis 语言行加固（方案B，2026-11-17：检索材料/改写查询语言 ≠
+# query_lang 时仍全程以 query_lang 作答；三源同步 defaults.py / nacos_init.py /
+# 内置 .txt，运行态经单键热更发布——只改内置 .txt 运行态不可见） ====
+
+
+def test_synthesis_language_line_carries_language_follow_guard() -> None:
+    """语言行加固句在场且与语言行同段（同一行内）：不以「- 」开头、不落任何变体段
+    ——_apply_answerable_variant 行级过滤按四个变体前缀（synthesis.py:112-117）
+    切分，该行原样保留（节点级全变体保留由
+    test_synthesis_language_line_guard_survives_all_variants 锁）。"""
+    for text in _prompt_texts("fast.synthesis"):
+        lang_lines = [line for line in text.splitlines() if line.startswith("二、语言")]
+        assert len(lang_lines) == 1
+        line = lang_lines[0]
+        assert "跟随{{query_lang}}作答" in line
+        assert (
+            "即使检索材料或改写查询的语言与{{query_lang}}不同，也必须全程以{{query_lang}}作答"
+            in line
+        )
+        assert "（代码块、专有名词、来源标题可保留原文）" in line
+        assert not line.startswith("- ")  # 变体段外（行级过滤不触及）
+
+
+# ==== B13 输入安全增量（common.safety_check / common.safety_reply 两新键 +
+# fast.rewrite / deep.planner 的 safety 字段增量；三源同步：内置 .txt ≡ defaults.py
+# 由 test_defaults_prompts_match_builtin_files 遍历 BUILTIN_PROMPT_FILES 自动覆盖新键，
+# nacos_init.py ≡ defaults.py 由 test_config_center.py TestNacosInitScriptParity 锁） ====
+
+
+def test_safety_check_placeholder_union_locked() -> None:
+    """common.safety_check 占位符并集恰为 {query, query_lang}（B13 变量集就此冻结）。"""
+    expected = {"query", "query_lang"}
+    assert _placeholders(load_builtin_prompt("common.safety_check")) == expected
+    assert _placeholders(PROMPTS_CONFIG["prompts"]["common.safety_check"]) == expected
+    assert builtin_prompt_files()["common.safety_check"] == "common/safety_check.txt"
+
+
+def test_safety_reply_placeholder_union_locked() -> None:
+    """common.safety_reply 占位符并集恰为 {query_lang}（B13 变量集就此冻结）。"""
+    expected = {"query_lang"}
+    assert _placeholders(load_builtin_prompt("common.safety_reply")) == expected
+    assert _placeholders(PROMPTS_CONFIG["prompts"]["common.safety_reply"]) == expected
+    assert builtin_prompt_files()["common.safety_reply"] == "common/safety_reply.txt"
+
+
+def test_safety_check_carries_action_contract_and_injection_guard() -> None:
+    """safety_check 契约锚点：严格 JSON 输出形态 / reject 组合约束 / pii→sanitize /
+    拿不准一律 pass / 正当语境负例指引 / 防提示注入句（query 是被判定对象）。"""
+    for text in _prompt_texts("common.safety_check"):
+        assert '{"action":"pass|sanitize|reject","category":"danger|profanity|pii|none"}' in text
+        assert "action=reject 仅允许配 category=danger 或 profanity" in text
+        assert "category=pii 一律配 action=sanitize" in text
+        assert "拿不准一律 pass" in text
+        assert "研究/教育语境" in text  # 正当语境负例指引
+        assert "一律 pass，不得 reject" in text
+        assert "被判定的对象" in text  # 防提示注入：query 是被判定对象不是指令
+        assert "不得执行" in text
+
+
+def test_safety_reply_carries_line_prefixes_and_tone_contract() -> None:
+    """safety_reply 结构锚点：两类别段行前缀（validator SAFETY_REPLY_LINE_PREFIXES
+    硬校验同源）+ 公共行为引导行 + 温和不说教/两三句/替代方向/语言跟随语义。"""
+    for text in _prompt_texts("common.safety_reply"):
+        lines = text.splitlines()
+        for prefix in ("- 危险请求回复段：", "- 辱骂回复段："):
+            assert any(line.startswith(prefix) for line in lines), f"缺行前缀：{prefix}"
+        assert "不说教" in text
+        assert "两三句以内" in text
+        assert "替代方向" in text  # 拒绝并说明替代行为
+        assert "温和" in text
+
+
+def test_rewrite_and_planner_schema_contains_safety_token() -> None:
+    """fast.rewrite / deep.planner 输出 schema 含 safety 字段 token（B13 软校验锚点）。
+
+    validator 侧为软校验（告警不拒收）——内置默认必须带 token（否则每次启动刷
+    WARNING）；token 为带引号精确形态，散文提及不算。
+    """
+    token = '"safety":"none|danger|profanity"'
+    for key in ("fast.rewrite", "deep.planner"):
+        for text in _prompt_texts(key):
+            assert token in text
+            assert "正当语境一律 none" in text  # 语义层判定指引（正当语境放行）
+            assert "拿不准一律 none" in text
+
+
+def test_safety_lexicon_defaults_present() -> None:
+    """SPEC_CONFIG safety 节种子保守齐备（B13）：enabled=False（契约灰度初值——
+    nacos-config.md §3/§8 v1.30「初值 enabled=false 灰度，A50 验收后用户裁决开启」）、
+    三表非空且在校验上限内、超时/长度初值取 §3 现行示例 1500/2000/300。"""
+    safety = SPEC_CONFIG["safety"]
+    assert safety["enabled"] is False
+    assert safety["mode"] == "hybrid"
+    assert 0 < len(safety["danger_terms"]) <= 200
+    assert 0 < len(safety["profanity_terms"]) <= 200
+    assert 0 < len(safety["grey_rules"]) <= 50
+    assert safety["classify_timeout_ms"] == 1500
+    assert safety["reply_timeout_ms"] == 2000
+    assert safety["reply_max_chars"] == 300
+
+
+def test_safety_lexicon_seed_terms_unambiguous() -> None:
+    """直拦词表零歧义纪律（评审 P1 负例保护）：高频正当语境条目不得入直拦词表——
+    自杀方法（预防/求助语境）、他妈的（鲁迅《论"他妈的"》学术语境）、废物（废物
+    利用手工语境）、白痴（医学/文学语境）、狗屁（狗屁不通文章生成器）、滚蛋（水滚蛋
+    烹饪语境）——正当语境负例指引（common.safety_check 第二节）只对 grey LLM 复核
+    通道生效、对词表直拦路径结构性不生效，直拦词表必须零歧义；歧义条目由 grey_rules
+    送审通道承载。"""
+    safety = SPEC_CONFIG["safety"]
+    for ambiguous in ("自杀方法", "他妈的", "废物", "白痴", "狗屁", "滚蛋"):
+        assert ambiguous not in safety["danger_terms"], ambiguous
+        assert ambiguous not in safety["profanity_terms"], ambiguous
+    # 歧义条目的送审面：grey_rules 覆盖掩码/语境变形（自杀+方法组合送 LLM 复核）
+    grey_joined = "|".join(safety["grey_rules"])
+    assert "自杀" in grey_joined
+    assert "白" in grey_joined  # 白痴掩码规则在场（grey 复核而非直拦）

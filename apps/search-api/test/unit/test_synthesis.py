@@ -458,6 +458,72 @@ async def test_synthesis_llm_generation_metadata_carries_strategy(
     assert metadata.get("query_type") == "other"
 
 
+async def test_synthesis_metadata_carries_user_query_and_sources_compact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """观测增补（Option B）：user_query=本轮用户原始问题；fused 非空时 sources_compact
+    按 [n] 引用序携带 ref_no/url/title/snippet——为线上评估器变量映射预置
+    （消费面挂账见 ARCH §6.6 v1.53）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案[1]。")])
+
+    await synthesis(_state(), _config())
+
+    metadata = (model.configs[0] or {}).get("metadata") or {}
+    assert metadata.get("user_query") == "pgvector 和 Milvus 怎么选？"
+    assert metadata.get("sources_compact") == [
+        {"ref_no": 1, "url": "https://a/1", "title": "t:https://a/1", "snippet": "正文片段"},
+        {"ref_no": 2, "url": "https://b/2", "title": "t:https://b/2", "snippet": "正文片段"},
+    ]
+    # 既有键不动
+    assert metadata.get("search_strategy") == "web"
+    assert "query_type" not in metadata  # state 未声明时不伪造（既有口径）
+
+
+async def test_synthesis_metadata_sources_compact_snippet_truncated_to_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sources_compact.snippet 截断 ≤200 字符（紧凑元数据——超长正文只留头部）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(
+        _state(fused=[{"url": "https://a/1", "title": "t", "snippet": "字" * 500}]),
+        _config(),
+    )
+
+    metadata = (model.configs[0] or {}).get("metadata") or {}
+    sources = metadata.get("sources_compact")
+    assert sources is not None
+    assert len(sources[0]["snippet"]) == 200
+
+
+async def test_synthesis_metadata_user_query_truncated_to_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """user_query 截断 ≤200 字符（ARCH §6.6 v1.43 metadata 单值 ≤200 口径对齐——span 层同规）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(_state(query="问" * 500), _config())
+
+    metadata = (model.configs[0] or {}).get("metadata") or {}
+    user_query = metadata.get("user_query")
+    assert user_query is not None
+    assert len(user_query) == 200
+
+
+async def test_synthesis_metadata_empty_fused_omits_sources_compact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """零来源轮（direct/recall）：sources_compact 键省略（键可省口径）；user_query 仍在。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+
+    await synthesis(_state(strategy="direct", fused=[]), _config())
+
+    metadata = (model.configs[0] or {}).get("metadata") or {}
+    assert "sources_compact" not in metadata
+    assert metadata.get("user_query") == "pgvector 和 Milvus 怎么选？"
+    assert metadata.get("search_strategy") == "direct"
+
+
 # ---- B11 P1a：连接类长窗重试（nacos-config §3 v1.24 / 决策 4）----
 
 
@@ -789,6 +855,30 @@ async def test_synthesis_history_block_injected_only_for_recall(
         prompt_text = model.prompts[0][0].content
         assert history_snippet not in prompt_text, f"{label} 轮不得注入历史块"
         assert "{{history_block}}" not in prompt_text
+
+
+async def test_synthesis_language_line_guard_survives_all_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """语言行加固句（方案B，2026-11-17）在四种变体切分后均完整保留：追加句与语言行
+    同行（不以「- 」开头、不入任何变体段），_apply_answerable_variant 行级过滤只动
+    四个变体前缀行——「检索材料语言 ≠ query_lang 时仍全程以 query_lang 作答」的兜底
+    在 direct / verify(web+answerable) / web / recall 全变体生效。"""
+    expected_line = (
+        "二、语言：跟随zh作答（已由代码判定，无需说明所用语言）；"
+        "即使检索材料或改写查询的语言与zh不同，也必须全程以zh作答"
+        "（代码块、专有名词、来源标题可保留原文）。"
+    )
+    for state, label in (
+        (_state(strategy="direct", fused=[]), "direct"),
+        (_state(strategy="web", answerable=True), "verify(web+answerable)"),
+        (_state(strategy="web"), "web"),
+        (_recall_state(), "recall"),
+    ):
+        model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+        await synthesis(state, _config())
+        prompt_text = model.prompts[0][0].content
+        assert expected_line in prompt_text, f"{label} 变体语言行加固句丢失"
 
 
 async def test_synthesis_recall_missing_variant_falls_back_to_direct(

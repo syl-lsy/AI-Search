@@ -1,10 +1,10 @@
 /**
- * src/types/api.d.ts — api.md（v1.19）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.23）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.19（REST + SSE 协议唯一事实源；§2.12 POST
+ *   - docs/contract/api.md v1.23（REST + SSE 协议唯一事实源；§2.12 POST
  *     /turns/{turn_id}/regenerate（REQ-063/A47）+ §0 错误码 409006 + §7.2/§2.5
- *     stages[].extra 可选键 source_retries 随本批镜像同步——frontend-api.md §8.5 v1.26，F5 工单）
+ *     stages[].extra 可选键 source_retries 随本批镜像同步——frontend-api.md §8.5 v1.28，F5 工单）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
  *   - frontend-api.md §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
@@ -28,6 +28,7 @@ export type Uuid = string
 export type ErrorCode =
   | '400001' // 请求参数错误
   | '403001' // 记忆功能已关闭
+  | '403002' // 内容安全拒绝——§0 域码（B13 拒答轮：轮终态 failed + turns.error 载荷携带本码）
   | '404001' // 资源不存在
   | '404002' // 该来源无快照 → 404
   | '404004' // 轮次不存在（反馈端点，api.md §0 v1.16；语义同 404001 turn 维度，独立码便于反馈面埋点区分）
@@ -43,8 +44,15 @@ export type ErrorCode =
   | '500001' // 内部错误（兜底）
   | '503001' // 配置中心不可达且无缓存
 
-/** SSE 专属错误码（仅出现在 error 事件，不用于 REST；api.md §7.2） */
-export type SseErrorCode = '500101' | '500201' | '500301' | '500401'
+/**
+ * SSE 专属错误码（仅出现在 error 事件，不用于 REST；api.md §7.2）
+ */
+export type SseErrorCode =
+  | '403002' // 内容安全拒绝——§0 域码，允许出现于 error 帧（B13 拒答轮：无部分内容 → error 后直接关闭、无 done）
+  | '500101'
+  | '500201'
+  | '500301'
+  | '500401'
 
 /** api.md §0 成功信封（/api/ 前缀自动包装） */
 export interface ApiSuccessEnvelope<T> {
@@ -141,6 +149,10 @@ export interface StageExtra {
   strategy?: string
   /** api.md §7.2/§2.5 v1.19 P1b 留痕：源名→同源延迟重试次数映射（stage(search,done) extra，形如 {"tavily": 1}；无重试零键，前端零渲染义务） */
   source_retries?: Record<string, number>
+  /** api.md §7.4/§2.5 v1.23 B13 安全拒绝轮 stage failed extra 留痕（命中类别 danger|profanity（pii 走 sanitize 不产生 failed stage，前端零消费不展示）；宽松 string 同 strategy 先例） */
+  safety?: string
+  /** api.md §7.4/§2.5 v1.23 B13 拦截层标注（pre_route|rewrite|planner，前端零消费不展示） */
+  layer?: string
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */

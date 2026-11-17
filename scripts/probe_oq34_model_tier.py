@@ -29,14 +29,16 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from deepagents.middleware.filesystem import FsToolName  # 仅类型标注用（纯类型导入，无副作用）
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_TEST = REPO_ROOT / ".env.test"
 SUBAGENT_PROMPT_TXT = REPO_ROOT / "apps/search-api/app/agent/prompts/deep/subagent_system.txt"
 
 CONTRACT_TOOL_NAMES = {"web_search", "firecrawl_read", "save_snapshot"}
-READ_ONLY_FS_TOOLS = ["ls", "read_file", "glob", "grep"]
+READ_ONLY_FS_TOOLS: list[FsToolName] = ["ls", "read_file", "glob", "grep"]
 ROUNDS_CAP = 3  # 规模硬上限：每档 ≤3 轮
 QUESTION_SUBTOPIC = "Milvus 与 Qdrant 在部署形态、性能与运维成本上的差异及各自适用场景"
 SUMMARY_MAX_TOKENS = 1200  # ARCH §4.2 摘要预算
@@ -171,18 +173,25 @@ def validate_summary(text: str) -> dict[str, Any] | None:
 
 def build_probe_subagent(model: Any, tag: str) -> Any:
     """批次 2 同形装配：3 契约工具 + 只读文件中间件（OQ-33 契约形态）。"""
+    from deepagents import SubAgent
     from deepagents.backends import StateBackend
     from deepagents.middleware.filesystem import FilesystemMiddleware
     from deepagents.middleware.subagents import create_sub_agent
+    from langchain.agents.middleware import AgentMiddleware
 
     tools, _ = make_mock_tools()
-    spec = {
+    spec: SubAgent = {
         "name": f"probe-researcher-{tag}",
         "description": "probe subagent",
         "system_prompt": render_subagent_prompt(QUESTION_SUBTOPIC),
         "model": model,
         "tools": tools,
-        "middleware": [FilesystemMiddleware(backend=StateBackend(), tools=READ_ONLY_FS_TOOLS)],
+        # cast：deepagents 0.7.32 上游 typing 缺口——FilesystemMiddleware[None, Any] 因
+        # StateT 不变性装不进 SubAgent.middleware: list[AgentMiddleware]（运行时形态正确）
+        "middleware": cast(
+            list[AgentMiddleware],
+            [FilesystemMiddleware(backend=StateBackend(), tools=READ_ONLY_FS_TOOLS)],
+        ),
     }
     return create_sub_agent(spec)
 

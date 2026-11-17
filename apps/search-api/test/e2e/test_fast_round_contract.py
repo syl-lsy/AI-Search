@@ -15,7 +15,8 @@ Last-Event-ID 重放/落库逐字段）已在 integration 锁死——本层只�
 - 答案长度上限：中文 ≤3000 字（代码级硬截断口径，spec fast.max_answer_chars——
   synthesis 硬截断、软引导归提示词）；英文 ≤2000 词（等价信息量口径）；
 - 语言跟随：中文题→答主体中文 / 英文题→答主体英文（判定口径镜像
-  turn_service.detect_query_lang 的 CJK 占比 ≥30% 规则，§2.5 query_lang 事实源）。
+  turn_service.detect_query_lang 两条款规则——CJK 占比 ≥30% **或** ≥2 连续 CJK 字符，
+  PRD v1.24 同源口径，§2.5 query_lang 事实源）。
 
 断言纪律：断言结构不断言文案——长度、编号对应、事件顺序、语言主体，不比对具体措辞。
 
@@ -53,6 +54,8 @@ FAST_TRUNK = ("rewrite", "search", "write")
 FAST_TRUNK_DIRECT = ("rewrite", "write")
 #: 语言判定 CJK 占比阈值（镜像 turn_service.CJK_RATIO_THRESHOLD = 0.30，OQ-2 同口径）
 CJK_RATIO_THRESHOLD = 0.30
+#: ≥2 连续 CJK 字符判 zh 的最短词组长度（镜像 turn_service.CJK_RUN_MIN = 2，PRD v1.24 方案A）
+CJK_RUN_MIN = 2
 #: 单轮 SSE 收流上限（真链路实测 39~49s；轮预算 fast.turn_timeout_s 已于 v1.25 改为
 #: 120s——正文篇幅不再被 30s 口径压缩，收流上限随预算放宽留余量）
 SSE_ROUND_TIMEOUT_S = 150.0
@@ -152,12 +155,23 @@ def _get_detail(base_url: str, turn_id: str) -> dict:
 
 
 def _detect_answer_lang(text: str) -> str:
-    """答案主体语言判定：非空白字符 CJK 占比 ≥30% → zh（镜像 detect_query_lang，OQ-2）。"""
+    """答案主体语言判定（镜像 detect_query_lang 两条款，PRD v1.24 口径同源——OQ-2）：
+    zh ⇔ 非空白字符 CJK 占比 ≥30%（分母=非空白字符）**或**原始串存在 ≥2 连续 CJK
+    字符（连续按原始串相邻计，空白/标点打断）；空串/零有效字符回落 en。
+    独立实现、不 import 生产函数（e2e 侧自足性——与 test_fast_followups 同款镜像）。"""
     chars = [c for c in text if not c.isspace()]
-    if not chars:
-        return "en"
     cjk = sum(1 for c in chars if any(lo <= ord(c) <= hi for lo, hi in _CJK_RANGES))
-    return "zh" if cjk / len(chars) >= CJK_RATIO_THRESHOLD else "en"
+    if chars and cjk / len(chars) >= CJK_RATIO_THRESHOLD:
+        return "zh"
+    run = 0
+    for ch in text:  # 原始串扫描：空白/标点打断连续（与生产口径一致）
+        if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES):
+            run += 1
+            if run >= CJK_RUN_MIN:
+                return "zh"
+        else:
+            run = 0
+    return "en"
 
 
 def _rewrite_strategy(frames: list[dict]) -> str | None:

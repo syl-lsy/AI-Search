@@ -311,8 +311,9 @@ async def test_real_main_graph_messages_frames_only_from_synthesis(
     )
     assert set(custom_types) == {"stage", "sources"}  # custom 仅 stage/sources（token 不在 custom 域）
     # updates 双层形态（TurnRunner final_state 消费面）：顶层键=子图节点名（聚合投影回填）、
-    # 子图命名空间帧键=内层节点名（五节点全运行的证明）
-    assert top_update_nodes == {"fast"}
+    # 子图命名空间帧键=内层节点名（五节点全运行的证明）；B13 起 safety_check 首节点
+    # 直通零更新 → 顶层 updates 记 {safety_check: None}（键名入集、None 被跳过不炸）
+    assert top_update_nodes == {"fast", "safety_check"}
     assert inner_update_nodes == {"rewrite", "web_search", "merge_dedupe", "fuse_rerank", "synthesis"}
 
 

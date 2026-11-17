@@ -27,6 +27,15 @@ answerable=false），旧提示词 + 新代码 = 全量轮零行为变化。对�
 降级观测面收敛在 stage done.extra={fallback} + state.errors[]（留痕不丢）+ 兜底路径
 AgentLog 埋点（失败原因可观测——批次 7 披露的零埋点缺口一并修）。
 
+**Layer 2 输入安全拦截（B13，api.md §7.4 v1.23）**：RewriteOutput 增 `safety`
+初判字段（`none|danger|profanity`，**缺省 `none` 灰度安全**——旧提示词无本字段即
+全量 none，存量轮零行为变化，沿 search_strategy v1.20 先例）。仅 LLM 成功路径
+（主调用与修复回喂）判读：`spec.safety` enabled 且 mode=hybrid 且初判 ∈
+{danger, profanity} → 类别化拒答话术 → stage(rewrite, failed, detail="安全拦截")
+→ ContentRejectedError（TurnRunner 走安全拒绝轮收束）。**机制兜底/传输兜底路径
+不判 safety**：Layer 1（主图壳 pre_route 词表硬命中 / grey LLM 复核）已对该 query
+前置覆盖，兜底路径本就无可靠 safety 判读面（LLM 输出未成形），不重复拦截。
+
 纯函数边界：节点无 DB/EventBus；提示词经 AssetCenter 内存快照解析（未启动回落内置
 默认）；LLM 工厂（`build_light_model`）可注入可 mock——单测全 mock 零网络。
 memory_directive 为 M5 记忆通道：解析但**不写 state**（FastState 无该字段），仅经
@@ -46,6 +55,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.agent.graphs.signals import emit_stage
 from app.agent.guards import (
+    ContentRejectedError,
     TurnDeadline,
     default_retry_on,
     ensure_not_canceled,
@@ -53,6 +63,7 @@ from app.agent.guards import (
     retry_policy_from_spec,
 )
 from app.agent.prompts import render_prompt, resolve_prompt
+from app.agent.safety import generate_rejection_reply, load_safety_config
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
 from app.core.logger import AgentLog
@@ -63,6 +74,7 @@ __all__ = [
     "FALLBACK_SEARCH_STRATEGY",
     "TRANSPORT_FALLBACK_QUERY_TYPE",
     "RewriteOutput",
+    "SafetyFlag",
     "SearchStrategy",
     "build_light_model",
     "rewrite",
@@ -92,18 +104,28 @@ QueryType = Literal[
 #: - verify ≡ answerable=true；web 默认全管道。
 SearchStrategy = Literal["direct", "verify", "web", "recall"]
 
+#: 输入安全初判三值（B13：none=正常 / danger=危险意图 / profanity=纯辱骂发泄；
+#: reject 组合约束同 safety.reply——pii 不在本通道，sanitize 面归 sanitizer）
+SafetyFlag = Literal["none", "danger", "profanity"]
+
+#: Layer 2 拦截白名单（safety 初判命中且 enabled+hybrid 才拒；none 一律直通）
+_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity")
+
 
 class RewriteOutput(BaseModel):
     """rewrite 结构化输出（nacos-config.md §1 fast.rewrite 输出 JSON 契约，S15）。
 
     `search_strategy` 缺省 `web`（v1.20 灰度安全：旧提示词无本字段即全量 web，
     存量轮零行为变化——字段由提示词热更启用）。
+    `safety` 缺省 `none`（B13 灰度安全同款：旧提示词无本字段即全量放行，
+    存量轮零行为变化；命中拦截面仅成功路径，见 `_safety_gate`）。
     """
 
     queries: list[str] = Field(min_length=1)
     query_type: QueryType
     answerable_from_knowledge: bool
     search_strategy: SearchStrategy = "web"
+    safety: SafetyFlag = "none"
     time_range: Literal["day", "week", "month", "year"] | None = None
     memory_directive: str | None = None
 
@@ -167,13 +189,17 @@ def _format_history(history: Any) -> str:
     return "\n".join(blocks)
 
 
-def _render_prompt(state: Mapping[str, Any]) -> str:
-    """fast.rewrite 模板渲染（五占位符契约集；memory_hints 为 M5 通道、启用前恒空串）。"""
+def _render_prompt(state: Mapping[str, Any], query_lang: str) -> str:
+    """fast.rewrite 模板渲染（五占位符契约集；memory_hints 为 M5 通道、启用前恒空串）。
+
+    query_lang 由调用方解析后传入（TurnRunner 前置纯代码判定值，改写不改判——PRD
+    OQ-2；Layer 2 拒答话术消费同一值，单一来源防漂移）。
+    """
     return render_prompt(
         resolve_prompt("fast.rewrite"),
         {
             "type_rules": resolve_prompt("common.type_rules"),
-            "query_lang": str(state.get("query_lang") or "en"),
+            "query_lang": query_lang,
             "memory_hints": "",  # M5 记忆→查询改写通道；启用前恒空（memory-api.md §2）
             "history": _format_history(state.get("history")),
             "query": str(state.get("query") or ""),
@@ -330,12 +356,57 @@ def _success_update(parsed: RewriteOutput, spec: Mapping[str, Any]) -> dict[str,
     }
 
 
+async def _safety_gate(
+    parsed: RewriteOutput,
+    spec: Mapping[str, Any],
+    query_lang: str,
+    config: RunnableConfig | None,
+) -> None:
+    """Layer 2 输入安全拦截（B13，api.md §7.4 v1.23 错误码 403002 拒绝轮）。
+
+    调用时机 = LLM 成功路径拿到 parsed 后（主调用与修复回喂共用）；**机制兜底/
+    传输兜底路径不进本函数**——Layer 1（主图壳 pre_route 词表硬命中 / grey LLM
+    复核 reject）已对该 query 前置覆盖，兜底路径本就无可靠 safety 判读面（LLM
+    输出未成形），不重复拦截。
+
+    直通三条件（任一命中即放行，判定按灰度安全顺序排布）：初判 ∉ {danger,
+    profanity}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
+    不走本通道；旧提示词全量 none → 零配置判读、零告警面，存量轮日志面亦零
+    变化）；`load_safety_config` 返回 None（fail-open：spec 缺 safety 节 /
+    enabled=false / mode 非法——本分支仅在模型真打出 flag 时可达，缺节告警
+    不刷正常轮）；mode=lexicon（词表模式不消费模型初判，Layer 1 词表为准）。
+
+    命中顺序：类别化拒答话术（SafetyConfig 透传保观测 + RunnableConfig 透传挂
+    Langfuse 轮次 trace）→ stage(rewrite, failed, detail="安全拦截",
+    extra={safety, layer}) → ContentRejectedError。**raise 点在 rewrite 的
+    try/except 兜底族之外**——ContentRejectedError 属 Exception 族，若在兜底
+    try 内上抛会被传输兜底 except 吞掉降级，拦截语义即失效；直达 TurnRunner
+    走安全拒绝轮收束（error 403002，reply 作为 error.message）。
+    """
+    if parsed.safety not in _REJECT_CATEGORIES:
+        return
+    safety_config = load_safety_config(spec)
+    if safety_config is None or safety_config.mode != "hybrid":
+        return
+    reply = await generate_rejection_reply(
+        parsed.safety, query_lang, safety_config, config
+    )
+    emit_stage(
+        "rewrite",
+        "failed",
+        detail="安全拦截",
+        extra={"safety": parsed.safety, "layer": "rewrite"},
+    )
+    raise ContentRejectedError(parsed.safety, reply, layer="rewrite")
+
+
 async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """rewrite 节点（fast 子图）：stage(rewrite, done) 收口（running 由 TurnRunner
     图前同步发布——ARCH §4.3 首 stage ≤1s 且无重复 seq）。"""
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
 
     query = str(state.get("query") or "")
+    query_lang = str(state.get("query_lang") or "en")
     spec = state.get("spec")
     spec = spec if isinstance(spec, Mapping) else {}
     fast_section = spec.get("fast") if isinstance(spec, Mapping) else None
@@ -353,10 +424,12 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
     chain = build_light_model(mapping if isinstance(mapping, Mapping) else None).with_structured_output(
         RewriteOutput, method="function_calling"
     )
-    prompt_text = _render_prompt(state)
+    prompt_text = _render_prompt(state, query_lang)
 
     update: dict[str, Any]
     extra_parts: dict[str, Any] = {}
+    #: Layer 2 判读对象（B13）——仅成功路径非 None；两兜底路径置 None 即不判 safety
+    accepted: RewriteOutput | None = None
     try:
         raw = await _invoke_with_retry(
             chain,
@@ -367,6 +440,7 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             config=config,
         )
         parsed = _extract(raw)
+        accepted = parsed
         update = _success_update(parsed, spec)
         if parsed.memory_directive:
             extra_parts = {"memory_directive": parsed.memory_directive}
@@ -403,6 +477,7 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
                 node="rewrite",
             ).warning()
         if repaired is not None:
+            accepted = repaired  # 修复回喂成功路径同判 safety（B13）
             update = _success_update(repaired, spec)
             if repaired.memory_directive:
                 extra_parts = {"memory_directive": repaired.memory_directive}
@@ -432,6 +507,13 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             reason="llm_retry_exhausted",
         )
         extra_parts = {"fallback": "degraded"}
+
+    # Layer 2 安全拦截门（B13）：仅 LLM 成功路径判 safety；命中即 emit failed +
+    # raise ContentRejectedError——raise 点在上方兜底 except 族之外（该异常属
+    # Exception 族，兜底 try 内上抛会被传输兜底吞掉），直达 TurnRunner 拒绝轮；
+    # 两兜底路径 accepted=None 自然跳过（Layer 1 已前置覆盖，见 _safety_gate）
+    if accepted is not None:
+        await _safety_gate(accepted, spec, query_lang, config)
 
     # strategy 恒随 done.extra 留痕（direct 形态为 api.md §7.4 钉死形态；verify/web
     # 轮为观测增量）+ 分支标注（fallback / memory_directive）合并

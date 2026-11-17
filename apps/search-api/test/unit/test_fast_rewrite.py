@@ -740,3 +740,253 @@ def test_rewrite_output_accepts_recall_and_navigational_literals() -> None:
             query_type="navigation",  # 非枚举值（坏例警示保留词）
             answerable_from_knowledge=False,
         )
+
+
+# ==== Layer 2 输入安全拦截（B13，api.md §7.4 v1.23 拒绝轮 403002）====
+#
+# 契约口径（逐条红锁）：
+# - `safety` 三值 none|danger|profanity，**缺省 none 灰度安全**——旧提示词（无本字段）
+#   + 新代码 → 全量放行，存量轮零行为变化（沿 search_strategy v1.20 先例）；
+# - 仅成功路径（主调用/修复回喂）判读：初判 ∈ {danger, profanity} 先行短路（none
+#   零判读——不触 load_safety_config，日志面零变化），再验 spec.safety enabled +
+#   mode=hybrid；mode=lexicon / enabled=false 一律忽略 flag 照常返回
+#   （fail-open：安全检查不挡检索，safety.config 契约口径）；
+# - 命中顺序：拒答话术（SafetyConfig + RunnableConfig 透传保观测）→
+#   stage(rewrite, failed, detail="安全拦截", extra={safety, layer="rewrite"}) →
+#   ContentRejectedError（不发 done——TurnRunner 捕获后走拒绝轮收束）；
+# - 机制兜底/传输兜底路径不判 safety（Layer 1 pre_route 已前置覆盖）。
+
+#: spec.safety 节（hybrid 形态，键位与 defaults.py SPEC_CONFIG safety 节同源）
+_SAFETY_HYBRID: dict[str, Any] = {
+    "enabled": True,
+    "mode": "hybrid",
+    "danger_terms": ["制造炸弹"],
+    "profanity_terms": ["傻逼"],
+    "grey_rules": [],
+    "classify_timeout_ms": 2000,
+    "reply_timeout_ms": 4000,
+    "reply_max_chars": 500,
+}
+
+_SPEC_SAFETY: dict[str, Any] = {**_SPEC, "safety": _SAFETY_HYBRID}
+
+
+def _install_rejection_stub(
+    monkeypatch: pytest.MonkeyPatch, reply: str = "温和拒答话术。"
+) -> list[dict[str, Any]]:
+    """拒答话术生成打桩（零网络）；返回调用记录供透传断言。"""
+    calls: list[dict[str, Any]] = []
+
+    async def _stub(
+        category: str,
+        query_lang: str,
+        config: Any,
+        runnable_config: Any = None,
+    ) -> str:
+        calls.append(
+            {
+                "category": category,
+                "query_lang": query_lang,
+                "config": config,
+                "runnable_config": runnable_config,
+            }
+        )
+        return reply
+
+    monkeypatch.setattr(fast_rewrite, "generate_rejection_reply", _stub)
+    return calls
+
+
+def _install_safety_loader_recorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Any]:
+    """load_safety_config 调用记录器（透传真实实现）——锁「兜底路径零判读」。"""
+    calls: list[Any] = []
+    real = fast_rewrite.load_safety_config
+
+    def _recorder(spec: Any) -> Any:
+        calls.append(spec)
+        return real(spec)
+
+    monkeypatch.setattr(fast_rewrite, "load_safety_config", _recorder)
+    return calls
+
+
+def test_rewrite_output_safety_default_is_none() -> None:
+    """schema 缺省值锁死：RewriteOutput().safety == "none"（B13 灰度安全底线）；枚举外值拒收。"""
+    from pydantic import ValidationError
+
+    from app.agent.nodes.fast_rewrite import RewriteOutput
+
+    parsed = RewriteOutput(
+        queries=["q"], query_type="other", answerable_from_knowledge=False
+    )
+    assert parsed.safety == "none"
+    with pytest.raises(ValidationError):
+        RewriteOutput(
+            queries=["q"],
+            query_type="other",
+            answerable_from_knowledge=False,
+            safety="pii",  # 非枚举值（pii 归 sanitize 通道，不在 reject 三值内）
+        )
+
+
+async def test_legacy_output_without_safety_field_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """灰度锁：旧提示词 fixture（无 safety 字段）+ safety 已启用的 hybrid spec →
+    解析缺省 none 照常返回、done 形态零变化、零判读零拦截（存量轮零行为变化——
+    先行短路使日志面亦零变化：不触 load_safety_config，缺节告警不刷正常轮）。"""
+    chain = _FakeChain([dict(_OK_OUTPUT)])  # _OK_OUTPUT 无 safety 键
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+    loader_calls = _install_safety_loader_recorder(monkeypatch)
+
+    update = await rewrite({**_STATE, "spec": _SPEC_SAFETY}, _config())
+
+    assert update["query_type"] == "comparison"
+    assert update["search_strategy"] == "web"
+    assert emitted[-1][2] == {"extra": {"strategy": "web"}}  # done 形态零变化
+    assert rejection_calls == []  # 缺省 none → 零拒答话术调用
+    assert loader_calls == []  # 缺省 none → 先行短路，零配置判读
+
+
+@pytest.mark.parametrize("category", ["danger", "profanity"])
+async def test_safety_hit_raises_content_rejected_with_stage_failed(
+    monkeypatch: pytest.MonkeyPatch, category: str
+) -> None:
+    """命中（danger/profanity）→ ContentRejectedError 三字段齐备 + stage(rewrite,
+    failed, detail="安全拦截") 形态钉死 + done 不发 + 透传（SafetyConfig/query_lang/
+    RunnableConfig）保观测。"""
+    from app.agent.guards import ContentRejectedError
+    from app.agent.safety.config import SafetyConfig
+
+    chain = _FakeChain([{**_OK_OUTPUT, "safety": category}])
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+    runnable = _config()
+
+    with pytest.raises(ContentRejectedError) as exc_info:
+        await rewrite({**_STATE, "spec": _SPEC_SAFETY}, runnable)
+
+    exc = exc_info.value
+    assert exc.category == category
+    assert exc.reply == "温和拒答话术。"  # 打桩话术原样进异常（error.message 源头）
+    assert exc.layer == "rewrite"
+    assert ContentRejectedError.code == "403002"
+    # stage 形态：恰一条 failed（done 不发），detail/extra 钉死
+    assert [(key, status) for key, status, _ in emitted] == [("rewrite", "failed")]
+    assert emitted[-1][2] == {
+        "detail": "安全拦截",
+        "extra": {"safety": category, "layer": "rewrite"},
+    }
+    # 透传面：类别、语言（state 注入值）、SafetyConfig 实例、RunnableConfig 原样
+    assert len(rejection_calls) == 1
+    call = rejection_calls[0]
+    assert call["category"] == category
+    assert call["query_lang"] == "zh"
+    assert isinstance(call["config"], SafetyConfig)
+    assert call["config"].mode == "hybrid"
+    assert call["runnable_config"] is runnable
+
+
+async def test_safety_lexicon_mode_ignores_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mode=lexicon → 忽略 flag 照常返回（词表模式不消费模型初判，Layer 1 为准）。"""
+    spec = {
+        **_SPEC,
+        "safety": {**_SAFETY_HYBRID, "mode": "lexicon"},
+    }
+    chain = _FakeChain([{**_OK_OUTPUT, "safety": "danger"}])
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+
+    update = await rewrite({**_STATE, "spec": spec}, _config())
+
+    assert update["query_type"] == "comparison"  # 正常产出
+    assert update["rewritten_queries"] == _OK_OUTPUT["queries"]
+    assert [(key, status) for key, status, _ in emitted] == [("rewrite", "done")]
+    assert rejection_calls == []
+
+
+async def test_safety_disabled_ignores_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """enabled=false（回退门）→ 忽略 flag 照常返回（load_safety_config None 直通）。"""
+    spec = {
+        **_SPEC,
+        "safety": {**_SAFETY_HYBRID, "enabled": False},
+    }
+    chain = _FakeChain([{**_OK_OUTPUT, "safety": "danger"}])
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+
+    update = await rewrite({**_STATE, "spec": spec}, _config())
+
+    assert update["query_type"] == "comparison"
+    assert [(key, status) for key, status, _ in emitted] == [("rewrite", "done")]
+    assert rejection_calls == []
+
+
+async def test_safety_hit_on_repair_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """修复回喂成功路径命中同样触发（主调用校验失败 → 回喂产出带 flag → 拦截）。"""
+    from app.agent.guards import ContentRejectedError
+
+    bad = {**_OK_OUTPUT, "query_type": "opinion"}  # 枚举外值 → 进修复回喂
+    chain = _FakeChain([bad, {**_OK_OUTPUT, "safety": "danger"}])
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+
+    with pytest.raises(ContentRejectedError) as exc_info:
+        await rewrite({**_STATE, "spec": _SPEC_SAFETY}, _config())
+
+    assert exc_info.value.layer == "rewrite"
+    assert exc_info.value.category == "danger"
+    assert len(chain.prompts) == 2  # 主调用 + 修复回喂，拦截发生在回喂产出后
+    assert [(key, status) for key, status, _ in emitted] == [("rewrite", "failed")]
+    assert len(rejection_calls) == 1
+
+
+async def test_mechanism_fallback_does_not_check_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """机制兜底路径零判读（Layer 1 pre_route 已前置覆盖）——load_safety_config
+    一次都不进、done 仍按兜底形态发。"""
+    chain = _FakeChain([
+        {**_OK_OUTPUT, "query_type": "opinion"},
+        {**_OK_OUTPUT, "query_type": "opinion"},
+    ])
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+    loader_calls = _install_safety_loader_recorder(monkeypatch)
+
+    update = await rewrite({**_STATE, "spec": _SPEC_SAFETY}, _config())
+
+    assert update["errors"] == [{"stage": "rewrite", "reason": "structured_output_invalid"}]
+    assert emitted[-1][2] == {"extra": {"strategy": "web", "fallback": "mechanism"}}
+    assert loader_calls == []  # 兜底路径零判读
+    assert rejection_calls == []
+
+
+async def test_transport_fallback_does_not_check_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """传输兜底路径零判读（Layer 1 已前置覆盖）——降级原始 query 单发不拦截。"""
+    request = httpx.Request("POST", "http://litellm/v1")
+    chain = _FakeChain([
+        httpx.ConnectError("refused", request=request),
+        httpx.ConnectError("refused", request=request),
+    ])
+    _, emitted = _install(monkeypatch, chain)
+    rejection_calls = _install_rejection_stub(monkeypatch)
+    loader_calls = _install_safety_loader_recorder(monkeypatch)
+
+    update = await rewrite({**_STATE, "spec": _SPEC_SAFETY}, _config())
+
+    assert update["errors"] == [{"stage": "rewrite", "reason": "llm_retry_exhausted"}]
+    assert emitted[-1][2] == {"extra": {"strategy": "web", "fallback": "degraded"}}
+    assert loader_calls == []
+    assert rejection_calls == []

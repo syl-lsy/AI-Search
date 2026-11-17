@@ -21,6 +21,7 @@ import AnswerRenderer from '@/components/markdown/AnswerRenderer.vue'
 import ThinkingPanel from '@/components/markdown/ThinkingPanel.vue'
 import ImageCardRow from '@/components/answer/ImageCardRow.vue'
 import Timeline from '@/components/answer/Timeline.vue'
+import { CONTENT_SAFETY_ERROR_CODE } from '@/constants/errors'
 import { QUESTION_CLAMP_THRESHOLD } from '@/constants/ui'
 import type { TurnState } from '@/stores/turn'
 
@@ -38,6 +39,12 @@ const emit = defineEmits<{
 }>()
 
 const isLive = computed(() => props.turn.status === 'running' || props.turn.status === 'queued')
+/**
+ * B13 拒答轮：403002 内容安全拒绝 → 错误卡走中性温和样式分支（非强烈报错红）——
+ * 标题走 i18n「内容安全提示」，正文渲染服务端 message 话术；复用既有 errorMsg 渲染通路
+ * （SSE error.code / 2.5 error.code 双源）只加分支，其余错误码展示行为零变化。
+ */
+const isContentSafety = computed(() => props.turn.errorCode === CONTENT_SAFETY_ERROR_CODE)
 const doneSeconds = computed(() =>
   props.turn.durationMs !== null && props.turn.durationMs > 0
     ? Math.max(1, Math.round(props.turn.durationMs / 1000))
@@ -126,7 +133,19 @@ const qActionsVisible = ref(false)
       </template>
       <template v-else>{{ $t('answer.statusDone') }}</template>
       <template v-if="turn.sources.length > 0">· {{ turn.sources.length }} {{ $t('answer.sourceCount') }}</template>
-      <template v-if="turn.errorMsg">· {{ turn.errorMsg }}</template>
+      <!-- B13：403002 温和卡分支接管错误展示（状态行不再内联错误文本，防双份呈现） -->
+      <template v-if="turn.errorMsg && !isContentSafety">· {{ turn.errorMsg }}</template>
+    </div>
+
+    <!-- 内容安全温和卡（B13 拒答轮 403002）：中性温和样式（非强烈报错红）；标题走 i18n，
+         正文 = 服务端 message 话术；时间线 stage(rewrite|plan, failed) 由既有 Timeline failed
+         渲染承担，本卡不重复节点语义 -->
+    <div v-if="isContentSafety && turn.errorMsg" class="safety-card" role="status" data-testid="safety-card">
+      <UiIcon name="i-shield" size="sm" class="safety-ico" />
+      <div class="safety-text">
+        <span class="safety-title">{{ $t('answer.contentSafetyTitle') }}</span>
+        <span class="safety-msg">{{ turn.errorMsg }}</span>
+      </div>
     </div>
 
     <Timeline :stages="turn.stages" :status="turn.status" :show-compact-note="compactNote === true" />
@@ -232,6 +251,38 @@ const qActionsVisible = ref(false)
   color: var(--color-text-tertiary);
   font-size: var(--text-sm);
   margin-bottom: var(--space-5);
+}
+/* 内容安全温和卡（B13 拒答轮 403002）：中性表面色 + 常规边框（danger 语义色不用），§8.6 不自创样式 */
+.safety-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: var(--text-sm);
+}
+.safety-card .safety-ico {
+  color: var(--color-text-tertiary);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+.safety-card .safety-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.safety-card .safety-title {
+  color: var(--color-text-primary);
+  font-weight: var(--weight-medium);
+}
+.safety-card .safety-msg {
+  color: var(--color-text-tertiary);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 /* DegradedBanner（降级终态显著标注；tokens warning 语义色，§8.6 不自创样式） */
 .degraded-banner {

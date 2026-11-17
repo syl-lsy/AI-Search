@@ -66,6 +66,8 @@ const zhCN = {
       budget: '原因：预算上限',
       source_failure: '原因：搜索源熔断',
     },
+    // 内容安全温和卡标题（B13 拒答轮 403002——正文渲染服务端 message 话术，不走词表）
+    contentSafetyTitle: '内容安全提示',
     sourceCount: '个来源',
     sources: '来源',
     sourcesGroupTitle: '『{question}』的搜索结果',
@@ -279,6 +281,8 @@ const enUS: typeof zhCN = {
       budget: 'Reason: budget cap',
       source_failure: 'Reason: search sources exhausted',
     },
+    // Content safety gentle card title (B13 refusal turns, 403002 — body renders the server message verbatim)
+    contentSafetyTitle: 'Content safety notice',
     sourceCount: 'sources',
     sources: 'Sources',
     sourcesGroupTitle: 'Sources for “{question}”',

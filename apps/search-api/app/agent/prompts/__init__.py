@@ -39,6 +39,10 @@ BUILTIN_PROMPT_FILES: dict[str, str] = {
     "fast.synthesis": "fast/synthesis.txt",
     "common.type_rules": "common/type_rules.txt",
     "common.citation_rules": "common/citation_rules.txt",
+    # B13 输入安全两键（grey 区 LLM 分类 + 拒答话术；占位符集按契约锁死：
+    # safety_check = {query, query_lang} / safety_reply = {query_lang}）
+    "common.safety_check": "common/safety_check.txt",
+    "common.safety_reply": "common/safety_reply.txt",
     "fast.followups": "fast/followups.txt",
     # deep 四键（M2 批次 1 骨架终稿；占位符集按契约锁死，文案随批次 2~4 节点打磨）
     "deep.planner": "deep/planner.txt",

@@ -31,17 +31,18 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import Any, cast
 
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import StateBackend
-from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.filesystem import FilesystemMiddleware, FsToolName
 from deepagents.middleware.subagents import create_sub_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
-READ_ONLY_FS_TOOLS = ["ls", "read_file", "glob", "grep"]
+READ_ONLY_FS_TOOLS: list[FsToolName] = ["ls", "read_file", "glob", "grep"]
 CONTRACT_TOOL_NAMES = {"web_search", "firecrawl_read", "save_snapshot"}
 EXPECTED_SUBAGENT_FACE = CONTRACT_TOOL_NAMES | set(READ_ONLY_FS_TOOLS)
 
@@ -139,11 +140,16 @@ def phase2_contract_form() -> list[str]:
         "system_prompt": "You are a researcher.",
         "model": model,
         "tools": make_mock_tools(),
-        "middleware": [
-            FilesystemMiddleware(  # 按 .name 原位替换默认 FS 中间件（graph.py:222-249）
-                backend=StateBackend(), tools=READ_ONLY_FS_TOOLS
-            )
-        ],
+        # cast：deepagents 0.7.32 上游 typing 缺口——FilesystemMiddleware[None, Any] 因
+        # StateT 不变性装不进 SubAgent.middleware: list[AgentMiddleware]（运行时形态正确）
+        "middleware": cast(
+            list[AgentMiddleware],
+            [
+                FilesystemMiddleware(  # 按 .name 原位替换默认 FS 中间件（graph.py:222-249）
+                    backend=StateBackend(), tools=READ_ONLY_FS_TOOLS
+                )
+            ],
+        ),
     }
     gp_override: SubAgent = {  # 同名顶替自动 GP（graph.py:841 not any(name==...) 分支）
         "name": "general-purpose",
@@ -151,7 +157,10 @@ def phase2_contract_form() -> list[str]:
         "system_prompt": "",
         "model": model,
         "tools": [],
-        "middleware": [FilesystemMiddleware(backend=StateBackend(), tools=READ_ONLY_FS_TOOLS)],
+        "middleware": cast(
+            list[AgentMiddleware],
+            [FilesystemMiddleware(backend=StateBackend(), tools=READ_ONLY_FS_TOOLS)],
+        ),
     }
     agent = create_deep_agent(model=model, tools=[], subagents=[researcher, gp_override], system_prompt="main")
 
@@ -166,7 +175,8 @@ def phase2_contract_form() -> list[str]:
         failures.append(f"[GP 顶替失败] general-purpose 可见面={gp_face} 期望={READ_ONLY_FS_TOOLS}")
 
     # 主 agent 面：task 工具在位 + 文件工具全集（主面不收窄）
-    main_face = sorted(agent.nodes["tools"].bound.tools_by_name.keys())
+    # cast：create_deep_agent 返回类型上 bound 为 Runnable，ToolNode.tools_by_name 未在类型面暴露
+    main_face = sorted(cast(Any, agent.nodes["tools"].bound).tools_by_name.keys())
     if "task" not in main_face or "write_file" not in main_face:
         failures.append(f"[主面异常] 主 agent 工具面={main_face}")
     return failures
@@ -199,7 +209,7 @@ def phase3_offload_readonly() -> list[str]:
             "system_prompt": "",
             "model": scripted_model([{"name": "big_result", "args": {}, "id": "c1"}]),
             "tools": [big_result],
-            "middleware": [mw],
+            "middleware": cast(list[AgentMiddleware], [mw]),  # 上游 typing 缺口，同上
         }
     )
     result = sub.invoke({"messages": [HumanMessage("go")]})

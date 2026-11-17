@@ -23,7 +23,8 @@ nacos-config.md v1.22 §8 已写明「存量已部署环境的 Nacos spec.enable
 - 触发条件：`mode=fast` ∧ `status=completed` ∧ answer 非空 ∧ `enabled=true`（本环境恒
   满足），且出现 error 帧即违规；
 - payload：`items` 为 1~5 条非空字符串、单条 ≤200 字符、无重复（§7.2 items 校验口径）；
-- 语言跟随：items 整体 CJK 占比 ≥30%（镜像 detect_query_lang，OQ-2）；
+- 语言跟随：items 整体中文（镜像 detect_query_lang 两条款——CJK 占比 ≥30% 或
+  ≥2 连续 CJK，PRD v1.24 同源口径，OQ-2）；
 - **三方一致**：SSE `followups.items` == §2.5 `followups`（REST 事实源）==
   `turns.followups` 列（先落库再发布不变式——事件到达时 2.5 已可对账）；
 - **不入 turn_events**（ADR-003 第 4 条落库子集不变）：`turn_events` 无
@@ -66,8 +67,10 @@ STREAM_TIMEOUT_S = 150.0
 ITEMS_MAX_COUNT = 5
 ITEM_MAX_CHARS = 200
 
-#: 语言判定 CJK 占比阈值（镜像 turn_service.CJK_RATIO_THRESHOLD = 0.30）
+#: 语言判定 CJK 占比阈值（镜像 turn_service.CJK_RATIO_THRESHOLD = 0.30，OQ-2 同口径）
 CJK_RATIO_THRESHOLD = 0.30
+#: ≥2 连续 CJK 字符判 zh 的最短词组长度（镜像 turn_service.CJK_RUN_MIN = 2，PRD v1.24 方案A）
+CJK_RUN_MIN = 2
 _CJK_RANGES = ((0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0x20000, 0x2A6DF))
 
 #: 题面：nacos-config.md §1 v1.20 direct 判例原文（闲聊/能力询问 → 零检索直答）
@@ -243,12 +246,24 @@ def _db_followups(turn_id: str) -> tuple[object, bool]:
         conn.close()
 
 
-def _cjk_ratio(text: str) -> float:
+def _detect_answer_lang(text: str) -> str:
+    """语言判定（镜像 detect_query_lang 两条款，PRD v1.24 口径同源——OQ-2）：
+    zh ⇔ 非空白字符 CJK 占比 ≥30%（分母=非空白字符）**或**原始串存在 ≥2 连续 CJK
+    字符（连续按原始串相邻计，空白/标点打断）；空串/零有效字符回落 en。
+    独立实现、不 import 生产函数（e2e 侧自足性——与 test_fast_round_contract 同款镜像）。"""
     chars = [c for c in text if not c.isspace()]
-    if not chars:
-        return 0.0
     cjk = sum(1 for c in chars if any(lo <= ord(c) <= hi for lo, hi in _CJK_RANGES))
-    return cjk / len(chars)
+    if chars and cjk / len(chars) >= CJK_RATIO_THRESHOLD:
+        return "zh"
+    run = 0
+    for ch in text:  # 原始串扫描：空白/标点打断连续（与生产口径一致）
+        if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES):
+            run += 1
+            if run >= CJK_RUN_MIN:
+                return "zh"
+        else:
+            run = 0
+    return "en"
 
 
 def _collect_replay(base_url: str, turn_id: str, last_seq: int) -> list[dict]:
@@ -364,11 +379,13 @@ def test_e2e_fast_followups_event_contract(l4_base_url):
         )
     assert len(set(items)) == len(items), "items 不应有重复条目"
 
-    # 语言跟随（答案/追问语言 = query_lang；§7.2 + nacos fast.followups ④）
+    # 语言跟随（答案/追问语言 = query_lang；§7.2 + nacos fast.followups ④；
+    # 判定口径 = detect_query_lang 两条款镜像，PRD v1.24 同源）
     assert detail["query_lang"] == "zh"
     joined = "\n".join(items)
-    assert _cjk_ratio(joined) >= CJK_RATIO_THRESHOLD, (
-        f"items 整体应为中文（CJK 占比 ≥{CJK_RATIO_THRESHOLD}），实测 {_cjk_ratio(joined):.2f}"
+    assert _detect_answer_lang(joined) == "zh", (
+        f"items 整体应为中文（占比 ≥{CJK_RATIO_THRESHOLD} 或 ≥{CJK_RUN_MIN} 连续 CJK），"
+        f"实测判定 en：{items!r}"
     )
 
     # 三方一致：事件 == 2.5 == turns 列（先落库再发布不变式）

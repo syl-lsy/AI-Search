@@ -39,6 +39,7 @@ from langchain_core.exceptions import OutputParserException
 
 __all__ = [
     "ConnectionRetryPolicy",
+    "ContentRejectedError",
     "RetryPolicy",
     "RetryWindow",
     "TurnCanceledSignal",
@@ -384,6 +385,28 @@ class TurnCanceledSignal(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class ContentRejectedError(Exception):
+    """内容安全拒绝（B13 输入安全两层防御，api.md §0 v1.23 错误码 403002）。
+
+    Layer 1（主图壳 pre_route：词表硬命中 / grey LLM 复核 reject）与 Layer 2（子图内
+    rewrite|planner：模型 safety 初判命中且 enabled+hybrid）同形上抛——TurnRunner
+    捕获后走安全拒绝轮收束（stage(failed, extra.safety+layer) → error(403002) →
+    连接直接关闭无 done，api.md §7.4 v1.23）。字段：
+    - `category`：命中类别 ∈ danger|profanity（reject 组合约束，pii 不走本通道）；
+    - `reply`：类别化拒答话术（safety.reply 生成，作为 error.message）；
+    - `layer`：拦截层 ∈ pre_route|rewrite|planner（§7.4 两层同形标注）。
+    code 与 api.md §0 错误码表对齐（类属性——403002 仅经 SSE error 事件发射）。
+    """
+
+    code = "403002"
+
+    def __init__(self, category: str, reply: str, layer: str) -> None:
+        self.category = category
+        self.reply = reply
+        self.layer = layer
+        super().__init__(f"{layer} 内容安全拒绝（category={category}）")
 
 
 def ensure_not_canceled(config: Mapping[str, Any] | None) -> None:

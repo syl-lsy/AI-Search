@@ -90,7 +90,8 @@ class SynthesisError(Exception):
 
 
 def _resolve_strategy(state: Mapping[str, Any]) -> str:
-    """state 侧策略归一：只认三值，其余（旧提示词/未声明）一律 web。"""
+    """state 侧策略归一：只认四值（direct/verify/web/recall，B12 +recall），
+    其余（旧提示词/未声明）一律 web。"""
     strategy = state.get("search_strategy")
     return strategy if strategy in _SEARCH_STRATEGIES else "web"
 
@@ -133,15 +134,58 @@ def _apply_answerable_variant(
     return "\n".join(kept)
 
 
-def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, str]:
+#: 观测 metadata 单值截断上限（ARCH §6.6 v1.43「metadata 单值 ≤200 字符」口径——
+#: trace 层钉立的值形态纪律，span 层同规；snippet 与 user_query 共用）
+_METADATA_VALUE_MAX_CHARS = 200
+
+
+def _sources_compact(fused: list[Any]) -> list[dict[str, Any]]:
+    """fused 检索列表紧凑投影（ref_no 与 [n] 引用编号对齐——_sources_block 同序）。"""
+    return [
+        {
+            "ref_no": index,
+            "url": str(item.get("url") or ""),
+            "title": str(item.get("title") or ""),
+            "snippet": str(item.get("snippet") or "")[:_METADATA_VALUE_MAX_CHARS],
+        }
+        for index, item in enumerate(fused, start=1)
+    ]
+
+
+def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
     """轮策略观测元数据（ARCH §6.6 v1.44：search_strategy 与 query_type 同通道）。
 
     时序约束：本决策在 rewrite 之后才可知，而 Langfuse 轮级 trace 属性只能随 span
     创建写入（CallbackHandler 在根 run 启动时读 RunnableConfig.metadata）——故挂在
     **synthesis 生成 span**（本文最晚的 LLM run）的 metadata 上：M4 按策略分桶可从
     generation metadata 过滤；轮级留痕另走 stage(rewrite,done).extra（turn_events→§2.5）。
+
+    Option B 增补键（装配面如实口径——v1.53 评审修正）：
+    - `user_query`：本轮用户原始问题（state.query，不取改写后的 rewritten_queries；
+      截断 ≤200 字符，同 v1.43 metadata 单值口径）；
+    - `sources_compact`：fused 非空时的紧凑来源投影 [{ref_no,url,title,snippet≤200}]，
+      ref_no 与 [n] 引用编号对齐；**fused 为空时键省略**（键可省口径，同 api.md images 行）。
+
+    **消费面限制（如实，不夸大）**：
+    - **序列化形态**：本函数返回结构化值（list/dict），但 Langfuse SDK 对非 str 值经
+      json.dumps 序列化后以 `langfuse.observation.metadata.<key>` 字符串属性落库
+      （langfuse 4.18.0 attributes.py 实证）——评估器读到的是 JSON 编码字符串，
+      消费需 JSON 解析，非「结构化数组直取」；
+    - **部署可达性（挂账）**：当前部署 compose 收口 events_only 写模式（v4 默认），
+      observation metadata 的 REST 读端点不可达（2026-11-17 活体探针：observations
+      列表 metadata 全空、单观测端点返回 HTML 兜底、v2 traces 404；
+      seed_online_eval_dataset.py 实证 70,299 行观测 metadata 恒空）——**评估器经
+      Langfuse 消费本键待部署写模式裁决修复**（含通道①既有 search_strategy/query_type
+      同样不可见），或改走已证可达通道（turn_events stage extra / DatasetItem metadata）。
+      装配面保留：写模式修复后本函数产出即生效，零代码变更。
     """
-    metadata = {"search_strategy": _resolve_strategy(state)}
+    metadata: dict[str, Any] = {
+        "search_strategy": _resolve_strategy(state),
+        "user_query": str(state.get("query") or "")[:_METADATA_VALUE_MAX_CHARS],
+    }
+    fused = state.get("fused") or []
+    if fused:
+        metadata["sources_compact"] = _sources_compact(fused)
     query_type = state.get("query_type")
     if isinstance(query_type, str) and query_type:
         metadata["query_type"] = query_type

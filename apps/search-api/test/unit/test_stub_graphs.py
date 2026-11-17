@@ -20,12 +20,19 @@
   （Send 扇出并行副本正确合并——键集不变）；
 - deep 产出投影（M2 批次 1，R14①）：MainState 同名声明 DeepState 全部产出键且类型
   逐键对齐（deep 子图产出→主图回填不丢失）；degraded/errors 沿用既有横切声明，
-  deep 扇出 reducer 留批次 2 research 接入时再定。
+  deep 扇出 reducer 留批次 2 research 接入时再定；
+- 主图拓扑契约（B13）：START→safety_check（普通边，输入安全 Layer 1 pre_route）→
+  route_by_mode 条件边原样后移（fast/deep 两目标 conditional=True，无 START 直达
+  旧边）；主图 channel 含 safety 两键（safety_category/safety_action——拒绝语义走
+  ContentRejectedError 异常通道，safety_blocked 死键已删）
+  且 FastState/DeepState 不加（Layer 2 走异常不上 state）；直通轮零 safety 信号——
+  事件序列与 B3 形态逐字节一致（fixture spec 显式装载空词表 safety 节零告警）。
 """
 
 import operator
 import time
 import typing
+from collections.abc import Mapping
 from typing import Any
 
 import pytest
@@ -58,13 +65,25 @@ async def _run(
             signals.append(chunk)
         elif namespace == ():  # 顶层 updates：{node_name: state_delta}
             for node_update in chunk.values():
-                final.update(node_update)
+                # B13：safety_check 直通返回 {} → LangGraph updates 记 {node: None}
+                # （空更新帧形态，turn_service 顶层合并同防护）——None 非 state 增量，跳过
+                if isinstance(node_update, Mapping):
+                    final.update(node_update)
     return signals, final
 
 
-#: 接真语义的标准 spec 快照（TurnRunner 注入形态；routing 初值恒等 fast→fast/deep→deep）
+#: 接真语义的标准 spec 快照（TurnRunner 注入形态；routing 初值恒等 fast→fast/deep→deep）。
+#: B13：safety 节显式装载（load_safety_config 合法形态零告警——缺节会刷 fail-open
+#: WARNING 打破「正常路径零告警」断言）；空词表零命中零 grey → safety_check 零更新直通。
 _ROUTING_SPEC: dict[str, Any] = {
-    "routing": {"default_mode": "fast", "modes": {"fast": "fast", "deep": "deep"}}
+    "routing": {"default_mode": "fast", "modes": {"fast": "fast", "deep": "deep"}},
+    "safety": {
+        "enabled": True,
+        "mode": "hybrid",
+        "danger_terms": [],
+        "profanity_terms": [],
+        "grey_rules": [],
+    },
 }
 
 
@@ -126,6 +145,19 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _warnings(log_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in log_records if r["level"].name == "WARNING"]
+
+
+def _route_warnings(log_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """路由域（extra.graph == "main"）WARNING——层①/层②告警断言面。
+
+    B13 起 safety_check 在 spec 缺 safety 节时另发 safety 域 fail-open 告警
+    （AgentLog.graph="safety"，独立防线独立告警）——域过滤后互不串扰。
+    """
+    return [
+        r
+        for r in log_records
+        if r["level"].name == "WARNING" and r["extra"].get("graph") == "main"
+    ]
 
 
 # ---- 假搜索源（web_search 可冻结链经 configurable 注入，零网络）----
@@ -228,6 +260,38 @@ def _fast_expected(registry: _FakeRegistry) -> list[dict[str, Any]]:
 def test_registry_exposes_two_stub_graphs() -> None:
     """GRAPH_REGISTRY 注册 fast/deep 两张编译图（langgraph.json 三入口的子图键）。"""
     assert set(GRAPH_REGISTRY) == {"fast", "deep"}
+
+
+# ---- 主图拓扑契约（B13：START→safety_check→条件边后移）----
+
+
+def test_main_graph_topology_start_safety_check_then_route() -> None:
+    """拓扑契约（B13）：START→safety_check 普通边；route_by_mode 条件边原样后移至
+    safety_check（fast/deep 两目标 + conditional=True）；无 START 直达子图的旧边；
+    route_by_mode 函数与 targets 完全不动（双层兜底语义不变）。"""
+    assert {"safety_check", "fast", "deep"} <= set(main_graph.nodes)
+    edges = {(e.source, e.target, e.conditional) for e in main_graph.get_graph().edges}
+    assert ("__start__", "safety_check", False) in edges
+    assert ("safety_check", "fast", True) in edges
+    assert ("safety_check", "deep", True) in edges
+    assert not any(
+        source == "__start__" and target != "safety_check"
+        for source, target, _ in edges
+    )
+
+
+def test_main_graph_channels_include_safety_keys_only_on_main() -> None:
+    """主图 channel 含 safety 两键（safety_check 节点产出/标注通道；safety_blocked
+    死键已删——拒绝轮走 ContentRejectedError 异常，无 state 消费面）；子图 state 不加
+    （Layer 2 拦截走 ContentRejectedError 异常不上 state——B13 契约行）。"""
+    from app.agent.state import DeepState, FastState, MainState
+
+    keys = {"safety_category", "safety_action"}
+    assert keys <= set(MainState.__annotations__)
+    assert keys <= set(main_graph.channels)
+    assert "safety_blocked" not in MainState.__annotations__
+    assert "safety_category" not in FastState.__annotations__
+    assert "safety_category" not in DeepState.__annotations__
 
 
 #: FastState 输入字段（TurnRunner 注入面；ARCH §4.1）
@@ -490,7 +554,7 @@ async def test_routing_section_missing_uses_builtin_table_with_warning(
         )
 
         assert final["answer_md"] == answer_md
-        warnings = _warnings(log_records)
+        warnings = _route_warnings(log_records)
         assert len(warnings) == 1, f"mode={mode} 应恰有一条层①告警"
         assert "内置默认" in warnings[0]["message"]
         assert warnings[0]["extra"]["graph"] == "main"
@@ -508,7 +572,7 @@ async def test_routing_validation_failure_uses_builtin_table_with_warning(
     )
 
     assert final["answer_md"] == SYNTH_MOCK_ANSWER_MD
-    warnings = _warnings(log_records)
+    warnings = _route_warnings(log_records)
     assert len(warnings) == 1
     assert "内置默认" in warnings[0]["message"]
     assert warnings[0]["extra"]["mode"] == "fast"
@@ -520,7 +584,7 @@ async def test_default_mode_resolved_via_modes(log_records: list[dict[str, Any]]
     signals, final = await _run({"query": "x", "spec": spec})
 
     assert final["answer_md"] == STUB_DEEP_ANSWER_MD
-    warnings = _warnings(log_records)
+    warnings = _route_warnings(log_records)
     assert len(warnings) == 1
     assert "deep" in warnings[0]["message"]
     assert warnings[0]["extra"]["graph"] == "main"
@@ -538,7 +602,7 @@ async def test_mode_targeting_unregistered_graph_falls_back_with_warning(
     )
 
     assert final["answer_md"] == SYNTH_MOCK_ANSWER_MD
-    warnings = _warnings(log_records)
+    warnings = _route_warnings(log_records)
     assert len(warnings) == 1
     assert "deep" in warnings[0]["message"] and "ghost" in warnings[0]["message"]
     assert DEFAULT_GRAPH in warnings[0]["message"]

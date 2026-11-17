@@ -504,6 +504,80 @@ describe('subscribe 对账失败兜底（P2：裸 void reconcile 加 catch）', 
   })
 })
 
+describe('B13 拒答轮（error code=403002 内容安全拒绝）：等待关闭标记 + 终态收口', () => {
+  const REFUSAL_MSG = '您的提问涉及敏感内容，本轮无法作答。'
+
+  /** ask 建轮种子（本 describe 自持一份——作用域独立） */
+  async function seeded() {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('测试问题', 'fast')
+    return store
+  }
+
+  it('error(403002)：errorMsg/errorCode 写入 + refusalPendingClose 置位 + 节点标 failed；status 与生成中集合不动（等待关闭中）', async () => {
+    const store = await seeded()
+    store.applyEvent(TURN_ID, wire(1, 'stage', { stage_key: 'rewrite', status: 'running' }))
+    store.applyEvent(TURN_ID, wire(2, 'error', { code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' }))
+    const turn = store.turns[TURN_ID]!
+    expect(turn.errorMsg).toBe(REFUSAL_MSG)
+    expect(turn.errorCode).toBe('403002')
+    expect(turn.refusalPendingClose).toBe(true)
+    expect(turn.stages.find((s) => s.stage_key === 'rewrite')!.status).toBe('failed') // 时间线既有 failed 渲染承担
+    expect(turn.status).toBe('running')
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true)
+  })
+
+  it('其它错误码（500201）：refusalPendingClose 不置位（既有 error 路径零行为变化）', async () => {
+    const store = await seeded()
+    store.applyEvent(TURN_ID, wire(2, 'error', { code: '500201', message: '全部搜索源不可用', stage_key: 'search' }))
+    const turn = store.turns[TURN_ID]!
+    expect(turn.errorCode).toBe('500201')
+    expect(turn.refusalPendingClose).toBe(false)
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true)
+  })
+
+  it('onClosed 且 refusalPendingClose（流关闭未见 done）：生成中集合立即移除 + REST 对账收敛 failed + sseState 复位 idle（无重连横幅语义）', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = await seeded()
+      store.applyEvent(TURN_ID, wire(2, 'error', { code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' }))
+      mockedGet.mockResolvedValueOnce(
+        makeDetail({ status: 'failed', duration_ms: 4800, error: { code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' } }),
+      )
+      const callbacks = capturedCallbacks()
+      callbacks.onClosed({ afterError: true, duringHold: false })
+
+      // 终态收口①：生成中集合立即清除（不等对账回写）
+      expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+      // 终态收口②：连接态复位 idle（ReconnectBanner 只在 reconnecting 显示 → 不显）
+      expect(store.sseState).toBe('idle')
+      // 终态收口③：REST 对账收敛权威终态（status=failed + 403002 温和卡双源 errorCode 回填）
+      await vi.advanceTimersByTimeAsync(0)
+      const turn = store.turns[TURN_ID]!
+      expect(turn.status).toBe('failed')
+      expect(turn.errorMsg).toBe(REFUSAL_MSG)
+      expect(turn.errorCode).toBe('403002')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('防御：403002 后 done 仍到达 → 既有终态逻辑走（status 随 finish、生成中集合清除）；onClosed 因终态不再二次对账', async () => {
+    const store = await seeded()
+    store.applyEvent(TURN_ID, wire(2, 'error', { code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'degraded', degraded: true, degraded_reason: 'source_failure' }))
+    const callbacks = capturedCallbacks()
+    callbacks.onEvent(wire(9, 'done', { finish: 'degraded', degraded: true, degraded_reason: 'source_failure', duration_ms: 1200, source_count: 0 }))
+    await vi.waitFor(() => expect(store.turns[TURN_ID]!.status).toBe('degraded'))
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    // done 已置终态 → onClosed（即使 afterError=true 语义到达）不再触发对账
+    mockedGet.mockClear()
+    callbacks.onClosed({ afterError: true, duringHold: false })
+    expect(mockedGet).not.toHaveBeenCalled()
+  })
+})
+
 describe('seq 持久化节流（P3：persistSeq 200ms 一次；控制事件/终态立即落）', () => {
   it('delta 事件窗口内节流跳过（内存 lastSeq 照常推进）；控制事件/终态立即落', async () => {
     vi.useFakeTimers()

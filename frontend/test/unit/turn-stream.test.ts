@@ -449,6 +449,46 @@ describe('error 事件（error 非终态，§7.2；error 后直接关闭 = faile
   })
 })
 
+describe('B13 拒答轮（error code=403002 内容安全拒绝）：「等待关闭」标记 + 不重连收口', () => {
+  const refusalFrame = frame(3, 'error', { code: '403002', message: '您的提问涉及敏感内容，本轮无法作答。', stage_key: 'rewrite' })
+
+  it('error(403002) 照常交付并置等待关闭标记；流随后关闭（无 done）→ onClosed(afterError=true)、不重连', () => {
+    const { es, onEvent, onClosed } = setup()
+    es.open()
+    es.dispatch(refusalFrame)
+    expect(onEvent).toHaveBeenCalledTimes(1) // error 非终态：照常交付
+    es.fail(ES_READY_STATE.CONNECTING) // 服务端按契约关闭（无 done；原生 error 事件 CONNECTING 形态）
+    expect(es.closedByClient).toBe(true)
+    expect(onClosed).toHaveBeenCalledTimes(1)
+    expect(onClosed.mock.calls[0]![0]).toEqual({ afterError: true, duringHold: false })
+    vi.advanceTimersByTime(60_000)
+    expect(MockEventSource.instances).toHaveLength(1) // 不重连（重连只会收到同样的 error+close）
+  })
+
+  it('error(403002) 后看门狗静默（服务端未按契约主动关闭）→ close 收口、不重连（A13 断线重连豁免）', () => {
+    const { es, onClosed } = setup()
+    es.open()
+    es.dispatch(refusalFrame) // 首个业务事件武装看门狗
+    vi.advanceTimersByTime(HEARTBEAT_WATCHDOG_MS)
+    expect(es.closedByClient).toBe(true)
+    expect(onClosed).toHaveBeenCalledTimes(1)
+    expect(onClosed.mock.calls[0]![0]).toEqual({ afterError: true, duringHold: false })
+    expect(MockEventSource.instances).toHaveLength(1) // 不重连
+  })
+
+  it('防御：error(403002) 后仍收到 done → doneSeen 优先按既有终态逻辑走（afterError=false 正常收口）', () => {
+    const { es, onEvent, onClosed } = setup()
+    es.open()
+    es.dispatch(refusalFrame)
+    es.dispatch(frame(4, 'done', { finish: 'degraded', degraded: true, degraded_reason: 'source_failure', duration_ms: 1, source_count: 0 }))
+    expect(onEvent.mock.calls.map((c) => c[0]!.event)).toEqual(['error', 'done'])
+    expect(onClosed).toHaveBeenCalledTimes(1)
+    expect(onClosed.mock.calls[0]![0]).toEqual({ afterError: false, duringHold: false })
+    vi.advanceTimersByTime(60_000)
+    expect(MockEventSource.instances).toHaveLength(1)
+  })
+})
+
 describe('visibilitychange（生命周期 11：隐藏保持接收 + 回前台冲刷积压）', () => {
   it('隐藏期间照常入缓冲（连接不 close）；回前台立即冲刷积压（不等帧）', () => {
     const { es, onEvent } = setup()

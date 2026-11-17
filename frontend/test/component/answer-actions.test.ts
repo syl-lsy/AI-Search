@@ -57,6 +57,8 @@ function makeTurn(partial: Partial<TurnState> = {}): TurnState {
     feedbackHelpful: null,
     lastSeq: 9,
     errorMsg: null,
+    errorCode: null,
+    refusalPendingClose: false,
     degradedReason: null,
     memorySaved: null,
     durationMs: 7420,

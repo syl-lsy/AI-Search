@@ -46,6 +46,8 @@ function makeTurn(partial: Partial<TurnState>): TurnState {
     feedbackHelpful: null,
     lastSeq: 9,
     errorMsg: null,
+    errorCode: null,
+    refusalPendingClose: false,
     degradedReason: null,
     memorySaved: null,
     durationMs: null,
@@ -105,6 +107,44 @@ describe('TurnBlock：DegradedBanner（评审 P1——降级终态与 completed 
     i18n.global.locale.value = 'en-US'
     const w = mountTurn(makeTurn({ status: 'degraded', degradedReason: 'budget' }))
     expect(w.find('[data-testid="degraded-banner"]').text()).toContain('Research incomplete')
+    i18n.global.locale.value = 'zh-CN'
+  })
+})
+
+describe('TurnBlock：内容安全温和卡（B13 拒答轮 403002——错误渲染通路的中性温和分支）', () => {
+  const SERVER_MSG = '您的提问涉及敏感内容，本轮无法作答。请调整后重试。'
+
+  it('errorCode=403002：温和卡渲染（标题 i18n「内容安全提示」+ 正文=服务端 message）；状态行不再内联错误文本（防双份呈现）', () => {
+    const w = mountTurn(
+      makeTurn({ status: 'failed', errorCode: '403002', errorMsg: SERVER_MSG, stages: [{ stage_key: 'rewrite', status: 'failed' }] }),
+    )
+    const card = w.find('[data-testid="safety-card"]')
+    expect(card.exists()).toBe(true)
+    expect(card.attributes('role')).toBe('status')
+    expect(card.text()).toContain('内容安全提示')
+    expect(card.text()).toContain(SERVER_MSG)
+    // 中性温和分支：卡内无 danger 语义元素（强烈报错红仅允许存在于状态行状态点，错误展示本体不走 danger）
+    expect(card.find('.dot-danger').exists()).toBe(false)
+    // 状态行不内联错误文本（既有通路分支接管）
+    expect(w.find('[data-testid="turn-status"]').text()).not.toContain(SERVER_MSG)
+  })
+
+  it('其它错误码（500201）：无温和卡、状态行照旧内联错误文本（既有通路零变化）', () => {
+    const w = mountTurn(makeTurn({ status: 'running', errorCode: '500201', errorMsg: '全部搜索源不可用' }))
+    expect(w.find('[data-testid="safety-card"]').exists()).toBe(false)
+    expect(w.find('[data-testid="turn-status"]').text()).toContain('全部搜索源不可用')
+  })
+
+  it('errorMsg 为空（2.5 error 载荷缺形态）：即使 code=403002 也不渲染空卡（无空区块原则）', () => {
+    const w = mountTurn(makeTurn({ status: 'failed', errorCode: '403002', errorMsg: null }))
+    expect(w.find('[data-testid="safety-card"]').exists()).toBe(false)
+  })
+
+  it('en 界面下温和卡标题随语言切换（zh/en 双包同步）', () => {
+    expect(i18n.global.t('answer.contentSafetyTitle')).toBe('内容安全提示')
+    i18n.global.locale.value = 'en-US'
+    const w = mountTurn(makeTurn({ status: 'failed', errorCode: '403002', errorMsg: SERVER_MSG }))
+    expect(w.find('[data-testid="safety-card"]').text()).toContain('Content safety notice')
     i18n.global.locale.value = 'zh-CN'
   })
 })

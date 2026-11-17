@@ -111,6 +111,40 @@ REWRITE_SCHEMA_REQUIRED_TOKENS: tuple[str, ...] = (
 #: 静默丢历史注入（`render_prompt` 无该变量时不报错，历史块被无提示弃用）——拒收。
 SYNTHESIS_REQUIRED_PLACEHOLDERS: tuple[str, ...] = ("{{history_block}}",)
 
+#: common.safety_reply 两段拒答话术行前缀（B13 输入安全工单——行级类别段锚点，沿
+#: SYNTHESIS_VARIANT_PREFIXES 先例：任一缺失拒收；键缺失不拒收，回落内置默认）。
+SAFETY_REPLY_LINE_PREFIXES: tuple[str, ...] = (
+    "- 危险请求回复段：",
+    "- 辱骂回复段：",
+)
+
+#: fast.rewrite / deep.planner 输出 schema 须含的 safety 字段 token（B13——精确形态
+#: 防散文绕过，沿 REWRITE_SCHEMA_REQUIRED_TOKENS 带引号纪律；软校验见
+#: safety_token_warnings：告警不拒收）。
+SAFETY_FIELD_TOKEN = '"safety":"none|danger|profanity"'
+
+#: safety token 软校验覆盖的两键（B13——rewrite 与 planner 同构产出 safety 初判）
+SAFETY_TOKEN_PROMPT_KEYS: tuple[str, ...] = ("fast.rewrite", "deep.planner")
+
+
+def safety_token_warnings(prompts_section: Mapping[str, Any]) -> list[str]:
+    """fast.rewrite / deep.planner 的 safety 字段 token 软校验（B13；**告警不拒收**）。
+
+    沿 retry.connection 五键软校验先例：返回告警文案列表（空 = 无告警），调用方
+    （PromptsPayload 校验钩子）逐条落 ConfigLog WARNING。不拒收的理由：旧提示词若被
+    硬拒，生产环境会整版回落 L4 内置默认——运行态提示词被静默替换成内置版本（提示词
+    漂移陷阱）；safety 判定缺失时运行层按 fail-open 兜底为 none。
+    """
+    warnings: list[str] = []
+    for key in SAFETY_TOKEN_PROMPT_KEYS:
+        value = prompts_section.get(key)
+        if isinstance(value, str) and SAFETY_FIELD_TOKEN not in value:
+            warnings.append(
+                f"{key}：输出 schema 缺 safety 字段 token {SAFETY_FIELD_TOKEN}"
+                "（B13 输入安全增量；软校验不拒收，safety 判定缺失按 none 兜底）"
+            )
+    return warnings
+
 
 class PromptsPayload(_Envelope):
     """提示词模板：键位即契约（{graph}.{node} / memory.* / home.* / common.*）。
@@ -128,6 +162,11 @@ class PromptsPayload(_Envelope):
     （`|navigational|other"`）——**精确形态，散文提及不算**（security P3②）；
     ② 四段行前缀校验 +「- 回顾整理路径」；③ `{{history_block}}` 占位符必在
     （缺失则 recall 轮静默丢历史注入——security P3③）。
+
+    B13 增量（输入安全）：① `common.safety_reply` 两段行前缀齐备硬校验（缺段拒收，
+    SAFETY_REPLY_LINE_PREFIXES）；② fast.rewrite / deep.planner 的 safety 字段 token
+    软校验（safety_token_warnings——**告警不拒收**，防旧提示词被硬拒后生产回落 L4
+    内置默认造成提示词漂移的部署陷阱）。
     """
 
     model_config = ConfigDict(extra="allow")
@@ -183,7 +222,27 @@ class PromptsPayload(_Envelope):
                         f"fast.synthesis：缺历史注入占位符 {placeholder}"
                         "（v1.27 recall 变体契约）"
                     )
+        # §1 B13：common.safety_reply 两段行前缀齐备（拒答话术行级类别段锚点，沿
+        # fast.synthesis 变体前缀先例——缺段拒收）；键缺失不拒收（回落内置默认）。
+        safety_reply = value.get("common.safety_reply")
+        if isinstance(safety_reply, str):
+            lines = safety_reply.splitlines()
+            for prefix in SAFETY_REPLY_LINE_PREFIXES:
+                if not any(line.startswith(prefix) for line in lines):
+                    raise ValueError(
+                        f"common.safety_reply：缺行前缀 {prefix}（B13 拒答话术两段模板）"
+                    )
         return value
+
+    @model_validator(mode="after")
+    def _warn_missing_safety_token(self) -> "PromptsPayload":
+        """§1 B13：fast.rewrite / deep.planner 的 safety 字段 token 软校验
+        （safety_token_warnings——告警不拒收；接既有 ConfigLog WARNING 通道）。"""
+        from app.core.logger import ConfigLog  # 局部导入：校验层不拖重启动链
+
+        for message in safety_token_warnings(self.prompts):
+            ConfigLog(message=message, data_id="ai_search.agent.prompts.json").warning()
+        return self
 
 
 # ---- §2 mcp ----
@@ -497,6 +556,135 @@ class FollowupsSpec(BaseModel):
         return self
 
 
+# ---- §3 B13 safety：ReDoS 灾难性回溯形态静态检测（grey_rules 兜底第一层）----
+
+#: 外层无限量词（跟在 `)` 后）：`+` / `*` / `{n,}`（无上界）——有限量词（`?`、
+#: `{n,m}`）不迭代不指数，不标记
+_OUTER_QUANT_RE = re.compile(r"\)\s*(?:[+*]|\{\d+,\s*\})")
+
+#: 分组体内可疑形态：任一量词（含 `?`——`(ab?)+` 每轮两歧义仍指数）或交替
+#: （`(a|aa)+` 前缀重叠族）
+_INNER_SUSPECT_RE = re.compile(r"(?:[+*?]|\{\d+(?:\s*,\s*\d*)?\}|\|)")
+
+
+def _is_escaped(rule: str, index: int) -> bool:
+    """rule[index] 是否被反斜杠转义（连续反斜杠计数定奇偶）。"""
+    slashes = 0
+    i = index - 1
+    while i >= 0 and rule[i] == "\\":
+        slashes += 1
+        i -= 1
+    return slashes % 2 == 1
+
+
+def _has_catastrophic_form(rule: str) -> bool:
+    """grey_rules 灾难性回溯（ReDoS）形态启发式：无限量词修饰的分组，其分组体内
+    又含量词或交替 → 拒收。
+
+    覆盖经典签名 `(a+)+` / `^(([a-z])+.)+[A-Z]…` / `(a|aa)+` / `(ab?)+`。启发式
+    面向词表场景的运营规则（≤120 字符）：
+    - 假阳（拒掉 `(foo|bar)+` 这类罕见写法）是安全方向——运营改写规则即可；
+    - 假阴由运行面第二道防线兜底（safety_check 节点把词表/grey 扫描放线程 + 超时
+      包络，超预算 fail-open 直通，事件循环不挂死）。
+    """
+    for match in _OUTER_QUANT_RE.finditer(rule):
+        close = match.start()
+        depth = 0
+        open_idx = -1
+        for i in range(close, -1, -1):
+            ch = rule[i]
+            if _is_escaped(rule, i):
+                continue
+            if ch == ")":
+                depth += 1
+            elif ch == "(":
+                depth -= 1
+                if depth == 0:
+                    open_idx = i
+                    break
+        if open_idx < 0:
+            continue  # 未闭合分组由 re.compile 拒收，本检测不重复报
+        if _INNER_SUSPECT_RE.search(rule[open_idx + 1 : close]):
+            return True
+    return False
+
+
+class SafetySpec(BaseModel):
+    """§3 B13 输入安全节（fail-open 语义——节缺失=合法 None，安全检查不挡检索）。
+
+    词表纪律（§3 校验规则 v1.30）：danger_terms/profanity_terms ≤200 条、每条非空
+    ≤64 字符且条目去重；enabled=true 时两表至少其一非空；grey_rules ≤50 条、每条
+    ≤120 字符且逐条 re.compile 校验（编译失败=拒收 violation），并做灾难性回溯
+    （ReDoS）形态静态拒收——量词分组内嵌量词/交替（如 `(a+)+`、`(a|aa)+`）对短
+    payload 即指数级回溯，运行面扫描在 async 节点内执行、可挂死事件循环，必须在
+    发布口拦截。enabled 严格布尔：JSON 字符串/数字形态一律拒收（kill switch 单键
+    热更防 `"false"` 字符串漂移——validator 拒收 + 运行面严格判定的双防线之一）。
+    字段命名严禁含 token/key/secret/password（撞密钥嗅探，§2 安全条款）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = False
+    mode: Literal["lexicon", "hybrid"] = "hybrid"
+    danger_terms: list[str] = Field(default_factory=list, max_length=200)
+    profanity_terms: list[str] = Field(default_factory=list, max_length=200)
+    grey_rules: list[str] = Field(default_factory=list, max_length=50)
+    classify_timeout_ms: int = Field(default=2000, ge=200, le=10000)
+    reply_timeout_ms: int = Field(default=4000, ge=200, le=10000)
+    reply_max_chars: int = Field(default=500, ge=100, le=1000)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _check_enabled_strict_bool(cls, value: Any) -> Any:
+        """enabled 严格布尔（§3 校验规则「enabled 布尔」）：非 bool 拒收——pydantic
+        默认会把 "false"/0 等形态 coerce 成布尔，导致 validator 通过而运行面读到
+        原始字符串（bool("false")=True，kill switch 反向失效）。"""
+        if not isinstance(value, bool):
+            raise ValueError(
+                "enabled 须为布尔（JSON true/false；字符串/数字形态拒收——"
+                "kill switch 单键热更防形态漂移）"
+            )
+        return value
+
+    @field_validator("danger_terms", "profanity_terms")
+    @classmethod
+    def _check_term_entries(cls, value: list[str]) -> list[str]:
+        for term in value:
+            if not term:
+                raise ValueError("词表条目不得为空串")
+            if len(term) > 64:
+                raise ValueError("词表单条 ≤64 字符")
+        if len(set(value)) != len(value):
+            raise ValueError("词表条目须去重（重复条目拒收）")
+        return value
+
+    @model_validator(mode="after")
+    def _check_enabled_requires_terms(self) -> "SafetySpec":
+        """§3 校验规则：enabled=true 时两词表至少其一非空（空词表开启=配置矛盾）。"""
+        if self.enabled and not self.danger_terms and not self.profanity_terms:
+            raise ValueError(
+                "enabled=true 时 danger_terms/profanity_terms 至少其一非空"
+            )
+        return self
+
+    @field_validator("grey_rules")
+    @classmethod
+    def _check_grey_rules_compilable(cls, value: list[str]) -> list[str]:
+        for rule in value:
+            if len(rule) > 120:
+                raise ValueError("grey_rules 单条 ≤120 字符")
+            try:
+                re.compile(rule)
+            except re.error as exc:
+                # 违规描述只含定位与原因，不含规则原文（校验错误会进日志，值不外泄）
+                raise ValueError(f"grey_rules 正则编译失败（violation）：{exc}") from exc
+            if _has_catastrophic_form(rule):
+                raise ValueError(
+                    "grey_rules 疑似灾难性回溯形态（量词分组内嵌量词/交替，ReDoS "
+                    "violation）：请改写为有界量词形态"
+                )
+        return value
+
+
 class KbSpec(BaseModel):
     model_config = ConfigDict(extra="allow")
     top_k_per_query: int = Field(ge=1)
@@ -548,8 +736,9 @@ class MemorySpec(BaseModel):
 
 
 class SpecPayload(_Envelope):
-    """Agent Spec：fast/deep 必带；turn/followups/routing/memory/kb/history 缺失时
-    组装层按契约回落内置默认并告警（§3 各节注），校验层不拒收缺节。"""
+    """Agent Spec：fast/deep 必带；turn/followups/safety/routing/memory/kb/history 缺失时
+    组装层按契约回落内置默认并告警（§3 各节注），校验层不拒收缺节（safety 节缺失=
+    合法 fail-open 语义，B13）。"""
 
     model_config = ConfigDict(extra="allow")
     fast: FastSpec
@@ -557,6 +746,7 @@ class SpecPayload(_Envelope):
     turn: TurnSpec | None = None
     routing: RoutingSpec | None = None
     followups: FollowupsSpec | None = None
+    safety: SafetySpec | None = None  # §3 B13：节缺失=合法（fail-open，安全检查不挡检索）
     kb: KbSpec | None = None
     history: HistorySpec | None = None
     memory: MemorySpec | None = None

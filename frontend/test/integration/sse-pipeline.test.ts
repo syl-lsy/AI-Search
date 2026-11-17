@@ -27,7 +27,7 @@ import {
 } from '@/mocks/sseSequences'
 import { peekTurnStream } from '@/sse/turnStream'
 import { useTurnStore } from '@/stores/turn'
-import type { SseWireEvent } from '@/types/api'
+import type { SseWireEvent, TurnDetail } from '@/types/api'
 
 import { MockEventSource, ES_READY_STATE } from '../helpers/mockEventSource'
 
@@ -326,6 +326,94 @@ describe('queued 轮（生命周期 9：等待期仅心跳、无业务事件是�
     vi.advanceTimersByTime(60_000) // 等待期静默（看门狗武装前不判超时重连）
     expect(MockEventSource.instances).toHaveLength(1)
     expect(es.closedByClient).toBe(false)
+  })
+})
+
+describe('B13 拒答轮 403002 终态收口（transport+store 全链路：error+close 无 done）', () => {
+  const REFUSAL_MSG = '您的提问涉及敏感内容，本轮无法作答。'
+
+  /** 拒答轮线格帧（api.md §7.1 v1.10 例外形态：无部分内容 → error 后直接关闭、无 done；
+   * 时间线 stage(rewrite, failed) 已由后端发射，按既有 Timeline failed 渲染） */
+  function refusalFrames(turnId: string) {
+    return [
+      { id: 1, type: 'stage', data: JSON.stringify({ seq: 1, turn_id: turnId, ts: '2026-11-17T08:00:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' }) },
+      { id: 2, type: 'stage', data: JSON.stringify({ seq: 2, turn_id: turnId, ts: '2026-11-17T08:00:01Z', stage_key: 'rewrite', status: 'failed' }) },
+      { id: 3, type: 'error', data: JSON.stringify({ seq: 3, turn_id: turnId, ts: '2026-11-17T08:00:01Z', code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' }) },
+    ]
+  }
+
+  /** 2.5 对账返回（拒答轮权威终态：failed + error 载荷 403002） */
+  function refusalDetail(): TurnDetail {
+    return {
+      ...turnDetailFastCompleted,
+      turn_id: TURN_ID_FAST,
+      status: 'failed',
+      answer_md: '',
+      degraded: false,
+      degraded_reason: null,
+      error: { code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' },
+      duration_ms: 4800,
+      finished_at: '2026-11-17T08:00:05Z',
+    }
+  }
+
+  it('error(403002)+close 无 done：生成中集合立即清除 + 不重连（无新 EventSource 实例）+ sseState 复位 idle + REST 对账收敛 failed', async () => {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID_FAST, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('敏感问题', 'fast')
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true)
+    const es = MockEventSource.instances[0]!
+    es.open()
+    for (const f of refusalFrames(TURN_ID_FAST)) es.dispatch(f)
+
+    const turn = store.turns[TURN_ID_FAST]!
+    // error 照常交付：温和卡数据形态在位（渲染断言在 component/turn-block.test.ts）
+    expect(turn.errorMsg).toBe(REFUSAL_MSG)
+    expect(turn.errorCode).toBe('403002')
+    expect(turn.refusalPendingClose).toBe(true)
+    expect(turn.stages.map((s) => [s.stage_key, s.status])).toEqual([['rewrite', 'failed']]) // 时间线既有 failed 渲染
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true) // 等待关闭中：集合不动
+
+    // 服务端按契约关闭（无 done）→ EventSource error（CONNECTING 形态即原生将自动重连的形态）
+    mockedGet.mockResolvedValueOnce(refusalDetail()) // 终态收口④的 REST 权威（先挂——onClosed 触发对账）
+    es.fail(ES_READY_STATE.CONNECTING)
+    // 终态收口①：生成中集合立即清除（不等对账回写）
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    // 终态收口②：不重连（A13 断线重连豁免——推进 60s 无新实例）+ 连接已 close
+    expect(es.closedByClient).toBe(true)
+    vi.advanceTimersByTime(60_000)
+    expect(MockEventSource.instances).toHaveLength(1)
+    // 终态收口③：sseState 复位 idle（ReconnectBanner 只在 reconnecting 显示 → 不显）
+    expect(store.sseState).toBe('idle')
+    // 终态收口④：REST 对账收敛权威终态
+    await vi.waitFor(() => expect(turn.status).toBe('failed'))
+    expect(turn.errorMsg).toBe(REFUSAL_MSG)
+    expect(turn.errorCode).toBe('403002')
+  })
+
+  it('防御：error(403002) 后仍收到 done → 按既有终态逻辑走（status 随 finish、生成中集合清除、保活收口不变）', async () => {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID_FAST, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('敏感问题', 'fast')
+    const es = MockEventSource.instances[0]!
+    es.open()
+    for (const f of refusalFrames(TURN_ID_FAST)) es.dispatch(f)
+    // 契约外防御形态：拒答 error 后 done 仍到达（degraded 收尾）
+    mockedGet.mockResolvedValueOnce({
+      ...turnDetailFastCompleted,
+      status: 'degraded',
+      degraded: true,
+      degraded_reason: 'source_failure',
+      error: { code: '403002', message: REFUSAL_MSG, stage_key: 'rewrite' },
+    })
+    es.dispatch({ id: 4, type: 'done', data: JSON.stringify({ seq: 4, turn_id: TURN_ID_FAST, ts: '2026-11-17T08:00:02Z', finish: 'degraded', degraded: true, degraded_reason: 'source_failure', duration_ms: 1200, source_count: 0 }) })
+    const turn = store.turns[TURN_ID_FAST]!
+    await vi.waitFor(() => expect(turn.status).toBe('degraded'))
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    expect(turn.errorCode).toBe('403002') // 对账回填保持温和卡判定
+    // fast 轮 done 后保活窗口照旧（既有终态逻辑未被拒答标记破坏）
+    expect(es.closedByClient).toBe(false)
+    expect(store.sseState).toBe('idle') // held → idle 映射
   })
 })
 
