@@ -19,7 +19,8 @@
 #   用 ${VAR:-}（可空不阻塞起栈，调用时才需要真值）；其余基建密钥一律 ${VAR:?}（缺失即失败，fail fast）。
 #
 # 镜像版本基准（ADR-014 + 批次 1 留档）：
-#   litellm/litellm-database:v1.101.0（DB 模式——postgres 第三库 litellm + 共享 redis REDIS_DB=1）；
+#   litellm/litellm-database:v1.106.4（DB 模式——postgres 第三库 litellm + 共享 redis REDIS_DB=1；
+#   服务行以 digest 钉版 @sha256:db36453d…，2026-11-18 供应链四件套升级自 v1.101.0）；
 #   cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
 #   （digest 锁定留档——chainguard 免费档仅发布 latest，2026-11-05 经 cgr.dev 匿名 manifest 核对当时
 #   latest 多架构索引 digest；升级走增量 diff）；
@@ -299,7 +300,7 @@ services:
 
   # ═══════════════════ 模型面 · LiteLLM 网关（DB 模式，ADR-014）═══════════════════
   litellm:
-    image: litellm/litellm-database:v1.101.0
+    image: litellm/litellm-database@sha256:db36453d25e76c9eb689d7d51b8e5fa48843243d7a86ed1284cf574ce0107b3f  # v1.106.4 digest 钉版（供应链四件套 2026-11-18）；多架构 OCI index digest（linux/arm64=sha256:44b42f9832cc4e36efe1237c5a1ec497033591ccb1b5f471896703029fd3a89d / linux/amd64=sha256:496cc6cb0295414585790b86467566fb4c93d8e12d7f0e889f18fcfc54cbdd5e）
     restart: always
     command: ["--config", "/app/litellm-config/config.yaml", "--port", "4000"]
     ports:

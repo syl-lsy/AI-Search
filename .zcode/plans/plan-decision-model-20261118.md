@@ -3,6 +3,8 @@
 wf-level: T2 -- 跨域工单（基建/网关 + 后端图编排 + Nacos 契约 + 评测线），含契约增量预清单
 wf-gate: contract
 
+> **执行状态**：批次 0 已闭环（2026-11-18，dwfrun-b0565119，四件套全过，落档 docs/litellm-upgrade-batch0-20261118.md v1.2）；批次 1 R19 探针已 PASS（2026-11-18，报告 docs/research/decision-model-r19-probe-20261118.md——**端点定案=token-plan 同域同 Key，无需 Workspace ID，.env 预期零新增**，§10 用户参与点②③相应作废）；批次 2 待开工。
+
 ## 0. 背景与动机
 
 用户提议：在 LiteLLM 新增「Decision Model」分组（百炼 `decision-model-preview`，限时免费），
