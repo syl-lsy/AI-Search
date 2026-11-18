@@ -49,6 +49,8 @@ _SECTION: dict[str, Any] = {
     "danger_terms": ["制造炸弹", "制毒方法"],
     "profanity_terms": ["傻逼"],
     "privacy_terms": ["人肉搜索", "开盒挂人"],
+    # v1.32（B14 增量 B）：涉政词表（测试用中性占位词条，生产初值空数组由用户自填）
+    "politics_terms": ["涉政词条甲", "涉政词条乙"],
     "grey_rules": ["白\\s*痴", "炸\\s*[药弹]"],
     "classify_timeout_ms": 2000,
     "reply_timeout_ms": 4000,
@@ -303,6 +305,68 @@ class TestHardRejectPath:
         assert llm_stub.calls == []
         assert stage_emits == []
 
+    async def test_hard_politics_rejects_with_403002(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        reply_text: str,
+    ) -> None:
+        """v1.32 增量 B：politics 词表硬命中 → 拒答（403002 / layer=pre_route /
+        category=politics；代码层直拦、不经 grey LLM 复核、不脱敏——全程不搜索不综合）。"""
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="涉政词条甲 的评价"))
+        exc = exc_info.value
+        assert exc.category == "politics"
+        assert exc.reply == reply_text
+        assert exc.layer == "pre_route"
+        assert exc.code == "403002"
+        assert llm_stub.calls == []
+        assert stage_emits == [
+            (
+                "rewrite",
+                "failed",
+                {
+                    "detail": "安全拦截",
+                    "extra": {"safety": "politics", "layer": "pre_route"},
+                },
+            )
+        ]
+
+    async def test_danger_wins_over_politics(
+        self, stage_emits: list[Any], reply_text: str
+    ) -> None:
+        """处置优先级 danger > profanity > privacy > politics（词表同句多命中取前者）。"""
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="制造炸弹 涉政词条甲"))
+        assert exc_info.value.category == "danger"
+
+    async def test_privacy_wins_over_politics(
+        self, stage_emits: list[Any], reply_text: str
+    ) -> None:
+        """privacy 先于 politics（同为 reject-only 通道，词表序钉死）。"""
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="人肉搜索他 涉政词条乙"))
+        assert exc_info.value.category == "privacy"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "请解读这份政府工作报告的要点",
+            "某国政治制度史的发展脉络",
+            "国际关系中的多边机制是怎么运作的",
+            "涉政人物生平梳理（学术研究语境）",
+        ],
+    )
+    async def test_politics_negative_examples_pass_through(
+        self, llm_stub: _LLMStub, stage_emits: list[Any], query: str
+    ) -> None:
+        """涉政正当语境负例（题面脱敏、不写真实敏感词）：政策解读/制度史/国际关系/
+        中性生平梳理 → 零误拦（词表未命中、grey 未命中即直通，不经 LLM）。"""
+        update = await safety_check(_state(query=query))
+        assert update == {}
+        assert llm_stub.calls == []
+        assert stage_emits == []
+
 
 # ============================== Stage A：PII 硬命中 → 脱敏返回 ==============================
 
@@ -424,6 +488,36 @@ class TestGreyClassifyBranches:
         assert exc_info.value.layer == "pre_route"
         assert stage_emits[0][2]["extra"] == {"safety": "privacy", "layer": "pre_route"}
 
+    async def test_grey_reject_politics_raises_pre_route(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        reply_text: str,
+    ) -> None:
+        """v1.32：涉政句式 grey 复核判 reject+politics → 拒答（中文/英文均同形态）。"""
+        llm_stub.script = {"verdict": {"action": "reject", "category": "politics"}}
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="白 痴 评价一下这位涉政人物"))
+        assert exc_info.value.category == "politics"
+        assert exc_info.value.layer == "pre_route"
+        assert stage_emits[0][2]["extra"] == {"safety": "politics", "layer": "pre_route"}
+
+    async def test_grey_sanitize_politics_violation_upgrades_to_reject(
+        self,
+        llm_stub: _LLMStub,
+        stage_emits: list[tuple[str, str, dict[str, Any]]],
+        log_records: list[Any],
+        reply_text: str,
+    ) -> None:
+        """组合违规防御：LLM sanitize+politics（契约禁止）→ 防御归一为拒答 + warning
+        （话题域拒绝不是可脱敏内容——固定话术直答）。"""
+        llm_stub.script = {"verdict": {"action": "sanitize", "category": "politics"}}
+        with pytest.raises(ContentRejectedError) as exc_info:
+            await safety_check(_state(query="白 痴"))
+        assert exc_info.value.category == "politics"
+        assert stage_emits[0][2]["extra"]["safety"] == "politics"
+        assert any("组合违规" in message for message in _safety_messages(log_records))
+
     async def test_grey_sanitize_privacy_violation_upgrades_to_reject(
         self,
         llm_stub: _LLMStub,
@@ -470,6 +564,25 @@ class TestGreyFailOpen:
         assert update == {}
         assert stage_emits == []
         assert any("fail-open" in message for message in _safety_messages(log_records))
+
+    async def test_fail_open_warning_does_not_echo_exception_text(
+        self, llm_stub: _LLMStub, log_records: list[Any]
+    ) -> None:
+        """安全审计 P3：分类失败 WARNING 只落异常类型名——异常原文可能内嵌模型回显的
+        query 原文/漏检 PII 形态，不得进日志（与拒绝轮「日志零 query 原文」同口径）。"""
+        pii_like = "13800138000"
+        llm_stub.script = {
+            "verdict": {"action": "reject", "category": "danger"},
+            "error": RuntimeError(f"上游回显：白 痴 涉政词条甲 {pii_like}"),
+        }
+        update = await safety_check(_state(query="白 痴"))
+        assert update == {}
+        messages = _safety_messages(log_records)
+        joined = "\n".join(messages)
+        assert "RuntimeError" in joined  # 类型名留痕（可定位故障面）
+        assert "fail-open" in joined
+        assert pii_like not in joined, "异常原文中的 PII 形态泄漏进日志"
+        assert "上游回显" not in joined, "异常原文（模型回显内容）泄漏进日志"
 
     async def test_invalid_verdict_fail_open(self, llm_stub: _LLMStub) -> None:
         """LLM 输出非法枚举（结构化校验不过）→ fail-open {} 直通。"""

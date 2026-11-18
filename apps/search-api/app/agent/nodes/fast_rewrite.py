@@ -106,12 +106,14 @@ QueryType = Literal[
 SearchStrategy = Literal["direct", "verify", "web", "recall"]
 
 #: 输入安全初判四值（B13：none=正常 / danger=危险意图 / profanity=纯辱骂发泄 /
-#: privacy=隐私侵害意图；reject 组合约束同 safety.reply——pii 不在本通道，
-#: sanitize 面归 sanitizer。v1.31 +privacy）
-SafetyFlag = Literal["none", "danger", "profanity", "privacy"]
+#: privacy=隐私侵害意图；politics=涉政敏感话题讨论请求（v1.32 +，reject-only）；
+#: reject 组合约束同 safety.reply——pii 不在本通道，sanitize 面归 sanitizer）
+SafetyFlag = Literal["none", "danger", "profanity", "privacy", "politics"]
 
 #: Layer 2 拦截白名单（safety 初判命中且 enabled+hybrid 才拒；none 一律直通）
-_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity", "privacy")
+_REJECT_CATEGORIES: tuple[str, ...] = (
+    "danger", "profanity", "privacy", "politics",
+)
 
 
 class RewriteOutput(BaseModel):
@@ -372,7 +374,8 @@ async def _safety_gate(
     输出未成形），不重复拦截。
 
     直通三条件（任一命中即放行，判定按灰度安全顺序排布）：初判 ∉ {danger,
-    profanity, privacy}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
+    profanity, privacy, politics}（**先行短路**——none 直通 + reject 组合约束同
+    safety.reply，pii
     不走本通道；旧提示词全量 none → 零配置判读、零告警面，存量轮日志面亦零
     变化）；`load_safety_config` 返回 None（fail-open：spec 缺 safety 节 /
     enabled=false / mode 非法——本分支仅在模型真打出 flag 时可达，缺节告警

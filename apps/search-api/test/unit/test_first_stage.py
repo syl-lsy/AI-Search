@@ -293,7 +293,7 @@ async def test_deep_planner_node_no_longer_emits_running(
         ) -> _Chain:
             return _Chain()
 
-    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias: _Model())
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _Model())
     emitted: list[tuple[str, str]] = []
     monkeypatch.setattr(
         deep_planner_module,

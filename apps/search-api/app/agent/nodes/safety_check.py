@@ -7,7 +7,7 @@
   None（节缺失 / enabled=false / mode 非法，fail-open——安全检查不挡检索）→ 返回 {}
   直通；
 - **Stage A（代码层直拦，内核纯函数）**：`scan_lexicon` 词表硬命中 danger/profanity/
-  privacy → 拒答路径（见下，硬命中压 grey；v1.31 +privacy）；`detect_pii` 硬命中 → 脱敏返回 `{"query": 脱敏文本,
+  privacy → 拒答路径（见下，硬命中压 grey；v1.31 +privacy / v1.32 +politics）；`detect_pii` 硬命中 → 脱敏返回 `{"query": 脱敏文本,
   "safety_category": "pii", "safety_action": "sanitize"}`（AgentLog 记录，日志零 PII
   原文；脱敏轮 query 覆写后照常检索，不产生 error 事件）；零硬命中且有 grey → Stage B；
   扫描在工作线程执行并受 classify_timeout_s 超时包络（ReDoS 第二道防线——validator
@@ -15,7 +15,7 @@
 - **Stage B（grey LLM 复核，仅 hybrid）**：light 模型结构化分类 `SafetyVerdict`
   （提示词 `common.safety_check` 占位符 {{query}}/{{query_lang}}；method="function_calling"；
   classify_timeout_s 包络；RunnableConfig 透传保 Langfuse 观测）。pass → {}；
-  sanitize → 脱敏返回；reject（danger|profanity|privacy）→ 拒答路径。失败/超时/校验不过 →
+  sanitize → 脱敏返回；reject（danger|profanity|privacy|politics）→ 拒答路径。失败/超时/校验不过 →
   fail-open 返回 {} + AgentLog warning（宁可漏判不可误伤，同提示词口径）。
 
 拒答路径（节点内完成，不设独立 safe_reply 节点——设计定稿）：
@@ -26,7 +26,7 @@ mode：deep=plan / 其余=rewrite——TurnRunner 图前已发 running，此处 
 安全拒绝轮收束（error 403002，无 done，api.md §7.4 v1.23）。Layer 2（子图内
 rewrite/planner safety 初判）同形上抛不上 state——故子图 state 不加 safety_* 键。
 
-处置优先级（同句多形态命中）：danger > profanity > privacy > pii > grey（词表硬命中代码层直拦、
+处置优先级（同句多形态命中）：danger > profanity > privacy > politics > pii > grey（词表硬命中代码层直拦、
 不经 grey LLM 复核；PII 命中压 grey——lexicon.py「硬命中压 grey」同构语义）。
 
 组合违规防御：LLM 输出 reject+pii（提示词契约禁止的组合）→ 防御归一为 sanitize 路径
@@ -64,6 +64,10 @@ SAFETY_CHECK_PROMPT_KEY = "common.safety_check"
 #: 脱敏轮 state 动作标注（pass 直通零更新、reject 走异常不落 state——仅 sanitize 落键）
 _SAFETY_ACTION_SANITIZE = "sanitize"
 
+#: reject-only 类别（意图/话题域拒绝不是可脱敏内容——v1.32 +politics）：sanitize 判到
+#: 这些类别一律防御归一为拒答
+_REJECT_ONLY_CATEGORIES: tuple[str, ...] = ("danger", "profanity", "privacy", "politics")
+
 
 class SafetyVerdict(BaseModel):
     """grey 区 LLM 结构化分类输出（common.safety_check 输出 JSON 契约，§1 v1.31）。
@@ -74,7 +78,7 @@ class SafetyVerdict(BaseModel):
     """
 
     action: Literal["pass", "sanitize", "reject"]
-    category: Literal["danger", "profanity", "privacy", "pii", "none"]
+    category: Literal["danger", "profanity", "privacy", "politics", "pii", "none"]
 
 
 def _extract_verdict(raw: Any) -> SafetyVerdict:
@@ -83,13 +87,11 @@ def _extract_verdict(raw: Any) -> SafetyVerdict:
 
 
 def _hard_category(scan: Any) -> str | None:
-    """词表硬命中类别（danger > profanity > privacy——类别优先级钉死，与词表配置序无关）。"""
-    if any(hit.kind == "danger" for hit in scan.hard_hits):
-        return "danger"
-    if any(hit.kind == "profanity" for hit in scan.hard_hits):
-        return "profanity"
-    if any(hit.kind == "privacy" for hit in scan.hard_hits):
-        return "privacy"
+    """词表硬命中类别（danger > profanity > privacy > politics——类别优先级钉死，
+    与词表配置序无关；v1.32 +politics 第五类 reject-only）。"""
+    for kind in ("danger", "profanity", "privacy", "politics"):
+        if any(hit.kind == kind for hit in scan.hard_hits):
+            return kind
     return None
 
 
@@ -173,11 +175,10 @@ async def _classify(
     except TurnCanceledSignal:
         raise  # 取消非故障（R14③）：不落 fail-open，向上传播收束
     except Exception as exc:  # noqa: BLE001 —— LLM 故障/超时/渲染失败/校验失败一律 fail-open
+        # **日志只落异常类型名**（安全审计 P3）：异常原文可能内嵌模型回显的 query 原文 /
+        # 检测器漏掉的 PII 形态——与拒绝轮「日志零 query 原文」同口径，异常文本不进日志。
         AgentLog(
-            message=(
-                f"safety_check grey 分类失败（fail-open 直通）："
-                f"{type(exc).__name__}: {str(exc)[:200]}"
-            ),
+            message=f"safety_check grey 分类失败（fail-open 直通）：{type(exc).__name__}",
             graph="safety",
             node="safety_check",
         ).warning()
@@ -226,8 +227,8 @@ async def safety_check(state: Any, config: RunnableConfig | None = None) -> dict
         ).warning()
         return {}
 
-    # Stage A：词表硬命中（danger > profanity > privacy）→ 拒答路径（代码层直拦，
-    # 压 grey/PII）
+    # Stage A：词表硬命中（danger > profanity > privacy > politics，v1.32 五类别）
+    # → 拒答路径（代码层直拦，压 grey/PII）
     hard = _hard_category(scan)
     if hard is not None:
         raise await _reject(state, config, safety, hard)
@@ -252,30 +253,30 @@ async def _apply_verdict(
     safety: SafetyConfig,
     verdict: SafetyVerdict,
 ) -> dict[str, Any]:
-    """分类裁决落地：pass → {}；sanitize → 脱敏返回（privacy 除外，见下）；reject
-    （danger|profanity|privacy）→ 拒答路径。
+    """分类裁决落地：pass → {}；sanitize → 脱敏返回（reject-only 类别除外，见下）；
+    reject（danger|profanity|privacy|politics）→ 拒答路径。
 
-    组合违规防御（契约组合约束不信任模型自律）：sanitize+privacy 归一为拒答 +
-    warning（privacy 一律 reject 不得 sanitize——隐私侵害是意图不是可脱敏内容）；
-    reject+pii 归一 sanitize + warning（pii 一律 sanitize）；reject+none 视同 pass
-    （拿不准一律放行）。
+    组合违规防御（契约组合约束不信任模型自律——`_REJECT_ONLY_CATEGORIES`）：sanitize +
+    privacy/politics 归一为拒答 + warning（隐私侵害是意图、涉政话题是话题域命中，均
+    不是可脱敏内容）；reject+pii 归一 sanitize + warning（pii 一律 sanitize）；
+    reject+none 视同 pass（拿不准一律放行）。
     """
     if verdict.action == "pass":
         return {}
     if verdict.action == "sanitize":
-        if verdict.category == "privacy":
+        if verdict.category in _REJECT_ONLY_CATEGORIES:
             AgentLog(
                 message=(
-                    "safety_check 分类组合违规（sanitize+privacy，契约禁止）——防御归一为"
-                    "拒答路径（category=privacy 一律 reject 不得 sanitize）"
+                    f"safety_check 分类组合违规（sanitize+{verdict.category}，契约禁止）"
+                    "——防御归一为拒答路径（reject-only 类别一律 reject 不得 sanitize）"
                 ),
                 graph="safety",
                 node="safety_check",
             ).warning()
-            raise await _reject(state, config, safety, "privacy")
+            raise await _reject(state, config, safety, verdict.category)
         return _sanitize_update(query, verdict.category)
     # action == "reject"
-    if verdict.category in ("danger", "profanity", "privacy"):
+    if verdict.category in _REJECT_ONLY_CATEGORIES:
         raise await _reject(state, config, safety, verdict.category)
     if verdict.category == "pii":
         AgentLog(

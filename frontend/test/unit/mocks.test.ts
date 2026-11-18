@@ -2,18 +2,33 @@ import { describe, expect, it } from 'vitest'
 
 import { threadListFixture } from '@/mocks/threads'
 import {
+  POLITICS_REFUSAL_MESSAGE,
   TURN_ID_DEEP,
   TURN_ID_DIRECT,
+  TURN_ID_FALLBACK_DIGEST,
+  TURN_ID_FALLBACK_PARTIAL,
   TURN_ID_FAST,
+  TURN_ID_POLITICS,
   turnDetailDeepCompleted,
   turnDetailDirectCompleted,
   turnDetailDirectWithFollowups,
+  turnDetailFallbackDigestDegraded,
+  turnDetailFallbackPartialDegraded,
   turnDetailFastCompleted,
   turnDetailFastHelpful,
   turnDetailFastWithFollowups,
+  turnDetailPoliticsRefused,
   turnDetailQueued,
 } from '@/mocks/turnDetails'
-import { deepSequence, directFollowupsEvent, directSequence, fastSequence } from '@/mocks/sseSequences'
+import {
+  deepSequence,
+  directFollowupsEvent,
+  directSequence,
+  fallbackDigestSequence,
+  fallbackPartialSequence,
+  fastSequence,
+  politicsRefusalSequence,
+} from '@/mocks/sseSequences'
 import { modelsFixture } from '@/mocks/models'
 import { suggestionsFixture } from '@/mocks/suggestions'
 import type { SseWireEvent } from '@/types/api'
@@ -197,6 +212,134 @@ describe('轮次终态 fixture（api.md §2.5 镜像形态）', () => {
     expect(turnDetailQueued.status).toBe('queued')
     expect(turnDetailQueued.stages).toEqual([])
     expect(turnDetailQueued.finished_at).toBeNull()
+  })
+})
+
+describe('B14 兜底收束轮 fixture（api.md §7.4 v1.25 兜底收束形态 / PRD A51，§9 v1.29）', () => {
+  /** 序列基本不变量（与其他序列同构）：seq 单调、事件名合法、turn_id 一致 */
+  function assertSequenceInvariants(sequence: SseWireEvent[], expectedTurnId: string): void {
+    expect(sequence.length).toBeGreaterThan(0)
+    let prevSeq = 0
+    for (const wire of sequence) {
+      expect(SSE_EVENT_NAMES.has(wire.event)).toBe(true)
+      expect(wire.data.seq).toBe(wire.id)
+      expect(wire.data.seq).toBeGreaterThan(prevSeq)
+      expect(wire.data.turn_id).toBe(expectedTurnId)
+      prevSeq = wire.data.seq
+    }
+  }
+
+  it('digest 序列：主干形态锁死——零 error 事件、token 单事件整块、write done extra.fallback、done(degraded, reason=null)', () => {
+    assertSequenceInvariants(fallbackDigestSequence, TURN_ID_FALLBACK_DIGEST)
+    // 零 error 事件（「超时不能报错收束，必须有兜底产出」2026-11-18 裁决①）
+    expect(fallbackDigestSequence.some((w) => w.event === 'error')).toBe(false)
+    // token 恰一个事件且整块 = 2.5 fixture answer_md（digest 机械装配全文，fixture 互洽）
+    const tokens = fallbackDigestSequence.filter(
+      (w): w is Extract<SseWireEvent, { event: 'token' }> => w.event === 'token',
+    )
+    expect(tokens).toHaveLength(1)
+    expect(tokens[0]!.data.delta).toBe(turnDetailFallbackDigestDegraded.answer_md)
+    // stage(write,done) 留痕 extra={"fallback":"synthesis_digest"}
+    const writeDone = fallbackDigestSequence.find(
+      (w): w is Extract<SseWireEvent, { event: 'stage' }> =>
+        w.event === 'stage' && w.data.stage_key === 'write' && w.data.status === 'done',
+    )
+    expect(writeDone?.data.extra).toEqual({ fallback: 'synthesis_digest' })
+    // done 收尾：degraded、degraded_reason=null（枚举零扩容——兜底轮不属三枚举任一语义）
+    const done = fallbackDigestSequence.at(-1)
+    if (done?.event !== 'done') throw new Error('digest 序列应以 done 收尾')
+    expect(done.data.finish).toBe('degraded')
+    expect(done.data.degraded).toBe(true)
+    expect(done.data.degraded_reason).toBeNull()
+    expect(done.data.source_count).toBe(6)
+    // 主干次序：sources 批次先行、digest token 在 write running 之后（api.md §7.4 v1.25 序）
+    const eventOrder = fallbackDigestSequence.map((w) => w.event)
+    expect(eventOrder.indexOf('sources')).toBeGreaterThan(-1)
+    expect(eventOrder.indexOf('token')).toBeGreaterThan(eventOrder.indexOf('sources'))
+  })
+
+  it('digest 全文形态：说明行 + 前 5 条 [n] 来源行与 sources 卡编号对齐 + 「其余见来源面板」尾注', () => {
+    const md = turnDetailFallbackDigestDegraded.answer_md
+    expect(md).toContain('综合回答未能完成')
+    // [n] 1..5 与已发 sources 卡 ref_no 1..5 一一对齐（A51 GWT①「[n] 与来源卡编号对齐」）
+    for (const refNo of [1, 2, 3, 4, 5]) {
+      expect(md).toContain(`[${refNo}]`)
+      const source = turnDetailFallbackDigestDegraded.sources.find((s) => s.ref_no === refNo)
+      expect(source).toBeDefined()
+      expect(md).toContain(source!.title)
+    }
+    // fused>5 条 → 「其余见来源面板」尾注（sources 共 6 条，digest 只列前 5）
+    expect(turnDetailFallbackDigestDegraded.sources).toHaveLength(6)
+    expect(md).toContain('其余 1 条来源见下方来源面板')
+    expect(md).not.toContain('[6]') // N 上限 5：第 6 条不进 digest
+  })
+
+  it('partial 序列：token 流中断形态锁死——拼接=2.5 answer_md、句末标点截断、extra.fallback、done(degraded, reason=null)', () => {
+    assertSequenceInvariants(fallbackPartialSequence, TURN_ID_FALLBACK_PARTIAL)
+    expect(fallbackPartialSequence.some((w) => w.event === 'error')).toBe(false)
+    // 多 token 部分流（与 digest 单块形态对偶）且拼接与 2.5 fixture 一致
+    const tokens = fallbackPartialSequence.filter(
+      (w): w is Extract<SseWireEvent, { event: 'token' }> => w.event === 'token',
+    )
+    expect(tokens.length).toBeGreaterThan(1)
+    const joined = tokens.map((w) => w.data.delta).join('')
+    expect(joined).toBe(turnDetailFallbackPartialDegraded.answer_md)
+    // 截断到最近句末标点（。！？!?.）：句内残句丢弃、无伪造补全
+    expect(joined).toMatch(/[。！？!?.]$/)
+    const writeDone = fallbackPartialSequence.find(
+      (w): w is Extract<SseWireEvent, { event: 'stage' }> =>
+        w.event === 'stage' && w.data.stage_key === 'write' && w.data.status === 'done',
+    )
+    expect(writeDone?.data.extra).toEqual({ fallback: 'synthesis_partial' })
+    const done = fallbackPartialSequence.at(-1)
+    if (done?.event !== 'done') throw new Error('partial 序列应以 done 收尾')
+    expect(done.data.finish).toBe('degraded')
+    expect(done.data.degraded).toBe(true)
+    expect(done.data.degraded_reason).toBeNull()
+    expect(done.data.source_count).toBe(3)
+  })
+
+  it('politics 拒答序列：三帧形态锁死——stage failed extra(safety/layer)、error(403002)、无 done', () => {
+    assertSequenceInvariants(politicsRefusalSequence, TURN_ID_POLITICS)
+    expect(politicsRefusalSequence).toHaveLength(3)
+    // stage(rewrite,failed) 留痕：safety=politics（v1.25 值域扩容）+ layer=pre_route（v1.23 B13 先例键）
+    const failed = politicsRefusalSequence.find(
+      (w): w is Extract<SseWireEvent, { event: 'stage' }> => w.event === 'stage' && w.data.status === 'failed',
+    )
+    expect(failed?.data.stage_key).toBe('rewrite')
+    expect(failed?.data.extra).toEqual({ safety: 'politics', layer: 'pre_route' })
+    // error(403002) + message=中性引导话术（SSE 与 2.5 双源同话术，fixture 互洽）
+    const error = politicsRefusalSequence.at(-1)
+    if (error?.event !== 'error') throw new Error('politics 序列应以 error 收尾（无 done）')
+    expect(error.data.code).toBe('403002')
+    expect(error.data.message).toBe(POLITICS_REFUSAL_MESSAGE)
+    expect(error.data.stage_key).toBe('rewrite')
+    expect(politicsRefusalSequence.some((w) => w.event === 'done')).toBe(false)
+    expect(politicsRefusalSequence.some((w) => w.event === 'sources')).toBe(false) // 全程零搜索零综合
+  })
+
+  it('三个 2.5 终态孪生：digest/partial 降级态权威投影、politics failed 拒答投影', () => {
+    // digest：degraded + reason=null + 零 error + 兜底留痕重建
+    expect(turnDetailFallbackDigestDegraded.status).toBe('degraded')
+    expect(turnDetailFallbackDigestDegraded.degraded).toBe(true)
+    expect(turnDetailFallbackDigestDegraded.degraded_reason).toBeNull()
+    expect(turnDetailFallbackDigestDegraded.error).toBeNull()
+    expect(turnDetailFallbackDigestDegraded.stages.find((s) => s.stage_key === 'write')?.extra).toEqual({ fallback: 'synthesis_digest' })
+    expect(turnDetailFallbackDigestDegraded.export_available).toBe(false) // fast 不计入 report
+    // partial：同款降级投影 + answer_md 非空落库（A51 GWT②「刷新回看 partial 全文持久可见」读通道）
+    expect(turnDetailFallbackPartialDegraded.status).toBe('degraded')
+    expect(turnDetailFallbackPartialDegraded.degraded).toBe(true)
+    expect(turnDetailFallbackPartialDegraded.degraded_reason).toBeNull()
+    expect(turnDetailFallbackPartialDegraded.error).toBeNull()
+    expect(turnDetailFallbackPartialDegraded.answer_md.length).toBeGreaterThan(0)
+    expect(turnDetailFallbackPartialDegraded.stages.find((s) => s.stage_key === 'write')?.extra).toEqual({ fallback: 'synthesis_partial' })
+    // politics：failed + error 载荷复用承载（data-model.md §1.3）+ 零内容零来源
+    expect(turnDetailPoliticsRefused.status).toBe('failed')
+    expect(turnDetailPoliticsRefused.answer_md).toBe('')
+    expect(turnDetailPoliticsRefused.sources).toEqual([])
+    expect(turnDetailPoliticsRefused.error).toEqual({ code: '403002', message: POLITICS_REFUSAL_MESSAGE, stage_key: 'rewrite' })
+    expect(turnDetailPoliticsRefused.stages[0]?.extra).toEqual({ safety: 'politics', layer: 'pre_route' })
+    expect(turnDetailPoliticsRefused.degraded).toBe(false)
   })
 })
 

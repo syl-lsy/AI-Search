@@ -27,7 +27,7 @@ import httpx
 import pytest
 
 from app.agent.nodes import synthesis as synthesis_module
-from app.agent.nodes.synthesis import SynthesisError, synthesis
+from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback, synthesis
 
 _SPEC: dict[str, Any] = {
     "fast": {
@@ -86,7 +86,7 @@ def _install(
     script: list[Any],
 ) -> tuple[_FakeModel, list[dict[str, Any]], list[dict[str, Any]]]:
     model = _FakeModel(script)
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
     stages: list[dict[str, Any]] = []
     monkeypatch.setattr(
         synthesis_module,
@@ -177,8 +177,9 @@ async def test_synthesis_uses_chat_alias_from_mapping(monkeypatch: pytest.Monkey
     """别名 = 轮内映射快照 chat.options[chat_model_key]（OQ-11 同源）。"""
     seen: dict[str, str] = {}
 
-    def _spy(alias: str) -> _FakeModel:
+    def _spy(alias: str, **kw: Any) -> _FakeModel:
         seen["alias"] = alias
+        seen.update({k: v for k, v in kw.items()})
         return _FakeModel([_text_chunks("ok")])
 
     monkeypatch.setattr(synthesis_module, "build_chat_model", _spy)
@@ -191,23 +192,44 @@ async def test_synthesis_uses_chat_alias_from_mapping(monkeypatch: pytest.Monkey
     assert seen["alias"] == "chat-standard-glm"
 
 
-# ---- 模型工厂：关思维链（专项① synthesis 提速）----
+# ---- 模型工厂：thinking 按模式分档（v1.59 增量 C，ARCH §6.7）----
 
 
-def test_chat_model_disables_thinking_via_enable_thinking_extra_body() -> None:
-    """专项①（2026-11-13，M1 后 synthesis 提速）锁面：build_chat_model 产物必须携带
-    extra_body={'enable_thinking': False}——chat-standard 通道（百炼 qwen3.7-plus 经
-    litellm openai/ 兼容透传）生效键形态经网关探针钉死：
+def _capture_thinking(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """记录 build_chat_model 收到的档位实参（缺省键 → 记录 None 形态）。"""
+    seen: list[Any] = []
 
-    - `enable_thinking: false` 生效：流式 delta 零 reasoning_content（两轮 0 帧/0 字，
-      1.0~1.7s）；`think: false`（rewrite 先例的 ollama 原生形态）被 DashScope 上游
-      忽略（58/66 帧、310/350 字思维链，4.3~5.1s ≈ 基线 4.5s）——不照抄 ollama 形态；
-    - synthesis 为流式消费面（token/thinking 事件经 messages 流），不注入
-      disable_streaming（该参数是 rewrite 结构化输出通道专属——batch 8 A 裁决）。
-    """
-    model = synthesis_module.build_chat_model("chat-standard")
-    assert model.extra_body == {"enable_thinking": False}
-    assert model.disable_streaming is False  # 流式消费面：禁流式不得外溢到 synthesis
+    def _spy(alias: str, **kw: Any) -> _FakeModel:
+        seen.append(kw.get("thinking", "<absent>"))
+        return _FakeModel([_text_chunks("答案")])
+
+    monkeypatch.setattr(synthesis_module, "build_chat_model", _spy)
+    monkeypatch.setattr(synthesis_module, "emit_stage", lambda *a, **kw: None)
+    return seen
+
+
+async def test_synthesis_defaults_to_fast_off_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fast 档缺省 = off（裁决值）：spec 无 thinking 键时节点传 thinking="off"。"""
+    seen = _capture_thinking(monkeypatch)
+
+    await synthesis(_state(), _config())
+
+    assert seen == ["off"]
+
+
+async def test_synthesis_honors_spec_fast_thinking_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """spec.fast.thinking=on 热更即开（回退门：单键热更恢复开思考）。"""
+    seen = _capture_thinking(monkeypatch)
+    state = _state()
+    state["spec"] = {**state["spec"], "fast": {**state["spec"]["fast"], "thinking": "on"}}
+
+    await synthesis(state, _config())
+
+    assert seen == ["on"]
 
 
 # ---- 硬上限 / 引用越界 ----
@@ -299,14 +321,16 @@ async def test_synthesis_defensive_short_circuit_on_all_sources_failed(
         )
 
 
-async def test_synthesis_retry_exhausted_raises_synthesis_error(
+async def test_synthesis_retry_exhausted_with_sources_raises_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """传输类失败按 spec.retry 重试（max_attempts=2）→ 耗尽 → SynthesisError（500101 面）。"""
-    request = httpx_error = ConnectionError("网关断开")
+    """v1.59 增量 A：传输类失败按 spec.retry 重试（max_attempts=2）→ 耗尽且 fused 非空
+    → **SynthesisFallback**（500101 语义收窄为零源专属；兜底产出见兜底测试组）。"""
+    _tokens(monkeypatch)
+    httpx_error = ConnectionError("网关断开")
     _install(monkeypatch, [httpx_error, httpx_error])  # 两次流式尝试均失败
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):
         await synthesis(_state(), _config())
 
 
@@ -584,11 +608,12 @@ async def test_synthesis_connection_retry_total_window_gate(
 
     monkeypatch.setattr(synthesis_module, "_clock", clock)
     monkeypatch.setattr(synthesis_module, "_sleep", advancing_sleep)
+    _tokens(monkeypatch)
     model, _, _ = _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(5)])
     state = _state()
     state["spec"] = _connection_spec(total_window_s=3.0)
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):  # v1.59：窗闸放弃 → 兜底（不再 500101）
         await synthesis(state, _config())
 
     assert delays == [1.0, 2.0]  # 第三次退避 4s 超剩余窗（0s）→ 放弃
@@ -616,6 +641,7 @@ async def test_synthesis_deadline_default_is_120(monkeypatch: pytest.MonkeyPatch
 async def test_synthesis_connection_retry_deadline_double_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _tokens(monkeypatch)  # digest 整块 token 发射通道需打桩
     """TurnDeadline 双闸：轮预算不足一次 LLM 调用（turn_timeout_s=1 < llm_timeout_s=30）
     → 首次连接类失败即放弃重试（零退避）。"""
     delays = _install_sleeps(monkeypatch)
@@ -624,7 +650,7 @@ async def test_synthesis_connection_retry_deadline_double_gate(
     state["spec"] = _connection_spec()
     state["spec"]["fast"]["turn_timeout_s"] = 1
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):  # v1.59：TurnDeadline 放弃 → 兜底
         await synthesis(state, _config())
 
     assert delays == []
@@ -634,13 +660,14 @@ async def test_synthesis_connection_retry_deadline_double_gate(
 async def test_synthesis_connection_retry_exhausted_after_max_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _tokens(monkeypatch)  # digest 整块 token 发射通道需打桩
     """长窗 max_attempts=2（首试 + 1 重试）耗尽 → SynthesisError；退避仅 1 次。"""
     delays = _install_sleeps(monkeypatch)
     model, _, _ = _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(3)])
     state = _state()
     state["spec"] = _connection_spec(max_attempts=2)
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):  # v1.59：长窗耗尽 → 兜底
         await synthesis(state, _config())
 
     assert delays == [1.0]
@@ -650,6 +677,7 @@ async def test_synthesis_connection_retry_exhausted_after_max_attempts(
 async def test_synthesis_business_error_skips_long_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _tokens(monkeypatch)  # digest 整块 token 发射通道需打桩
     """业务类（OutputParserException）不进长窗：即时 SynthesisError、零退避、零重试。"""
     from langchain_core.exceptions import OutputParserException
 
@@ -658,7 +686,7 @@ async def test_synthesis_business_error_skips_long_window(
     state = _state()
     state["spec"] = _connection_spec()
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):  # v1.59：TurnDeadline 放弃 → 兜底
         await synthesis(state, _config())
 
     assert delays == []
@@ -668,6 +696,7 @@ async def test_synthesis_business_error_skips_long_window(
 async def test_synthesis_transient_5xx_keeps_short_window_with_connection_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _tokens(monkeypatch)  # digest 整块 token 发射通道需打桩
     """5xx 短窗（决策 1）：有 connection 节仍按 retry 主节 max_attempts=2 收口，不享长窗。"""
     delays = _install_sleeps(monkeypatch)
     request = httpx.Request("POST", "https://litellm.local/v1/chat/completions")
@@ -678,7 +707,7 @@ async def test_synthesis_transient_5xx_keeps_short_window_with_connection_node(
     state = _state()
     state["spec"] = _connection_spec()
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):  # v1.59：短窗耗尽 → 兜底
         await synthesis(state, _config())
 
     assert len(delays) == 1  # 主节 max_attempts=2 → 一次退避后耗尽
@@ -704,7 +733,7 @@ async def test_synthesis_per_call_timeout_envelope(monkeypatch: pytest.MonkeyPat
             return gen()
 
     monkeypatch.setattr(
-        synthesis_module, "build_chat_model", lambda alias: _HangingThenOkModel()
+        synthesis_module, "build_chat_model", lambda alias, **kw: _HangingThenOkModel()
     )
     monkeypatch.setattr(synthesis_module, "emit_stage", lambda *a, **k: None)
     state = _state()
@@ -721,6 +750,7 @@ async def test_synthesis_per_call_timeout_envelope(monkeypatch: pytest.MonkeyPat
 async def test_synthesis_mixed_tiers_share_total_attempt_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _tokens(monkeypatch)  # digest 整块 token 发射通道需打桩
     """评审 P2-3：短窗/长窗交替失败共享总尝试上限——connection 节在场时
     总物理尝试 ≤ connection.max_attempts（不再叠加成 1+4+2=7 次）。"""
     delays = _install_sleeps(monkeypatch)
@@ -738,7 +768,7 @@ async def test_synthesis_mixed_tiers_share_total_attempt_cap(
     spec["fast"]["retry"] = {**spec["fast"]["retry"], "max_attempts": 5}  # 主节也放到 5
     state["spec"] = spec
 
-    with pytest.raises(SynthesisError):
+    with pytest.raises(SynthesisFallback):  # v1.59：耗尽 → 兜底
         await synthesis(state, _config())
 
     assert len(model.prompts) == 5  # 交替失败被总上限截断（非 7 次）
@@ -956,3 +986,348 @@ async def test_synthesis_illegal_strategy_renders_web_regular_variant(
     assert "回顾整理路径" not in prompt_text
     assert "免检索直答路径" not in prompt_text
     assert "旧答案要点。" not in prompt_text  # 非法值轮不得注入历史块
+
+
+# ==== 兜底产出（v1.59 增量 A，api.md §7.4 兜底收束形态 / ARCH §6.2 兜底产出注）====
+#
+# 语义（2026-11-18 用户裁决①「超时不能报错收束，必须有兜底产出」）：
+# - fused 非空的 synthesis 终局失败（重试耗尽 / 窗闸 / TurnDeadline / 不可重试类）
+#   → SynthesisFallback（零 error 事件；digest 或 partial 两路径）；
+# - 零源轮（fused 空）保留 SynthesisError → TurnRunner 500101（语义收窄为零源专属）；
+# - digest = 纯机械来源速览（说明行 + 前 5 条 `[n] title：snippet` + 尾注），
+#   单事件整块 token 发射；title/snippet 转义防 [n] 伪造与版式注入。
+
+
+def _tokens(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """捕获 digest 整块 token 发射（custom 信号通道，零拼接）。"""
+    tokens: list[str] = []
+    monkeypatch.setattr(
+        synthesis_module, "emit_fallback_token", lambda delta: tokens.append(delta)
+    )
+    return tokens
+
+
+class TestClipToSentenceBoundary:
+    """句界清理纯函数（partial 收束：截断到最近句末标点/换行，残句丢弃不伪造补全）。"""
+
+    def test_keeps_complete_sentences_and_drops_fragment(self) -> None:
+        from app.agent.nodes.synthesis import _clip_to_sentence_boundary
+
+        assert _clip_to_sentence_boundary("第一句。第二句！残句未完结") == "第一句。第二句！"
+
+    def test_recognizes_all_contract_terminators(self) -> None:
+        from app.agent.nodes.synthesis import _clip_to_sentence_boundary
+
+        for mark in ("。", "！", "？", "!", "?", "."):
+            assert _clip_to_sentence_boundary(f"正文{mark}残") == f"正文{mark}"
+
+    def test_newline_is_boundary(self) -> None:
+        from app.agent.nodes.synthesis import _clip_to_sentence_boundary
+
+        assert _clip_to_sentence_boundary("第一行\n第二行未完") == "第一行"
+
+    def test_returns_empty_without_any_boundary(self) -> None:
+        from app.agent.nodes.synthesis import _clip_to_sentence_boundary
+
+        assert _clip_to_sentence_boundary("没有句界的半句话") == ""
+        assert _clip_to_sentence_boundary("") == ""
+
+    def test_trailing_whitespace_trimmed(self) -> None:
+        from app.agent.nodes.synthesis import _clip_to_sentence_boundary
+
+        assert _clip_to_sentence_boundary("正文。   ") == "正文。"
+
+
+class TestBuildDigest:
+    """digest 装配器（纯机械零 LLM）：双语说明行 + top5 来源 + 尾注 + 转义。"""
+
+    def test_zh_shape_top5_and_tail_note(self) -> None:
+        from app.agent.nodes.synthesis import _build_digest
+
+        fused = [_cand(f"https://s/{i}", snippet=f"片段{i}") for i in range(1, 8)]
+        digest = _build_digest("zh", fused)
+
+        assert "综合回答未能完成" in digest
+        assert "- [1] t:https://s/1：片段1" in digest
+        assert "- [5] t:https://s/5：片段5" in digest
+        assert "[6]" not in digest  # 仅前 5 条
+        assert "其余 2 条来源见来源面板" in digest  # fused 7 > 5 → 尾注
+        assert digest.count("\n- ") == 5  # 列表行恰 5 条
+
+    def test_en_shape_follows_language(self) -> None:
+        from app.agent.nodes.synthesis import _build_digest
+
+        digest = _build_digest("en", [_cand("https://s/1", snippet="snip")])
+
+        assert "could not be completed" in digest
+        assert "- [1] t:https://s/1：snip" in digest
+        assert "more sources are available" not in digest  # 1 条 ≤5 无尾注
+
+    def test_exactly_five_sources_no_tail_note(self) -> None:
+        from app.agent.nodes.synthesis import _build_digest
+
+        digest = _build_digest("zh", [_cand(f"https://s/{i}") for i in range(1, 6)])
+
+        assert "其余" not in digest
+
+    def test_escapes_citation_markers_in_source_text(self) -> None:
+        """来源 title/snippet 为外部内容：`[n]` 转义为全角括号（前端 CITE 解析只认
+        半角 `[\\d{1,2}]`——全角形态不产生伪造角标），markdown 控制字符反斜杠转义。"""
+        from app.agent.nodes.synthesis import _build_digest
+
+        digest = _build_digest(
+            "zh",
+            [{"url": "https://evil/1", "title": "[9] 官方公告", "snippet": "**加粗** `代码` # 标题"}],
+        )
+
+        assert "［9］ 官方公告" in digest  # 半角 [9] 已被转义（不产伪造引用）
+        assert "[9]" not in digest
+        assert "\\*\\*加粗\\*\\*" in digest
+        assert "\\`代码\\`" in digest
+        assert "\\# 标题" in digest
+
+    def test_snippet_truncated_to_120_chars(self) -> None:
+        from app.agent.nodes.synthesis import _build_digest
+
+        digest = _build_digest("zh", [{"url": "u", "title": "t", "snippet": "字" * 500}])
+
+        assert "字" * 120 in digest
+        assert "字" * 121 not in digest
+
+    def test_title_truncated_to_120_chars(self) -> None:
+        """title 显式截断 ≤120 字符（与 snippet 对称——把上游 API/DB String(512) 的隐性
+        约束变显式；超长标题不撑爆单行也不挤占 snippet 展示预算）。"""
+        from app.agent.nodes.synthesis import _DIGEST_TITLE_MAX_CHARS, _build_digest
+
+        assert _DIGEST_TITLE_MAX_CHARS == 120
+        digest = _build_digest("zh", [{"url": "u", "title": "题" * 300, "snippet": "s"}])
+
+        assert "题" * 120 in digest
+        assert "题" * 121 not in digest
+
+    def test_multiline_snippet_collapsed(self) -> None:
+        """换行折叠为空格（列表行必须单行——版式注入防线）。"""
+        from app.agent.nodes.synthesis import _build_digest
+
+        digest = _build_digest("zh", [{"url": "u", "title": "t", "snippet": "一行\n二行"}])
+
+        assert "一行 二行" in digest
+
+    def test_empty_title_falls_back_to_url(self) -> None:
+        from app.agent.nodes.synthesis import _build_digest
+
+        digest = _build_digest("zh", [{"url": "https://fallback/1", "title": "", "snippet": "s"}])
+
+        assert "- [1] https://fallback/1：s" in digest
+
+
+class TestSynthesisFallbackSignal:
+    """SynthesisFallback 信号族（沿 TurnCanceledSignal/ContentRejectedError 先例）。"""
+
+    def test_signal_carries_answer_kind_and_observability_fields(self) -> None:
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        signal = SynthesisFallback(
+            answer_md="来源速览", kind="synthesis_digest",
+            failure="timeout", attempts=2, source_count=7,
+        )
+        assert signal.answer_md == "来源速览"
+        assert signal.kind == "synthesis_digest"
+        assert signal.failure == "timeout"
+        assert signal.attempts == 2
+        assert signal.source_count == 7
+        assert isinstance(signal, Exception)  # 控制流信号（非故障，绕过图级重试）
+
+    async def test_terminal_failure_with_sources_raises_fallback_digest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """重试耗尽 + fused 非空 → SynthesisFallback(kind=synthesis_digest)：
+        digest 单块 token 发射 + stage(write,done,extra.fallback) + 不抛 SynthesisError。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        tokens = _tokens(monkeypatch)
+        _install(monkeypatch, [[ConnectionError("断")], [ConnectionError("再断")]])
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(_state(), _config())
+
+        fallback = excinfo.value
+        assert fallback.kind == "synthesis_digest"
+        assert fallback.failure == "connection"
+        assert fallback.attempts == 2
+        assert fallback.source_count == 2
+        assert tokens == [fallback.answer_md]  # 单事件整块（不逐字流）
+        assert "- [1] t:https://a/1：正文片段" in fallback.answer_md
+
+    async def test_digest_fallback_emits_stage_done_with_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """stage 序列 = running → done(extra.fallback=synthesis_digest)（api.md §7.4）。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        _tokens(monkeypatch)
+        model, stages, _ = _install(
+            monkeypatch, [[ConnectionError("断")], [ConnectionError("再断")]]
+        )
+
+        with pytest.raises(SynthesisFallback):
+            await synthesis(_state(), _config())
+
+        assert [(s["stage_key"], s["status"]) for s in stages] == [
+            ("write", "running"),
+            ("write", "done"),
+        ]
+        assert stages[1]["extra"] == {"fallback": "synthesis_digest"}
+
+    async def test_zero_source_terminal_failure_still_raises_synthesis_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """500101 语义收窄：零源轮一切终局失败仍走 SynthesisError（无兜底产出可给）。"""
+        tokens = _tokens(monkeypatch)
+        _install(monkeypatch, [[ConnectionError("断")], [ConnectionError("再断")]])
+
+        with pytest.raises(SynthesisError):
+            await synthesis(_state(fused=[]), _config())
+        assert tokens == []
+
+    async def test_non_retryable_with_sources_falls_back_not_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """不可重试类（OutputParserException）在 fused 非空时也走兜底（裁决①「一切终局
+        失败都兜底」）；failure 类别标注 non_retryable。"""
+        from langchain_core.exceptions import OutputParserException
+
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        tokens = _tokens(monkeypatch)
+        _install(monkeypatch, [[OutputParserException("解析失败")]])
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(_state(), _config())
+
+        assert excinfo.value.kind == "synthesis_digest"
+        assert excinfo.value.failure == "non_retryable"
+        assert excinfo.value.attempts == 1
+        assert tokens  # digest 已发射
+
+    async def test_partial_keeps_longest_complete_prefix_across_attempts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """部分正文跨尝试捕获：第 1 次产出「完整句+残句」后断、第 2 次零产出即止 →
+        kind=synthesis_partial，正文取最长可用前缀的句界清理结果（不伪造补全）。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        tokens = _tokens(monkeypatch)
+        _install(monkeypatch, [
+            [*_text_chunks("第一句完整。", "第二句残"), ConnectionError("断")],
+            [ConnectionError("再断")],
+        ])
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(_state(), _config())
+
+        fallback = excinfo.value
+        assert fallback.kind == "synthesis_partial"
+        assert fallback.answer_md == "第一句完整。"  # 残句丢弃
+        assert tokens == []  # partial 不补发 token（流内已发）
+
+    async def test_partial_strips_out_of_range_citations_and_caps_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """partial 正文同走 [n] 越界剔除与 max_answer_chars 截断，且**截断后仍以句界收尾**
+        （先截断再句界清理——硬上限不得留下残句）。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        _tokens(monkeypatch)
+        _install(monkeypatch, [
+            [*_text_chunks("事实[3]。多余的第二个句子。"), ConnectionError("断")],
+            [ConnectionError("再断")],
+        ])
+        state = _state(max_chars=6)
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(state, _config())
+
+        assert excinfo.value.kind == "synthesis_partial"
+        assert excinfo.value.answer_md == "事实。"  # [3] 越界剔除 + 上限内句界收尾
+        assert len(excinfo.value.answer_md) <= 6
+
+    async def test_no_complete_sentence_falls_back_to_digest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """不足一句（无任何句界）→ 按零可用正文走 digest（契约明文）。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        tokens = _tokens(monkeypatch)
+        _install(monkeypatch, [
+            [*_text_chunks("半句话没有句界"), ConnectionError("断")],
+            [ConnectionError("再断")],
+        ])
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(_state(), _config())
+
+        assert excinfo.value.kind == "synthesis_digest"
+        assert tokens == [excinfo.value.answer_md]
+
+    async def test_window_gate_terminal_falls_back_with_sources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """total_window_s 窗闸放弃 = 终局失败 → fused 非空走兜底（不再 SynthesisError）。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        delays = _install_sleeps(monkeypatch)
+        now = [0.0]
+
+        monkeypatch.setattr(synthesis_module, "_clock", lambda: now[0])
+
+        async def advancing_sleep(delay: float) -> None:
+            delays.append(delay)
+            now[0] += delay
+
+        monkeypatch.setattr(synthesis_module, "_sleep", advancing_sleep)
+        _tokens(monkeypatch)
+        _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(5)])
+        state = _state()
+        state["spec"] = _connection_spec(total_window_s=3.0)
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(state, _config())
+
+        assert excinfo.value.kind == "synthesis_digest"
+        assert len(delays) == 2  # 窗闸语义不变（1+2 后退避 4 超窗）
+
+    async def test_deadline_gate_terminal_falls_back_with_sources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TurnDeadline 放弃 = 终局失败 → 兜底（裁决①：窗/预算放弃都补产出）。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        delays = _install_sleeps(monkeypatch)
+        _tokens(monkeypatch)
+        _install(monkeypatch, [[ConnectionError("瞬断")] for _ in range(5)])
+        state = _state()
+        state["spec"] = _connection_spec()
+        state["spec"]["fast"]["turn_timeout_s"] = 1
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(state, _config())
+
+        assert excinfo.value.kind == "synthesis_digest"
+        assert delays == []
+
+    async def test_empty_output_falls_back_with_digest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """空输出（零 chunk 正常结束）同属终局失败 → fused 非空走 digest 兜底。"""
+        from app.agent.nodes.synthesis import SynthesisFallback
+
+        tokens = _tokens(monkeypatch)
+        _install(monkeypatch, [[]])
+
+        with pytest.raises(SynthesisFallback) as excinfo:
+            await synthesis(_state(), _config())
+
+        assert excinfo.value.kind == "synthesis_digest"
+        assert excinfo.value.failure == "non_retryable"  # 无 last_error 形态
+        assert tokens == [excinfo.value.answer_md]

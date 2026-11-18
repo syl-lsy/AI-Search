@@ -25,7 +25,7 @@ from typing import Any
 import psycopg2
 import pytest
 
-from app.agent.nodes.synthesis import SynthesisError
+from app.agent.nodes.synthesis import SynthesisFallback
 from app.core.config import common_settings
 from app.services.event_bus import SseEvent
 from app.services.turn_service import seed_seq_from_db
@@ -270,14 +270,25 @@ async def test_regenerate_failure_degrades_and_can_retry(
     b2_rest: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """再失败 → error(500101)+done(degraded)（sources 保留）；随后可再次 regenerate 成功。"""
+    """v1.59 增量 A：再失败 → 兜底产出收束（零 error、answer_md 落库、status=degraded）；
+    随后可再次 regenerate 成功。"""
     monkeypatch.setattr(
-        stub_flow, "FAKE_REGENERATE_ERROR", SynthesisError("综合生成失败（重试耗尽）")
+        stub_flow,
+        "FAKE_REGENERATE_ERROR",
+        SynthesisFallback(
+            answer_md="【来源速览】综合回答未能完成（生成超时或失败）……",
+            kind="synthesis_digest",
+            failure="timeout",
+            attempts=2,
+            source_count=2,
+        ),
     )
     response = await async_client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
     assert response.status_code == 200
     detail = await b2_rest.wait_turn_status(str(_TURN_ID), {"degraded"})
-    assert detail["error"]["code"] == "500101"
+    assert detail["error"] is None  # 兜底轮无错误卡（零 error 事件）
+    assert detail["degraded_reason"] is None
+    assert detail["answer_md"].startswith("【来源速览】")  # 兜底全文持久化
     assert len(detail["sources"]) == 2
     assert detail["duration_ms"] == _DURATION_MS
 

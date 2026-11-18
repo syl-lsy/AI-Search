@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from app.agent.nodes.synthesis import SynthesisError
+from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
 from app.agent.tools.registry import SearchChain
 from app.config_center.cache import AssetSnapshot
 from app.db.models import Source, Thread, Turn, TurnEvent, TurnFeedback
@@ -384,7 +384,9 @@ async def test_execute_regenerate_success_merges_stages_and_replaces_answer() ->
 
 
 async def test_execute_regenerate_failure_degrades_with_500101() -> None:
-    """再失败 → error(500101) + done(degraded)，sources 保留（可再次 regenerate）。"""
+    """**防御分支**（节点契约外形态）：SynthesisError 带 sources 时仍 error(500101)+
+    done(degraded)。v1.59 起真实再失败走 SynthesisFallback 兜底（上一用例），本路径
+    仅防节点契约被破坏时轮永卡 running 的兜底收尾（500101 实际不可达）。"""
     bus = _bus()
     turn = _turn(status="running")
     session = _RegenSession(turn=turn, sources=[_source(1, "https://a/1")], events=[])
@@ -402,6 +404,36 @@ async def test_execute_regenerate_failure_degrades_with_500101() -> None:
     done = next(e for e in events if e.event_type == "done")
     assert done.data["finish"] == "degraded" and done.data["source_count"] == 1
     assert kinds[-1] == "done"  # 降级收束：error 后跟 done
+
+
+async def test_execute_regenerate_fallback_degrades_without_error() -> None:
+    """v1.59 增量 A：再失败走兜底产出收束（零 error）——status=degraded、
+    answer_md=兜底全文、清旧 error、duration 不覆写、stages 追加。"""
+    bus = _bus()
+    turn = _turn(status="running")
+    turn.error = {"code": "500101", "message": "综合生成失败，请稍后重试", "stage_key": None}
+    session = _RegenSession(turn=turn, sources=[_source(1, "https://a/1")], events=[])
+    fallback = SynthesisFallback(
+        answer_md="部分正文。", kind="synthesis_partial",
+        failure="timeout", attempts=2, source_count=1,
+    )
+    scheduler = _scheduler(session, bus=bus, graph=_FakeRegenGraph(fail=fallback))
+
+    await scheduler.execute_regenerate(_TURN_ID)
+
+    assert turn.status == "degraded"
+    assert turn.answer_md == "部分正文。"  # 部分正文持久化（刷新不丢）
+    assert turn.error is None  # 兜底轮无错误卡（清旧 error）
+    assert turn.degraded_reason is None
+    assert turn.duration_ms == 9000  # regenerate 不覆写
+    events = await _drain_all(bus, _TURN_ID)
+    kinds = [e.event_type for e in events]
+    assert "error" not in kinds  # 零 error 事件
+    done = next(e for e in events if e.event_type == "done")
+    assert done.data["finish"] == "degraded"
+    assert done.data["degraded"] is True
+    assert done.data["degraded_reason"] is None
+    assert done.data["source_count"] == 1
 
 
 async def test_execute_regenerate_canceled_before_start() -> None:

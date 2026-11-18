@@ -10,6 +10,10 @@ dict 信号；TurnRunner 统一 `main_graph.astream(stream_mode=["messages","upd
 - `images`  → SSE `images` 事件 + turn_events 落库（A6，REQ-004——轮内至多一次、
   ≤3 张（OQ-6）、无图不发；条目 url 恒在、其余键可省——api.md v1.12）；
 - `token`   → SSE `token` 事件，**不落库**（ADR-003 第 4 条）；
+  【v1.59 注】`token` 为 B2 深桩期的 custom 增量形态（TurnRunner 未接线，保持原样——
+  深桩 write 答案经 updates 回填，custom token 丢弃不影响终态，test_r14 锁死）；
+- `fallback_token` → SSE `token` 事件（**v1.59 增量 A**：synthesis digest 整块机械
+  兜底——单事件承载完整来源速览 markdown；与 `token` 分开是为不改动深桩期既有行为）；
 - `context_compact` → SSE `context_compact` 事件（api.md §7.2 v1.3，**仅 deep**——
   深度研究上下文压缩通知；**publish-only 不落 turn_events**，压缩观测走 Langfuse；
   断线重放边界语义由 EventBus 内存缓冲重放承担；触发面归批次 3/4
@@ -29,6 +33,9 @@ STAGE = "stage"
 SOURCES = "sources"
 IMAGES = "images"
 TOKEN = "token"
+#: synthesis 兜底 digest 整块 token（v1.59 增量 A）——与深桩期 `token` 分型：前者接线
+#: 为 SSE token 事件，后者维持「custom token 丢弃」既有行为（零外部行为变化）
+FALLBACK_TOKEN = "fallback_token"
 CONTEXT_COMPACT = "context_compact"
 
 
@@ -74,6 +81,16 @@ def emit_images(images: list[dict[str, Any]]) -> None:
 def emit_token(delta: str) -> None:
     """发射 token 信号（Markdown 增量片段，直接拼接渲染；不入 turn_events）。"""
     get_stream_writer()({"type": TOKEN, "delta": delta})
+
+
+def emit_fallback_token(delta: str) -> None:
+    """发射 digest 整块 token 信号（v1.59 增量 A，api.md §7.2 v1.25 token 注）。
+
+    与 `emit_token`（深桩期 custom 增量、TurnRunner 未接线）分型：本类型由 TurnRunner
+    `_translate_custom` 映射为 SSE `token` 事件（publish-only，不落 turn_events），
+    **单个事件承载完整来源速览 markdown**——前端既有拼接渲染零新路径。
+    """
+    get_stream_writer()({"type": FALLBACK_TOKEN, "delta": delta})
 
 
 def emit_context_compact(

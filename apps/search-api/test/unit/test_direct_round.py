@@ -113,7 +113,7 @@ def _install_models(
     model = _FakeStreamChatModel(
         pieces=synth_pieces if synth_pieces is not None else ["你好！", "我可以帮你联网搜索或做深度研究。"]
     )
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
 
 
 def _scheduler(bus: EventBus, session: _FakeSession, registry: Any) -> Any:

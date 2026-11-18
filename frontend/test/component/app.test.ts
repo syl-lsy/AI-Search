@@ -264,6 +264,57 @@ describe('侧栏最近项管理动作（REQ-059：ThreadActionMenu 共用组件�
   })
 })
 
+describe('侧栏最近项激活高亮（当前浏览中的会话行：RouterLink 自动 router-link-active 类挂载点）', () => {
+  beforeEach(async () => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+    installDefaultGetMock()
+    i18n.global.locale.value = 'zh-CN'
+    await router.push('/')
+    await flushPromises()
+  })
+
+  it('停留在 /thread/{id}：对应最近行链接携带 router-link-active，其他行不带', async () => {
+    const app = await mountApp()
+    await router.push(`/thread/${THREAD_ID_FAST}`)
+    await flushPromises()
+    const linkOf = (id: string) => app.find(`[data-testid="sb-recent-row-${id}"] .sb-recent`)
+    expect(linkOf(THREAD_ID_FAST).classes()).toContain('router-link-active')
+    const otherId = threadListFixture.items[1]!.thread_id
+    expect(linkOf(otherId).classes()).not.toContain('router-link-active')
+    app.unmount()
+  })
+
+  it('首页（/）：无任何最近行携带激活类（激活=当前所处会话，非当前路由零误亮）', async () => {
+    const app = await mountApp()
+    expect(app.findAll('.sb-recent.router-link-active')).toHaveLength(0)
+    app.unmount()
+  })
+
+  it('置顶分区行同样携带激活类（置顶/最近两分区共用 .sb-recent——高亮选择器挂载点通用）', async () => {
+    mockedGet.mockReset()
+    mockedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/models') return modelsFixture
+      if (url === '/api/v1/threads') {
+        return {
+          total: threadListFixture.items.length,
+          items: [{ ...threadListFixture.items[0]!, pinned: true }, threadListFixture.items[1]!, threadListFixture.items[2]!],
+        }
+      }
+      throw new Error(`unexpected GET ${url}`)
+    })
+    const app = await mountApp()
+    await router.push(`/thread/${THREAD_ID_FAST}`)
+    await flushPromises()
+    // 置顶项（THREAD_ID_FAST）在置顶分区（sb-pinned-row）——同样命中 router-link-active
+    expect(app.find(`[data-testid="sb-pinned-row-${THREAD_ID_FAST}"] .sb-recent`).classes()).toContain('router-link-active')
+    const unpinnedId = threadListFixture.items[1]!.thread_id
+    expect(app.find(`[data-testid="sb-recent-row-${unpinnedId}"] .sb-recent`).classes()).not.toContain('router-link-active')
+    app.unmount()
+  })
+})
+
 describe('侧栏图标区三改（修复项⑧：删铃铛 / 放大镜=命令面板 / 折叠桌面语义）', () => {
   beforeEach(() => installDefaultGetMock())
   /** Teleport 到 body 的内容经 document 查询（wrapper.find 不穿 Teleport） */

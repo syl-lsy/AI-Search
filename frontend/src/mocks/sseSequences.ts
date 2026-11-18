@@ -6,7 +6,18 @@
  * 注意（§7.1）：心跳 `: ping` 为注释行，不占 seq，不出现在本 fixture。
  */
 import type { SseWireEvent } from '@/types/api'
-import { THREAD_ID_FAST, TURN_ID_DEEP, TURN_ID_DIRECT, TURN_ID_FAST } from './turnDetails'
+import {
+  POLITICS_REFUSAL_MESSAGE,
+  THREAD_ID_FAST,
+  TURN_ID_DEEP,
+  TURN_ID_DIRECT,
+  TURN_ID_FALLBACK_DIGEST,
+  TURN_ID_FALLBACK_PARTIAL,
+  TURN_ID_FAST,
+  TURN_ID_POLITICS,
+  turnDetailFallbackDigestDegraded,
+  turnDetailFallbackPartialDegraded,
+} from './turnDetails'
 
 /**
  * 快速模式序列（api.md §7.4）：
@@ -92,3 +103,67 @@ export const directFollowupsEvent: SseWireEvent = {
 
 /** 序列归属线程（fixture 自描述：THREAD_ID_FAST 也承载 deep/direct 轮的 thread_id） */
 export const SSE_SEQUENCE_THREAD_ID = THREAD_ID_FAST
+
+/**
+ * B14 兜底收束轮（digest 形态）序列（api.md §7.4 v1.25 兜底收束形态 / PRD A51 GWT①，
+ * §9 v1.29 fixture——B14 测试资产增补批）：
+ * synthesis 终局失败且 fused 非空、零可用正文 → 来源速览兜底：
+ * stage(rewrite,running→done) → stage(search,running) → sources(batch 6) → images（可选形态）
+ * → stage(search,done) → stage(write,running) → **token 单事件整块**（digest 全文 markdown：
+ * 说明行 + 前 5 条 [n] 来源行 + 「其余见来源面板」尾注——[n] 与 sources 卡编号对齐）
+ * → stage(write,done,extra={"fallback":"synthesis_digest"}) 留痕
+ * → done(finish=degraded, degraded=true, degraded_reason=null, source_count=6)。
+ * **零 error 事件**（「超时不能报错收束，必须有兜底产出」2026-11-18 裁决①；
+ * degraded_reason=null 不属三枚举任一语义，枚举零扩容）。
+ */
+export const fallbackDigestSequence: SseWireEvent[] = [
+  { id: 1, event: 'stage', data: { seq: 1, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' } },
+  { id: 2, event: 'stage', data: { seq: 2, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:01Z', stage_key: 'rewrite', status: 'done' } },
+  { id: 3, event: 'stage', data: { seq: 3, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:01Z', stage_key: 'search', status: 'running', label: '并行搜索 3 个查询', progress: { current: 1, total: 3 }, detail: 'SearXNG 0/3 · Tavily 0/3' } },
+  { id: 4, event: 'sources', data: { seq: 4, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:04Z', batch: turnDetailFallbackDigestDegraded.sources, total: 6 } },
+  { id: 5, event: 'images', data: { seq: 5, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:04Z', images: [{ url: 'https://example.com/nobel-2026-laureates.png' }] } },
+  { id: 6, event: 'stage', data: { seq: 6, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:05Z', stage_key: 'search', status: 'done' } },
+  { id: 7, event: 'stage', data: { seq: 7, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:00:05Z', stage_key: 'write', status: 'running', label: '综合中' } },
+  // digest 单事件整块 token（api.md §7.4 v1.25——前端既有 answer_md += delta 拼接路径零改动）
+  { id: 8, event: 'token', data: { seq: 8, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:01:05Z', delta: turnDetailFallbackDigestDegraded.answer_md } },
+  { id: 9, event: 'stage', data: { seq: 9, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:01:05Z', stage_key: 'write', status: 'done', extra: { fallback: 'synthesis_digest' } } },
+  { id: 10, event: 'done', data: { seq: 10, turn_id: TURN_ID_FALLBACK_DIGEST, ts: '2026-11-18T09:01:05Z', finish: 'degraded', degraded: true, degraded_reason: null, duration_ms: 60210, source_count: 6, usage: { total_tokens: 7412, cost_usd: 0.0071 } } },
+]
+
+/**
+ * B14 兜底收束轮（partial 形态）序列（api.md §7.4 v1.25 / PRD A51 GWT②）：
+ * 正常 token 流中断（部分正文 ≥1 完整句子）→ 句末截断收束：
+ * stage(rewrite,running→done) → stage(search,running) → sources(batch 3) → stage(search,done)
+ * → stage(write,running) → token…token（部分流）→ 【流中断，无更多 delta】
+ * → stage(write,done,extra={"fallback":"synthesis_partial"}) 留痕
+ * → done(finish=degraded, degraded=true, degraded_reason=null, source_count=3)。
+ * token 拼接 = 2.5 answer_md（句末标点截断形态——残句不呈现、无伪造补全，fixture 互洽）。
+ */
+export const fallbackPartialSequence: SseWireEvent[] = [
+  { id: 1, event: 'stage', data: { seq: 1, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' } },
+  { id: 2, event: 'stage', data: { seq: 2, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:01Z', stage_key: 'rewrite', status: 'done' } },
+  { id: 3, event: 'stage', data: { seq: 3, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:01Z', stage_key: 'search', status: 'running', label: '并行搜索 3 个查询', progress: { current: 1, total: 3 } } },
+  { id: 4, event: 'sources', data: { seq: 4, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:04Z', batch: turnDetailFallbackPartialDegraded.sources, total: 3 } },
+  { id: 5, event: 'stage', data: { seq: 5, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:04Z', stage_key: 'search', status: 'done' } },
+  { id: 6, event: 'stage', data: { seq: 6, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:04Z', stage_key: 'write', status: 'running', label: '综合中' } },
+  { id: 7, event: 'token', data: { seq: 7, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:20Z', delta: '量子计算的主要工程瓶颈集中在**物理层纠错**：' } },
+  { id: 8, event: 'token', data: { seq: 8, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:32Z', delta: '目前超导与离子阱两条路线的逻辑量子比特错误率仍远高于实用阈值，' } },
+  { id: 9, event: 'token', data: { seq: 9, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:44Z', delta: '需要数千个物理量子比特冗余编码单个逻辑量子比特，相干时间与控制精度相互制约 [1]。' } },
+  // 【中断】无更多 token——部分正文止于句末标点（合成收束，非客户端断流语义）
+  { id: 10, event: 'stage', data: { seq: 10, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:45Z', stage_key: 'write', status: 'done', extra: { fallback: 'synthesis_partial' } } },
+  { id: 11, event: 'done', data: { seq: 11, turn_id: TURN_ID_FALLBACK_PARTIAL, ts: '2026-11-18T09:10:45Z', finish: 'degraded', degraded: true, degraded_reason: null, duration_ms: 41230, source_count: 3, usage: { total_tokens: 7008, cost_usd: 0.0067 } } },
+]
+
+/**
+ * B14 politics 拒答轮序列（api.md §7.4 v1.25 增量 B / PRD A50 第九条 GWT）：
+ * 涉政敏感话题（politics 词表硬命中）→ 拒答轮即安全拒绝轮（B13 同款收口形态，
+ * Layer 1 pre_route 拦截——全程零搜索零综合）：
+ * stage(rewrite,running) → stage(rewrite,failed,extra={"safety":"politics","layer":"pre_route"})
+ * → error(403002, message=中性引导话术) → **无 done**（api.md §7.1 v1.10 例外条：无部分内容
+ * error 后服务端直接关闭）。extra.safety 值域 politics 为 v1.25 扩容（privacy v1.24 先例）。
+ */
+export const politicsRefusalSequence: SseWireEvent[] = [
+  { id: 1, event: 'stage', data: { seq: 1, turn_id: TURN_ID_POLITICS, ts: '2026-11-18T09:20:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' } },
+  { id: 2, event: 'stage', data: { seq: 2, turn_id: TURN_ID_POLITICS, ts: '2026-11-18T09:20:00Z', stage_key: 'rewrite', status: 'failed', extra: { safety: 'politics', layer: 'pre_route' } } },
+  { id: 3, event: 'error', data: { seq: 3, turn_id: TURN_ID_POLITICS, ts: '2026-11-18T09:20:00Z', code: '403002', message: POLITICS_REFUSAL_MESSAGE, stage_key: 'rewrite' } },
+]

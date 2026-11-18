@@ -475,14 +475,18 @@ class TestConnectionRetryNode:
     """§3 v1.24（B11 P1a）：`retry.connection` 五键——**告警不拒收**（软校验）。"""
 
     def test_defaults_include_connection_node(self):
-        """L4 内置默认含五键连接类节（生产 floor 与运行态同源）。"""
+        """L4 内置默认含五键连接类节（生产 floor 与运行态同源）。
+
+        v1.59 增量 A（B14）：`total_window_s` 20.0 → **60.0**（窗-包络对齐——一次完整
+        包络 60s + 全退避链 15s + 余量；nacos-config.md §3 v1.32）。
+        """
         node = BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["retry"]["connection"]
         assert node == {
             "max_attempts": 5,
             "initial_interval_s": 1.0,
             "backoff_factor": 2.0,
             "max_interval_s": 8.0,
-            "total_window_s": 20.0,
+            "total_window_s": 60.0,
         }
 
     def test_invalid_connection_node_not_rejected(self):
@@ -498,25 +502,50 @@ class TestConnectionRetryNode:
             assert validate_asset(SPEC_DATA_ID, payload) == payload
 
     def test_connection_warnings_cover_invalid_and_linkage(self):
-        """软校验文案：键非法告警 + 联动约束告警（10s + total_window_s + 8s > turn_timeout_s）。"""
+        """软校验文案：键非法告警 + 联动约束告警（10s + total_window_s + 8s > turn_timeout_s）。
+
+        v1.59 值口径（fast.llm_timeout_s=60 / total_window_s=60 / turn_timeout_s=120）：
+        内置默认组合零告警；total_window_s 拉大到 110 触发联动约束③。
+        """
         from app.config_center.validator import connection_retry_warnings
 
         assert connection_retry_warnings(
             {"retry": {"connection": BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["retry"]["connection"]},
-             "turn_timeout_s": 60}
+             "llm_timeout_s": 60, "turn_timeout_s": 120}
         ) == []
 
         invalid = connection_retry_warnings({"retry": {"connection": {"max_attempts": 0}},
-                                            "turn_timeout_s": 60})
+                                            "llm_timeout_s": 60, "turn_timeout_s": 120})
         assert len(invalid) == 1 and "回落 retry 主节" in invalid[0]
 
         relaxed = connection_retry_warnings(
             {"retry": {"connection": {
                 "max_attempts": 5, "initial_interval_s": 1.0, "backoff_factor": 2.0,
-                "max_interval_s": 8.0, "total_window_s": 45.0,
-            }}, "turn_timeout_s": 60}
+                "max_interval_s": 8.0, "total_window_s": 110.0,
+            }}, "llm_timeout_s": 60, "turn_timeout_s": 120}
         )
         assert len(relaxed) == 1 and "turn_timeout_s" in relaxed[0]
+
+    def test_connection_window_smaller_than_envelope_warns(self):
+        """软校验④（v1.59，trace 89043f23 事故形态）：total_window_s < llm_timeout_s →
+        WARN 不拒收——窗小于包络时首个重试决策点即被窗闸饿死（max_attempts 名实不符）。"""
+        from app.config_center.validator import connection_retry_warnings
+
+        warnings = connection_retry_warnings(
+            {"retry": {"connection": {
+                "max_attempts": 5, "initial_interval_s": 1.0, "backoff_factor": 2.0,
+                "max_interval_s": 8.0, "total_window_s": 30.0,
+            }}, "llm_timeout_s": 60, "turn_timeout_s": 120}
+        )
+        assert len(warnings) == 1
+        assert "total_window_s" in warnings[0] and "llm_timeout_s" in warnings[0]
+
+        # 软校验不拒收：整份 payload 仍可发布（运行期整节可用）
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["fast"]["retry"]["connection"].update({"total_window_s": 30.0}),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
 
     def test_missing_connection_node_is_silent(self):
         """节缺失 = 现状行为：零告警零拒收（回退门 = 单键热更删节）。"""
@@ -668,16 +697,17 @@ class TestSafetySpecRules:
         assert validate_asset(SPEC_DATA_ID, payload) == payload
 
     def test_defaults_seed_safety_section_conservative(self):
-        """L4 种子：enabled=False（契约灰度初值——nacos-config.md §3/§8 v1.30「初值
-        enabled=false 灰度，A50 验收后用户裁决开启」）+ mode=hybrid + 三表齐备且保守
-        （danger/profanity/privacy；宁可漏不可误）；grey_rules 均可编译且非灾难性
-        回溯形态。"""
+        """L4 种子：enabled=True（v1.59 增量 B 裁决④「全类别生效」——nacos-config.md §3
+        v1.32；kill switch 单键回退门保留）+ mode=hybrid + 三表齐备且保守
+        （danger/profanity/privacy；宁可漏不可误）+ politics_terms 初值空数组（词表内容
+        用户自填、AI 零生成）+ grey_rules 均可编译且非灾难性回溯形态。"""
         safety = BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]
-        assert safety["enabled"] is False
+        assert safety["enabled"] is True
         assert safety["mode"] == "hybrid"
         assert 0 < len(safety["danger_terms"]) <= 200
         assert 0 < len(safety["profanity_terms"]) <= 200
         assert 0 < len(safety["privacy_terms"]) <= 200
+        assert safety["politics_terms"] == []  # v1.32：初值空数组（用户 Nacos 控制台自填）
         assert 0 < len(safety["grey_rules"]) <= 50
         for rule in safety["grey_rules"]:
             re.compile(rule)  # 不抛即合法
@@ -705,7 +735,9 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
+    @pytest.mark.parametrize(
+        "field", ["danger_terms", "profanity_terms", "privacy_terms", "politics_terms"]
+    )
     def test_term_lexicon_over_200_rejected(self, field):
         payload = _mutated(
             SPEC_DATA_ID, lambda p, f=field: p["safety"].update({f: ["词"] * 201})
@@ -713,7 +745,9 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
+    @pytest.mark.parametrize(
+        "field", ["danger_terms", "profanity_terms", "privacy_terms", "politics_terms"]
+    )
     def test_term_entry_empty_rejected(self, field):
         payload = _mutated(
             SPEC_DATA_ID, lambda p, f=field: p["safety"][f].append("")
@@ -721,7 +755,9 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
+    @pytest.mark.parametrize(
+        "field", ["danger_terms", "profanity_terms", "privacy_terms", "politics_terms"]
+    )
     def test_term_entry_over_64_chars_rejected(self, field):
         """§3 校验规则 v1.30：词表单条 ≤64 字符（越界拒收）。"""
         payload = _mutated(
@@ -730,18 +766,26 @@ class TestSafetySpecRules:
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    @pytest.mark.parametrize("field", ["danger_terms", "profanity_terms", "privacy_terms"])
+    @pytest.mark.parametrize(
+        "field", ["danger_terms", "profanity_terms", "privacy_terms", "politics_terms"]
+    )
     def test_term_entry_duplicated_rejected(self, field):
-        """§3 校验规则 v1.30：词表条目去重（重复条目拒收）。"""
+        """§3 校验规则 v1.30：词表条目去重（重复条目拒收）；politics_terms 初值空表
+        （v1.32）→ 先播种再重复。"""
         payload = _mutated(
-            SPEC_DATA_ID, lambda p, f=field: p["safety"][f].append(p["safety"][f][0])
+            SPEC_DATA_ID,
+            lambda p, f=field: (
+                p["safety"][f].append(p["safety"][f][0])
+                if p["safety"][f]
+                else p["safety"].update({f: ["涉政词条", "涉政词条"]})
+            ),
         )
         with pytest.raises(AssetValidationError):
             validate_asset(SPEC_DATA_ID, payload)
 
-    def test_enabled_true_empty_lexicons_rejected(self):
-        """§3 校验规则 v1.31：enabled=true 时三词表（danger/profanity/privacy）
-        至少其一非空（空词表开启=矛盾）。"""
+    def test_politics_terms_only_lexicon_accepted_and_usable(self):
+        """v1.32 四表口径：politics_terms 非空即满足「至少其一非空」，且条目规则同
+        danger_terms（≤200 / 非空 ≤64 / 去重）。"""
         payload = _mutated(
             SPEC_DATA_ID,
             lambda p: p["safety"].update(
@@ -750,6 +794,24 @@ class TestSafetySpecRules:
                     "danger_terms": [],
                     "profanity_terms": [],
                     "privacy_terms": [],
+                    "politics_terms": ["涉政词条甲", "涉政词条乙"],
+                }
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_enabled_true_empty_lexicons_rejected(self):
+        """§3 校验规则 v1.32：enabled=true 时四词表（danger/profanity/privacy/
+        politics）至少其一非空（空词表开启=矛盾）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"].update(
+                {
+                    "enabled": True,
+                    "danger_terms": [],
+                    "profanity_terms": [],
+                    "privacy_terms": [],
+                    "politics_terms": [],
                 }
             ),
         )
@@ -757,7 +819,7 @@ class TestSafetySpecRules:
             validate_asset(SPEC_DATA_ID, payload)
 
     def test_enabled_true_privacy_only_lexicon_accepted(self):
-        """v1.31 三表口径：仅 privacy_terms 非空也满足「至少其一非空」。"""
+        """v1.32 四表口径：仅 privacy_terms 非空也满足「至少其一非空」。"""
         payload = _mutated(
             SPEC_DATA_ID,
             lambda p: p["safety"].update(
@@ -766,6 +828,7 @@ class TestSafetySpecRules:
                     "danger_terms": [],
                     "profanity_terms": [],
                     "privacy_terms": ["人肉搜索"],
+                    "politics_terms": [],
                 }
             ),
         )
@@ -899,9 +962,11 @@ class TestSafetyTokenSoftCheck:
         prompts = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]
         assert safety_token_warnings(prompts) == []
 
-    def test_safety_token_carries_four_values(self):
-        """v1.31 四值枚举：token 精确形态含 privacy（软校验锚点即契约面）。"""
-        assert SAFETY_FIELD_TOKEN == '"safety":"none|danger|profanity|privacy"'
+    def test_safety_token_carries_five_values(self):
+        """v1.32 五值枚举：token 精确形态含 privacy|politics（软校验锚点即契约面）。"""
+        assert SAFETY_FIELD_TOKEN == (
+            '"safety":"none|danger|profanity|privacy|politics"'
+        )
         for key in ("fast.rewrite", "deep.planner"):
             assert SAFETY_FIELD_TOKEN in BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"][key]
 
@@ -948,3 +1013,112 @@ class TestSafetyTokenSoftCheck:
         """键缺失不告警（回落内置默认由既有键级告警通道覆盖，不重复计数）。"""
         assert safety_token_warnings({}) == []
         assert safety_token_warnings({"fast.rewrite": 123}) == []  # 非字符串形态不碰
+
+
+class TestThinkingSpec:
+    """§3 v1.32（B14 增量 C）：`fast.thinking` / `deep.thinking` —— 枚举 on|off，
+    键缺失合法（pydantic 默认值承载代码缺省 fast=off / deep=on），非法值拒收。"""
+
+    def test_defaults_carry_mode_thinking(self):
+        fast = BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]
+        deep = BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]
+        assert fast["thinking"] == "off"  # 裁决值：快速模式不开思考
+        assert deep["thinking"] == "on"  # 裁决值：深度模式开思考
+
+    @pytest.mark.parametrize("mode, value", [("fast", "on"), ("fast", "off"),
+                                             ("deep", "on"), ("deep", "off")])
+    def test_valid_thinking_values_accepted(self, mode, value):
+        payload = _mutated(SPEC_DATA_ID, lambda p: p[mode].update({"thinking": value}))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    @pytest.mark.parametrize("mode, expected", [("fast", "off"), ("deep", "on")])
+    def test_missing_thinking_key_legal_with_mode_default(self, mode, expected):
+        """键缺失合法（旧 spec 可过校验）：默认值承载裁决值 fast=off / deep=on。"""
+        from app.config_center.validator import DeepSpec, FastSpec
+
+        payload = _mutated(SPEC_DATA_ID, lambda p: p[mode].pop("thinking"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+        model_cls = FastSpec if mode == "fast" else DeepSpec
+        assert getattr(model_cls.model_validate(payload[mode]), "thinking") == expected
+
+    @pytest.mark.parametrize("value", ["auto", "true", True, 1, ""])
+    def test_invalid_thinking_value_rejected(self, value):
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["fast"].update({"thinking": value}))
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+
+class TestPoliticsCategory:
+    """§3 v1.32（B14 增量 B）：politics 类别——拒答话术第四段 + safety 枚举五值。"""
+
+    def test_safety_reply_politics_prefix_is_fourth_segment(self):
+        from app.config_center.validator import SAFETY_REPLY_CATEGORY_PREFIXES
+
+        assert set(SAFETY_REPLY_CATEGORY_PREFIXES) == {
+            "danger", "profanity", "privacy", "politics"
+        }
+        assert SAFETY_REPLY_CATEGORY_PREFIXES["politics"] == "- 涉政话题回复段："
+
+    def test_safety_reply_missing_politics_segment_rejected(self):
+        """四段任一缺失即拒收（拒答话术行级锚点缺失=该类别话术失锚）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "common.safety_reply": p["prompts"]["common.safety_reply"].replace(
+                        "- 涉政话题回复段：", "- 其它回复段："
+                    )
+                }
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="涉政话题回复段"):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_safety_field_token_is_five_values(self):
+        """safety 字段枚举五值（none|danger|profanity|privacy|politics）——软校验 token
+        与内置默认同源；planner/rewrite 双键均在场。"""
+        assert SAFETY_FIELD_TOKEN == '"safety":"none|danger|profanity|privacy|politics"'
+        for key in ("fast.rewrite", "deep.planner"):
+            assert SAFETY_FIELD_TOKEN in BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"][key]
+
+
+class TestContractLexiconAlignment:
+    """第⑩件（v1.30 遗留漂移收口）：代码内置词表初值逐表对齐契约 §3 示例值。
+
+    契约侧为准（2026-11-18 用户裁决）——danger/profanity/grey_rules 三表与旧内置种子
+    存在出入；本批三源（.txt/defaults.py/nacos_init.py）一并按契约示例值落位。
+    """
+
+    def test_danger_terms_match_contract_example(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["danger_terms"] == [
+            "制造炸弹", "合成毒品", "生物武器", "制爆教程",
+        ]
+
+    def test_profanity_terms_match_contract_example(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["profanity_terms"] == [
+            "傻逼", "滚蛋", "废物东西",
+        ]
+
+    def test_privacy_terms_match_contract_example(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["privacy_terms"] == [
+            "人肉搜索", "开盒挂人", "查开房记录",
+        ]
+
+    def test_grey_rules_match_contract_example(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["grey_rules"] == [
+            "how\\s+to\\s+(make|build)\\s+(a\\s+)?(bomb|explosive|weapon)",
+            "(教|教我).{0,6}(制毒|制爆)",
+            "kill\\s+(myself|oneself)\\s+how",
+            "(查|帮我查).{0,8}(住址|身份证号|开房记录|定位|行踪|轨迹)",
+            "(帮忙|帮我).{0,6}(找人|查人)",
+        ]
+
+
+class TestFastLlmTimeout:
+    """§3 v1.32（B14 增量 A 裁决①）：fast.llm_timeout_s 30 → 60（全节点共享键）。"""
+
+    def test_fast_llm_timeout_default_is_60(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["llm_timeout_s"] == 60
+
+    def test_deep_llm_timeout_stays_60(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]["llm_timeout_s"] == 60

@@ -139,8 +139,8 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
                 yield AIMessageChunk(content=piece)
 
     monkeypatch.setattr(rewrite_module, "build_light_model", lambda mapping: _RewriteModel())
-    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias: _PlannerModel())
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: _SynthModel())
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: _SynthModel())
 
 
 def _warnings(log_records: list[dict[str, Any]]) -> list[dict[str, Any]]:

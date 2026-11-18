@@ -9,8 +9,11 @@ think:false / temperature=0，批次 8 A 裁决），保持既有落位不动。
 - `resolve_chat_alias`：chat 别名解析——state `chat_model_key` → 轮内映射快照
   `chat.options`（OQ-11 同源：轮内不重读，热更只对后续轮生效），缺省回落
   `chat.default`，全缺回落内置 MODEL_MAPPING_CONFIG 兜底；
+- `resolve_thinking`：模式级思考档位（`spec.<mode>.thinking`，枚举 on|off）——键缺失/
+  非法回落裁决值 **fast=off / deep=on**（nacos-config.md §3 v1.32）；
 - `build_chat_model`：chat 强模型实例（openai_reasoning provider + LiteLLM 网关），
-  `stream_usage=True`（M2 批次 1 usage 方案 A，docs/m2-usage-probe-batch0.md §4）。
+  `stream_usage=True`（M2 批次 1 usage 方案 A，docs/m2-usage-probe-batch0.md §4）；
+  `thinking` 档位按模式注入 extra_body（v1.59 增量 C，ARCH §6.7）。
 """
 
 from collections.abc import Mapping
@@ -22,7 +25,41 @@ from pydantic import SecretStr
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
 
-__all__ = ["build_chat_model", "resolve_chat_alias"]
+__all__ = [
+    "OFF_THINKING_EXTRA_BODY",
+    "THINKING_MODES",
+    "build_chat_model",
+    "off_thinking_extra_body",
+    "resolve_chat_alias",
+    "resolve_thinking",
+]
+
+#: 思考档位枚举（nacos-config.md §3 v1.32；validator FastSpec/DeepSpec Literal 同源）
+THINKING_MODES: tuple[str, ...] = ("on", "off")
+
+#: 键缺失/非法的档位回落（裁决值：快速模式不开思考 / 深度模式开思考——ARCH §6.7 v1.59）
+_DEFAULT_THINKING: dict[str, str] = {"fast": "off", "deep": "on"}
+
+#: **off 档禁用键组**（三模型腿逐腿形态，2026-11-18 网关探针钉死——
+#: `scripts/probe_thinking_mode_params.py` 实测留档）：
+#:
+#: - `enable_thinking: false`：百炼 qwen 腿（批次 9 专项①已钉形态，DashScope 生效）；
+#: - `reasoning_effort: "low"`：智谱 GLM 腿最低档——GLM 无法完全关思考（网关错误信息
+#:   实证档位词 low/high/max 存在）；探针：flash 腿 reasoning 2020→0 字符、standard 腿
+#:   high/max 分别 1138/1644 字符而 low 恒 0——键活且 low 为最低档。该键名不在 B13
+#:   网关剥离钩子清单（钩子只剥 enable_thinking/think），high 档能触发思考即证未被剥；
+#: - `extra_body: {"thinking": {"type": "disabled"}}`：DeepSeek 腿禁思考——**必须嵌套在
+#:   LiteLLM 的 provider 级 extra_body 才透传**（顶层 `thinking` 被 LiteLLM 丢弃，探针
+#:   实证仍出 131~174 字符思考流）；嵌套形态 reasoning 归零。`thinking.type="off"` 触发
+#:   上游 500，禁用该取值。
+#:
+#: on 档 = **零禁用键注入**（=v1.58 后现状）；本键只管「开关」不管「深度」——on 档 GLM
+#: 走模型默认思考深度（如实钉注）。light 路径（rewrite/safety/followups）不经本键。
+OFF_THINKING_EXTRA_BODY: dict[str, Any] = {
+    "enable_thinking": False,
+    "reasoning_effort": "low",
+    "extra_body": {"thinking": {"type": "disabled"}},
+}
 
 
 def resolve_chat_alias(state: Mapping[str, Any], config: RunnableConfig | None) -> str:
@@ -39,7 +76,32 @@ def resolve_chat_alias(state: Mapping[str, Any], config: RunnableConfig | None) 
     return alias
 
 
-def build_chat_model(alias: str) -> Any:
+def resolve_thinking(spec: Mapping[str, Any] | None, mode: str) -> str:
+    """模式思考档位：`spec.<mode>.thinking` ∈ {on, off}；键缺失/非法回落裁决值。
+
+    回落口径 = fast=off / deep=on（nacos-config.md §3 v1.32「初值与代码缺省=裁决值」）
+    ——validator 拒收非法值之外的第二道防线（Studio 直跑/旧 spec 无键形态），沿
+    guards.llm_timeout_s 先例：guard 不抛、不阻塞主链路。
+    """
+    section = spec.get(mode) if isinstance(spec, Mapping) else None
+    value = section.get("thinking") if isinstance(section, Mapping) else None
+    if isinstance(value, str) and value in THINKING_MODES:
+        return value
+    return _DEFAULT_THINKING.get(mode, "on")
+
+
+def off_thinking_extra_body() -> dict[str, Any]:
+    """off 档禁用键组的独立副本（嵌套 dict 深拷贝——调用方变异不得污染常量）。"""
+    return {
+        "enable_thinking": OFF_THINKING_EXTRA_BODY["enable_thinking"],
+        "reasoning_effort": OFF_THINKING_EXTRA_BODY["reasoning_effort"],
+        "extra_body": {
+            "thinking": dict(OFF_THINKING_EXTRA_BODY["extra_body"]["thinking"])
+        },
+    }
+
+
+def build_chat_model(alias: str, *, thinking: str = "on") -> Any:
     """chat 模型实例：别名经映射解析后的 LiteLLM 别名（Standard/Speed 档）。
 
     import reasoning_chat_model 即注册 openai_reasoning provider（R8）——GLM/DeepSeek
@@ -52,22 +114,22 @@ def build_chat_model(alias: str) -> Any:
     永不填充（done.usage 轮级累计、Langfuse GENERATION usage 同源此缺口）。网关两通道
     （chat-standard / qwen3.5-4b-ollama）流式透传已活体探针实证；非流式调用不受影响。
 
-    `extra_body={"enable_thinking": False}`（专项① 2026-11-13 synthesis 提速）：
-    chat-standard 通道（百炼 qwen3.7-plus，DashScope OpenAI 兼容端点）生效键形态经
-    网关探针钉死——`enable_thinking: false` 流式 delta 零 reasoning_content（1.0~1.7s），
-    rewrite 先例的 `think: false`（ollama 原生形态）被该通道上游忽略（思维链仍在，
-    ~4.3~5.1s ≈ 基线）。仅关思维链不关流式（disable_streaming 为 rewrite 结构化输出
-    通道专属，不外溢）；透传 reasoning_content 的 R8 补丁保持不变——GLM/DeepSeek 等
-    未受该键影响的通道若有思维链仍正常透出。
+    **`thinking` 按模式分档（v1.59 增量 C，ARCH §6.7）**：
+    - `thinking="off"`（fast synthesis / regenerate 微图）→ 注入 `OFF_THINKING_EXTRA_BODY`
+      三腿禁用键组（形态经网关注入探针钉死，见常量注释）；
+    - `thinking="on"`（deep planner/reflect/writer 等）→ **零禁用键注入**（=v1.58 后现状）。
+    任何非 "off" 取值按 on 处理（防御：档位枚举由 validator 与 resolve_thinking 双重收口）。
     """
     import app.utils.reasoning_chat_model  # noqa: F401 —— 注册副作用（幂等）
     from langchain.chat_models import init_chat_model
 
-    return init_chat_model(
-        model=alias,
-        model_provider="openai_reasoning",
-        base_url=str(litellm_settings.base_url),
-        api_key=SecretStr(litellm_settings.api_key.get_secret_value()),
-        stream_usage=True,
-        extra_body={"enable_thinking": False},
-    )
+    kwargs: dict[str, Any] = {
+        "model": alias,
+        "model_provider": "openai_reasoning",
+        "base_url": str(litellm_settings.base_url),
+        "api_key": SecretStr(litellm_settings.api_key.get_secret_value()),
+        "stream_usage": True,
+    }
+    if thinking == "off":
+        kwargs["extra_body"] = off_thinking_extra_body()
+    return init_chat_model(**kwargs)

@@ -65,6 +65,9 @@ const zhCN = {
       timeout: '原因：超时兜底',
       budget: '原因：预算上限',
       source_failure: '原因：搜索源熔断',
+      // degraded_reason=null（B14 兜底收束轮——api.md §7.4 v1.25 digest/partial：不属三枚举任一语义；
+      // 基调沿 frontend-api.md v1.29 钉注②与 api.md §7.4 说明行「回答生成未完成」）
+      none: '原因：回答生成未完成',
     },
     // 内容安全温和卡标题（B13 拒答轮 403002——正文渲染服务端 message 话术，不走词表）
     contentSafetyTitle: '内容安全提示',
@@ -280,6 +283,10 @@ const enUS: typeof zhCN = {
       timeout: 'Reason: timeout fallback',
       budget: 'Reason: budget cap',
       source_failure: 'Reason: search sources exhausted',
+      // degraded_reason=null (B14 fallback-converged turns — api.md §7.4 v1.25 digest/partial:
+      // not covered by any of the three enum values; wording per frontend-api.md v1.29 note ②
+      // and the api.md §7.4 digest lead-in "answer generation incomplete")
+      none: 'Reason: answer generation incomplete',
     },
     // Content safety gentle card title (B13 refusal turns, 403002 — body renders the server message verbatim)
     contentSafetyTitle: 'Content safety notice',

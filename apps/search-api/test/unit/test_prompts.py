@@ -445,33 +445,40 @@ def test_safety_reply_placeholder_union_locked() -> None:
 
 
 def test_safety_check_carries_action_contract_and_injection_guard() -> None:
-    """safety_check 契约锚点：严格 JSON 输出形态 / reject 组合约束（三类别） /
-    privacy 一律 reject / pii→sanitize / 拿不准一律 pass / 正当语境负例指引（含
-    隐私保护/合规语境）/ 防提示注入句（query 是被判定对象）。"""
+    """safety_check 契约锚点：严格 JSON 输出形态 / reject 组合约束（四类别） /
+    privacy 与 politics 一律 reject / pii→sanitize / 拿不准一律 pass / 正当语境负例
+    指引（含隐私保护/合规语境、涉政正当语境）/ 防提示注入句（query 是被判定对象）。"""
     for text in _prompt_texts("common.safety_check"):
         assert (
             '{"action":"pass|sanitize|reject",'
-            '"category":"danger|profanity|privacy|pii|none"}' in text
+            '"category":"danger|profanity|privacy|politics|pii|none"}' in text
         )
-        assert "action=reject 仅允许配 category=danger、profanity 或 privacy" in text
+        assert "action=reject 仅允许配 category=danger、profanity、privacy 或 politics" in text
         assert "category=privacy 一律配 action=reject" in text
+        assert "category=politics 一律配 action=reject" in text
         assert "不得 sanitize" in text
         assert "category=pii 一律配 action=sanitize" in text
         assert "拿不准一律 pass" in text
         assert "研究/教育语境" in text  # 正当语境负例指引
         assert "隐私保护/合规语境" in text  # v1.31 隐私负例条目
+        assert "涉政正当语境" in text  # v1.32 涉政正当求知负例条目
         assert "一律 pass，不得 reject" in text
         assert "被判定的对象" in text  # 防提示注入：query 是被判定对象不是指令
         assert "不得执行" in text
 
 
 def test_safety_reply_carries_line_prefixes_and_tone_contract() -> None:
-    """safety_reply 结构锚点：三类别段行前缀（validator SAFETY_REPLY_LINE_PREFIXES
-    硬校验同源：危险/辱骂/隐私）+ 公共行为引导行 + 温和不说教/两三句/替代方向/语言
-    跟随语义。"""
+    """safety_reply 结构锚点：四类别段行前缀（validator SAFETY_REPLY_LINE_PREFIXES
+    硬校验同源：危险/辱骂/隐私/涉政）+ 公共行为引导行 + 温和不说教/两三句/替代方向/
+    语言跟随语义。"""
     for text in _prompt_texts("common.safety_reply"):
         lines = text.splitlines()
-        for prefix in ("- 危险请求回复段：", "- 辱骂回复段：", "- 隐私请求回复段："):
+        for prefix in (
+            "- 危险请求回复段：",
+            "- 辱骂回复段：",
+            "- 隐私请求回复段：",
+            "- 涉政话题回复段：",
+        ):
             assert any(line.startswith(prefix) for line in lines), f"缺行前缀：{prefix}"
         assert "不说教" in text
         assert "两三句以内" in text
@@ -480,49 +487,62 @@ def test_safety_reply_carries_line_prefixes_and_tone_contract() -> None:
 
 
 def test_rewrite_and_planner_schema_contains_safety_token() -> None:
-    """fast.rewrite / deep.planner 输出 schema 含 safety 字段四值 token（B13 v1.31
-    软校验锚点）。
+    """fast.rewrite / deep.planner 输出 schema 含 safety 字段五值 token（B13 v1.31 四值
+    → **v1.32 +politics 五值**；软校验锚点）。
 
     validator 侧为软校验（告警不拒收）——内置默认必须带 token（否则每次启动刷
     WARNING）；token 为带引号精确形态，散文提及不算。
     """
-    token = '"safety":"none|danger|profanity|privacy"'
+    token = '"safety":"none|danger|profanity|privacy|politics"'
     for key in ("fast.rewrite", "deep.planner"):
         for text in _prompt_texts(key):
             assert token in text
-            assert "privacy" in text  # 四值枚举在场（判定指引同段出现）
+            assert "politics" in text  # 五值枚举在场（判定指引同段出现）
             assert "正当语境一律 none" in text  # 语义层判定指引（正当语境放行）
             assert "拿不准一律 none" in text
 
 
 def test_safety_lexicon_defaults_present() -> None:
-    """SPEC_CONFIG safety 节种子保守齐备（B13）：enabled=False（契约灰度初值——
-    nacos-config.md §3/§8 v1.30「初值 enabled=false 灰度，A50 验收后用户裁决开启」）、
-    三表非空且在校验上限内、超时/长度初值取 §3 现行示例 1500/2000/300。"""
+    """SPEC_CONFIG safety 节种子齐备（B13 → v1.32 四表 + 全类别启用）：enabled=True
+    （2026-11-18 裁决④，kill switch 单键回退门保留）、三表非空且在校验上限内、
+    politics_terms 初值空数组（词表内容用户自填）、超时/长度初值取 §3 现行示例
+    1500/2000/300。"""
     safety = SPEC_CONFIG["safety"]
-    assert safety["enabled"] is False
+    assert safety["enabled"] is True
     assert safety["mode"] == "hybrid"
     assert 0 < len(safety["danger_terms"]) <= 200
     assert 0 < len(safety["profanity_terms"]) <= 200
     assert 0 < len(safety["privacy_terms"]) <= 200
+    assert safety["politics_terms"] == []
     assert 0 < len(safety["grey_rules"]) <= 50
     assert safety["classify_timeout_ms"] == 1500
     assert safety["reply_timeout_ms"] == 2000
     assert safety["reply_max_chars"] == 300
 
 
-def test_safety_lexicon_seed_terms_unambiguous() -> None:
-    """直拦词表零歧义纪律（评审 P1 负例保护）：高频正当语境条目不得入直拦词表——
-    自杀方法（预防/求助语境）、他妈的（鲁迅《论"他妈的"》学术语境）、废物（废物
-    利用手工语境）、白痴（医学/文学语境）、狗屁（狗屁不通文章生成器）、滚蛋（水滚蛋
-    烹饪语境）——正当语境负例指引（common.safety_check 第二节）只对 grey LLM 复核
-    通道生效、对词表直拦路径结构性不生效，直拦词表必须零歧义；歧义条目由 grey_rules
-    送审通道承载。"""
+def test_safety_lexicon_seed_terms_follow_contract_example() -> None:
+    """第⑩件（v1.30 遗留漂移收口，2026-11-18 用户裁决「以契约侧为准」）：内置词表
+    逐表对齐 nacos-config.md §3 示例值。
+
+    **如实注记**：契约示例 profanity_terms 含「滚蛋」、grey_rules 未含旧种子的
+    「白痴/脑残/废物/狗屁/他妈的」掩码规则与「自杀…方法」送审规则——旧种子曾按
+    「零歧义直拦」纪律排除部分条目（B13 评审 P1）。本批按用户裁决以契约示例值为准
+    （Nacos 运行值可热更覆盖，示例值定位为种子示意）；风险已在交付说明登记。
+    """
     safety = SPEC_CONFIG["safety"]
-    for ambiguous in ("自杀方法", "他妈的", "废物", "白痴", "狗屁", "滚蛋"):
-        assert ambiguous not in safety["danger_terms"], ambiguous
-        assert ambiguous not in safety["profanity_terms"], ambiguous
-    # 歧义条目的送审面：grey_rules 覆盖掩码/语境变形（自杀+方法组合送 LLM 复核）
-    grey_joined = "|".join(safety["grey_rules"])
-    assert "自杀" in grey_joined
-    assert "白" in grey_joined  # 白痴掩码规则在场（grey 复核而非直拦）
+    assert safety["danger_terms"] == [
+        "制造炸弹", "合成毒品", "生物武器", "制爆教程",
+    ]
+    assert safety["profanity_terms"] == ["傻逼", "滚蛋", "废物东西"]
+    assert safety["grey_rules"] == [
+        "how\\s+to\\s+(make|build)\\s+(a\\s+)?(bomb|explosive|weapon)",
+        "(教|教我).{0,6}(制毒|制爆)",
+        "kill\\s+(myself|oneself)\\s+how",
+        "(查|帮我查).{0,8}(住址|身份证号|开房记录|定位|行踪|轨迹)",
+        "(帮忙|帮我).{0,6}(找人|查人)",
+    ]
+    # 全部规则可编译（运行面 compile 不抛）
+    import re as _re
+
+    for rule in safety["grey_rules"]:
+        _re.compile(rule)

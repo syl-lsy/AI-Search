@@ -33,7 +33,8 @@ __all__ = [
 SAFETY_REPLY_PROMPT_KEY = "common.safety_reply"
 
 #: 类别 → 段行前缀（与 validator.SAFETY_REPLY_CATEGORY_PREFIXES 是**同一映射**
-#: ——单一事实源，拒绝两处各自硬编码序号；reject 类别 = danger|profanity|privacy，
+#: ——单一事实源，拒绝两处各自硬编码序号；reject 类别 = danger|profanity|privacy|
+#: politics（v1.32 +politics），
 #: safety_check 契约「category=pii 一律 sanitize 不得 reject」故 pii 不在本通道）
 _CATEGORY_LINE_PREFIXES: dict[str, str] = SAFETY_REPLY_CATEGORY_PREFIXES
 
@@ -95,12 +96,14 @@ async def generate_rejection_reply(
 ) -> str:
     """生成类别化拒答话术（失败/超时/空输出回落模板段文本，恒返回非空尽力话术）。
 
-    category ∈ danger|profanity|privacy（ValueError fail-fast——reject 组合约束在
+    category ∈ danger|profanity|privacy|politics（ValueError fail-fast——reject 组合约束在
     safety_check 契约钉死，pii 不走本通道）；query_lang 为代码判定的问题语言。
     config 为 `safety.config.SafetyConfig`（提供 reply_timeout_s / reply_max_chars）。
     """
     if category not in _CATEGORY_LINE_PREFIXES:
-        raise ValueError(f"拒答话术类别非法：{category!r}（仅 danger|profanity|privacy）")
+        raise ValueError(
+            f"拒答话术类别非法：{category!r}（仅 danger|profanity|privacy|politics）"
+        )
     raw = resolve_prompt(SAFETY_REPLY_PROMPT_KEY)
     kept, body = _keep_category_section(raw, category)
     try:

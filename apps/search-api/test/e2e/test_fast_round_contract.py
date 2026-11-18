@@ -37,6 +37,11 @@ extra_body={"enable_thinking": False} 关思维链（生效键形态经网关探
 （`docs/perf-sampling-m15.md`：主口径 P50=15.43s / P90=22.69s、C 多面熔断 4/5 → 0/5，
 即挂牌根因「synthesis 慢侧撞满 fast.turn_timeout_s=60」已实测消解），故本文件四条硬约束
 （stage 主干序 / [n]↔sources 双向 / 字数上限 / 语言跟随）自此恢复自动化回归保护。
+
+【2026-11-18 注记】`enable_thinking:false` 提速键已于 2026-11-18 撤销（用户裁决：思考
+全面开启，fast/deep 一视同仁）——上文历史摘牌记录原样保留（审计链不删改）；摘牌依据的
+事实基础（synthesis 关思维链提速）已变化，但四硬约束断言与摘牌结论不受影响（约束断的是
+结构非思维链，thinking 事件本不在本文件断言面）。
 """
 
 import json

@@ -50,8 +50,16 @@ const doneSeconds = computed(() =>
     ? Math.max(1, Math.round(props.turn.durationMs / 1000))
     : null,
 )
-/** 降级终态（done finish=degraded / 2.5 degraded 双源）：与 completed 严格区分（§3 done 行） */
-const isDegraded = computed(() => props.turn.degradedReason !== null)
+/**
+ * 降级终态（done finish=degraded / 2.5 degraded 双源）：与 completed 严格区分（§3 done 行）。
+ * 双条件判定（B14 修复）：兜底收束轮（api.md §7.4 v1.25）done(degraded, degraded_reason=null)
+ * 经 done/2.5 双源投影后 degradedReason 恒 null——单键 degradedReason!==null 会漏判（banner
+ * 不渲染 + 状态行误显绿点「已完成」）；status==='degraded'（done.finish / 2.5 status 直写，
+ * 双路径均已覆盖）为主键，degradedReason!==null 为投影时序错位的防御性兜底。
+ */
+const isDegraded = computed(
+  () => props.turn.status === 'degraded' || props.turn.degradedReason !== null,
+)
 const qId = computed(() => `turn-${props.turn.turnId}-q`)
 const aId = computed(() => `turn-${props.turn.turnId}-a`)
 const headingPrefix = computed(() => props.turn.turnId.slice(0, 8))
@@ -155,11 +163,12 @@ const qActionsVisible = ref(false)
     <ImageCardRow :images="turn.images" />
 
     <!-- DegradedBanner（frontend-api.md §3 done 行 / §5 组件清单；api.md §2.5：研究未完成显著标注）：
-         数据源 turn.degradedReason（SSE done + 2.5 对账双源，stores/turn.ts），reason 三枚举分立文案 -->
+         数据源 turn.status === 'degraded' ∨ turn.degradedReason（SSE done + 2.5 对账双源，stores/turn.ts），
+         reason 三枚举分立文案；兜底收束轮（api.md §7.4 v1.25）degraded_reason=null → 'none' 空态词条 -->
     <div v-if="isDegraded" class="degraded-banner" role="status" data-testid="degraded-banner">
       <UiIcon name="i-alert" size="sm" class="degraded-ico" />
       <span class="degraded-main">{{ $t('answer.degradedBanner') }}</span>
-      <span class="degraded-reason">{{ $t(`answer.degradedReason.${turn.degradedReason}`) }}</span>
+      <span class="degraded-reason">{{ $t(`answer.degradedReason.${turn.degradedReason ?? 'none'}`) }}</span>
     </div>
 
     <div v-if="turn.answer_md" :id="aId" data-testid="turn-answer">

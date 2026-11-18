@@ -124,7 +124,7 @@ def _install_real_graph(
         )(),
     )
     model = _StreamChatModel(pieces=synth_pieces, prompts=[])
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
 
     registry = _RecordingRegistry()
     scheduler = turn_service.ThreadScheduler(

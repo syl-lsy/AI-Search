@@ -93,7 +93,7 @@ class MainState(TypedDict, total=False):
     # TurnRunner 收束 403002，不经 state——拒绝语义全在异常通道，无 state 消费面）：
     # - safety_category/safety_action：脱敏轮标注（safety_check._sanitize_update 写入，
     #   query 同帧覆写为脱敏文本；pass 直通零更新、reject 走异常不落 state）。
-    safety_category: Literal["danger", "profanity", "pii", "none"]
+    safety_category: Literal["danger", "profanity", "privacy", "politics", "pii", "none"]
     safety_action: Literal["sanitize"]
 
 

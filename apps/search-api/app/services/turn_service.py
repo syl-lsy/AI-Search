@@ -53,7 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.graphs.main import graph as main_graph
 from app.agent.graphs.regenerate import graph as regenerate_graph
 from app.agent.guards import ContentRejectedError, TurnCanceledSignal
-from app.agent.nodes.synthesis import SynthesisError
+from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
 from app.agent.safety import detect_pii, load_safety_config, sanitize
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
 from app.config_center import AssetSnapshot, get_asset_center
@@ -959,8 +959,9 @@ class ThreadScheduler:
         - 事件面：custom(stage)+messages(token/thinking) 走既有翻译器；updates 仅用于
           取 synthesis 最终 `answer_md`（不发布——事件面与常规轮零差异）；
         - 终态：成功 → completed（stages 追加 write 段、duration_ms 不覆写、清旧
-          error）；再失败 → error(500101)/500301/500001 + done(degraded)（sources 保留，
-          可再次 regenerate）；取消 → canceled（merge stages）；
+          error）；再失败 → **兜底产出收束**（v1.59 增量 A：synthesis 节点产 digest/partial
+          → done(finish=degraded, degraded_reason=null)，零 error；regenerate 轮恒有
+          sources 故 500101 不可达）/ 500301/500001 仍有防御分支；取消 → canceled（merge stages）；
         - 竞态：推进后被取消/删除（status≠running）→ 零事件退出（canceled 已由
           cancel_turn 收口）。
         - **加载段同在异常收口面**（评审 P3）：`_load_turn` 的 DB 瞬断若在 try 外会
@@ -980,10 +981,29 @@ class ThreadScheduler:
                 turn_id, turn, ctx, code="500301", message="轮次执行超时，请稍后重试",
                 exc=exc, degraded_reason="timeout",
             )
+        except SynthesisFallback as exc:
+            # regenerate 继承兜底（v1.59 增量 A）：微图复用同一 synthesis 节点，再失败
+            # 也走兜底产出（regenerate 轮恒有 sources → 500101 在本路径不可达）。
+            if ctx is None:  # 组装段异常形态防御：ctx 未建成时回落最小 ctx（不重跑组装）
+                turn = await self._reload_turn_for_failure(turn_id, turn)
+                if turn is None:
+                    return
+                ctx = _RunContext(
+                    turn_id=str(turn.id),
+                    thread_id=str(turn.thread_id),
+                    user_id=turn.user_id,
+                    mode="fast",
+                    query=str(turn.query),
+                    query_lang=str(turn.query_lang or "en"),
+                    regenerate=True,
+                )
+                ctx.sources_count = await self._count_sources(str(turn.id))
+            await self._finish_synthesis_fallback(ctx, exc)
         except SynthesisError as exc:
-            # 再失败照旧 500101 降级收束（sources 保留，可再次 regenerate）
+            # 防御路径（节点契约：fused 非空即兜底，SynthesisError 仅零源——regenerate
+            # 恒有 sources 故实际不可达）；保留既有失败收束语义，message 随 500101 收窄同步。
             await self._finish_regenerate_failure(
-                turn_id, turn, ctx, code="500101", message="综合生成失败，已保留检索来源",
+                turn_id, turn, ctx, code="500101", message="综合生成失败，请稍后重试",
                 exc=exc, degraded_reason=None,
             )
         except TurnCanceledSignal as exc:
@@ -1317,8 +1337,9 @@ class ThreadScheduler:
                 row.timing = {"stages": [*(existing or []), *(stages or [])]}
             else:
                 row.timing = {"stages": stages or []}
-            # usage（M2 批次 1 方案 A）：_finish_completed 传轮级 collector 累计值；
-            # 未传（失败/取消/兜底路径，本批口径）保持 {} 旧形态（UsageBrief 全可空）
+            # usage（M2 批次 1 方案 A）：_finish_completed 与 _finish_synthesis_fallback
+            # 传轮级 collector 累计值（兜底轮语义=仅计已消耗的失败尝试 token，成功侧零
+            # ——digest 零 LLM）；未传（失败/取消路径）保持 {} 旧形态（UsageBrief 全可空）
             row.usage = usage if usage is not None else {}
             row.finished_at = now
             if row.started_at is None:  # 失败/取消路径可能未经 promote（防御）
@@ -1660,6 +1681,65 @@ class ThreadScheduler:
             },
         )
 
+    async def _finish_synthesis_fallback(
+        self, ctx: _RunContext, fallback: SynthesisFallback
+    ) -> None:
+        """synthesis 兜底收束（v1.59 增量 A，api.md §7.4 兜底收束形态）。
+
+        语义：**零 error 事件**——节点已完成兜底产出（digest / partial）并经 stage extra
+        留痕，此处只落终态：
+        - `turns.status=degraded` + `answer_md=兜底全文`（digest=来源速览 markdown /
+          partial=句界清理后的部分正文——**部分正文持久化**，刷新不丢）；
+        - `done(finish=degraded, degraded=True, degraded_reason=null, source_count 沿轮累计)`
+          ——degraded_reason 枚举（timeout/budget/source_failure）零扩容，兜底轮不属任一
+          语义（ARCH §6.2 二分口径；误置 source_failure 会把来源完好的轮标成「研究未完成」）；
+        - regenerate 口径同失败收束：stages 追加 / duration_ms 不覆写 / 清旧 error
+          （最新一次 done 判读——兜底轮无错误，旧错误卡不再与答案并现）；
+        - 观测（ARCH §6.6 v1.59 兜底观测条②）：轮末 AgentLog 结构化字段（fallback kind /
+          终局失败类别 / 物理尝试次数 / partial 字符数 / digest 来源条数）。
+        - followups 不触发（`should_generate_followups` 仅 status=completed——degraded 轮
+          不产增强面，沿既有口径）。
+        """
+        kind = fallback.kind
+        AgentLog(
+            message=(
+                f"轮次兜底收束：fallback={kind} failure={fallback.failure} "
+                f"attempts={fallback.attempts} partial_chars="
+                f"{len(fallback.answer_md) if kind == 'synthesis_partial' else 0} "
+                f"digest_sources="
+                f"{fallback.source_count if kind == 'synthesis_digest' else 0}"
+            ),
+            graph="turn_runner",
+        ).warning()
+        usage = ctx.usage_collector.total() if ctx.usage_collector is not None else {}
+        outcome = await self._persist_terminal(
+            ctx.turn_id,
+            status="degraded",
+            answer_md=fallback.answer_md,
+            stages=ctx.stages,
+            degraded_reason=None,
+            merge_stages=ctx.regenerate,
+            preserve_duration=ctx.regenerate,
+            clear_error=ctx.regenerate,
+            usage=usage,
+        )
+        if outcome is None:
+            return  # 终态竞态落败：winner 已发布终态事件，本方零事件退出
+        _, duration_ms = outcome
+        await self._publish_and_persist(
+            ctx,
+            "done",
+            {
+                "finish": "degraded",
+                "degraded": True,
+                "degraded_reason": None,
+                "duration_ms": duration_ms,
+                "source_count": ctx.sources_count,
+                "usage": usage,
+            },
+        )
+        self._nudge_thread(ctx.thread_id)
+
     async def _finish_degraded_with_error(
         self,
         ctx: _RunContext,
@@ -1688,8 +1768,8 @@ class ThreadScheduler:
             error=error_payload,
             stages=ctx.stages,
             degraded_reason=degraded_reason,
-            # regenerate 再失败：stages 追加 / duration_ms 不覆写（§2.12「再失败照旧
-            # error(500101)+done(degraded)，可再次 regenerate」）
+            # regenerate 再失败：stages 追加 / duration_ms 不覆写（§2.12 v1.25 起再失败
+            # 走兜底产出收束；本分支为防御路径，stages/duration 口径不变）
             merge_stages=ctx.regenerate,
             preserve_duration=ctx.regenerate,
         )
@@ -2072,19 +2152,24 @@ class ThreadScheduler:
                 ctx, code="500201", message="全部搜索源不可用，请稍后重试", exc=exc
             )
             return
+        except SynthesisFallback as exc:
+            # 兜底产出收束（v1.59 增量 A）：fused 非空的 synthesis 终局失败（重试耗尽 /
+            # 窗闸 / TurnDeadline 放弃 / 不可重试类）——节点已产出 digest/partial 并发
+            # stage(write,done,extra.fallback)，此处零 error 事件直接落 degraded（api.md §7.4）。
+            await self._finish_synthesis_fallback(ctx, exc)
+            return
         except SynthesisError as exc:
-            # LLM 调用重试耗尽（§4.1 synthesis 行 / api.md §7.2 500101）：收束形态按
-            # 「有/无部分内容」二分（§7.1 v1.10 例外条）——**direct 轮恒零 sources**（§7.2
-            # v1.14 direct 形态：零检索、不发 sources/images、done.source_count=0），失败即
-            # 必然「无部分内容」→ 零内容收束（error 后直接关闭、不发 done，failed 终态经
-            # §2.5 对账）；sources 已发布轮保留已收集来源 → 降级收束 done(finish=degraded)。
+            # 500101 语义收窄（v1.59）后仅零源轮可达：零内容收束（error 后直接关闭、
+            # 不发 done，failed 终态经 §2.5 对账）。fused 非空轮的终局失败走上一分支
+            # 兜底——本分支的 sources_count>0 形态是节点契约外的防御路径（真出现时仍
+            # 按「有部分内容」降级收束，保留来源可见性）。
             if ctx.sources_count == 0:
                 await self._fail_turn(
                     ctx, code="500101", message="综合生成失败，请稍后重试", exc=exc
                 )
                 return
             await self._finish_degraded_with_error(
-                ctx, code="500101", message="综合生成失败，已保留检索来源", exc=exc,
+                ctx, code="500101", message="综合生成失败，请稍后重试", exc=exc,
                 degraded_reason=None,  # 枚举（timeout/budget/source_failure）外不上报
             )
             return
@@ -2148,10 +2233,12 @@ class ThreadScheduler:
     async def _translate_custom(self, ctx: _RunContext, payload: dict[str, Any]) -> None:
         """custom 信号 → SSE 事件（一对一翻译；未知类型告警忽略）。
 
-        token/thinking 不在 custom 域（§6.1：仅 messages 流映射）；custom 流承载
+        token/thinking 主流不在 custom 域（§6.1：仅 messages 流映射）；custom 流承载
         stage/sources/images（落库）+ context_compact（M2 批次 1——**publish-only
         不落 turn_events**，api.md §7.2 v1.3「压缩观测走 Langfuse；ADR-003 第 4 条
-        子集不变」，仅 deep 产生；EventBus 内存缓冲重放承担断线重放边界）。
+        子集不变」，仅 deep 产生；EventBus 内存缓冲重放承担断线重放边界）+
+        **fallback_token（v1.59 增量 A：synthesis digest 整块 mechanical 兜底——单事件
+        承载完整来源速览，publish-only 同 messages 流 token 口径）**。
         """
         ptype = payload.get("type")
         business = {k: v for k, v in payload.items() if k != "type"}
@@ -2166,6 +2253,13 @@ class ThreadScheduler:
             ctx.sources_count += len(batch)
         elif ptype == "images":
             await self._publish_and_persist(ctx, "images", business)  # B2 桩不发；翻译面预留
+        elif ptype == "fallback_token":
+            # v1.59 增量 A：synthesis digest 整块 token（零 LLM 机械兜底——single-event
+            # 承载完整来源速览 markdown，非逐字流；api.md §7.2 v1.25 token 注）。与
+            # messages 流 token 同口径 publish-only（ADR-003 第 4 条不入 turn_events），
+            # 前端既有拼接渲染零新路径。**深桩期 custom `token` 不在此列**——维持既有
+            # 「未知信号丢弃」行为（B2 桩契约零变化，test_r14 锁死）。
+            await self._publish_only(ctx, "token", {"delta": str(business.get("delta") or "")})
         elif ptype == "context_compact":
             # publish-only（api.md §7.2 v1.3）：不入 turn_events 落库子集
             # （db/models/turn_event.py event_type 注释口径不变）；seq 照常盖章占号
@@ -2269,7 +2363,9 @@ class ThreadScheduler:
         """
         if ctx.sources_count > 0:
             # 已发布 sources 即在失败前有部分内容（timeout 500301 / 搜索链 500201 /
-            # LLM 重试耗尽 500101 / 未知异常 500001 同款）——降级收束（同 500101 形态）
+            # 未知异常 500001 同款）——降级收束。**LLM 重试耗尽 500101 收窄后不在此列**
+            # （v1.59：仅零源轮发射——零源路径恒零 sources，不进入本分支；fused 非空轮
+            # 走 _finish_synthesis_fallback 兜底产出收束）
             degraded_reason = "timeout" if code == "500301" else None  # 枚举内才上报
             await self._finish_degraded_with_error(
                 ctx,

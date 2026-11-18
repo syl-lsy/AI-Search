@@ -20,6 +20,7 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRoute, useRouter } from 'vue-router'
 
 import UiIcon from '@/components/icons/UiIcon.vue'
 import UiTooltip from '@/components/common/UiTooltip.vue'
@@ -38,6 +39,8 @@ const props = withDefaults(
 
 const { t } = useI18n()
 const store = useThreadListStore()
+const route = useRoute()
+const router = useRouter()
 
 /* ---------- 层级状态机：closed → menu → confirm | rename（Esc 任意层关闭） ---------- */
 const layer = ref<'closed' | 'menu' | 'confirm' | 'rename'>('closed')
@@ -172,12 +175,19 @@ function onRenameEnter(e: KeyboardEvent): void {
   submitRename()
 }
 
-/* ---------- 删除二次确认 ---------- */
+/* ---------- 删除二次确认 ----------
+ * 删除成功且当前路由正是被删线程（route.params.threadId 命中）→ 跳回首页（新建）：
+ * 单点覆盖侧栏（App.vue 置顶/最近两分区）与会话页（ThreadsView 行级）两处复用——
+ * 非当前线程场景（会话页行级删除、侧栏删别的线程）params 不匹配自然 no-op。
+ * 失败（store 返回 false：409005 有进行中轮次/网络异常等——store 已 toast 且行回滚保留）不跳转。 */
 const wConfirmCancel = ref<HTMLButtonElement | null>(null)
 
-function confirmDelete(): void {
+async function confirmDelete(): Promise<void> {
   closeAll()
-  void store.deleteThread(props.thread.thread_id)
+  const deleted = await store.deleteThread(props.thread.thread_id)
+  if (deleted && route.params.threadId === props.thread.thread_id) {
+    await router.push('/')
+  }
 }
 
 /* ---------- 键盘：Esc 关闭+焦点返还；方向键在 menuitem 间移动 ----------

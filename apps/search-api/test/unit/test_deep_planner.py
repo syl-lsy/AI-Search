@@ -105,7 +105,7 @@ def _install(
 ) -> tuple[_FakeModel, list[tuple[str, str, dict[str, Any]]]]:
     """注入模型假体 + stage 发射记录器；返回 (假模型, stage 记录) 供断言。"""
     model = _FakeModel(chain)
-    monkeypatch.setattr(deep_planner, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(deep_planner, "build_chat_model", lambda alias, **kw: model)
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     monkeypatch.setattr(
         deep_planner, "emit_stage", lambda key, status, **kw: emitted.append((key, status, kw))
@@ -273,8 +273,9 @@ async def test_planner_receives_chat_alias_from_mapping_snapshot(
     seen: dict[str, Any] = {}
     chain = _FakeChain([dict(_OK_OUTPUT)])
 
-    def _spy(alias: str) -> _FakeModel:
+    def _spy(alias: str, **kw: Any) -> _FakeModel:
         seen["alias"] = alias
+        seen.update(kw)
         return _FakeModel(chain)
 
     monkeypatch.setattr(deep_planner, "build_chat_model", _spy)
@@ -454,7 +455,7 @@ async def test_transport_timeout_falls_back(monkeypatch: pytest.MonkeyPatch) -> 
             await _hang(prompt, config)
 
     model = _FakeModel(_HangingChain())
-    monkeypatch.setattr(deep_planner, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(deep_planner, "build_chat_model", lambda alias, **kw: model)
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     monkeypatch.setattr(
         deep_planner, "emit_stage", lambda key, status, **kw: emitted.append((key, status, kw))
@@ -672,7 +673,7 @@ async def test_legacy_output_without_safety_field_passes_through(
     assert loader_calls == []  # 缺省 none → 先行短路，零配置判读
 
 
-@pytest.mark.parametrize("category", ["danger", "profanity", "privacy"])
+@pytest.mark.parametrize("category", ["danger", "profanity", "privacy", "politics"])
 async def test_safety_hit_raises_content_rejected_with_stage_failed(
     monkeypatch: pytest.MonkeyPatch, category: str
 ) -> None:
@@ -802,3 +803,34 @@ async def test_transport_fallback_does_not_check_safety(
     assert emitted[-1][2] == {"extra": {"subtopics": 1, "fallback": "degraded"}}
     assert loader_calls == []
     assert rejection_calls == []
+
+
+# ---- thinking 按模式分档（v1.59 增量 C，ARCH §6.7）----
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, "on"),  # deep 档缺省 = on（裁决值）
+        ({"thinking": "off"}, "off"),
+        ({"thinking": "on"}, "on"),
+    ],
+)
+async def test_planner_passes_deep_thinking_mode(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any], expected: str
+) -> None:
+    """planner 经共享工厂传 deep 档位：spec.deep.thinking 透传、键缺失回落 on。"""
+    seen: dict[str, Any] = {}
+    chain = _FakeChain([dict(_OK_OUTPUT)])
+
+    def _spy(alias: str, **kw: Any) -> _FakeModel:
+        seen.update(kw)
+        return _FakeModel(chain)
+
+    monkeypatch.setattr(deep_planner, "build_chat_model", _spy)
+    monkeypatch.setattr(deep_planner, "emit_stage", lambda key, status, **kw: None)
+
+    state = {**_STATE, "spec": {**_STATE.get("spec", {}), "deep": {**(_STATE.get("spec", {}).get("deep", {})), **overrides}}}
+    await planner(state, _config())
+
+    assert seen.get("thinking") == expected

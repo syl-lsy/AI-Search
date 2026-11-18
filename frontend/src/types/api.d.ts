@@ -1,10 +1,11 @@
 /**
- * src/types/api.d.ts — api.md（v1.24）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.25）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.24（REST + SSE 协议唯一事实源；§2.12 POST
- *     /turns/{turn_id}/regenerate（REQ-063/A47）+ §0 错误码 409006 + §7.2/§2.5
- *     stages[].extra 可选键 source_retries 随本批镜像同步——frontend-api.md §8.5 v1.28，F5 工单）
+ *   - docs/contract/api.md v1.25（REST + SSE 协议唯一事实源；本批 B14 随批镜像 = §2.5/§7.2
+ *     stages[].extra 可选键 fallback（synthesis_digest | synthesis_partial，§7.4 v1.25 兜底收束
+ *     形态留痕）——frontend-api.md §8.5 v1.29 §8.5 登记行；thinking/token/done/error 事件面
+ *     契约零变更）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
  *   - frontend-api.md §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
@@ -153,6 +154,8 @@ export interface StageExtra {
   safety?: string
   /** api.md §7.4/§2.5 v1.23 B13 拦截层标注（pre_route|rewrite|planner，前端零消费不展示） */
   layer?: string
+  /** api.md §7.4/§2.5 v1.25 B14 兜底收束轮留痕（synthesis_digest=来源速览兜底 | synthesis_partial=部分正文收束——stage(write,done) extra 携带，评测/审计判兜底轮型与 M4 采样排除依据〔digest 轮不计入 P50/P90〕；前端零消费不展示——degraded 渲染走 done/2.5 的 status/degraded 字段；宽松 string 同 strategy/safety 先例，值域扩容零类型形状变更） */
+  fallback?: string
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */

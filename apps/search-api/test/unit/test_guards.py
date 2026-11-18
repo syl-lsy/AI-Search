@@ -90,7 +90,7 @@ def test_default_retry_on_classification() -> None:
 
 
 def test_llm_and_tool_timeouts_from_spec_with_contract_defaults() -> None:
-    """分级超时（§6.2）：读 spec.<mode>，缺省回落契约值——fast 30/10、deep 60/30。"""
+    """分级超时（§6.2）：读 spec.<mode>，缺省回落契约值——fast 60/10（v1.59）、deep 60/30。"""
     spec: dict[str, Any] = {
         "fast": {"llm_timeout_s": 15, "tool_timeout_s": 5},
         "deep": {"llm_timeout_s": 90},
@@ -99,9 +99,9 @@ def test_llm_and_tool_timeouts_from_spec_with_contract_defaults() -> None:
     assert tool_timeout_s(spec, "fast") == 5.0
     assert llm_timeout_s(spec, "deep") == 90.0
     assert tool_timeout_s(spec, "deep") == 30.0  # deep 未给 tool_timeout_s → 契约缺省
-    assert llm_timeout_s({}, "fast") == 30.0  # 整节缺失 → 契约缺省
+    assert llm_timeout_s({}, "fast") == 60.0  # 整节缺失 → 契约缺省（v1.59：30→60）
     assert tool_timeout_s({}, "deep") == 30.0
-    assert llm_timeout_s({"fast": {"llm_timeout_s": "oops"}}, "fast") == 30.0  # 非法回落
+    assert llm_timeout_s({"fast": {"llm_timeout_s": "oops"}}, "fast") == 60.0  # 非法回落
 
 
 def test_pop_cancel_flag_same_semantics_as_turn_runner() -> None:

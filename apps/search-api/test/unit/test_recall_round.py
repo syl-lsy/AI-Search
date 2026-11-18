@@ -96,7 +96,7 @@ def _install_models(
         pieces=synth_pieces if synth_pieces is not None else ["你之前聊了 LangGraph", "与 pgvector 的选型。"],
         prompts=[],
     )
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
     return prompts, model
 
 
@@ -211,7 +211,7 @@ async def test_non_recall_round_does_not_inject_history_recall(
         )(),
     )
     model = _FakeStreamChatModel(pieces=["答案"], prompts=[])
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
     bus = _bus()
     turn = _TurnRow(status="running", query="LangGraph 条件边怎么写？")
 

@@ -21,15 +21,19 @@ synthesis 节点放行，§6.1/R14③），节点只累积 text → answer_md。
 - **外部内容包裹**（§6.4.3 铁律）：来源逐条 `<external_content source="{url}" type="web">`
   包裹（声明行在提示词内）；历史块/memory_block 为**声明行软防线**（模型转述产物，
   低风险层级——P2 裁决）；memory_block M5 前恒空串；
-- **失败语义**：全源失败防御性短路（主短路在 merge_dedupe）；LLM 失败按**错误三档
-  分级**重试（B11 P1a / ARCH §6.2 v1.49）——连接类（httpx transport / 单调用包络超时 /
-  openai 连接形态）走 `spec.fast.retry.connection` 长窗指数退避（1/2/4/8，总窗
-  total_window_s 硬闸，与 TurnDeadline 双闸先到先放弃）；5xx 类沿用 `spec.fast.retry`
-  主节短窗；业务类（4xx/结构化解析失败）不重试。耗尽 → SynthesisError → TurnRunner
-  error 500101（LLM 调用重试耗尽）+ done(finish=degraded)——已收集 sources 保留
-  （api.md §7.2 error 收束「有部分内容时 error 后跟 done(finish=degraded)」）。
+- **失败语义（v1.59 增量 A 重写收束面）**：全源失败防御性短路（主短路在 merge_dedupe）；
+  LLM 失败按**错误三档分级**重试（B11 P1a / ARCH §6.2 v1.49）——连接类（httpx transport /
+  单调用包络超时 / openai 连接形态）走 `spec.fast.retry.connection` 长窗指数退避
+  （1/2/4/8，总窗 total_window_s 硬闸，与 TurnDeadline 双闸先到先放弃）；5xx 类沿用
+  `spec.fast.retry` 主节短窗；业务类（4xx/结构化解析失败）不重试。**终局失败二分**：
+  - **fused 非空**（有来源可用）→ 抛控制流信号 `SynthesisFallback`（不抛 SynthesisError）：
+    有可用部分正文（跨尝试最长前缀经句界清理）走 partial；否则走 digest（纯机械来源速览，
+    单事件整块 token 发射）——TurnRunner 零 error 事件收束 done(finish=degraded,
+    degraded_reason=null)（api.md §7.4 兜底收束形态；ARCH §6.2 v1.59 兜底产出注）；
+  - **零源轮**（direct/recall/防御性短路漏网）→ `SynthesisError` → TurnRunner error 500101
+    （语义收窄为零源专属，message「综合生成失败，请稍后重试」）+ 流结束（无 done）。
 - **单调用超时包络**（决策 4）：每次 astream 包 `asyncio.timeout(min(llm_timeout_s,
-  剩余轮预算))`——无包络时单次挂起会直接吃光 60s 兜底、重试窗形同虚设。
+  剩余轮预算))`——无包络时单次挂起会直接吃光轮预算、重试窗形同虚设。
 
 stage(write, running, label=综合中 → done) 夹全部动作（api.md §7.4）。节点纯函数：模型
 工厂可注入可 mock，零 DB/EventBus。
@@ -50,19 +54,20 @@ from app.agent.external_content import external_content
 from app.agent.guards import (
     RetryWindow,
     TurnDeadline,
+    classify_failure_kind,
     classify_retry_tier,
     connection_retry_policy_from_spec,
     ensure_not_canceled,
     llm_timeout_s,
     retry_policy_from_spec,
 )
-from app.agent.graphs.signals import emit_stage
-from app.agent.llm import build_chat_model, resolve_chat_alias
+from app.agent.graphs.signals import emit_fallback_token, emit_stage
+from app.agent.llm import build_chat_model, resolve_chat_alias, resolve_thinking
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.agent.tools.registry import SearchChainUnavailable
 from app.utils.history_recall import render_history_recall
 
-__all__ = ["SynthesisError", "build_chat_model", "synthesis"]
+__all__ = ["SynthesisError", "SynthesisFallback", "build_chat_model", "synthesis"]
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
@@ -86,7 +91,147 @@ _clock = time.monotonic
 
 
 class SynthesisError(Exception):
-    """综合生成失败（LLM 重试耗尽/流中断）——TurnRunner 捕获 → error 500101 + 降级收束。"""
+    """综合生成失败——**500101 语义收窄后仅零源轮形态**（fused 空且终局失败）。
+
+    TurnRunner 捕获 → error 500101 + 直接关闭（无 done：零源轮无部分内容可降级，
+    api.md §7.1 v1.10 例外条）。fused 非空轮的一切终局失败走 `SynthesisFallback`。
+    """
+
+
+class SynthesisFallback(Exception):
+    """synthesis 终局失败但 fused 非空的**控制流信号**（v1.59 增量 A，非故障）。
+
+    沿 `TurnCanceledSignal` / `ContentRejectedError` 信号族先例：节点内已完成兜底产出
+    （digest 机械速览 / partial 句界清理正文）并发射 `stage(write, done, extra.fallback)`，
+    再上抛本信号——TurnRunner 捕获后走 `_finish_synthesis_fallback`：落 answer_md +
+    done(finish=degraded, degraded_reason=null)、**零 error 事件**（api.md §7.4 v1.25）。
+    为什么不走 state.degraded：`_finish_completed` 对 fast degraded=True 一律派生
+    degraded_reason=source_failure（ARCH §6.2 v1.41 注②），兜底轮 sources 完好、该值是误标。
+
+    字段：
+    - `answer_md`：兜底全文（digest 全文 / 句界清理后的部分正文）；
+    - `kind`：∈ {synthesis_digest, synthesis_partial}（stage extra 与 M4 采样判据同源）；
+    - `failure`：终局失败类别 ∈ {timeout, connection, non_retryable}（轮末 AgentLog 留痕）；
+    - `attempts`：物理尝试次数；`source_count`：fused 来源条数（digest 截断前总量）。
+    """
+
+    def __init__(
+        self,
+        *,
+        answer_md: str,
+        kind: str,
+        failure: str,
+        attempts: int,
+        source_count: int,
+    ) -> None:
+        self.answer_md = answer_md
+        self.kind = kind
+        self.failure = failure
+        self.attempts = attempts
+        self.source_count = source_count
+        super().__init__(
+            f"synthesis 兜底收束（kind={kind}, failure={failure}, attempts={attempts}）"
+        )
+
+
+#: 句末标点（partial 句界清理锚点——api.md §7.4「截断到最近句末标点（。！？!?.）或换行」）
+_SENTENCE_END_CHARS = frozenset("。！？!?.")
+# 注：句点 `.`/`!`/`?` 为英文形态；中文全角标点单字符即句界。
+
+#: digest 结构常量（机械兜底无热更诉求——OQ-6 IMAGES_MAX_COUNT 先例，api.md §7.4）
+_DIGEST_MAX_SOURCES = 5
+#: snippet 截断（契约明文 ≤120 字符）
+_DIGEST_SNIPPET_MAX_CHARS = 120
+#: title 截断（安全审计 P3：与 snippet 对称的显式上限——上游 API/DB String(512) 只是
+#: 隐性约束，超长标题会撑爆单行列表并挤占展示预算）
+_DIGEST_TITLE_MAX_CHARS = 120
+
+#: digest 说明行（query_lang 驱动双语）
+_DIGEST_PREAMBLE: dict[str, str] = {
+    "zh": (
+        "综合回答未能完成（生成超时或失败），以下是本次检索到的来源速览，"
+        "可先参考；稍后可点击「重新生成」重试。"
+    ),
+    "en": (
+        "The synthesized answer could not be completed (generation timed out or "
+        'failed). Here is a quick overview of the sources retrieved in this round; '
+        'you can retry with "Regenerate" later.'
+    ),
+}
+
+#: digest 尾注（fused > 前 5 条时）
+_DIGEST_MORE: dict[str, str] = {
+    "zh": "（其余 {n} 条来源见来源面板）",
+    "en": "({n} more sources are available in the sources panel)",
+}
+
+#: markdown 控制字符（digest 来源文本转义集——防版式注入；`[`/`]` 单独走全角转换）
+_DIGEST_MARKDOWN_ESCAPE_CHARS = frozenset("\\`*_#<>|~")
+
+#: 空白折叠（含换行——列表行必须单行）
+_DIGEST_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _digest_lang(query_lang: Any) -> str:
+    """digest 语言档：仅 zh 走中文，其余（en/缺失/非法）一律 en（与全站语言跟随口径一致）。"""
+    return "zh" if str(query_lang or "") == "zh" else "en"
+
+
+def _escape_digest_text(text: str) -> str:
+    """来源文本（外部内容）进 digest 前的转义：空白折叠 + markdown 控制字符 + [n] 防伪造。
+
+    **安全敏感点（ARCH §6.4）**：title/snippet 来自外部网页——
+    - `[`/`]` 转全角 `［`/`］`：前端 `[n]` 角标解析只认半角 `[\\d{1,2}]`（renderer.ts
+      CITE_SPLIT_PATTERN），半角残留即伪造引用/点开错误来源卡；全角形态视觉相近但不可解析
+      （反斜杠转义不成立——markdown-it 先还原 `\\[` 为 `[`，仍会被前端切成角标）；
+    - markdown 控制字符反斜杠转义：防标题/加粗/代码/表格等版式注入；
+    - 换行折叠为空格：列表行保持单行。
+    """
+    collapsed = _DIGEST_WHITESPACE_RE.sub(" ", str(text)).strip()
+    escaped = "".join(
+        f"\\{char}" if char in _DIGEST_MARKDOWN_ESCAPE_CHARS else char
+        for char in collapsed
+    )
+    return escaped.replace("[", "［").replace("]", "］")
+
+
+def _build_digest(query_lang: Any, fused: list[Any]) -> str:
+    """来源速览装配器（**纯机械零 LLM**，api.md §7.4 digest 结构）。
+
+    结构 = 说明行（双语）+ 前 5 条 `- [n] title：snippet` 列表行（[n] 与已发 sources
+    卡编号同序，由装配器生成）+ 尾注（fused 超过 5 条时）；title/snippet 各截断
+    ≤120 字符（title 上限为显式代码约束——空标题回落 URL 同样受该上限）。
+    调用方保证 fused 非空（零源轮不走本形态）。
+    """
+    lang = _digest_lang(query_lang)
+    lines: list[str] = [_DIGEST_PREAMBLE[lang], ""]
+    head = fused[:_DIGEST_MAX_SOURCES]
+    for index, item in enumerate(head, start=1):
+        # 截断在转义之前：上限语义按原始字符计（转义符不计入用户可见长度预算）
+        raw_title = str(item.get("title") or "")[:_DIGEST_TITLE_MAX_CHARS]
+        raw_url = str(item.get("url") or "")[:_DIGEST_TITLE_MAX_CHARS]
+        raw_snippet = str(item.get("snippet") or "")
+        title = _escape_digest_text(raw_title) or _escape_digest_text(raw_url)
+        snippet = _escape_digest_text(raw_snippet[:_DIGEST_SNIPPET_MAX_CHARS])
+        lines.append(f"- [{index}] {title}：{snippet}" if snippet else f"- [{index}] {title}")
+    remaining = len(fused) - len(head)
+    if remaining > 0:
+        lines.extend(["", _DIGEST_MORE[lang].format(n=remaining)])
+    return "\n".join(lines)
+
+
+def _clip_to_sentence_boundary(text: str) -> str:
+    """截断到最近句末标点/换行（partial 收束：**残句丢弃、不伪造补全**）。
+
+    无任何句界（不足一句）→ 空串（调用方按零可用正文走 digest——api.md §7.4 明文）。
+    """
+    last_boundary = -1
+    for index, char in enumerate(text):
+        if char in _SENTENCE_END_CHARS or char == "\n":
+            last_boundary = index
+    if last_boundary < 0:
+        return ""
+    return text[: last_boundary + 1].strip()
 
 
 def _resolve_strategy(state: Mapping[str, Any]) -> str:
@@ -278,7 +423,11 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
         if isinstance(fast_section, Mapping)
         else 120.0
     )
-    model = build_chat_model(resolve_chat_alias(state, config))
+    model = build_chat_model(
+        resolve_chat_alias(state, config),
+        # v1.59 增量 C：fast 档缺省 off（spec.fast.thinking 热更可切 on）
+        thinking=resolve_thinking(spec, "fast"),
+    )
 
     template = _apply_answerable_variant(
         resolve_prompt("fast.synthesis"),
@@ -308,6 +457,9 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
 
     answer = ""
     last_error: Exception | None = None
+    #: 部分正文跨尝试捕获（v1.59 增量 A）：流内已作为 token 事件发出的最长尝试文本
+    #: ——终局失败时取「最长可用前缀」做句界清理（不拼接残段、不伪造补全）
+    best_partial = ""
     short_failures = 0  # 短窗（transient / 无 connection 节点的连接类）失败次数
     connection_failures = 0  # 连接类长窗失败次数（含首试失败）
     total_attempts = 0  # 物理尝试总次数（混档共享上限，见下）
@@ -337,9 +489,13 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
             answer = "".join(accumulated)
             break
         except Exception as exc:
+            attempt_text = "".join(accumulated)
+            if len(attempt_text) > len(best_partial):
+                best_partial = attempt_text
             tier = classify_retry_tier(exc)
             if tier == "non_retryable":
-                raise SynthesisError(f"综合生成失败（不可重试）：{exc}") from exc
+                last_error = exc
+                break  # 业务类不重试 → 终局失败（fused 非空走兜底）
             last_error = exc
             if tier == "connection" and connection_policy is not None:
                 # 连接类长窗（1/2/4/8，cap max_interval_s）+ 总窗硬闸 + TurnDeadline 双闸
@@ -357,7 +513,7 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
                     break
                 await _sleep(delay)
                 if window.remaining_s() <= 0.0:
-                    break  # 尝试耗时吃满窗口：先到先放弃（既有 SynthesisError 语义）
+                    break  # 尝试耗时吃满窗口：先到先放弃（终局失败面见收束分支）
                 continue
             # 短窗（维持现状）：spec.<mode>.retry 主节，可选 jitter
             short_failures += 1
@@ -365,18 +521,73 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
                 break
             if total_attempts >= attempts_cap:
                 break  # 混档共享上限（同 connection 分支注释）
-            if not budget.can_attempt(30.0):
+            # deadline-aware 重试预算：预计单次成本 = 单调用包络（v1.59 顺手项——原硬编码
+            # 30.0 在 llm_timeout_s 改 60 后与其名实不符，改读包络实值）
+            if not budget.can_attempt(call_timeout_s):
                 break
             delay = policy.initial_interval_s * (
                 policy.backoff_factor ** (short_failures - 1)
             )
             await _sleep(random.uniform(0, delay) if policy.jitter else delay)
     if not answer:
-        raise SynthesisError(
-            f"综合生成失败（LLM 调用重试耗尽）：{last_error!r}" if last_error else "综合生成失败（空输出）"
+        _raise_terminal_failure(
+            fused=fused,
+            best_partial=best_partial,
+            last_error=last_error,
+            attempts=total_attempts,
+            max_chars=max_chars,
+            query_lang=state.get("query_lang"),
         )
 
     answer = answer[:max_chars]
     answer = _strip_out_of_range_citations(answer, len(fused))
     emit_stage("write", "done")
     return {"answer_md": answer, "degraded": False}
+
+
+def _raise_terminal_failure(
+    *,
+    fused: list[Any],
+    best_partial: str,
+    last_error: Exception | None,
+    attempts: int,
+    max_chars: int,
+    query_lang: Any,
+) -> None:
+    """终局失败二分收束（v1.59 增量 A）：fused 非空 → SynthesisFallback；零源 → SynthesisError。
+
+    - **partial 路径**：最长跨尝试前缀先过 [n] 越界剔除、按 max_chars 截断、再句界清理
+      （硬上限不得留下残句）——清理后非空即 partial；不足一句按零可用正文走 digest；
+    - **digest 路径**：`_build_digest` 机械装配 → `emit_fallback_token` **单事件整块**发射 →
+      `stage(write, done, extra={"fallback": kind})`（事件序：token → stage done → done）；
+    - 两条路径均抛 `SynthesisFallback`（零 error 事件，TurnRunner 落 degraded）。
+    """
+    if not fused:
+        raise SynthesisError(
+            f"综合生成失败（LLM 调用重试耗尽）：{last_error!r}"
+            if last_error
+            else "综合生成失败（空输出）"
+        )
+    failure = classify_failure_kind(last_error) if last_error is not None else "non_retryable"
+    partial = _clip_to_sentence_boundary(
+        _strip_out_of_range_citations(best_partial, len(fused))[:max_chars]
+    )
+    if partial:
+        emit_stage("write", "done", extra={"fallback": "synthesis_partial"})
+        raise SynthesisFallback(
+            answer_md=partial,
+            kind="synthesis_partial",
+            failure=failure,
+            attempts=attempts,
+            source_count=len(fused),
+        )
+    digest = _build_digest(query_lang, fused)
+    emit_fallback_token(digest)  # 单事件整块（前端既有拼接渲染零新路径）
+    emit_stage("write", "done", extra={"fallback": "synthesis_digest"})
+    raise SynthesisFallback(
+        answer_md=digest,
+        kind="synthesis_digest",
+        failure=failure,
+        attempts=attempts,
+        source_count=len(fused),
+    )

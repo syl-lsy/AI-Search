@@ -122,7 +122,7 @@ def _mock_llm(
         else [("综合回答正文[1]。", "text"), ("结论[2]。", "text"), ("补充说明。", "text")],
         on_chunk=synth_on_chunk,
     )
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
 
 
 def _r14_scheduler(
@@ -347,7 +347,7 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
         ) -> _PlanChain:
             return _PlanChain()
 
-    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias: _PlannerModel())
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
 
     # (a) raw 帧面
     payload: dict[str, Any] = {

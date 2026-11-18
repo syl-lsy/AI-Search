@@ -63,7 +63,7 @@ from app.agent.guards import (
     ensure_not_canceled,
     llm_timeout_s,
 )
-from app.agent.llm import build_chat_model, resolve_chat_alias
+from app.agent.llm import build_chat_model, resolve_chat_alias, resolve_thinking
 from app.agent.prompts import render_prompt, resolve_prompt
 from app.agent.safety import generate_rejection_reply, load_safety_config
 from app.core.logger import AgentLog
@@ -96,10 +96,12 @@ PlannerQueryType = Literal[
 
 #: 输入安全初判四值（B13，fast_rewrite.SafetyFlag 对称同构——模块本地声明防跨节点
 #: import 面；deep 侧字段由提示词 v1.30 增量产出 / v1.31 扩 privacy）
-SafetyFlag = Literal["none", "danger", "profanity", "privacy"]
+SafetyFlag = Literal["none", "danger", "profanity", "privacy", "politics"]
 
 #: Layer 2 拦截白名单（none 一律直通；pii 不走本通道——reject 组合约束同 safety.reply）
-_REJECT_CATEGORIES: tuple[str, ...] = ("danger", "profanity", "privacy")
+_REJECT_CATEGORIES: tuple[str, ...] = (
+    "danger", "profanity", "privacy", "politics",
+)
 
 
 class OutlineSection(BaseModel):
@@ -253,7 +255,8 @@ async def _safety_gate(
     输出未成形），不重复拦截。
 
     直通三条件（任一命中即放行，判定按灰度安全顺序排布）：初判 ∉ {danger,
-    profanity, privacy}（**先行短路**——none 直通 + reject 组合约束同 safety.reply，pii
+    profanity, privacy, politics}（**先行短路**——none 直通 + reject 组合约束同
+    safety.reply，pii
     不走本通道；旧提示词全量 none → 零配置判读、零告警面，存量轮日志面亦零
     变化）；`load_safety_config` 返回 None（fail-open：spec 缺 safety 节 /
     enabled=false / mode 非法——本分支仅在模型真打出 flag 时可达，缺节告警
@@ -298,7 +301,9 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
     budget = TurnDeadline(llm_timeout)  # 规划段包络：主调用 + 修复回喂（deadline-aware）
 
     alias = resolve_chat_alias(state, config)
-    chain = build_chat_model(alias).with_structured_output(
+    # v1.59 增量 C：deep 档缺省 on（spec.deep.thinking 热更可切 off）——plan/reflect/writer
+    # 同档（M2 后续节点经同一工厂取档位；light 路径不经本键）
+    chain = build_chat_model(alias, thinking=resolve_thinking(spec, "deep")).with_structured_output(
         PlannerOutput, method="function_calling"
     )
     prompt_text = _render_prompt(state, max_subagents)

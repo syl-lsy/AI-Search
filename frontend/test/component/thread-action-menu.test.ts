@@ -13,6 +13,8 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createMemoryHistory, createRouter } from 'vue-router'
+import type { Router } from 'vue-router'
 
 import { deleteThread, listThreads, patchThread } from '@/api/threads'
 import { toast } from '@/composables/toast'
@@ -59,20 +61,38 @@ function makeThread(extra: Partial<ThreadListItem> = {}): ThreadListItem {
   }
 }
 
-async function mountMenu(thread: ThreadListItem, variant: 'active' | 'archived' = 'active') {
+/** 测试路由（memory history 实例隔离，不与共享单例 @/router 串历史）：
+ *  删除跳转用例要求组件 setup 里 useRoute/useRouter 可注入——最小三路由骨架，
+ *  route component 用 render 函数（运行时构建无模板编译器，禁 template 字符串）。 */
+function makeTestRouter(initialPath = '/'): Router {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/', component: { render: () => null } },
+      { path: '/threads', component: { render: () => null } },
+      { path: '/thread/:threadId', component: { render: () => null } },
+    ],
+  })
+  void router.push(initialPath)
+  return router
+}
+
+async function mountMenu(thread: ThreadListItem, variant: 'active' | 'archived' = 'active', routePath = '/') {
   const pinia = createPinia()
   setActivePinia(pinia)
   mockedList.mockResolvedValue({ total: 1, items: [thread] })
   const store = useThreadListStore()
   await store.fetchThreads({ mode: null })
+  const router = makeTestRouter(routePath)
+  await router.isReady()
   // attachTo document.body：焦点返还与外点关闭须走真实 DOM 语义（theme-switcher.test.ts 同款）
   const w = mount(ThreadActionMenu, {
     props: { thread, variant },
-    global: { plugins: [pinia, i18n] },
+    global: { plugins: [pinia, i18n, router] },
     attachTo: document.body,
   })
   await flushPromises()
-  return { w, store }
+  return { w, store, router }
 }
 
 beforeEach(() => {
@@ -226,6 +246,46 @@ describe('删除二次确认（v1.23：居中 modal——Teleport 到 body，doc
     await flushPromises()
     expect(mockedDelete).not.toHaveBeenCalled()
     expect(document.querySelector('[data-testid="tam-confirm"]')).toBeNull()
+  })
+})
+
+describe('删除当前浏览中的线程 → 跳转首页（删除成功且 route.params.threadId 命中被删线程）', () => {
+  it('删除成功且当前路由=被删线程（/thread/{id} 答案页侧栏删除）→ 确认后跳转 /（新建）', async () => {
+    const thread = makeThread()
+    const { w, router } = await mountMenu(thread, 'active', `/thread/${thread.thread_id}`)
+    expect(router.currentRoute.value.path).toBe(`/thread/${thread.thread_id}`)
+    await w.find('[data-testid="tam-trigger"]').trigger('click')
+    await menuItemsW()[4]!.trigger('click') // 删除 → 居中确认层
+    mockedDelete.mockResolvedValueOnce({ deleted: true })
+    ;(document.querySelector('[data-testid="tam-confirm-delete"]') as HTMLElement).click()
+    await flushPromises()
+    expect(mockedDelete).toHaveBeenCalledWith(thread.thread_id)
+    // 跳转在删除确认成功之后：store.deleteThread 返回 true 才 push('/')
+    expect(router.currentRoute.value.path).toBe('/')
+  })
+
+  it('删除失败（store 返回 false——行已回滚保留）不跳转（留在被删线程页）', async () => {
+    const thread = makeThread()
+    const { w, router } = await mountMenu(thread, 'active', `/thread/${thread.thread_id}`)
+    await w.find('[data-testid="tam-trigger"]').trigger('click')
+    await menuItemsW()[4]!.trigger('click')
+    mockedDelete.mockRejectedValueOnce(new Error('网络异常'))
+    ;(document.querySelector('[data-testid="tam-confirm-delete"]') as HTMLElement).click()
+    await flushPromises()
+    expect(mockedDelete).toHaveBeenCalledWith(thread.thread_id)
+    expect(router.currentRoute.value.path).toBe(`/thread/${thread.thread_id}`)
+  })
+
+  it('当前路由非被删线程（如 /threads 会话页行级菜单）→ 删除成功也不跳转（route.params 不匹配 no-op）', async () => {
+    const thread = makeThread()
+    const { w, router } = await mountMenu(thread, 'active', '/threads')
+    await w.find('[data-testid="tam-trigger"]').trigger('click')
+    await menuItemsW()[4]!.trigger('click')
+    mockedDelete.mockResolvedValueOnce({ deleted: true })
+    ;(document.querySelector('[data-testid="tam-confirm-delete"]') as HTMLElement).click()
+    await flushPromises()
+    expect(mockedDelete).toHaveBeenCalledWith(thread.thread_id)
+    expect(router.currentRoute.value.path).toBe('/threads')
   })
 })
 

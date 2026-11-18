@@ -887,6 +887,19 @@ onUnmounted(() => {
   align-items: center;
   gap: var(--space-2);
 }
+/* 激活态高亮：当前浏览中的会话行——RouterLink 自动携带 router-link-active（Vue Router
+   前缀匹配，/thread/{id} 恰好等于当前会话页；首页/会话页等其余路由零误亮），置顶/最近
+   两分区共用本选择器（同 .sb-recent 类，无附加选择器）。视觉语言对齐 tokens.css
+   .sb-recent.active 先例（面底+主文字色）但底色改取 --color-surface-active：浅色主题
+   --color-surface 与 --color-bg-sidebar 同值（#f7f7f8）激活不可见，surface-active 两主题
+   均可辨（暗 #2d3031 / 亮 #e3e3e6）且强于 hover ghost——激活=当前所处会话、hover=悬停
+   预览，强度分层；文字色 secondary→primary 提升可读性，未读点/图钉/生成中指示等子元素
+   各自带色不受影响；深浅色全部由 tokens 变量驱动。特异性（两个类 + data-v 属性）压过
+   tokens.css .sb-recent:hover（0,2,0）——激活行 hover 不闪变。 */
+.sb-recent.router-link-active {
+  background: var(--color-surface-active);
+  color: var(--color-text-primary);
+}
 .sb-unread {
   flex: none;
   width: 8px;

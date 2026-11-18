@@ -44,6 +44,7 @@ __all__ = [
     "RetryWindow",
     "TurnCanceledSignal",
     "TurnDeadline",
+    "classify_failure_kind",
     "classify_retry_tier",
     "connection_retry_policy_from_spec",
     "default_retry_on",
@@ -82,14 +83,15 @@ class ConnectionRetryPolicy:
     - `initial_interval_s` / `backoff_factor`：退避序列 initial×factor^(n-1)（1/2/4/8）；
     - `max_interval_s`：单次退避上限（cap，默认 8.0）；
     - `total_window_s`：**重试总窗硬闸**——退避 sleeps + 重试尝试耗时 ≤ 该值，先到先
-      放弃（与 `TurnDeadline` 双闸；窗闸放弃 = 既有 SynthesisError→degraded 语义）。
+      放弃（与 `TurnDeadline` 双闸；窗闸放弃 = 终局失败 → synthesis 兜底产出收束，
+      api.md §7.4 v1.25）。默认 60.0 = nacos-config.md §3 v1.32 窗-包络对齐值。
     """
 
     max_attempts: int = 5
     initial_interval_s: float = 1.0
     backoff_factor: float = 2.0
     max_interval_s: float = 8.0
-    total_window_s: float = 20.0
+    total_window_s: float = 60.0  # v1.32：20 → 60（窗-包络对齐，nacos-config §3）
 
     def delay_for(self, retry_index: int) -> float:
         """第 retry_index 次重试（1-based）的退避秒数：initial×factor^(n-1)，cap max。"""
@@ -109,7 +111,9 @@ _CONNECTION_POLICY_KEYS: tuple[str, ...] = (
 
 
 #: 分级超时契约缺省（§6.2 容错清单；spec 缺值时的回落口径）
-_DEFAULT_LLM_TIMEOUT_S: dict[str, float] = {"fast": 30.0, "deep": 60.0}
+#: v1.59 增量 A：fast 30 → **60**（裁决①；spec 缺值回落口径的第二道防线——不同步会
+#: 在 L4 回落态复刻窗-包络错配；nacos-config.md §3 v1.32「三处同步」条款）
+_DEFAULT_LLM_TIMEOUT_S: dict[str, float] = {"fast": 60.0, "deep": 60.0}
 _DEFAULT_TOOL_TIMEOUT_S: dict[str, float] = {"fast": 10.0, "deep": 30.0}
 
 
@@ -199,7 +203,8 @@ class RetryWindow:
 
     语义（决策 4）：退避 sleeps + 重试尝试耗时 ≤ total_window_s，「先到先放弃」——
     每次 sleep 前 `can_wait(delay)` 预检、sleep 后 `remaining_s()` 复查（真实耗时
-    自然把尝试耗时计入窗口）；窗闸放弃 = 既有 SynthesisError→degraded 收束。
+    自然把尝试耗时计入窗口）；窗闸放弃 = 终局失败（v1.59 起 fused 非空轮走兜底产出
+    收束，零源轮仍 SynthesisError → 500101）。
     """
 
     def __init__(
@@ -349,6 +354,25 @@ def default_retry_on(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
     return True
+
+
+def classify_failure_kind(exc: BaseException | None) -> str:
+    """终局失败**类别**（观测口径，v1.59 增量 A）：∈ timeout | connection | non_retryable。
+
+    与 `classify_retry_tier` 的分工：tier 决定「怎么重试」，failure kind 决定「兜底轮
+    日志怎么归类」（ARCH §6.6 兜底观测条：轮末 AgentLog 记终局失败类别）——
+    - 叶异常含内置 `TimeoutError`（单调用包络超时）→ **timeout**（trace 89043f23 形态）；
+    - 其余连接类（httpx transport / openai 连接形态）→ **connection**；
+    - 其余（业务类/结构化解析失败/空输出 exc=None）→ **non_retryable**。
+    """
+    if exc is None:
+        return "non_retryable"  # 空输出形态：非重试类终止，无异常可归类
+    leaves = list(_iter_exception_leaves(exc))
+    if any(isinstance(leaf, TimeoutError) for leaf in leaves):
+        return "timeout"
+    if is_connection_failure(exc):
+        return "connection"
+    return "non_retryable"
 
 
 def pop_cancel_flag(config: Mapping[str, Any] | None) -> str | None:

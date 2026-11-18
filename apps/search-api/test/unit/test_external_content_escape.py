@@ -31,7 +31,7 @@ class _FakeModel:
 
 def _install(monkeypatch: pytest.MonkeyPatch) -> _FakeModel:
     model = _FakeModel()
-    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias: model)
+    monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: model)
     monkeypatch.setattr(synthesis_module, "emit_stage", lambda *a, **kw: None)
     return model
 

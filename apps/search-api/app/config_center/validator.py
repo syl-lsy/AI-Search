@@ -119,6 +119,8 @@ SAFETY_REPLY_CATEGORY_PREFIXES: dict[str, str] = {
     "danger": "- 危险请求回复段：",
     "profanity": "- 辱骂回复段：",
     "privacy": "- 隐私请求回复段：",
+    # v1.32（B14 增量 B）：涉政话题段（中性引导式框架句；politics 一律 reject 直答）
+    "politics": "- 涉政话题回复段：",
 }
 
 #: 前缀有序元组（校验与测试遍历用；顺序即契约段序，生成自上面的映射）
@@ -128,8 +130,9 @@ SAFETY_REPLY_LINE_PREFIXES: tuple[str, ...] = tuple(
 
 #: fast.rewrite / deep.planner 输出 schema 须含的 safety 字段 token（B13——精确形态
 #: 防散文绕过，沿 REWRITE_SCHEMA_REQUIRED_TOKENS 带引号纪律；软校验见
-#: safety_token_warnings：告警不拒收。v1.31 枚举扩四值 +privacy）。
-SAFETY_FIELD_TOKEN = '"safety":"none|danger|profanity|privacy"'
+#: safety_token_warnings：告警不拒收。v1.31 枚举扩四值 +privacy；**v1.32 五值
+#: +politics**）。
+SAFETY_FIELD_TOKEN = '"safety":"none|danger|profanity|privacy|politics"'
 
 #: safety token 软校验覆盖的两键（B13——rewrite 与 planner 同构产出 safety 初判）
 SAFETY_TOKEN_PROMPT_KEYS: tuple[str, ...] = ("fast.rewrite", "deep.planner")
@@ -388,12 +391,16 @@ def connection_retry_warnings(fast_section: Mapping[str, Any]) -> list[str]:
     """`retry.connection` 节软校验（B11 P1a；**告警不拒收**——灰度安全）。
 
     返回告警文案列表（空 = 无告警）；调用方（FastSpec 校验钩子）逐条落 ConfigLog
-    WARNING。三类告警：
+    WARNING。四类告警：
     ① 节点形态非法（非对象）→ 运行期整节回落 retry 主节；
     ② 任一键缺失/类型或越界非法 → 同上（整节回落，不做半新半旧混合）；
     ③ 联动约束 `前置预估 10s + total_window_s + 单次成功调用 8s > turn_timeout_s`
        → 提示同步评估 turn_timeout_s（用户裁决「总窗 ~30s」量级意图由
-       total_window_s 承载，放宽时须复核预算）。
+       total_window_s 承载，放宽时须复核预算）；
+    ④【v1.32（B14 增量 A）】**`total_window_s < fast.llm_timeout_s` → 重试总窗小于
+       单调用包络**（trace 89043f23 事故形态：窗 20 < 包络 30 → 包络超时类失败后首个
+       重试决策点即被窗闸饿死，max_attempts=5 名实不符仅 2 次物理尝试）；建议对齐
+       `total_window_s ≥ llm_timeout_s`。**软校验不拒收**（运行值可单键热更在线调窗）。
     """
     retry = fast_section.get("retry")
     if not isinstance(retry, Mapping):
@@ -431,6 +438,17 @@ def connection_retry_warnings(fast_section: Mapping[str, Any]) -> list[str]:
                 f"fast.turn_timeout_s {float(turn_timeout):g}s；"
                 "建议同步评估 turn_timeout_s"
             )
+    # ④ v1.32（B14 增量 A）：窗-包络对齐——窗小于单调用包络时包络超时类失败的首个
+    # 重试决策点即被窗闸饿死（trace 89043f23：窗 20 < 包络 30 仅 2 次物理尝试）。
+    llm_timeout = fast_section.get("llm_timeout_s")
+    if isinstance(total_window, (int, float)) and isinstance(llm_timeout, (int, float)):
+        if float(total_window) < float(llm_timeout):
+            warnings.append(
+                "retry.connection：窗-包络对齐告警（软校验不拒收）——"
+                f"total_window_s {float(total_window):g}s < fast.llm_timeout_s "
+                f"{float(llm_timeout):g}s；包络超时类失败后首个重试决策点即被窗闸"
+                "放弃（max_attempts 名实不符），建议对齐 total_window_s ≥ llm_timeout_s"
+            )
     return warnings
 
 
@@ -454,6 +472,9 @@ class FastSpec(BaseModel):
     llm_timeout_s: int = Field(gt=0)
     tool_timeout_s: int = Field(gt=0)
     turn_timeout_s: int = Field(gt=0)
+    #: §3 v1.32（B14 增量 C）：模式级思考开关——**键缺失合法**（默认值承载裁决值
+    #: fast=off / deep=on），非法值拒收。
+    thinking: Literal["on", "off"] = "off"
     recursion_limit: int = Field(gt=0)
     retry: RetrySpec
 
@@ -505,6 +526,8 @@ class DeepSpec(BaseModel):
     llm_timeout_s: int = Field(gt=0)
     tool_timeout_s: int = Field(gt=0)
     turn_timeout_s: int = Field(gt=0)
+    #: §3 v1.32（B14 增量 C）：deep 档思考开关（裁决值 default=on）
+    thinking: Literal["on", "off"] = "on"
     code_exec_enabled: bool = False
     code_exec_timeout_s: int = Field(gt=0)
     code_exec_cpu_limit: float = Field(gt=0, le=4)  # §3 v1.5：0 < cpu ≤ 4（核）
@@ -638,6 +661,9 @@ class SafetySpec(BaseModel):
     profanity_terms: list[str] = Field(default_factory=list, max_length=200)
     #: B13 增量一（v1.31）：隐私侵害意图词表（规则同 danger_terms）
     privacy_terms: list[str] = Field(default_factory=list, max_length=200)
+    #: v1.32（B14 增量 B）：涉政敏感话题词表——**初值空数组**（内容用户 Nacos 自填，
+    #: AI 零生成）；结构规则镜像 danger_terms（≤200 / 单条非空 ≤64 / 去重）
+    politics_terms: list[str] = Field(default_factory=list, max_length=200)
     grey_rules: list[str] = Field(default_factory=list, max_length=50)
     classify_timeout_ms: int = Field(default=2000, ge=200, le=10000)
     reply_timeout_ms: int = Field(default=4000, ge=200, le=10000)
@@ -656,7 +682,9 @@ class SafetySpec(BaseModel):
             )
         return value
 
-    @field_validator("danger_terms", "profanity_terms", "privacy_terms")
+    @field_validator(
+        "danger_terms", "profanity_terms", "privacy_terms", "politics_terms"
+    )
     @classmethod
     def _check_term_entries(cls, value: list[str]) -> list[str]:
         for term in value:
@@ -670,16 +698,19 @@ class SafetySpec(BaseModel):
 
     @model_validator(mode="after")
     def _check_enabled_requires_terms(self) -> "SafetySpec":
-        """§3 校验规则 v1.31：enabled=true 时三词表（danger/profanity/privacy）
-        至少其一非空（空词表开启=配置矛盾）。"""
+        """§3 校验规则 v1.32：enabled=true 时**四词表**（danger/profanity/privacy/
+        politics）至少其一非空（空词表开启=配置矛盾；politics_terms 空初值不影响
+        该约束——politics 拦截面在词表自填前由 Layer 2 初判 + grey 复核兜）。"""
         if (
             self.enabled
             and not self.danger_terms
             and not self.profanity_terms
             and not self.privacy_terms
+            and not self.politics_terms
         ):
             raise ValueError(
-                "enabled=true 时 danger_terms/profanity_terms/privacy_terms 至少其一非空"
+                "enabled=true 时 danger_terms/profanity_terms/privacy_terms/"
+                "politics_terms 至少其一非空"
             )
         return self
 

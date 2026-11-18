@@ -49,6 +49,7 @@ _VALID_SECTION: dict[str, Any] = {
     "danger_terms": ["制造炸弹", "制毒方法"],
     "profanity_terms": ["傻逼", "SB"],
     "privacy_terms": ["人肉搜索", "开盒挂人"],
+    "politics_terms": ["涉政词条甲"],
     "grey_rules": ["炸\\s*[药弹]", "傻[Bb]|S[Bb]"],
     "classify_timeout_ms": 2000,
     "reply_timeout_ms": 4000,
@@ -87,6 +88,7 @@ class TestLoadSafetyConfig:
         assert config.danger_terms == ("制造炸弹", "制毒方法")
         assert config.profanity_terms == ("傻逼", "SB")
         assert config.privacy_terms == ("人肉搜索", "开盒挂人")
+        assert config.politics_terms == ("涉政词条甲",)
         assert len(config.grey_rules) == 2
         assert all(isinstance(p, re.Pattern) for p in config.grey_rules)
         assert config.classify_timeout_s == 2.0  # 2000ms → 2s
@@ -172,6 +174,7 @@ class TestLoadSafetyConfig:
         assert config.danger_terms == ()
         assert config.profanity_terms == ()
         assert config.privacy_terms == ()
+        assert config.politics_terms == ()  # v1.32：politics 初值空表（用户自填）
         assert config.grey_rules == ()
         assert config.classify_timeout_s == 2.0
         assert config.reply_timeout_s == 4.0
@@ -361,6 +364,7 @@ def _config(**overrides: Any) -> SafetyConfig:
         "danger_terms": ("制造炸弹", "制毒方法"),
         "profanity_terms": ("傻逼", "SB", "白痴", "滚蛋"),
         "privacy_terms": ("人肉搜索", "开盒挂人"),
+        "politics_terms": ("涉政词条甲", "涉政词条乙"),
         "grey_rules": (re.compile("炸\\s*[药弹]"), re.compile("白\\s*痴")),
         "classify_timeout_s": 2.0,
         "reply_timeout_s": 4.0,
@@ -420,6 +424,25 @@ class TestScanLexicon:
             ("profanity", "傻逼"),
             ("privacy", "人肉搜索"),
         ]
+
+    def test_politics_hit(self) -> None:
+        """v1.32 涉政词表硬命中：kind=politics（第五类，reject-only 通道）。"""
+        scan = scan_lexicon("涉政词条甲 的评价", _config())
+        assert [(h.kind, h.term) for h in scan.hard_hits] == [("politics", "涉政词条甲")]
+        assert scan.grey is False
+
+    def test_politics_priority_after_privacy(self) -> None:
+        """处置优先级 danger > profanity > privacy > politics（v1.32 词表配置序输出）。"""
+        scan = scan_lexicon("制造炸弹 傻逼 人肉搜索 涉政词条乙", _config())
+        assert [h.kind for h in scan.hard_hits] == [
+            "danger", "profanity", "privacy", "politics",
+        ]
+
+    def test_empty_politics_terms_never_hit(self) -> None:
+        """politics 初值空表（用户自填前）：任何文本零 politics 命中（不误拦）。"""
+        scan = scan_lexicon("请解读这份政府工作报告", _config(politics_terms=()))
+        assert [h for h in scan.hard_hits if h.kind == "politics"] == []
+        assert scan.grey is False
 
     def test_no_grey_rules_no_grey(self) -> None:
         scan = scan_lexicon("炸 药", _config(grey_rules=()))
@@ -497,6 +520,18 @@ class TestKeepCategorySection:
         assert "- 辱骂回复段：" not in kept
         assert body == "隐私话术"
 
+    def test_politics_inverse(self) -> None:
+        """politics 段切分（v1.32，四类别模板）：只留涉政段，其余三段删除。"""
+        template = (
+            "- 危险请求回复段：危险\n- 辱骂回复段：辱骂话术\n"
+            "- 隐私请求回复段：隐私话术\n- 涉政话题回复段：涉政话术"
+        )
+        kept, body = _keep_category_section(template, "politics")
+        assert "- 危险请求回复段：" not in kept
+        assert "- 辱骂回复段：" not in kept
+        assert "- 隐私请求回复段：" not in kept
+        assert body == "涉政话术"
+
     def test_category_prefixes_single_source(self) -> None:
         """段前缀映射单一事实源（评审 P3）：reply 直接复用 validator 常量，
         两处不再按序号各自硬编码（防类别增删时位置耦合漏改）。"""
@@ -504,7 +539,9 @@ class TestKeepCategorySection:
         from app.config_center.validator import SAFETY_REPLY_CATEGORY_PREFIXES
 
         assert reply_module._CATEGORY_LINE_PREFIXES is SAFETY_REPLY_CATEGORY_PREFIXES
-        assert set(SAFETY_REPLY_CATEGORY_PREFIXES) == {"danger", "profanity", "privacy"}
+        assert set(SAFETY_REPLY_CATEGORY_PREFIXES) == {
+            "danger", "profanity", "privacy", "politics",
+        }
 
     def test_missing_section_yields_empty_body(self) -> None:
         """旧模板缺段（validator 拒收之外的兜底面）：body 为空串。"""
@@ -560,6 +597,29 @@ class TestGenerateRejectionReply:
             "privacy", "中文", load_safety_config({"safety": _VALID_SECTION})
         )
         assert "不能协助查询或挖掘他人隐私信息" in reply
+        assert "{{query_lang}}" not in reply
+
+    async def test_politics_prompt_sections(self, fake_model: _FakeModel) -> None:
+        """politics（v1.32）：只保留涉政段，其余三段删除（四类别模板行级切分）。"""
+        await generate_rejection_reply(
+            "politics", "中文", load_safety_config({"safety": _VALID_SECTION})
+        )
+        prompt = fake_model.calls[0]["prompt"]
+        assert "- 涉政话题回复段：" in prompt
+        assert "- 危险请求回复段：" not in prompt
+        assert "- 辱骂回复段：" not in prompt
+        assert "- 隐私请求回复段：" not in prompt
+
+    async def test_politics_failure_falls_back_to_politics_section(
+        self, fake_model: _FakeModel
+    ) -> None:
+        """politics 兜底：LLM 故障回落涉政段文本（中性引导式框架句）。"""
+        fake_model._error = RuntimeError("boom")
+        reply = await generate_rejection_reply(
+            "politics", "中文", load_safety_config({"safety": _VALID_SECTION})
+        )
+        assert "该类话题暂不支持讨论" in reply
+        assert "参考官方权威信息来源" in reply
         assert "{{query_lang}}" not in reply
 
     async def test_llm_failure_falls_back_to_section_text(

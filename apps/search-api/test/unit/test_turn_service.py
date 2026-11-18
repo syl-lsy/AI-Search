@@ -29,7 +29,7 @@ from app.exception import (
     TurnTerminalException,
 )
 from app.agent.guards import ContentRejectedError
-from app.agent.nodes.synthesis import SynthesisError
+from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry
 from app.services import turn_service
 from app.services.event_bus import EventBus
@@ -1040,6 +1040,129 @@ async def test_synthesis_error_degraded_finish_with_error_and_done() -> None:
     assert channel is not None and channel.terminal is True
 
 
+# ---- v1.59 增量 A：synthesis 兜底收束（api.md §7.4 兜底收束形态）----
+
+
+class _SynthesisFallbackGraph(_FakeGraph):
+    """兜底假图：sources → stage(write running) → fallback_token(digest 整块) →
+    stage(write done, extra.fallback) → 抛 SynthesisFallback（零 error 收束路径）。"""
+
+    def __init__(self, *, kind: str = "synthesis_digest") -> None:
+        super().__init__([])
+        self._kind = kind
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+        answer = "来源速览整块" if self._kind == "synthesis_digest" else "部分正文。"
+        kind = self._kind
+
+        async def gen():
+            yield (
+                ("fast:r1",),
+                "custom",
+                {"type": "sources", "batch": [dict(_SRC)], "total": 1},
+            )
+            yield (
+                ("fast:r1",),
+                "custom",
+                {"type": "stage", "stage_key": "write", "status": "running", "label": "综合中"},
+            )
+            if kind == "synthesis_digest":
+                yield (("fast:r1",), "custom", {"type": "fallback_token", "delta": answer})
+            yield (
+                ("fast:r1",),
+                "custom",
+                {"type": "stage", "stage_key": "write", "status": "done",
+                 "extra": {"fallback": kind}},
+            )
+            raise SynthesisFallback(
+                answer_md=answer, kind=kind, failure="timeout", attempts=2, source_count=1
+            )
+
+        return gen()
+
+
+@pytest.mark.parametrize(
+    ("kind", "answer"),
+    [("synthesis_digest", "来源速览整块"), ("synthesis_partial", "部分正文。")],
+)
+async def test_synthesis_fallback_finishes_degraded_without_error(kind: str, answer: str) -> None:
+    """兜底收束：零 error 事件 + done(finish=degraded, degraded_reason=null) +
+    turns.status=degraded + answer_md 落库（digest 整块 token 经 custom 通道 publish-only）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _SynthesisFallbackGraph(kind=kind))
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    assert "error" not in {e.event_type for e in published}
+    done = published[-1]
+    assert done.event_type == "done"
+    assert done.data["finish"] == "degraded"
+    assert done.data["degraded"] is True
+    assert done.data["degraded_reason"] is None
+    assert done.data["source_count"] == 1
+    assert turn.status == "degraded"
+    assert turn.answer_md == answer
+    assert turn.error is None  # 兜底轮无错误卡
+    # stage(write, done) 的 extra.fallback 留痕（M4 采样判据键）
+    write_done = [
+        e for e in published
+        if e.event_type == "stage" and e.data.get("stage_key") == "write"
+        and e.data.get("status") == "done"
+    ]
+    assert write_done[0].data["extra"] == {"fallback": kind}
+    # digest 整块 token 单事件（partial 不补发 token）
+    tokens = [e for e in published if e.event_type == "token"]
+    assert [t.data["delta"] for t in tokens] == ([answer] if kind == "synthesis_digest" else [])
+    # publish-only：token 不入 turn_events（ADR-003 第 4 条）
+    events = [obj for obj in session.added if type(obj).__name__ == "TurnEvent"]
+    assert "token" not in {e.event_type for e in events}
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True
+
+
+async def test_synthesis_error_zero_source_fails_with_500101() -> None:
+    """500101 语义收窄：零源轮终局失败仍 error(500101) 后直接关闭（无 done、status=failed）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _SynthesisBoomNoSourcesGraph())
+
+    await scheduler._execute_turn(turn)
+
+    published = await _drain_all(bus, str(turn.id))
+    error = next(e for e in published if e.event_type == "error")
+    assert error.data["code"] == "500101"
+    assert error.data["message"] == "综合生成失败，请稍后重试"
+    assert "done" not in {e.event_type for e in published}
+    assert turn.status == "failed"
+    channel = bus._channels.get(str(turn.id))
+    assert channel is not None and channel.terminal is True
+
+
+class _SynthesisBoomNoSourcesGraph(_FakeGraph):
+    """零源失败假图：直接抛 SynthesisError（无 sources 发布——direct/recall 形态）。"""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+
+        async def gen():
+            raise SynthesisError("综合生成失败（空输出）")
+            yield  # pragma: no cover —— 生成器语法占位（不可达）
+
+        return gen()
+
+
 # ---- seed_seq_from_db（进程重启防 uq 撞库）----
 
 
@@ -1728,17 +1851,19 @@ class _RejectGraph(_FakeGraph):
         *,
         reply: str = "该请求涉及危险内容，我无法协助。",
         layer: str = "pre_route",
+        category: str = "danger",
     ) -> None:
         super().__init__([])
         self._reply = reply
         self._layer = layer
+        self._category = category
 
     def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
                 subgraphs: bool = False) -> Any:
         self.payloads.append(payload)
         self.configs.append(config)
         raise ContentRejectedError(
-            category="danger", reply=self._reply, layer=self._layer
+            category=self._category, reply=self._reply, layer=self._layer
         )
 
 
@@ -1826,6 +1951,43 @@ async def test_content_rejected_log_records_layer_category_not_query(
     assert "layer=pre_route" in joined
     assert "category=danger" in joined
     assert "13812345678" not in joined  # query 原文零泄漏
+
+
+async def test_politics_reject_logged_with_category_bucket(log_records: list[dict]) -> None:
+    """v1.32 观测（ARCH §6.6 输入安全观测注）：politics 轮即安全拒绝轮——轮末留痕
+    category=politics、layer 桶同通道（R19 误拦率探针 politics 桶复用同一日志面）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(
+        bus, _FakeSessionFactory(session), _RejectGraph(category="politics")
+    )
+
+    await scheduler._execute_turn(turn)
+
+    joined = "\n".join(str(r["message"]) for r in log_records)
+    assert "category=politics" in joined
+    assert "layer=pre_route" in joined
+    assert turn.status == "failed"
+
+
+async def test_synthesis_fallback_logs_structured_observability_fields(
+    log_records: list[dict],
+) -> None:
+    """兜底观测（ARCH §6.6 v1.59 兜底观测条②，events_only 下天然可达）：轮末结构化
+    日志含 fallback kind / 终局失败类别 / 物理尝试次数 / digest 来源条数。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _SynthesisFallbackGraph())
+
+    await scheduler._execute_turn(turn)
+
+    joined = "\n".join(str(r["message"]) for r in log_records)
+    assert "fallback=synthesis_digest" in joined
+    assert "failure=timeout" in joined
+    assert "attempts=2" in joined
+    assert "digest_sources=1" in joined
 
 
 async def test_build_regenerate_context_resanitizes_query_when_safety_enabled() -> None:
