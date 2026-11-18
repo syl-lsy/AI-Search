@@ -54,7 +54,7 @@ from app.agent.graphs.main import graph as main_graph
 from app.agent.graphs.regenerate import graph as regenerate_graph
 from app.agent.guards import ContentRejectedError, TurnCanceledSignal
 from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
-from app.agent.safety import detect_pii, load_safety_config, sanitize
+from app.agent.safety import SafetyConfig, detect_pii, load_safety_config, sanitize
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
@@ -1868,6 +1868,34 @@ class ThreadScheduler:
             [(str(query), str(answer_md or "")) for query, answer_md in rows]
         )
 
+    @staticmethod
+    def _sanitize_history_rows(
+        rows: list[Any], safety: SafetyConfig | None
+    ) -> list[Any]:
+        """历史行集装配前统一脱敏（history 出域缺口）：两通道共用本行集，故同享结果。
+
+        缺口根因（Langfuse trace 6cdec1eb 实证）：sanitize 通道此前只覆盖当前轮 query
+        （safety_check Stage A）；追问轮 history 块读的是前轮 `turns.query` 原文，前轮
+        PII 经 history 注入 rewrite/planner 提示词出域到 LLM 提供商。本方法在
+        `_format_history` / `_format_history_recall` 之前对 `(query, answer_md)` 两个
+        元素分别跑 `detect_pii` + `sanitize`（纯函数，占位词与当前轮同口径）——答案
+        元素一并处理：答案头/骨架同样进提示词，不得携带前轮 PII。
+
+        `safety is None` 原样返回（fail-open / kill switch）：spec 缺 safety 节或
+        `safety.enabled=false` → `load_safety_config` 返 None，契约语义「单键热更即
+        全链直通」——此处**不得**做成无条件脱敏，否则回退门失效。落库原文不受影响
+        （§2.5 turns.query 事实源口径不变，只改进程内装配出的 history 副本）。
+        """
+        if safety is None:
+            return rows
+        return [
+            (
+                sanitize(str(query), detect_pii(str(query))),
+                sanitize(str(answer_md or ""), detect_pii(str(answer_md or ""))),
+            )
+            for query, answer_md in rows
+        ]
+
     async def _can_start(self, row: Any) -> bool:
         """启动条件（每线程同时一轮）：无其他 ACTIVE 轮 + 抢占/FIFO 次序约束。
 
@@ -2023,6 +2051,11 @@ class ThreadScheduler:
             # 指代消解）恒装配；通道二（recall 轮 synthesis 消费）仅 fast 轮装配（deep 轮
             # DeepState 不消费、total=False 缺键合法——不白付骨架解析成本，评审 P2-2 门控）。
             history_rows = await self._load_history_rows(thread_id, turn_id)
+            # history 出域缺口修复：前轮 PII 原文不得经两通道提示词出域（trace
+            # 6cdec1eb 实证）——行集层统一脱敏，safety 关（kill switch）原样直通。
+            history_rows = self._sanitize_history_rows(
+                history_rows, load_safety_config(ctx.spec_payload)
+            )
             is_fast_mode = str(turn.mode) != "deep"
             initial_state: dict[str, Any] = {
                 "turn_id": turn_id,

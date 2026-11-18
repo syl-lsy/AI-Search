@@ -13,6 +13,7 @@ cancel 两态 + 409002；resolve_chat_model 非法键 400001；B13 拒绝轮（e
 """
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -29,6 +30,7 @@ from app.exception import (
     TurnTerminalException,
 )
 from app.agent.guards import ContentRejectedError
+from app.agent.safety import load_safety_config
 from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry
 from app.services import turn_service
@@ -2078,3 +2080,140 @@ async def test_completed_round_logs_safety_summary_when_state_carries_keys(
 
     joined = "\n".join(str(r["message"]) for r in log_records)
     assert "轮次安全摘要：category=pii action=sanitize" in joined
+
+
+# ---- history 装配 PII 脱敏（安全 sanitize 通道的 history 出域缺口修复）----
+#
+# 缺口实证（Langfuse trace 6cdec1eb）：safety sanitize 通道此前只覆盖当前轮 query
+# （safety_check Stage A）；追问轮的 history 块从 DB 读前轮 `turns.query` 原文，
+# 前轮 PII 经 history 注入 rewrite/planner 提示词出域到 LLM 提供商（trace 里原始
+# 手机号在 rewrite prompt 的唯一出现点=历史 Q 行）。修复口径=历史行集在两通道装配
+# 前统一过 detect_pii+sanitize（`_sanitize_history_rows`），两 formatter 本身不动；
+# safety=None 直通（kill switch：spec 缺 safety 节 / safety.enabled=false → 全链直通）。
+
+#: 历史行 PII 样本（手机号/邮箱形态由 sanitizer 单测锁定，此处复用同形串验服务面接线）
+_HISTORY_PII_QUERY = "我的手机号 13812345678 能查到什么？"
+_HISTORY_PII_QUERY_SANITIZED = "我的手机号 [手机号] 能查到什么？"
+_HISTORY_PII_ANSWER = "记录显示：手机号 13812345678，邮箱 alice@example.com。"
+_HISTORY_PII_ANSWER_SANITIZED = "记录显示：手机号 [手机号]，邮箱 [邮箱]。"
+
+
+async def test_assembly_sanitizes_pii_in_both_history_channels() -> None:
+    """safety 开 → 两通道的历史 Q 行与答案在装配前脱敏，前轮 PII 原文零出域。
+
+    断言价值：脱敏必须发生在**行集层**（两通道共用同一行集）——只改一个 formatter
+    会留下另一条出域路径；且 Q 与答案两个元素同等处理（答案头/骨架同样进提示词）。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="刚才那个号码还能查吗？")
+    session = _FakeSession(
+        turn=turn,
+        execute_rows=[
+            (_HISTORY_PII_QUERY, _HISTORY_PII_ANSWER),
+            ("更早一问", "更早答案。"),
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph, spec=_SAFETY_ON_SPEC)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    # 通道一（rewrite/planner 消费）：形态与时间正序零变化，仅命中区间被替换
+    assert payload["history"] == [
+        {"q": "更早一问", "a_head": "更早答案。"},
+        {"q": _HISTORY_PII_QUERY_SANITIZED, "a_head": _HISTORY_PII_ANSWER_SANITIZED},
+    ]
+    # 通道二（recall 轮 synthesis 消费）：Q 行与骨架答案同样脱敏
+    recall_latest = payload["history_recall"][-1]
+    assert recall_latest["q"] == _HISTORY_PII_QUERY_SANITIZED
+    assert "[手机号]" in recall_latest["a"]
+    assert "[邮箱]" in recall_latest["a"]
+    # 出域面终检：序列化后的两通道字段零原文号码/邮箱
+    serialized = json.dumps(
+        {"history": payload["history"], "history_recall": payload["history_recall"]},
+        ensure_ascii=False,
+    )
+    assert "13812345678" not in serialized
+    assert "alice@example.com" not in serialized
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(None, id="no_safety_section"),  # 节缺失 → fail-open（告警一次）
+        pytest.param(
+            {**_SPEC_PAYLOAD, "safety": {"enabled": False}}, id="enabled_false"
+        ),  # 回退门合法直通（§1 v1.30：单键热更即全链直通）
+    ],
+)
+async def test_assembly_keeps_raw_history_when_safety_off(
+    spec: dict[str, Any] | None,
+) -> None:
+    """kill switch：safety 关（节缺失 / enabled=false）→ history 原样保留。
+
+    意义：修复不得做成无条件脱敏——enabled=false 是契约允许的回退门，届时历史
+    必须逐字直通（与当前轮 query 的 fail-open 口径一致）。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="刚才那个号码还能查吗？")
+    session = _FakeSession(
+        turn=turn, execute_rows=[(_HISTORY_PII_QUERY, _HISTORY_PII_ANSWER)]
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph, spec=spec)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert payload["history"] == [
+        {"q": _HISTORY_PII_QUERY, "a_head": _HISTORY_PII_ANSWER[:200]}
+    ]
+    assert payload["history_recall"][0]["q"] == _HISTORY_PII_QUERY
+    assert "[手机号]" not in json.dumps(payload["history"], ensure_ascii=False)
+    # recall 通道同向对称（评审 P3）：序列化终检手法与 safety-on 用例同款，方向相反
+    # ——kill switch 的语义是原文直通，故断言原文仍在、占位词零出现（两通道一致）。
+    serialized_recall = json.dumps(payload["history_recall"], ensure_ascii=False)
+    assert "13812345678" in serialized_recall
+    assert "alice@example.com" in serialized_recall
+    assert "[手机号]" not in serialized_recall
+    assert "[邮箱]" not in serialized_recall
+
+
+async def test_assembly_keeps_history_unchanged_without_pii() -> None:
+    """safety 开但历史无 PII → 内容零改写（sanitize 空命中返回原文）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="接着上次说")
+    session = _FakeSession(turn=turn, execute_rows=[("上一问", "普通答案。")])
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph, spec=_SAFETY_ON_SPEC)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert payload["history"] == [{"q": "上一问", "a_head": "普通答案。"}]
+    assert payload["history_recall"] == [{"q": "上一问", "a": "普通答案。"}]
+
+
+def test_sanitize_history_rows_sanitizes_query_and_answer_elements() -> None:
+    """直测纯函数：q 与 a 两个元素同等脱敏（答案元素此前是缺口的一半）。
+
+    非法/空答案（None）按 formatter 既有口径归一为空串，不炸。
+    """
+    safety = load_safety_config(_SAFETY_ON_SPEC)
+    assert safety is not None
+    rows = [(_HISTORY_PII_QUERY, _HISTORY_PII_ANSWER), ("无 PII 问句", None)]
+
+    sanitized = ThreadScheduler._sanitize_history_rows(rows, safety)
+
+    assert sanitized == [
+        (_HISTORY_PII_QUERY_SANITIZED, _HISTORY_PII_ANSWER_SANITIZED),
+        ("无 PII 问句", ""),
+    ]
+
+
+def test_sanitize_history_rows_passthrough_when_safety_none() -> None:
+    """safety=None（fail-open / kill switch）→ 行集原样返回，零脱敏零改写。"""
+    rows: list[Any] = [(_HISTORY_PII_QUERY, _HISTORY_PII_ANSWER)]
+
+    assert ThreadScheduler._sanitize_history_rows(rows, None) == rows
