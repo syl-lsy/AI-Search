@@ -89,7 +89,9 @@ class MainState(TypedDict, total=False):
     usage_total: int
     degraded_reason: str | None  # "timeout" | "budget" | "source_failure"（api.md §7.2 枚举）
     # 横切（reducer 承接 Send 扇出并行副本：errors 追加、degraded 逻辑或——§4.1 键集不变；
-    # deep 侧同名回填共用本通道，DeepState 侧为普通类型——两侧形态批次 2 对齐）
+    # deep 侧同名回填共用本通道——批次 2 reducer 改造后 DeepState.errors 已为同型
+    # Annotated[list, add]（两侧自此一致）；degraded 维持两侧不同型：MainState 侧 or_、
+    # DeepState 侧普通布尔（deep degraded 收敛归批次 3 guards 再定，DeepState 注同源））
     errors: Annotated[list[dict[str, Any]], add]
     degraded: Annotated[bool, or_]
     # safety（B13 主图壳 pre_route：safety_check 节点产出——Layer 1 专属；子图 state
@@ -167,7 +169,9 @@ class DeepState(TypedDict, total=False):
     subtopics: list[str]
     outline: list[dict[str, Any]]  # [{section, intent}] 报告章节骨架
     # research/reflect 累积（deepagents 子代理，B4）
-    subagent_reports: list[dict[str, Any]]
+    subagent_reports: Annotated[list[dict[str, Any]], add]  # M2 批次 2 reducer 改造：
+    #   扇出合流（research 门控/后续 supplement 轮各自增量追加，superstep 末拼接）；
+    #   MainState 同名投影保持批次 1 普通类型零改动（两侧形态有意不同——状态契约测试注）
     visited_urls: list[str]
     searched_queries: list[str]
     snapshots: list[dict[str, Any]]  # [{url, object_key, size}]
@@ -179,6 +183,7 @@ class DeepState(TypedDict, total=False):
     answer_md: str  # TurnRunner 终态落库统一读该键（桩期即由 write 桩产出）
     # 横切
     usage_total: int
-    degraded: bool
+    degraded: bool  # 维持普通布尔——批次 3 guards 再定（2026-11-16 批次 2 派单裁决）
     degraded_reason: str | None  # "timeout" | "budget" | "source_failure"（api.md §7.2 枚举）
-    errors: list[dict[str, Any]]
+    errors: Annotated[list[dict[str, Any]], add]  # M2 批次 2 reducer 改造：扇出合流
+    #   （注解与 MainState 既有横切声明同型——两侧自此一致，R14① 对齐域内）

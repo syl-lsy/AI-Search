@@ -539,11 +539,13 @@ def test_fast_graph_modules_do_not_import_reader_tools() -> None:
 
     代码级保证（共识约束）：fast 既有语义零回退是底线——哨兵扫描 fast 图壳与
     全部 fast 节点模块，任何 url_reader 导入即红（ImportFrom 与直导 ast.Import 两形态）。
+    M2 批次 2 扫描域修订：deep_ 前缀节点（deep_planner/deep_research——deep 消费面）
+    排除在 fast 图面外；deep_research 为读取链/三工具的合法装配消费面。
     """
     root = Path(__file__).resolve().parents[2] / "app" / "agent"
-    fast_files = sorted((root / "nodes").glob("*.py")) + sorted(
-        p for p in (root / "graphs").glob("*.py") if p.name != "deep.py"
-    )
+    fast_files = sorted(
+        p for p in (root / "nodes").glob("*.py") if not p.name.startswith("deep_")
+    ) + sorted(p for p in (root / "graphs").glob("*.py") if p.name != "deep.py")
     assert fast_files, "fast 图面文件缺失（哨兵扫描面为空）"
     offenders: list[str] = []
     for path in fast_files:

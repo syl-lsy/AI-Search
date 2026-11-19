@@ -369,7 +369,7 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
 
     # 搜索链假体：registry.resolve 恒 [tavily]、search 恒确定性候选（桩流面零真源调用）
     from app.agent.tools import registry as registry_module
-    from app.agent.tools.registry import SearchChain
+    from app.agent.tools.registry import ReadChain, SearchChain
 
     class _FakeSearchRegistry:
         def __init__(self) -> None:
@@ -381,6 +381,12 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
         def resolve(self, payload: Any, query_lang: str) -> SearchChain:
             return SearchChain(
                 sources=["tavily"], backup=None, degraded=False, detail="tavily（假体）"
+            )
+
+        def resolve_read(self, payload: Any) -> "ReadChain":
+            # M2 批次 2：读取链轮启动冻结（deep research 注入面）——假体恒主位 [firecrawl]
+            return ReadChain(
+                sources=["firecrawl"], backup=None, degraded=False, detail="firecrawl（假体）"
             )
 
         def credential_ready(self, server: str) -> bool:
@@ -413,6 +419,33 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
     )
     monkeypatch.setattr(
         "app.services.turn_service.get_tools_registry", lambda: _FakeSearchRegistry()
+    )
+
+    # deep research 假体（M2 批次 2）：deep 轮 research 接真后，REST/SSE 桩流测试的 deep
+    # 分流（ModeRoutingFakeGraph → 真 deep 子图）不得触真 LLM 研究环（每轮 50s+ 会撞
+    # 60s 轮次终态等待窗）——主协调器桩为「零 task 派发单帧收尾」（research 子代理语义
+    # 由 unit test_deep_research.py 与 requires_llm 冒烟承担；同 followups「真实生成链
+    # 路由 unit 与 e2e 承担」口径。requires_llm 标记用例豁免本假体——真 LLM 冒烟面）。
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
+    from app.agent.nodes import deep_research as deep_research_module
+
+    class _ResearchMainModel(GenericFakeChatModel):
+        """派发桩：单帧纯文本收尾（零 task 调用）——bind_tools 返回 self（探针同款）。"""
+
+        def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
+            return self
+
+    monkeypatch.setattr(
+        deep_research_module,
+        "build_chat_model",
+        lambda alias, **kw: _ResearchMainModel(messages=iter([AIMessage(content="零派发汇总收尾。")])),
+    )
+    monkeypatch.setattr(
+        deep_research_module,
+        "_subagent_model",
+        lambda alias, index: _ResearchMainModel(messages=iter([AIMessage(content="保留。")])),
     )
 
     # followups 图外钩子假体（REQ-046；v1.22 起 spec 默认 enabled=true）：桩流测试不得

@@ -18,6 +18,11 @@ dependencies = [
     # B1 双健康探针出站探活（MinIO /minio/health/live + LiteLLM 轻量探活，api.md §1.2）：
     # httpx 升为运行依赖（== 锁定，与 dev 组同版）——原「骨架期 app 代码不引用」口径随探针落地解除
     "httpx==0.28.1",
+    # M2 批次 2 修复轮：save_snapshot 快照链默认路径运行依赖（object_cleanup 同款 SDK）——
+    # live 验证发现 B②：SDK 不在依赖时 importlib ModuleNotFoundError，首轮真读即断快照链
+    # （原「批次 1 交付说明『生产接线前须补运行依赖』预警」于本批兑现）。== 锁定
+    # （2026-11-19 PyPI 当日稳定版）；升级随 minio-py 上游演进并重跑活体实测护栏
+    "minio==7.2.20",
     # ── AI 栈：== 锁定（ARCH v1.21 依赖策略「AI 依赖取当日稳定版锁定」；锁定值 = 2026-11-04 uv.lock 定版快照）
     "langgraph==1.2.19",       # M2 批次 0 == 锁定（=uv.lock 现解析值；原 ARCH「>=1.1 下限例外」收口，deep 流式 subgraphs=True + StreamPart v2 语义不变，§6.1）
     "langchain==1.4.9",        # 2026-11-04 当日稳定版锁定

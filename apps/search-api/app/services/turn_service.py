@@ -2032,6 +2032,8 @@ class ThreadScheduler:
             )
             tools_registry.bind(ctx.mcp_payload)  # 连接条目+熔断参数按本轮快照刷新（指纹缓存复用）
             search_chain = tools_registry.resolve(ctx.mcp_payload, query_lang)
+            read_chain = tools_registry.resolve_read(ctx.mcp_payload)  # M2 批次 2：读取链轮启动
+            #   冻结（deep research 注入面——nacos §2 v1.8 主备条件装载，与搜索链同语义）
             if search_chain.degraded or not search_chain.sources:
                 servers = ctx.mcp_payload.get("servers") if isinstance(ctx.mcp_payload, Mapping) else None
                 server_summary = (
@@ -2107,6 +2109,7 @@ class ThreadScheduler:
                             "cancel_flags": self._cancel_flags,
                             "model_mapping": dict(ctx.mapping_payload),
                             "search_chain": search_chain,
+                            "read_chain": read_chain,
                             "tools_registry": tools_registry,
                         },
                         # Langfuse trace root=轮（ARCH §6.6）：trace_id=turn_id 对账、

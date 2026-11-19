@@ -40,7 +40,7 @@ from app.agent.nodes import fuse_rerank as fuse_module
 from app.agent.nodes import merge_dedupe as merge_module
 from app.agent.nodes import synthesis as synthesis_module
 from app.agent.nodes import web_search as ws_module
-from app.agent.tools.registry import SearchChain, ToolRegistry
+from app.agent.tools.registry import ReadChain, SearchChain, ToolRegistry
 from app.services.event_bus import EventBus
 from test.unit.turn_fakes import (
     _MAPPING_PAYLOAD,
@@ -320,13 +320,20 @@ async def test_real_main_graph_messages_frames_only_from_synthesis(
 async def test_deep_stub_zero_messages_and_runner_zero_token_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """deep 零泄漏基线（R14③，M2 批次 2 修订：planner 接真 + write 桩形态）：
-    (a) 真 deep 子图经主图壳运行零 messages 帧（planner 结构化输出为非流式调用、
-    假体零回调帧；write 桩 token 走 custom、被翻译器丢弃）；
-    (b) TurnRunner 侧零 token/thinking SSE 事件（stage 序列 + done 正常）——
-    writer 放行语义由下方模拟 namespace 门控测试单独锁定（批次 4 writer 实装后
-    本基线由真 writer 帧形态接通）。"""
+    """deep 零泄漏基线（R14③，M2 批次 2 修订：planner+research 接真 + write 桩形态）：
+    (a) 真 deep 子图经主图壳运行，messages 帧零 writer 帧（实测帧形态：research 协调器
+    为 deepagents 编译体，其 LLM 帧 langgraph_node="model"（内层节点名，子代理同形）、
+    namespace 多段——`_is_deep_writer_messages` 只放行 deep 顶层单段 namespace 的
+    writer，帧全被门控拦；planner 结构化输出桩为零回调帧形态）；writer 放行语义由
+    下方模拟 namespace 门控测试单独锁定（批次 4 writer 实装后本基线由真 writer 帧形态
+    接通）；
+    (b) TurnRunner 侧零 token/thinking SSE 事件（stage 序列 + done 正常——含 research
+    零派发桩形态的 search running 帧）。"""
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
     from app.agent.nodes import deep_planner as deep_planner_module
+    from app.agent.nodes import deep_research as deep_research_module
 
     class _PlanChain:
         async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
@@ -347,9 +354,25 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
         ) -> _PlanChain:
             return _PlanChain()
 
-    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
+    class _ResearchMainModel(GenericFakeChatModel):
+        """派发桩：单帧纯文本收尾（零 task 调用）——bind_tools 返回 self（探针同款）。"""
 
-    # (a) raw 帧面
+        def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
+            return self
+
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
+    monkeypatch.setattr(
+        deep_research_module,
+        "build_chat_model",
+        lambda alias, **kw: _ResearchMainModel(messages=iter([AIMessage(content="零派发汇总收尾。")])),
+    )
+    monkeypatch.setattr(
+        deep_research_module,
+        "_subagent_model",
+        lambda alias, index: _ResearchMainModel(messages=iter([AIMessage(content="保留。")])),
+    )
+
+    # (a) raw 帧面：research 真装配运行（链经 configurable 注入——TurnRunner 同形态）
     payload: dict[str, Any] = {
         "turn_id": "r14-deep",
         "thread_id": "r14-thread",
@@ -362,13 +385,22 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
         "spec": dict(_R14_SPEC),
         "images": [],
     }
-    message_count = 0
+    deep_config = {
+        "configurable": {
+            "search_chain": SearchChain(sources=["tavily"], backup=None, degraded=False, detail="tavily"),
+            "read_chain": ReadChain(sources=["firecrawl"], backup=None, degraded=False, detail="firecrawl"),
+            "tools_registry": ToolRegistry(),
+        }
+    }
+    message_nodes: set[str] = set()
     async for _namespace, stream_mode, chunk in main_graph.astream(
-        payload, config={"configurable": {}}, stream_mode=["messages", "custom"], subgraphs=True
+        payload, config=deep_config, stream_mode=["messages", "custom"], subgraphs=True
     ):
         if stream_mode == "messages":
-            message_count += 1
-    assert message_count == 0
+            meta = chunk[1] if isinstance(chunk, tuple) and len(chunk) > 1 else None
+            node = meta.get("langgraph_node") if isinstance(meta, dict) else None
+            message_nodes.add(str(node))
+    assert "writer" not in message_nodes  # R14③：writer 门控外零放行（帧全部被拦）
 
     # (b) TurnRunner 侧
     bus = _bus()
@@ -380,6 +412,9 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
     assert [e.event_type for e in published if e.event_type in ("token", "thinking")] == []
     assert published[-1].event_type == "done" and published[-1].data["finish"] == "completed"
     assert turn.status == "completed"  # write 桩答案经 updates 回填（custom token 被丢弃不影响终态）
+    # research 零派发桩形态：plan/search 两 stage 帧在时间线（search running 带 extra.subagents）
+    stages = [e.data.get("stage_key") for e in published if e.event_type == "stage"]
+    assert "plan" in stages and "search" in stages
 
 
 class _ScriptedTripleGraph:

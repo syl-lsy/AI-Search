@@ -44,16 +44,42 @@ def _chat_alias_ready() -> str | None:
     return None
 
 
-async def test_planner_real_llm_structure_via_deep_graph() -> None:
+async def test_planner_real_llm_structure_via_deep_graph(monkeypatch: pytest.MonkeyPatch) -> None:
     """真 LLM 冒烟（经 deep 子图直跑）：stage(plan,done,extra.subtopics) + DeepState
-    产出结构齐全（subtopics ≤ spec.deep.max_subagents / outline 必填 / 7 类枚举）。"""
+    产出结构齐全（subtopics ≤ spec.deep.max_subagents / outline 必填 / 7 类枚举）。
+
+    M2 批次 2：deep 子图 planner→research→write——planner 为本测试真依赖面（真 LLM）；
+    research 段以零派发桩替代（链注入 + build_chat_model/_subagent_model 桩）——其
+    真 LLM 行为由 test_deep_research_node.py 冒烟承担，本测试聚焦 planner 结构。"""
     skip_reason = _chat_alias_ready()
     if skip_reason:
         pytest.skip(skip_reason)
 
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
     from app.agent.graphs.deep import graph as deep_graph
+    from app.agent.nodes import deep_research as deep_research_module
     from app.agent.state import DeepState
+    from app.agent.tools.registry import ReadChain, SearchChain
     from app.config_center.defaults import SPEC_CONFIG
+
+    class _ResearchMainModel(GenericFakeChatModel):
+        """派发桩：单帧纯文本收尾（零 task 调用）——bind_tools 返回 self（探针同款）。"""
+
+        def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
+            return self
+
+    monkeypatch.setattr(
+        deep_research_module,
+        "build_chat_model",
+        lambda alias, **kw: _ResearchMainModel(messages=iter([AIMessage(content="零派发汇总收尾。")])),
+    )
+    monkeypatch.setattr(
+        deep_research_module,
+        "_subagent_model",
+        lambda alias, index: _ResearchMainModel(messages=iter([AIMessage(content="保留。")])),
+    )
 
     state: dict[str, Any] = {
         "query": "LangGraph 和 deepagents 是什么关系？各自适合什么场景？",
@@ -69,6 +95,9 @@ async def test_planner_real_llm_structure_via_deep_graph() -> None:
             "thread_id": "it-planner-th",
             "turn_id": "it-planner-turn",
             "model_mapping": {"chat": {"options": {"qwen": "chat-standard"}, "default": "qwen"}},
+            # M2 批次 2 增量：research 注入面（链冻结——TurnRunner 同形态）
+            "search_chain": SearchChain(sources=["tavily"], backup=None, degraded=False, detail="tavily"),
+            "read_chain": ReadChain(sources=["firecrawl"], backup=None, degraded=False, detail="firecrawl"),
         }
     }
 

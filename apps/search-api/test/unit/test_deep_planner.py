@@ -13,7 +13,8 @@
 - 失败语义（ARCH §6.2 P1，不终止）：校验失败 → 修复回喂 1 次 → 仍失败走机制兜底
   单子课题（factoid 化，显式常量）；传输失败 → 直接机制兜底；**兜底不置 DeepState.
   degraded**（不属 api.md §7.2 degraded_reason 枚举任一语义——fast_rewrite 2026-11-13
-  B 裁决同款），留痕面 = errors[] + stage done.extra.fallback；
+  B 裁决同款），留痕面 = errors[]（stage done.extra 仅契约钉键 subtopics——批次 2
+  修复轮移除未钉 fallback/memory_directive 键）；
 - TurnDeadline 包络（spec.deep.llm_timeout_s，缺省 60）：主调用 asyncio.timeout 包络，
   修复回喂前查剩余预算（耗尽即跳过回喂直入兜底）；
 - ensure_not_canceled 入口接线（R14② 跨子图取消感知，同 fast 五节点先例）；
@@ -206,19 +207,18 @@ async def test_planner_stage_events_done_only_with_subtopics_count(
     assert emitted[-1][2] == {"extra": {"subtopics": 2}}
 
 
-async def test_planner_memory_directive_extra_only(
+async def test_planner_memory_directive_parsed_but_not_emitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """memory_directive（M5 通道）不写 state（DeepState 无该字段），仅经 done.extra 留档。"""
+    """memory_directive（M5 通道）解析但不写 state（DeepState 无该字段）、**不入事件面**
+    （契约未钉键，批次 2 修复轮移除 done.extra 留档——M5 落地随契约增量一并启用）。"""
     chain = _FakeChain([{**_OK_OUTPUT, "memory_directive": "记住：偏好官方文档源"}])
     _, emitted = _install(monkeypatch, chain)
 
     update = await planner({**_STATE}, _config())
 
     assert "memory_directive" not in update
-    assert emitted[-1][2] == {
-        "extra": {"subtopics": 2, "memory_directive": "记住：偏好官方文档源"}
-    }
+    assert emitted[-1][2] == {"extra": {"subtopics": 2}}  # extra 仅契约钉键
 
 
 async def test_planner_prompt_renders_query_history_and_type_rules(
@@ -319,7 +319,7 @@ async def test_validation_failure_repairs_once_then_mechanism_fallback(
 ) -> None:
     """校验失败 → 错误文本回喂修复 1 次 → 仍败 → 机制兜底单子课题（factoid 化）：
     subtopics=[原始 query]、outline 单节、不置 degraded、errors[] 留痕、
-    done.extra.fallback=mechanism。"""
+    done.extra 仅契约钉键（subtopics=N）。"""
     bad = {**_OK_OUTPUT, "query_type": "opinion"}  # 枚举外值（坏例警示禁止形态）
     chain = _FakeChain([bad, bad])
     _, emitted = _install(monkeypatch, chain)
@@ -338,7 +338,7 @@ async def test_validation_failure_repairs_once_then_mechanism_fallback(
     assert "degraded" not in update
     assert update["errors"] == [{"stage": "plan", "reason": "structured_output_invalid"}]
     assert [(key, status) for key, status, _ in emitted] == [("plan", "done")]
-    assert emitted[-1][2] == {"extra": {"subtopics": 1, "fallback": "mechanism"}}
+    assert emitted[-1][2] == {"extra": {"subtopics": 1}}  # extra 仅契约钉键（未钉 fallback 已移除）
 
 
 async def test_validation_failure_repaired_successfully(
@@ -398,7 +398,7 @@ async def test_repair_skipped_when_budget_exhausted(
     assert captured == [60.0]  # 包络 = spec.deep.llm_timeout_s（ask 钉死形态）
     assert len(chain.prompts) == 1  # 预算耗尽 → 修复回喂跳过（直入兜底）
     assert update["query_type"] == "factoid"
-    assert emitted[-1][2]["extra"]["fallback"] == "mechanism"
+    assert emitted[-1][2]["extra"] == {"subtopics": 1}  # 留痕归 errors[]（extra 仅钉键）
 
 
 async def test_deadline_default_is_60_when_spec_missing(
@@ -428,7 +428,7 @@ async def test_transport_failure_falls_back_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """传输类失败（网络/超时）→ 不回喂、直接兜底单子课题（deep 轮整预算兜底归批次 3
-    guards；节点面不终止）；extra.fallback=degraded + errors[] 留痕。"""
+    guards；节点面不终止）；errors[] 留痕（stage extra 仅契约钉键）。"""
     request = httpx.Request("POST", "http://litellm/v1")
     chain = _FakeChain([httpx.ConnectError("refused", request=request)])
     _, emitted = _install(monkeypatch, chain)
@@ -440,7 +440,7 @@ async def test_transport_failure_falls_back_directly(
     assert update["query_type"] == "factoid"
     assert "degraded" not in update  # 兜底不置 degraded（同机制兜底口径）
     assert update["errors"] == [{"stage": "plan", "reason": "llm_call_failed"}]
-    assert emitted[-1][2] == {"extra": {"subtopics": 1, "fallback": "degraded"}}
+    assert emitted[-1][2] == {"extra": {"subtopics": 1}}  # extra 仅契约钉键（未钉 fallback 已移除）
 
 
 async def test_transport_timeout_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -466,7 +466,7 @@ async def test_transport_timeout_falls_back(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert update["query_type"] == "factoid"
     assert update["errors"] == [{"stage": "plan", "reason": "llm_call_failed"}]
-    assert emitted[-1][2]["extra"]["fallback"] == "degraded"
+    assert emitted[-1][2]["extra"] == {"subtopics": 1}  # 留痕归 errors[]（extra 仅钉键）
 
 
 # ---- 兜底形态边界 ----
@@ -782,7 +782,7 @@ async def test_mechanism_fallback_does_not_check_safety(
     update = await planner({**_STATE, "spec": _SPEC_SAFETY}, _config())
 
     assert update["errors"] == [{"stage": "plan", "reason": "structured_output_invalid"}]
-    assert emitted[-1][2] == {"extra": {"subtopics": 1, "fallback": "mechanism"}}
+    assert emitted[-1][2] == {"extra": {"subtopics": 1}}  # extra 仅契约钉键（未钉 fallback 已移除）
     assert loader_calls == []  # 兜底路径零判读
     assert rejection_calls == []
 
@@ -800,7 +800,7 @@ async def test_transport_fallback_does_not_check_safety(
     update = await planner({**_STATE, "spec": _SPEC_SAFETY}, _config())
 
     assert update["errors"] == [{"stage": "plan", "reason": "llm_call_failed"}]
-    assert emitted[-1][2] == {"extra": {"subtopics": 1, "fallback": "degraded"}}
+    assert emitted[-1][2] == {"extra": {"subtopics": 1}}  # extra 仅契约钉键（未钉 fallback 已移除）
     assert loader_calls == []
     assert rejection_calls == []
 

@@ -43,7 +43,7 @@ from app.agent.graphs.registry import GRAPH_REGISTRY
 from app.agent.nodes import fuse_rerank as fuse_module
 from app.agent.nodes import merge_dedupe as merge_module
 from app.agent.state import DeepState, FastState, MainState
-from app.agent.tools.registry import SearchChain, ToolRegistry
+from app.agent.tools.registry import ReadChain, SearchChain, ToolRegistry
 
 
 async def _run(
@@ -89,10 +89,17 @@ _ROUTING_SPEC: dict[str, Any] = {
 
 @pytest.fixture(autouse=True)
 def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rewrite/synthesis/deep planner 已接真（fast 节点 1/5+5/5 + deep planner）：
-    路由/序列测试不依赖真 LLM——fixture 假体直注（rewrite/planner 结构化输出 +
-    synthesis 流式 content，零网络）。"""
+    """rewrite/synthesis/deep planner/deep research 已接真（fast 节点 1/5+5/5 + deep
+    planner+research）：路由/序列测试不依赖真 LLM——fixture 假体直注（rewrite/planner
+    结构化输出 + synthesis 流式 content + research 派发桩，零网络）。
+
+    research 桩形态：主协调器模型单帧纯文本收尾（零 task 派发）→ research 节点零子代理
+    运行（序列测试只验事件骨架——子代理语义由 test_deep_research.py 锁定）。"""
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
     from app.agent.nodes import deep_planner as deep_planner_module
+    from app.agent.nodes import deep_research as deep_research_module
     from app.agent.nodes import fast_rewrite as rewrite_module
     from app.agent.nodes import synthesis as synthesis_module
 
@@ -138,9 +145,25 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
             for piece in ("综合回答正文[1]。", "结论[2]。"):
                 yield AIMessageChunk(content=piece)
 
+    class _ResearchMainModel(GenericFakeChatModel):
+        """派发桩：单帧纯文本收尾（零 task 调用）——bind_tools 返回 self（探针同款）。"""
+
+        def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
+            return self
+
     monkeypatch.setattr(rewrite_module, "build_light_model", lambda mapping: _RewriteModel())
     monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
     monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: _SynthModel())
+    monkeypatch.setattr(
+        deep_research_module,
+        "build_chat_model",
+        lambda alias, **kw: _ResearchMainModel(messages=iter([AIMessage(content="零派发汇总收尾。")])),
+    )
+    monkeypatch.setattr(
+        deep_research_module,
+        "_subagent_model",
+        lambda alias, index: _ResearchMainModel(messages=iter([AIMessage(content="保留。")])),
+    )
 
 
 def _warnings(log_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -201,6 +224,24 @@ def _search_config(registry: _FakeRegistry | None = None) -> dict[str, Any]:
         "configurable": {
             "search_chain": SearchChain(
                 sources=["tavily"], backup=None, degraded=False, detail="tavily"
+            ),
+            "tools_registry": registry if registry is not None else _FakeRegistry(),
+        }
+    }
+
+
+def _deep_config(registry: _FakeRegistry | None = None) -> dict[str, Any]:
+    """deep 轮 TurnRunner 注入形态（M2 批次 2 增量 read_chain——research 消费面）。
+
+    research 节点 fail-fast 面（搜索链未注入/为空 → SearchChainUnavailable 500201 族）
+    需要链在场；读取链本配置给主位 [firecrawl]（派发桩不派发 task，读取面不触网）。"""
+    return {
+        "configurable": {
+            "search_chain": SearchChain(
+                sources=["tavily"], backup=None, degraded=False, detail="tavily"
+            ),
+            "read_chain": ReadChain(
+                sources=["firecrawl"], backup=None, degraded=False, detail="firecrawl"
             ),
             "tools_registry": registry if registry is not None else _FakeRegistry(),
         }
@@ -343,9 +384,12 @@ _DEEP_OUTPUT_KEYS = {
     "degraded_reason",
     "errors",
 }
-#: 本批新增的 deep 投影键（普通类型逐键对齐 DeepState）；errors/degraded 不在内——
-#: 两侧横切声明形态本批有意不同（见 _DEEP_OUTPUT_KEYS 注）。
-_DEEP_TYPE_ALIGNED_KEYS = _DEEP_OUTPUT_KEYS - {"errors", "degraded"}
+#: 本批新增的 deep 投影键（普通类型逐键对齐 DeepState）；degraded/subagent_reports
+#: 不在内——degraded 维持普通布尔（两侧同型但批次 3 guards 再定）；subagent_reports
+#: 两侧形态有意不同（M2 批次 2：DeepState 改 Annotated[add] 扇出合流、MainState 保持
+#: 批次 1 普通类型零改动——deep 子图终态回填全量值，普通覆盖语义即正确投影）。
+#: errors 两侧自此同注解（M2 批次 2 DeepState 同步改 Annotated[add]——在对齐域内）。
+_DEEP_TYPE_ALIGNED_KEYS = _DEEP_OUTPUT_KEYS - {"degraded", "subagent_reports"}
 
 
 def test_main_state_projects_all_fast_inputs() -> None:
@@ -385,13 +429,28 @@ def test_main_state_backfills_all_deep_outputs() -> None:
 
 
 def test_main_state_deep_output_types_align_with_deep_state() -> None:
-    """deep 产出投影类型逐键对齐 DeepState（M2 批次 1）：本批新增投影键注解一致——
-    回填值类型零漂移。errors/degraded 两侧横切形态本批有意不同（MainState 带 fast 扇出
-    add/or reducer、DeepState 普通类型），不在对齐域——deep 扇出 reducer 批次 2 再定。"""
+    """deep 产出投影类型逐键对齐 DeepState（M2 批次 1 立；批次 2 域修订）：投影键注解
+    一致——回填值类型零漂移。errors 两侧自此同注解（批次 2 DeepState 同步 Annotated[add]
+    ——扇出合流对齐 MainState 既有横切）；subagent_reports 两侧形态有意不同（DeepState
+    add、MainState 批次 1 普通类型零改动——子图终态回填全量值），不在对齐域。"""
     for key in _DEEP_TYPE_ALIGNED_KEYS:
         assert (
             MainState.__annotations__[key] == DeepState.__annotations__[key]
         ), f"MainState.{key} 类型与 DeepState.{key} 不一致"
+
+
+def test_deep_state_fanout_reducers_batch2() -> None:
+    """M2 批次 2 reducer 改造（派单裁决）：DeepState.subagent_reports/errors 用
+    Annotated[list, add] 支持扇出合流（research 门控/后续 supplement 轮各自增量）；
+    degraded 维持普通布尔（批次 3 guards 再定）；MainState 投影零改动
+    （subagent_reports 仍为普通 list——子图终态回填全量值即正确投影）。"""
+    hints = typing.get_type_hints(DeepState, include_extras=True)
+    assert operator.add in getattr(hints["subagent_reports"], "__metadata__", ())
+    assert operator.add in getattr(hints["errors"], "__metadata__", ())
+    assert getattr(hints["degraded"], "__metadata__", ()) == ()  # 普通布尔（无 reducer）
+    main_hints = typing.get_type_hints(MainState, include_extras=True)
+    assert getattr(main_hints["subagent_reports"], "__metadata__", ()) == ()  # 投影零改动
+    assert operator.add in getattr(main_hints["errors"], "__metadata__", ())  # 横切既有面
 
 
 def test_state_query_type_literal_matches_rewrite_node() -> None:
@@ -495,13 +554,22 @@ async def test_route_fast_to_fast_subgraph(log_records: list[dict[str, Any]]) ->
 
 
 async def test_route_deep_to_deep_subgraph(log_records: list[dict[str, Any]]) -> None:
-    """路由二：轮内 spec.routing 快照 mode=deep → deep 子图（M2 批次 2 planner 接真）；
-    序列对齐 §7.4（plan done 带 extra.subtopics）；产出经顶层 updates 回填；零告警。"""
-    signals, final = await _run({"mode": "deep", "query": "多框架对比研究报告", "spec": _ROUTING_SPEC})
+    """路由二：轮内 spec.routing 快照 mode=deep → deep 子图（M2 批次 2 planner+research
+    接真）；序列对齐 §7.4（plan done 带 extra.subtopics → search running 带
+    extra.subagents——派发桩零 task，无后续 read/sources 帧）；产出经顶层 updates 回填；
+    零告警。"""
+    signals, final = await _run(
+        {"mode": "deep", "query": "多框架对比研究报告", "spec": _ROUTING_SPEC},
+        config=_deep_config(),
+    )
 
     assert final["answer_md"] == STUB_DEEP_ANSWER_MD
     assert final["subtopics"] == ["deep planner 桩期子课题一", "deep planner 桩期子课题二"]
     assert final["query_type"] == "multi_facet"
+    # research 桩零派发：五产出键全量回写（空集——覆盖语义下显式空投影）
+    assert final["subagent_reports"] == []
+    assert final["visited_urls"] == [] and final["searched_queries"] == []
+    assert final["snapshots"] == [] and final["collected_sources"] == []
     assert signals == _deep_expected()
     assert all(signal["type"] != "sources" for signal in signals)
     assert _warnings(log_records) == []
@@ -550,7 +618,7 @@ async def test_routing_section_missing_uses_builtin_table_with_warning(
         registry = _FakeRegistry()
         signals, final = await _run(
             {"mode": mode, "query": "x"},
-            config=_search_config(registry) if mode == "fast" else None,
+            config=_search_config(registry) if mode == "fast" else _deep_config(registry),
         )
 
         assert final["answer_md"] == answer_md
@@ -581,7 +649,7 @@ async def test_routing_validation_failure_uses_builtin_table_with_warning(
 async def test_default_mode_resolved_via_modes(log_records: list[dict[str, Any]]) -> None:
     """default_mode 经 modes 解析为图名（v1.19 键域口径）：default_mode=deep 且 mode 缺失 → deep 兜底。"""
     spec = {"routing": {"default_mode": "deep", "modes": {"fast": "fast", "deep": "deep"}}}
-    signals, final = await _run({"query": "x", "spec": spec})
+    signals, final = await _run({"query": "x", "spec": spec}, config=_deep_config())
 
     assert final["answer_md"] == STUB_DEEP_ANSWER_MD
     warnings = _route_warnings(log_records)
@@ -694,10 +762,11 @@ async def test_sources_payload_matches_api_contract() -> None:
 
 
 def _deep_expected() -> list[dict[str, Any]]:
-    """api.md §7.4 深度模式主干（701-708 行）的现行展开：plan/write 两阶段
-    （M2 批次 2：planner 接真——plan done 带 extra.subtopics；write 仍为桩）。
+    """api.md §7.4 深度模式主干（701-708 行）的现行展开（M2 批次 2：planner+research
+    接真——plan done 带 extra.subtopics、search running 带 extra.subagents；write 仍
+    为桩；派发桩零 task → 无 read/sources 后续帧）。
 
-    M2 批次 1：plan running 归 TurnRunner 图前发布（同 fast rewrite 先例——§7.4
+    M2 批次 1 起：plan running 归 TurnRunner 图前发布（同 fast rewrite 先例——§7.4
     序列的 stage(plan,running) 仍在，但发射源改为 TurnRunner，图内 plan 只发 done，
     避免双 running；本函数只覆盖图内信号面，TurnRunner 图前 running 由
     test_first_stage.py 锁定）。
@@ -708,6 +777,17 @@ def _deep_expected() -> list[dict[str, Any]]:
             "stage_key": "plan",
             "status": "done",
             "extra": {"subtopics": 2},  # api.md §7.4「stage(plan,done,extra.subtopics)」钉死形态
+        },
+        {
+            "type": "stage",
+            "stage_key": "search",
+            "status": "running",  # api.md §7.4「stage(search,running,extra.subagents[3])」形态
+            "extra": {
+                "subagents": [
+                    {"subtopic": "deep planner 桩期子课题一", "status": "pending"},  # §7.2 钉死键面（name 未钉键已移除）
+                    {"subtopic": "deep planner 桩期子课题二", "status": "pending"},
+                ]
+            },
         },
         {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"},
         *({"type": "token", "delta": d} for d in STUB_DEEP_TOKEN_DELTAS),

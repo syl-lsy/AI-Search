@@ -20,8 +20,9 @@ DDL 下无行级承载（api.md §5.1 摘录 2000 字符为读取期口径，与
 **分层注**：本模块属 agent 工具面（非图节点）——图节点纯函数铁律不破（batch 2 经
 configurable 注入 session_factory/minio 工厂）；工具自身携带 IO（同 ARCH §6.3 把
 表登记显式分配给本工具），session 为**短事务例外**（自管 commit，铁律 10 同
-TurnRunner/KB worker 口径）。minio SDK 惰性导入（object_cleanup 同款纪律：SDK 未装
-不阻塞应用启动，生产接线前须补运行依赖——见批次 2 派单注记）。
+TurnRunner/KB worker 口径）。minio SDK 惰性导入（object_cleanup 同款纪律：导入期
+不阻塞应用启动）——**SDK 已于批次 2 修复轮升为运行依赖（pyproject `minio==7.2.20`）**，
+缺 SDK 的运行面残留归一 SnapshotError（见失败语义）。
 """
 
 import asyncio
@@ -70,10 +71,17 @@ def object_key_for(user_id: str, thread_id: str, turn_id: str, url_hash: str) ->
 
 
 def _default_session_factory() -> Any:
-    """生产会话工厂（懒导入——工具模块导入期不触 db 引擎单例）。"""
+    """生产会话构造（懒导入——工具模块导入期不触 db 引擎单例）。
+
+    形态契约：零参可调用返回 **AsyncSession 实例**（`async with` 直用，与注入面
+    `session_factory=lambda: session` 同构）——`get_session_factory()` 返回
+    async_sessionmaker 本体，此处再调用一层产出会话（批次 2 修复轮：曾直接返回
+    sessionmaker，`async with session_factory()` 形态错配必抛 TypeError——live
+    验证发现 B①，单测假体注入面曾掩盖）。
+    """
     from app.db.session import get_session_factory
 
-    return get_session_factory()
+    return get_session_factory()()
 
 
 def _default_minio_client_factory() -> Any:
@@ -140,9 +148,12 @@ async def save_snapshot(
 ) -> dict[str, Any]:
     """写快照对象 + 登记 snapshots 行（幂等；返回引用元数据，不含正文本体）。
 
-    失败语义：MinIO 写失败 → SnapshotError（零行登记——不产孤儿行）；登记唯一键
-    冲突（并发竞态）→ 幂等复用既有行（WARN 留痕）；标识/入参非法 → ValueError
-    （编程错误，先于任何 IO）。
+    失败语义：**IO 面失败一律归一 SnapshotError**（MinIO 写失败/会话工厂构造失败/
+    默认工厂形态错配/minio SDK 缺失——原异常经 raise from 链入，零行登记不产孤儿行；
+    节点侧与显式工具面只识别 SnapshotError 一类基建失败，批次 2 修复轮钉死——此前
+    默认路径 TypeError/ModuleNotFoundError 会穿透 deep_research 捕获面崩子代理任务）；
+    登记唯一键冲突（并发竞态）→ 幂等复用既有行（WARN 留痕）；标识/入参非法 →
+    ValueError（编程错误，先于任何 IO，不归一）。
     """
     url = (url or "").strip()
     if not url:
@@ -162,45 +173,53 @@ async def save_snapshot(
     session_factory = session_factory or _default_session_factory
     minio_client_factory = minio_client_factory or _default_minio_client_factory
 
-    async with session_factory() as session:
-        existing = await _find_snapshot(session, turn_uuid, u_hash)
-        if existing is not None:
-            return _meta(existing, reused=True)  # 幂等复用：零重复行/零重复对象
-
-        client = await asyncio.to_thread(minio_client_factory)
-        try:
-            await asyncio.to_thread(_ensure_bucket_and_put, client, object_key, content)
-        except Exception as exc:
-            raise SnapshotError(
-                f"快照对象写入失败：{type(exc).__name__}（零行登记）"
-            ) from exc
-
-        row = Snapshot(
-            user_id=user_uuid,
-            thread_id=thread_uuid,
-            turn_id=turn_uuid,
-            url=url,
-            url_hash=u_hash,
-            object_key=object_key,
-            content_type=SNAPSHOT_CONTENT_TYPE,
-            size_bytes=size_bytes,
-            fetched_at=datetime.now(timezone.utc),
-        )
-        session.add(row)
-        try:
-            await session.commit()
-        except IntegrityError as exc:
-            # 并发竞态：唯一键 (turn_id, url_hash) 冲突 → 回查既有行幂等复用
-            # （对象同键覆盖不产生重复对象；先到行的元数据为准）
-            await session.rollback()
+    try:
+        async with session_factory() as session:
             existing = await _find_snapshot(session, turn_uuid, u_hash)
-            if existing is None:
-                raise SnapshotError("快照登记冲突且既有行不可见（异常竞态）") from exc
-            BusinessLog(
-                message="快照登记竞态冲突——幂等复用既有行（零重复行）",
-                action="快照登记",
-                entity="snapshot",
-                entity_id=str(existing.id),
-            ).warning()
-            return _meta(existing, reused=True)
-        return _meta(row, reused=False)
+            if existing is not None:
+                return _meta(existing, reused=True)  # 幂等复用：零重复行/零重复对象
+
+            client = await asyncio.to_thread(minio_client_factory)
+            try:
+                await asyncio.to_thread(_ensure_bucket_and_put, client, object_key, content)
+            except Exception as exc:
+                raise SnapshotError(
+                    f"快照对象写入失败：{type(exc).__name__}（零行登记）"
+                ) from exc
+
+            row = Snapshot(
+                user_id=user_uuid,
+                thread_id=thread_uuid,
+                turn_id=turn_uuid,
+                url=url,
+                url_hash=u_hash,
+                object_key=object_key,
+                content_type=SNAPSHOT_CONTENT_TYPE,
+                size_bytes=size_bytes,
+                fetched_at=datetime.now(timezone.utc),
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                # 并发竞态：唯一键 (turn_id, url_hash) 冲突 → 回查既有行幂等复用
+                # （对象同键覆盖不产生重复对象；先到行的元数据为准）
+                await session.rollback()
+                existing = await _find_snapshot(session, turn_uuid, u_hash)
+                if existing is None:
+                    raise SnapshotError("快照登记冲突且既有行不可见（异常竞态）") from exc
+                BusinessLog(
+                    message="快照登记竞态冲突——幂等复用既有行（零重复行）",
+                    action="快照登记",
+                    entity="snapshot",
+                    entity_id=str(existing.id),
+                ).warning()
+                return _meta(existing, reused=True)
+            return _meta(row, reused=False)
+    except SnapshotError:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— IO 面失败归一（批次 2 修复轮）：默认工厂
+        # 构造/形态错配（TypeError）/minio SDK 缺失（ModuleNotFoundError）/连接失败等
+        # 一律 SnapshotError，不穿透调用方捕获面（deep_research 只识别 SnapshotError）；
+        # 取消传播不受影响（CancelledError 属 BaseException）
+        raise SnapshotError(f"快照链路失败：{type(exc).__name__}") from exc

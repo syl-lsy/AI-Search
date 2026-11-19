@@ -23,7 +23,9 @@ query_type 7 类枚举（无 navigational——判导航型输出 factoid，深�
   循环——deep 轮整预算兜底归批次 3 guards，节点面只保证不终止）；
 - **兜底不置 DeepState.degraded**（2026-11-13 B 裁决 fast_rewrite 同款：兜底不属
   api.md §7.2 degraded_reason 枚举任一语义，置位会被 TurnRunner 派生误标「研究未
-  完成」）；降级可见面 = stage done.extra={fallback} + state.errors[] 留痕。
+  完成」）；降级可见面 = state.errors[] 留痕（reason=structured_output_invalid /
+  llm_call_failed）——stage done.extra 仅契约钉键 subtopics（批次 2 修复轮移除未钉
+  fallback/memory_directive 键；契约钉文字归收官环节统一走增量 diff）。
 
 超时包络：TurnDeadline(spec.deep.llm_timeout_s，缺省 60)——主调用 asyncio.timeout
 包络；修复回喂前查剩余预算（耗尽即跳过回喂直入兜底，deadline-aware）。
@@ -42,7 +44,8 @@ ContentRejectedError（TurnRunner 走安全拒绝轮收束，api.md §7.4 v1.23�
 
 事件：stage(plan, done, extra.subtopics=N)（api.md §7.4 钉死形态）——running 由
 TurnRunner 图前发布（M2 批次 1，§4.3 无重复 seq），节点只发 done。memory_directive
-为 M5 记忆通道：解析但不写 state（DeepState 无该字段），仅经 done.extra 留档。
+为 M5 记忆通道：解析但不写 state（DeepState 无该字段）、**不入事件面**（契约未钉键，
+批次 2 修复轮移除 done.extra 留档——M5 落地时随契约增量一并启用）。
 
 纯函数边界：节点无 DB/EventBus；提示词经 AssetCenter 内存快照解析（未启动回落内置
 默认）；LLM 工厂（build_chat_model）可注入可 mock——单测全 mock 零网络。
@@ -309,7 +312,6 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
     prompt_text = _render_prompt(state, max_subagents)
 
     update: dict[str, Any] | None
-    extra_parts: dict[str, Any] = {}
     #: Layer 2 判读对象（B13）——仅成功路径非 None；两兜底路径恒 None 即不判 safety
     accepted: PlannerOutput | None = None
     try:
@@ -317,8 +319,6 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
         parsed = _extract(raw)
         accepted = parsed
         update = _success_update(parsed, max_subagents)
-        if parsed.memory_directive:
-            extra_parts = {"memory_directive": parsed.memory_directive}
     except (OutputParserException, ValidationError) as exc:
         # 修复回喂 1 次（§6.2 P1）：校验错误文本回喂 LLM 修复 → 仍失败走机制兜底
         AgentLog(
@@ -356,8 +356,6 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
             if repaired is not None:
                 accepted = repaired  # 修复回喂成功路径同判 safety（B13）
                 update = _success_update(repaired, max_subagents)
-                if repaired.memory_directive:
-                    extra_parts = {"memory_directive": repaired.memory_directive}
         else:
             AgentLog(
                 message="planner 修复回喂预算耗尽（跳过回喂直入机制兜底）",
@@ -365,9 +363,8 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
                 node="planner",
             ).warning()
         if update is None:
-            # 机制兜底：单子课题 factoid 化（显式常量，不终止）
+            # 机制兜底：单子课题 factoid 化（显式常量，不终止；留痕走 errors[] reason）
             update = _fallback_update(query, reason="structured_output_invalid")
-            extra_parts = {"fallback": "mechanism"}
     except Exception as exc:
         # 传输失败（网络/超时类）→ 直接兜底（单调用面，无传输重试循环——deep 轮整预算
         # 兜底归批次 3 guards；节点面只保证不终止）
@@ -380,7 +377,6 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
             node="planner",
         ).warning()
         update = _fallback_update(query, reason="llm_call_failed")
-        extra_parts = {"fallback": "degraded"}
 
     # Layer 2 安全拦截门（B13）：仅 LLM 成功路径判 safety；命中即 emit failed +
     # raise ContentRejectedError——raise 点在上方兜底 except 族之外（该异常属
@@ -389,8 +385,9 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
     if accepted is not None:
         await _safety_gate(accepted, spec, query_lang, config)
 
-    # subtopics 计数恒随 done.extra 留痕（api.md §7.4 钉死形态 extra.subtopics=N）
-    # + 分支标注（fallback / memory_directive）合并
-    extra = {"subtopics": len(update.get("subtopics") or []), **extra_parts}
+    # subtopics 计数恒随 done.extra 留痕（api.md §7.4 钉死形态 extra.subtopics=N）——
+    # extra 仅契约钉键（批次 2 修复轮移除未钉 fallback/memory_directive 键，留痕归
+    # state.errors[]；契约增量钉文字归收官环节）
+    extra = {"subtopics": len(update.get("subtopics") or [])}
     emit_stage("plan", "done", extra=extra)
     return update

@@ -323,6 +323,63 @@ def test_blank_url_or_content_rejected() -> None:
     assert session.added == []
 
 
+# ---- 默认路径失败归一（批次 2 修复轮：live 发现 B——默认路径异常曾穿透
+# deep_research 捕获面崩子代理任务；IO 面失败一律 SnapshotError）----
+
+
+def test_default_path_misshaped_session_factory_normalizes_to_snapshot_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 session 工厂形态错配（返回非 async-with 对象——live 发现 B①形态：
+    曾直接返回 async_sessionmaker 本体，`async with` 必抛 TypeError）→ 归一
+    SnapshotError（原异常类型入消息），不再穿透调用方捕获面。"""
+    import app.agent.tools.save_snapshot as save_snapshot_module
+
+    monkeypatch.setattr(save_snapshot_module, "_default_session_factory", lambda: object())
+    minio = _FakeMinio()
+    session = _FakeSession(query_results=[[]])  # 未被用到（会话构造即炸）
+    with pytest.raises(SnapshotError) as exc_info:
+        asyncio.run(
+            save_snapshot(
+                url="https://a.example/p",
+                content="# 正文",
+                user_id=_ids()[0],
+                thread_id=_ids()[1],
+                turn_id=_ids()[2],
+                minio_client_factory=lambda: minio,
+            )
+        )
+    assert "TypeError" in str(exc_info.value)  # 原异常类型留痕
+    assert minio.puts == [] and session.added == []  # 零副作用
+
+
+def test_default_path_missing_minio_sdk_normalizes_to_snapshot_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 MinIO 工厂 SDK 缺失（importlib ModuleNotFoundError——live 发现 B②形态：
+    minio 曾不在运行依赖）→ 归一 SnapshotError，零行登记（不产孤儿行）。"""
+    import app.agent.tools.save_snapshot as save_snapshot_module
+
+    def _raise_module_missing() -> Any:
+        raise ModuleNotFoundError("No module named 'minio'")
+
+    monkeypatch.setattr(save_snapshot_module, "_default_minio_client_factory", _raise_module_missing)
+    session = _FakeSession(query_results=[[]])
+    with pytest.raises(SnapshotError) as exc_info:
+        asyncio.run(
+            save_snapshot(
+                url="https://a.example/p",
+                content="# 正文",
+                user_id=_ids()[0],
+                thread_id=_ids()[1],
+                turn_id=_ids()[2],
+                session_factory=lambda: session,
+            )
+        )
+    assert "ModuleNotFoundError" in str(exc_info.value)
+    assert session.added == [] and session.commits == 0  # 零孤儿行
+
+
 # ---- fast 工具面物理不含 save_snapshot（AST 哨兵，代码级保证）----
 
 
@@ -386,13 +443,18 @@ def test_sentinel_detects_direct_import_form() -> None:
 
 def test_fast_graph_modules_do_not_import_save_snapshot() -> None:
     """AST 哨兵：fast 图壳与全部 fast 节点模块零 import save_snapshot/deep_tools
-    （ImportFrom 与直导 ast.Import 两形态同面）。"""
+    （ImportFrom 与直导 ast.Import 两形态同面）。
+
+    M2 批次 2 扫描域修订：deep_ 前缀节点（deep_planner/deep_research——deep 消费面）
+    排除在 fast 图面外；deep_research 为契约三工具的合法装配消费面（deep_tools.py
+    「fast 面零交集」语义不变——fast 模块仍零导入）。
+    """
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2] / "app" / "agent"
-    fast_files = sorted((root / "nodes").glob("*.py")) + sorted(
-        p for p in (root / "graphs").glob("*.py") if p.name != "deep.py"
-    )
+    fast_files = sorted(
+        p for p in (root / "nodes").glob("*.py") if not p.name.startswith("deep_")
+    ) + sorted(p for p in (root / "graphs").glob("*.py") if p.name != "deep.py")
     assert fast_files, "fast 图面文件缺失（哨兵扫描面为空）"
     offenders: list[str] = []
     for path in fast_files:
