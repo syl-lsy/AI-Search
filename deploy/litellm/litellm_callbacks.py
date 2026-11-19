@@ -1,6 +1,7 @@
-"""LiteLLM 自定义回调：GLM 腿 thinking 参数剥离（B13 增量批·增量二）。
+"""LiteLLM 自定义回调：GLM 腿 thinking 参数剥离（B13 增量批·增量二）+ OTel decisions 兼容垫片。
 
-溯源：docs/ARCHITECTURE.md v1.57 §7「GLM 腿 thinking 参数剥离」钉注。
+溯源：docs/ARCHITECTURE.md v1.57 §7「GLM 腿 thinking 参数剥离」钉注；
+OTel 垫片 = plan-decision-model-20261118 批次 2 接线实测发现（2026-11-19）。
 
 ## 为什么需要这个钩子
 
@@ -36,6 +37,19 @@ config.yaml 的 `drop_params: true` 只覆盖 OpenAI 规范键，不覆盖 `extr
 命中后从请求体剥离 `enable_thinking` 与 `think`（顶层与 `extra_body` 内两处都剥，
 上游不接受任何形态的「关思考」）。GLM 腿允许思考（更慢更贵，ARCH v1.57 §7 已接受）。
 
+## OTel decisions 兼容垫片（本文件第二职责）
+
+litellm 1.106.4 上游 bug：`integrations/opentelemetry.py` 的 success/failure 全链路
+（set_attributes:2530 起、_record_metrics:1709 等消费点）把 `response_obj` 当 dict 调
+`.get()`——decisions 路由（`/v1/systemone`）返回的是 `DecisionsResponse`（pydantic
+v2 模型、无 `.get`），每次 decisions 调用必产一条 `AttributeError` traceback 且该 span
+属性中断（探针 200 不受影响，纯观测面损伤）。聊天等常规路由的 `ModelResponse` 是
+dict-like（有 `.get`），不受影响。上游修复版本未定（1.107.0 供应链投毒事件后升级面
+冻结，批次 0 digest 钉版），故在本模块 import 时对 OTel 四个 logging 入口方法打
+defensive 垫片：仅当响应对象**非 dict-like 且可 `model_dump()`** 时转 dict 再进原实现
+——chat 路径零触碰（ModelResponse 有 `.get`，守卫直接放行）；dump 失败 fail-open 保持
+原对象。升级 litellm 时此处须复检（入口签名与 1.106.4 对齐；R8/R16 同型护栏理念）。
+
 ## 注册（config.yaml）
 
 ```yaml
@@ -63,7 +77,7 @@ from typing import Any
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_logger import CustomLogger
 
-__all__ = ["GlmThinkingParamGuard", "glm_thinking_guard"]
+__all__ = ["GlmThinkingParamGuard", "glm_thinking_guard", "patch_otel_decisions_response_compat"]
 
 #: GLM 腿不接受的「关思考」键（DashScope qwen 的 enable_thinking / Ollama 的 think）
 _THINKING_KEYS: tuple[str, ...] = ("enable_thinking", "think")
@@ -201,3 +215,88 @@ class GlmThinkingParamGuard(CustomLogger):
 #: config.yaml `litellm_settings.callbacks` 消费的模块级实例
 #: （`litellm_callbacks.glm_thinking_guard` 点分路径 → 本实例）
 glm_thinking_guard = GlmThinkingParamGuard()
+
+
+# ---------------------------------------------------------------------------
+# OTel decisions 兼容垫片（模块 import 时自动应用一次）
+# ---------------------------------------------------------------------------
+
+
+def _normalize_response_for_otel(response_obj: Any) -> Any:
+    """非 dict-like 的 pydantic 响应转 dict；dict-like / 无 model_dump 的对象原样放行。
+
+    守卫口径：`hasattr(obj, "get")` 为真（dict、ModelResponse 等既有链路）零触碰；
+    仅 DecisionsResponse 这类「pydantic v2 但不模拟 dict」的响应需要转换。dump 失败
+    fail-open 返回原对象——垫片自身故障不得改变观测链路的失败语义。
+    """
+    if response_obj is None or hasattr(response_obj, "get") or not hasattr(response_obj, "model_dump"):
+        return response_obj
+    try:
+        return response_obj.model_dump()
+    except Exception as exc:  # noqa: BLE001 —— fail-open：dump 失败维持上游原行为
+        verbose_proxy_logger.warning(
+            "otel_decisions_compat: model_dump failed (passthrough original): %s", exc
+        )
+        return response_obj
+
+
+def patch_otel_decisions_response_compat() -> None:
+    """给 OTel 四个 logging 入口打 decisions 响应归一化垫片（幂等、防御式）。
+
+    背景：litellm 1.106.4 OTel 集成对 decisions 路由的 response_obj 假设为 dict
+    （opentelemetry.py set_attributes:2530 / _record_metrics:1709 等消费点直接
+    `.get()`），DecisionsResponse 无 `.get` → 每次 decisions 调用一条 AttributeError
+    traceback 且 span 属性中断。入口四方法是 logging core 统一通道（success/failure
+    × sync/async），在此归一化一次即覆盖全部下游消费点。签名与 1.106.4 对齐
+    （(self, kwargs, response_obj, start_time, end_time)），升级 litellm 时须复检。
+    """
+    import asyncio
+    import functools
+
+    try:
+        from litellm.integrations.opentelemetry import OpenTelemetry
+    except Exception as exc:  # noqa: BLE001 —— 导入失败仅降级（无 OTel 观测面）
+        verbose_proxy_logger.warning("otel_decisions_compat: OpenTelemetry import failed, skip: %s", exc)
+        return
+
+    entry_methods = (
+        "log_success_event",
+        "log_failure_event",
+        "async_log_success_event",
+        "async_log_failure_event",
+    )
+    patched: list[str] = []
+    for name in entry_methods:
+        original = getattr(OpenTelemetry, name, None)
+        if original is None or getattr(original, "_decisions_compat", False):
+            continue
+
+        if asyncio.iscoroutinefunction(original):
+
+            @functools.wraps(original)
+            async def wrapper(
+                self: Any, kwargs: Any, response_obj: Any, start_time: Any, end_time: Any,
+                __orig: Any = original,
+            ) -> Any:
+                return await __orig(self, kwargs, _normalize_response_for_otel(response_obj), start_time, end_time)
+
+        else:
+
+            @functools.wraps(original)
+            def wrapper(
+                self: Any, kwargs: Any, response_obj: Any, start_time: Any, end_time: Any,
+                __orig: Any = original,
+            ) -> Any:
+                return __orig(self, kwargs, _normalize_response_for_otel(response_obj), start_time, end_time)
+
+        wrapper._decisions_compat = True  # type: ignore[attr-defined] —— 幂等标记
+        setattr(OpenTelemetry, name, wrapper)
+        patched.append(name)
+
+    if patched:
+        verbose_proxy_logger.info(
+            "otel_decisions_compat: normalized pydantic responses at entry methods: %s", ", ".join(patched)
+        )
+
+
+patch_otel_decisions_response_compat()

@@ -3,6 +3,10 @@
 结构、字段范围与初值依据 docs/contract/nacos-config.md §1~§5（键位即契约）；逐条校验
 规则见 §3 校验规则段与 §2 安全条款，每个模型/校验器 docstring 标注契约出处。
 
+v1.33 决策模型键组（Decision Model 工单批次 2，ADR-016）：`fast.decision.*` 标量键组
+白名单定向扩容（home.suggest_pool 非模板先例）+ questions_json 方言硬校验 + shadow
+严格布尔——详见下方 DECISION_* 常量区注。
+
 安全口径：
 - 密钥嗅探：值中出现疑似密钥形态（`^(sk-|tvly-|fc-|as_sk-)`，§2）或敏感字段名
   （key/secret/token/password）携带非 env 名的值 → 整版拒收（ADR-005：密钥绝不入 Nacos）；
@@ -12,6 +16,7 @@
 - pydantic 模型对未知键宽容（extra="allow"）——契约「新增节点提示词新增键，不改结构」；
   已知键的类型/范围错误拒收，未知键不拒收（热更兼容优先）。
 """
+import json
 import re
 from collections.abc import Mapping
 from typing import Any, Literal
@@ -98,14 +103,11 @@ SYNTHESIS_VARIANT_PREFIXES: tuple[str, ...] = (
     "- 回顾整理路径",
 )
 
-#: fast.rewrite 输出 schema 串须含的**枚举串本体**（v1.27 扩容——精确形态防散文绕过，
-#: 沿 v1.20 `"search_strategy"` 带引号纪律）：strategy 四值枚举串 + 题型枚举串的
-#: navigational 尾段。修复前用裸词 token（`"recall" in value`），正文散文提及即可蒙混，
-#: 热更漂移回旧枚举时静默放过（security P3②/评审 P3④）。
-REWRITE_SCHEMA_REQUIRED_TOKENS: tuple[str, ...] = (
-    '"search_strategy":"direct|verify|web|recall"',
-    '|navigational|other"',
-)
+#: 【v1.33 退役】fast.rewrite 输出 schema 串枚举 token 硬校验（v1.20/v1.27
+#: `"search_strategy":"direct|verify|web|recall"` + `|navigational|other"`）——
+#: 减面后 fast.rewrite 不再承载分类 schema（判据唯一事实源 = fast.decision.questions_json），
+#: 防漂移载体同步迁移：questions_json 的 search_strategy choice options 缺策略枚举值
+#: → decision_prompts_warnings 软告警（枚举内容热更迭代频繁，告警不拒收）。
 
 #: fast.synthesis 必须保留的历史注入占位符（v1.27 / security P3③）：缺失则 recall 轮
 #: 静默丢历史注入（`render_prompt` 无该变量时不报错，历史块被无提示弃用）——拒收。
@@ -129,13 +131,158 @@ SAFETY_REPLY_LINE_PREFIXES: tuple[str, ...] = tuple(
 )
 
 #: fast.rewrite / deep.planner 输出 schema 须含的 safety 字段 token（B13——精确形态
-#: 防散文绕过，沿 REWRITE_SCHEMA_REQUIRED_TOKENS 带引号纪律；软校验见
-#: safety_token_warnings：告警不拒收。v1.31 枚举扩四值 +privacy；**v1.32 五值
-#: +politics**）。
+#: 防散文绕过，带引号纪律；软校验见 safety_token_warnings：告警不拒收。v1.31 枚举扩
+#: 四值 +privacy；**v1.32 五值 +politics**）。
 SAFETY_FIELD_TOKEN = '"safety":"none|danger|profanity|privacy|politics"'
 
 #: safety token 软校验覆盖的两键（B13——rewrite 与 planner 同构产出 safety 初判）
 SAFETY_TOKEN_PROMPT_KEYS: tuple[str, ...] = ("fast.rewrite", "deep.planner")
+
+
+# ---- §1 v1.33 决策模型键组（fast.decision.*——prompts dataId 内非模板标量值，----
+# ---- home.suggest_pool 非模板先例的定向扩容；nacos-config.md §1 v1.33）        ----
+
+#: SystemOne questions 题面载体键（纯 JSON 无占位符；消费方 decision_client）
+DECISION_QUESTIONS_KEY = "fast.decision.questions_json"
+DECISION_CONFIDENCE_FLOOR_KEY = "fast.decision.confidence_floor"
+DECISION_TIMEOUT_MS_KEY = "fast.decision.timeout_ms"
+DECISION_SHADOW_KEY = "fast.decision.shadow"
+
+#: 标量键组（类型越界拒收该 dataId——validator 白名单扩容的类型闸面）
+DECISION_SCALAR_KEYS: tuple[str, ...] = (
+    DECISION_CONFIDENCE_FLOOR_KEY,
+    DECISION_TIMEOUT_MS_KEY,
+    DECISION_SHADOW_KEY,
+)
+
+#: SystemOne 方言题型枚举（R19 探针实证——litellm box 等方言上游 400 拒收）
+DECISION_QUESTION_TYPES: tuple[str, ...] = ("noul", "choice", "score")
+
+#: 四约定题键（decision_client 按题键取结果；软校验齐备性）
+DECISION_CONTRACT_QUESTION_KEYS: tuple[str, ...] = (
+    "query_type",
+    "search_strategy",
+    "answerable",
+    "safety_shadow",
+)
+
+#: 标量键边界（与 decision_client 代码侧守卫同口径）
+_DECISION_CONFIDENCE_BOUNDS = (0.0, 1.0)  # 0 < 值 ≤ 1
+_DECISION_TIMEOUT_MS_BOUNDS = (100, 10000)  # 含端点
+
+
+def decision_questions_violations(value: Any) -> list[str]:
+    """questions_json 方言硬校验（R19 探针 §四/§七——违规发上去必 400，坏配置不上线
+    沿 ADR-005 语义）：违规返回定位列表（不含值本身）；合法返回空表。
+
+    三条硬规则：题对象 `type` ∈ {noul, choice, score}（litellm box 方言被 400 拒收）；
+    `choice` 的 criteria 必须是对象（选项→判据），缺失同拒；`score` 的 criteria 必须
+    是数组（锚点按序成 legend）。
+    """
+    try:
+        questions = json.loads(value) if isinstance(value, str) else value
+    except ValueError:
+        return [f"{DECISION_QUESTIONS_KEY}：须为合法 JSON 字符串"]
+    if not isinstance(questions, dict) or not questions:
+        return [f"{DECISION_QUESTIONS_KEY}：须为非空 JSON 对象"]
+    violations: list[str] = []
+    for question_key, question in questions.items():
+        path = f"{DECISION_QUESTIONS_KEY}.{question_key}"
+        if not isinstance(question, dict):
+            violations.append(f"{path}：题对象须为 JSON 对象")
+            continue
+        question_type = question.get("type")
+        if question_type not in DECISION_QUESTION_TYPES:
+            violations.append(
+                f"{path}：type 须 ∈ {list(DECISION_QUESTION_TYPES)}"
+                "（litellm box 方言上游 400 拒收）"
+            )
+            continue
+        criteria = question.get("criteria")
+        if question_type == "choice" and not isinstance(criteria, dict):
+            violations.append(f"{path}：choice 的 criteria 须为对象（选项→判据，上游 400 拒收）")
+        elif question_type == "score" and not isinstance(criteria, list):
+            violations.append(f"{path}：score 的 criteria 须为数组（锚点按序成 legend，上游 400 拒收）")
+    return violations
+
+
+def decision_prompts_warnings(prompts_section: Mapping[str, Any]) -> list[str]:
+    """四约定题键齐备与 query_type other 兜底软校验（§1 v1.33——**告警不拒收**）。
+
+    沿 safety_token_warnings 先例：返回告警文案列表（空 = 无告警），调用方
+    （PromptsPayload 校验钩子）逐条落 ConfigLog WARNING。键缺失不告警（运行面
+    decision_client 回落内置默认并告警——validator 侧对旧 payload 零噪音）。
+
+    other 兜底建议仅 query_type 题（判据回滚 v0 2026-11-19 澄清：契约 §1 v1.33
+    原文中 search_strategy/safety_shadow 选项为原值无 other——一刀切规则会对契约
+    原文自身误报；策略拿不准回落 web 在代码侧保守缺省）。
+    """
+    warnings: list[str] = []
+    raw = prompts_section.get(DECISION_QUESTIONS_KEY)
+    if not isinstance(raw, str):
+        return warnings
+    try:
+        questions = json.loads(raw)
+    except ValueError:
+        return warnings  # 非法 JSON 由硬校验拒收，软校验不重复报
+    if not isinstance(questions, dict):
+        return warnings
+    missing = [
+        key for key in DECISION_CONTRACT_QUESTION_KEYS if key not in questions
+    ]
+    if missing:
+        warnings.append(
+            f"{DECISION_QUESTIONS_KEY}：缺约定题键 {missing}"
+            "（软校验不拒收——decision 侧该题回落保守缺省）"
+        )
+    # v1.20/v1.27 防漂移检查的迁移载体：search_strategy choice options 须含四值策略枚举
+    # （缺值 → decision 永不产出该策略 → 全量轮回落 web 的 R17 漂移面）——软告警不拒收
+    # （options 与判据同属热更迭代面，硬拒会挡运营迭代）。
+    strategy_question = questions.get("search_strategy")
+    if isinstance(strategy_question, dict) and strategy_question.get("type") == "choice":
+        options = strategy_question.get("options")
+        options_set = set(options) if isinstance(options, list) else set()
+        absent = [value for value in ("direct", "recall", "verify", "web") if value not in options_set]
+        if absent:
+            warnings.append(
+                f"{DECISION_QUESTIONS_KEY}.search_strategy：options 缺策略枚举值 {absent}"
+                "（v1.20/v1.27 防漂移检查迁移载体——软校验不拒收，缺值策略永不产出）"
+            )
+    # other 兜底建议仅 query_type 题（v1.33 原文形态——search_strategy/safety_shadow
+    # 选项为契约原值不含 other，一刀切会对契约原文自身误报）
+    query_type_question = questions.get("query_type")
+    if isinstance(query_type_question, dict) and query_type_question.get("type") == "choice":
+        options = query_type_question.get("options")
+        if isinstance(options, list) and "other" not in options:
+            warnings.append(
+                f"{DECISION_QUESTIONS_KEY}.query_type：choice 建议含 other 兜底选项"
+                "（百炼官方建议；软校验不拒收）"
+            )
+    return warnings
+
+
+def _check_decision_scalar(key: str, value: Any) -> None:
+    """标量键类型/范围闸（越界 raise ValueError → 整版拒收）。
+
+    - confidence_floor：数值（布尔拒收）且 0 < 值 ≤ 1；
+    - timeout_ms：整数（布尔拒收）且 100 ≤ 值 ≤ 10000；
+    - shadow：严格布尔（SafetySpec.enabled 同款——字符串/数字形态拒收，kill switch
+      防 "false" 形态漂移）。
+    """
+    if key == DECISION_SHADOW_KEY:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key}：shadow 须为布尔（JSON true/false，字符串/数字形态拒收）")
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key}：须为数值（布尔/字符串形态拒收）")
+    if key == DECISION_CONFIDENCE_FLOOR_KEY:
+        low, high = _DECISION_CONFIDENCE_BOUNDS
+        if not (low < float(value) <= high):
+            raise ValueError(f"{key}：须满足 0 < 值 ≤ 1")
+        return
+    low, high = _DECISION_TIMEOUT_MS_BOUNDS
+    if not float(value).is_integer() or not (low <= float(value) <= high):
+        raise ValueError(f"{key}：须为整数且 {low} ≤ 值 ≤ {high}")
 
 
 def safety_token_warnings(prompts_section: Mapping[str, Any]) -> list[str]:
@@ -198,25 +345,25 @@ class PromptsPayload(_Envelope):
                     if len(entry) > 200:
                         raise ValueError("home.suggest_pool 单条 ≤200 字符")
                 continue
+            if key == DECISION_QUESTIONS_KEY:
+                # §1 v1.33：题面载体 = JSON 字符串，逐题过方言硬校验（违规拒收——发上去必 400）
+                if not isinstance(item, str):
+                    raise ValueError(f"{key}：题面载体必须是 JSON 字符串")
+                violations = decision_questions_violations(item)
+                if violations:
+                    raise ValueError("；".join(violations))
+                continue
+            if key in DECISION_SCALAR_KEYS:
+                _check_decision_scalar(key, item)
+                continue
             if not isinstance(item, str):
                 raise ValueError(f"{key}：模板值必须是字符串")
 
-        # §3 v1.20 条 1 + v1.27 扩容：fast.rewrite 输出 schema 串须含 search_strategy 键与
-        # **枚举串本体**（四值策略串 + navigational 尾段）。判据取带引号的契约形态——
-        # 只认 schema 串内的字段声明，散文提及该词即蒙混的路径被封（schema 串缺失则
-        # 模型按旧契约产出、direct/recall 边永不触发）。
-        rewrite = value.get("fast.rewrite")
-        if isinstance(rewrite, str):
-            if '"search_strategy"' not in rewrite:
-                raise ValueError(
-                    "fast.rewrite：输出 schema 串须含 search_strategy 键（v1.20 检索策略契约）"
-                )
-            for token in REWRITE_SCHEMA_REQUIRED_TOKENS:
-                if token not in rewrite:
-                    raise ValueError(
-                        f"fast.rewrite：输出 schema 枚举串须含 {token}（v1.27 recall/"
-                        "navigational 契约——裸词出现在散文里不算）"
-                    )
+        # 【v1.33 退役】§3 v1.20 条 1 + v1.27 扩容的 fast.rewrite schema 枚举串硬校验：
+        # 减面后 fast.rewrite 不再承载分类 schema（判据唯一事实源 = fast.decision.
+        # questions_json，方言硬校验见 decision_questions_violations；策略枚举防漂移
+        # 软告警见 decision_prompts_warnings）——slim 形态合法通过，旧全量形态亦容忍
+        # （发布过渡窗：Nacos 旧值 + 新代码，判据双份冗余无害）。
         # §3 v1.20 条 2 + v1.27 扩容：fast.synthesis 须含四段行前缀与 history_block 占位符
         synthesis = value.get("fast.synthesis")
         if isinstance(synthesis, str):
@@ -252,6 +399,17 @@ class PromptsPayload(_Envelope):
         from app.core.logger import ConfigLog  # 局部导入：校验层不拖重启动链
 
         for message in safety_token_warnings(self.prompts):
+            ConfigLog(message=message, data_id="ai_search.agent.prompts.json").warning()
+        return self
+
+    @model_validator(mode="after")
+    def _warn_decision_prompts(self) -> "PromptsPayload":
+        """§1 v1.33：fast.decision.questions_json 四约定题键齐备与 query_type other
+        兜底软校验（decision_prompts_warnings——告警不拒收；键缺失零告警，运行面回落
+        内置默认）。"""
+        from app.core.logger import ConfigLog  # 局部导入：校验层不拖重启动链
+
+        for message in decision_prompts_warnings(self.prompts):
             ConfigLog(message=message, data_id="ai_search.agent.prompts.json").warning()
         return self
 
@@ -843,6 +1001,15 @@ class ChatMapping(BaseModel):
 
 
 class ModelMappingPayload(_Envelope):
+    """§5：模型映射（v1.33 +`decision`）。
+
+    `decision` 为**映射键唯一允许空串者**——缺省空串 = kill switch 关闭（decision
+    不启用、意图识别全量走 light 路径 = 现状行为，存量轮零变化沿 search_strategy
+    v1.20 灰度先例）；非空 = litellm 别名，**不做别名白名单校验**（别名注册面在
+    litellm config.yaml 网关静态层、Nacos 不感知——未知别名在调用时网关报错 →
+    decision 失败兜底回 light，灰度安全）。其余五键 min_length=1 惯例不变。
+    """
+
     model_config = ConfigDict(extra="allow")
     chat: ChatMapping
     vision: str = Field(min_length=1)
@@ -850,6 +1017,7 @@ class ModelMappingPayload(_Envelope):
     rerank: str = Field(min_length=1)
     light: str = Field(min_length=1)
     memory: str = Field(min_length=1)
+    decision: str = ""
 
 
 # ---- 校验入口 ----

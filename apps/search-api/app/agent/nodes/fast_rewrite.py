@@ -1,62 +1,88 @@
 """rewrite 节点（B3 节点 1/5——ARCH §4.1 rewrite 行 / DEV §5.1 五步闭环）。
 
-职责五合一（light 模型，S14/S15 基元）：
-① 指代消解 ② 顺带分类（7+1）③ 参数可答判定 ④ 检索 query 集（type_query_map 夹取）
-⑤ 检索策略判定（v1.44 B9：`search_strategy ∈ {direct,verify,web}`；v1.51 +recall——
-nacos-config.md §1 v1.27，「搜不搜」与「答案形态」两维正交）。
-语言判定已前置纯代码（TurnRunner 注入 `query_lang`，改写不改判——PRD OQ-2）。
+**职责再分配（v1.33 Decision Model 批次 2，ADR-016 串行先判——拓扑零改动）**：
+- `model.mapping.decision` 非空（轮内映射快照）→ 节点内**前置 decision 步骤**
+  （`decision_client` 单次 systemone 调用，四题并行：query_type/search_strategy/
+  answerable/safety_shadow〔仅观测〕）。判定生效（choice confidence ≥
+  `fast.decision.confidence_floor`，逐字段保守回落）时：
+  `strategy ∈ {direct, recall}` → **跳过 light 调用**直达 synthesis（省 1.5~6s）；
+  `verify/web` → light **瘦身调用**只生成 queries/time_range/memory_directive
+  （+safety 初判——判定面本批留 light，契约 v1.33 冻结钉注），decision 回填三分类字段；
+- kill switch（decision 空串/缺失，**缺省态**）→ decision 整体跳过，light **全职责
+  路径**（分类+判据+queries+safety）= 现状行为，存量轮零行为变化（沿 search_strategy
+  v1.20 灰度先例）——done.extra **零 decision_source 键**（api.md v1.26 键可省略口径）；
+- decision 失败/超时/解析失败/低置信 → light 全职责路径兜底（**零能力回退**——原
+  五件事全量模板 `_load_full_rewrite_template` 逐字节保留，判据面 =
+  `common.type_rules` 热更），`decision_source=light_fallback` 留痕，**不置 degraded**；
+- shadow（`fast.decision.shadow=true`）→ decision 只观测不生效（light 全职责照常），
+  双结果落 done.extra（`decision_shadow` 观测载荷 + light 侧 update）与 Langfuse
+  generation metadata。
+
+light 职责面（减面后三件事，v1.33 批次 2 实施指引）：①指代消解 ②queries 产出
+（type_query_map 夹取）③safety 初判；query_type/answerable_from_knowledge/
+search_strategy 三字段在 decision 生效轮由 decision 承载、在 light 全职责轮仍由
+light 判定（原全量模板 + type_rules 判据面逐字节保留——e2e 实证瘦身 schema 串与
+全量工具 schema 冲突会致本地 light 校验失败率陡增，prompt schema 串必须与工具
+schema 同形）。语言判定已前置纯代码（TurnRunner 注入 `query_lang`，改写不改判
+——PRD OQ-2）。
 
 **策略灰度安全（v1.20 硬约束，v1.51 沿用）**：字段缺失（旧提示词 v1.18）/ 值非法 / 两兜底
 路径一律 `web`——pydantic 缺省 `web` + 修复回喂失败走机制兜底（strategy=web,
-answerable=false），旧提示词 + 新代码 = 全量轮零行为变化。对齐纪律（nacos §1「两字段必须
-一致」）：`verify → answerable=True`；`direct`/`recall → answerable=False`；`web → 保留模型
-原值`（回滚态 answerable 驱动的 synthesis 变体不变——ARCH §8 B9①）。recall 强制 false 的
-理由=**历史 ≠ 知识**（线程私有内容非模型通用稳定知识，ARCH §4.1 v1.51）。
+answerable=false）。对齐纪律（nacos §1「两字段必须一致」）：`verify → answerable=True`；
+`direct`/`recall → answerable=False`；`web → 保留原值`（回滚态 answerable 驱动的
+synthesis 变体不变——ARCH §8 B9①）。recall 强制 false 的理由=**历史 ≠ 知识**。
+decision 生效轮同纪律（`_aligned_answerable` 复用）。
 
 失败语义（ARCH §4.1/§6.2，不终止两路径）：
-- **校验失败**（结构化输出解析/校验不过）→ 修复回喂 1 次（§6.2 P1：校验错误文本回喂）
-  → 仍失败按 factoid 档 / 3 query 机制兜底（显式常量，**不经 type_query_map 夹取**，
-  ARCH §4.1 v1.4 澄清）；
+- **校验失败**（结构化输出解析/校验不过）→ 修复回喂 1 次（§6.2 P1）→ 仍失败按
+  factoid 档 / 3 query 机制兜底（显式常量，**不经 type_query_map 夹取**）；
 - **传输失败**（网络/超时类，`default_retry_on` 分类判据）→ 按 spec.retry（轮内快照，
-  OQ-11 同源）重试 + 退避 jitter → 耗尽 → 降级原始 query 单发；每次重试尝试前查轮级
-  剩余预算（deadline-aware，§6.2 P0——剩余 < 预计单调用成本即放弃重试）。
+  OQ-11 同源）重试 + 退避 jitter → 耗尽 → 降级原始 query 单发；deadline-aware（§6.2 P0）；
+- decision 生效轮的**瘦身调用失败**（校验/传输）→ light 全职责路径接管
+  （decision_source=light_fallback——轮判定源以最终产出方为准）。
 
 兜底可见面（2026-11-13 B 裁决）：两兜底路径**不再置 FastState.degraded**——rewrite
-兜底不属 api.md §7.2 degraded_reason 枚举（timeout/budget/source_failure）任一语义，
-置位会被 TurnRunner 派生为 source_failure、把答案完整的正常轮误标「研究未完成」；
-降级观测面收敛在 stage done.extra={fallback} + state.errors[]（留痕不丢）+ 兜底路径
-AgentLog 埋点（失败原因可观测——批次 7 披露的零埋点缺口一并修）。
+兜底不属 api.md §7.2 degraded_reason 枚举（timeout/budget/source_failure）任一语义；
+降级观测面收敛在 stage done.extra={fallback} + state.errors[] + AgentLog 埋点。
 
-**Layer 2 输入安全拦截（B13，api.md §7.4 v1.23）**：RewriteOutput 增 `safety`
-初判字段（`none|danger|profanity|privacy`，**缺省 `none` 灰度安全**——旧提示词无本字段即
-全量 none，存量轮零行为变化，沿 search_strategy v1.20 先例）。仅 LLM 成功路径
-（主调用与修复回喂）判读：`spec.safety` enabled 且 mode=hybrid 且初判 ∈
-{danger, profanity, privacy} → 类别化拒答话术 → stage(rewrite, failed,
-detail="安全拦截")
-→ ContentRejectedError（TurnRunner 走安全拒绝轮收束）。**机制兜底/传输兜底路径
-不判 safety**：Layer 1（主图壳 pre_route 词表硬命中 / grey LLM 复核）已对该 query
-前置覆盖，兜底路径本就无可靠 safety 判读面（LLM 输出未成形），不重复拦截。
+**Layer 2 输入安全拦截（B13，api.md §7.4 v1.23）**：safety 初判字段
+（`none|danger|profanity|privacy|politics`，缺省 `none` 灰度安全）。仅 LLM 成功路径
+判读：`spec.safety` enabled 且 mode=hybrid 且初判 ∈ {danger, profanity, privacy,
+politics} → 类别化拒答话术 → stage(rewrite, failed, detail="安全拦截") →
+ContentRejectedError。**机制兜底/传输兜底路径与 decision direct/recall 轮（零 light
+判读面）不判 safety**：Layer 1（主图壳 pre_route 词表硬命中 / grey LLM 复核）已对该
+query 前置覆盖；decision 的 safety_shadow 仅观测记录、不参与拦截（契约保守口径）。
 
 纯函数边界：节点无 DB/EventBus；提示词经 AssetCenter 内存快照解析（未启动回落内置
-默认）；LLM 工厂（`build_light_model`）可注入可 mock——单测全 mock 零网络。
+默认）；LLM 工厂（`build_light_model`）与 decision 调用（`run_decision`）可注入可
+mock——单测全 mock 零网络。
 memory_directive 为 M5 记忆通道：解析但**不写 state**（FastState 无该字段），仅经
-stage done.extra 留档（api.md §7.2 stage 可选业务字段，TurnRunner 吸收进 timing）。
-`strategy` 恒随 stage(rewrite,done).extra 留痕（api.md §7.4 v1.14 direct 形态钉死
-`extra.strategy=direct`；verify/web 轮为观测增量，M4 按策略分桶）。
+stage done.extra 留档。`strategy` 恒随 stage(rewrite,done).extra 留痕（api.md §7.4
+v1.14 direct 形态钉死 `extra.strategy=direct`；verify/web 轮为观测增量，M4 按策略
+分桶）；decision 启用轮 `extra.decision_source` 留痕（api.md v1.26：
+decision | light_fallback | shadow 三值，键可省略——kill switch 轮与存量轮不携带）。
 """
 
 import asyncio
 import random
 from collections.abc import Mapping
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, ValidationError
 
+from app.agent.decision_client import (
+    align_answerable,
+    resolve_decision_params,
+    run_decision,
+)
 from app.agent.graphs.signals import emit_stage
 from app.agent.guards import (
     ContentRejectedError,
+    TurnCanceledSignal,
     TurnDeadline,
     default_retry_on,
     ensure_not_canceled,
@@ -75,6 +101,7 @@ __all__ = [
     "FALLBACK_SEARCH_STRATEGY",
     "TRANSPORT_FALLBACK_QUERY_TYPE",
     "RewriteOutput",
+    "RewriteSlimOutput",
     "SafetyFlag",
     "SearchStrategy",
     "build_light_model",
@@ -123,6 +150,11 @@ class RewriteOutput(BaseModel):
     存量轮零行为变化——字段由提示词热更启用）。
     `safety` 缺省 `none`（B13 灰度安全同款：旧提示词无本字段即全量放行，
     存量轮零行为变化；命中拦截面仅成功路径，见 `_safety_gate`）。
+
+    v1.33 注：本 schema = **light 全职责路径**（kill switch 关闭态 / decision 失败
+    兜底态）的输出契约——三分类字段（query_type/answerable/search_strategy）在
+    decision 生效轮由 decision 回填、在本路径仍由 light 判定（判据 = questions_json
+    附录，见 `_classification_appendix`）。
     """
 
     queries: list[str] = Field(min_length=1)
@@ -132,6 +164,27 @@ class RewriteOutput(BaseModel):
     safety: SafetyFlag = "none"
     time_range: Literal["day", "week", "month", "year"] | None = None
     memory_directive: str | None = None
+
+
+class RewriteSlimOutput(BaseModel):
+    """light **瘦身调用**输出 schema（v1.33 决策生效 verify/web 轮——ADR-016②）。
+
+    只生成 decision 输出长度 0 天然不可承接的文本生成面四字段：queries /
+    time_range / memory_directive / safety（**safety 判定面本批留 light**——契约
+    v1.33 冻结钉注，B13 两层防御不动）；query_type/answerable/search_strategy 三
+    分类字段由 decision 回填（`_decision_slim_update`）。缺省值口径与 RewriteOutput
+    一致（safety=none 灰度安全）。
+    """
+
+    queries: list[str] = Field(min_length=1)
+    safety: SafetyFlag = "none"
+    time_range: Literal["day", "week", "month", "year"] | None = None
+    memory_directive: str | None = None
+
+
+class _LightPhaseFailure(Exception):
+    """瘦身调用终局失败信号（校验回喂仍败/传输耗尽）——rewrite 捕获后回退 light
+    全职责路径（decision_source=light_fallback），不抛穿节点。"""
 
 
 def build_light_model(mapping: Mapping[str, Any] | None = None) -> Any:
@@ -194,8 +247,13 @@ def _format_history(history: Any) -> str:
 
 
 def _render_prompt(state: Mapping[str, Any], query_lang: str) -> str:
-    """fast.rewrite 模板渲染（五占位符契约集；memory_hints 为 M5 通道、启用前恒空串）。
+    """fast.rewrite 模板渲染（v1.33 减面版四占位符——decision 生效 verify/web 轮的
+    light 瘦身调用专用）。
 
+    减面后模板零 {{type_rules}} 引用（decision 生效轮判据面 = fast.decision.questions_json
+    经 decision_client 装配）；变量映射仍携带 type_rules——Nacos 发布过渡窗的存量旧值
+    （v1.32 全量模板）引用它时渲染不炸（render_prompt 只对「缺变量」fail-fast，多变量
+    无害），两形态兼容。
     query_lang 由调用方解析后传入（TurnRunner 前置纯代码判定值，改写不改判——PRD
     OQ-2；Layer 2 拒答话术消费同一值，单一来源防漂移）。
     """
@@ -209,6 +267,87 @@ def _render_prompt(state: Mapping[str, Any], query_lang: str) -> str:
             "query": str(state.get("query") or ""),
         },
     )
+
+
+@lru_cache(maxsize=1)
+def _load_full_rewrite_template() -> str:
+    """light 全职责路径模板（v1.33——原五件事全量模板逐字节保留）。
+
+    减面后 `fast.rewrite`（Nacos 键）承载瘦身版（decision 生效 verify/web 轮专用）；
+    kill switch 关闭态 / decision 失败兜底态的 light 全职责路径**不消费该键**，改用
+    本内置全量模板（原模板逐字节保留——含 {{type_rules}} 引用，判据面 =
+    `common.type_rules`（Nacos 热更，与 questions_json 双侧同步纪律不变））。保留
+    理由（e2e 实证，test_fast_round_contract direct 判例）：瘦身 schema 串 + 分类附录
+    与全量 RewriteOutput 工具 schema 冲突，本地 light 模型（qwen3.5:4b）校验失败率
+    陡增直入机制兜底——**prompt schema 串与工具 schema 必须同形**。本文件为无键
+    内置资产（不注册 BUILTIN_PROMPT_FILES、不经 Nacos——兜底路径的模板面静态，
+    判据面仍经 {{type_rules}} 热更；变更随代码发布）。
+    """
+    return (
+        Path(__file__).resolve().parent.parent / "prompts" / "fast" / "rewrite_full.txt"
+    ).read_text(encoding="utf-8")
+
+
+def _render_full_prompt(state: Mapping[str, Any], query_lang: str) -> str:
+    """light 全职责路径 prompt：原五件事全量模板渲染（= v1.33 前现状逐字节）。
+
+    变量集五件套（type_rules/query_lang/memory_hints/history/query）与减面前
+    `_render_prompt` 完全一致——kill switch 关闭态 = 现状行为回归锁（e2e
+    test_fast_round_contract 三判例 + unit kill switch 回归锁同证）。
+    """
+    return render_prompt(
+        _load_full_rewrite_template(),
+        {
+            "type_rules": resolve_prompt("common.type_rules"),
+            "query_lang": query_lang,
+            "memory_hints": "",  # M5 记忆→查询改写通道；启用前恒空（memory-api.md §2）
+            "history": _format_history(state.get("history")),
+            "query": str(state.get("query") or ""),
+        },
+    )
+
+
+def _extract_slim(raw: Any) -> RewriteSlimOutput:
+    """瘦身输出归一校验：结构化输出（pydantic 实例）或裸 dict → RewriteSlimOutput；
+    全空白 queries 视为解析失败（与 RewriteOutput 同判）。"""
+    parsed = raw if isinstance(raw, RewriteSlimOutput) else RewriteSlimOutput.model_validate(raw)
+    if not _dedupe_queries(parsed.queries):
+        raise OutputParserException("queries 全为空白——视同结构化输出校验失败")
+    return parsed
+
+
+def _decision_update(outcome: Any) -> dict[str, Any]:
+    """decision 生效 direct/recall 轮的 state 增量（跳过 light——ADR-016②）。
+
+    rewritten_queries 固定空表：零检索轮 queries 不参与路由（search_fanout 判定
+    先于空 queries）；answerable 经 `_aligned_answerable` 对齐（direct/recall →
+    False——历史 ≠ 知识纪律，decision 误判 true 亦被修正）；safety 不写 state
+    （decision 的 safety_shadow 仅观测不参与拦截，Layer 1 已前置覆盖）。
+    """
+    strategy = outcome.search_strategy
+    return {
+        "rewritten_queries": [],
+        "query_type": outcome.query_type,
+        "answerable_from_knowledge": _aligned_answerable(strategy, outcome.answerable),
+        "search_strategy": strategy,
+        "time_range": None,
+        "degraded": False,
+    }
+
+
+def _decision_slim_update(outcome: Any, slim: RewriteSlimOutput, spec: Mapping[str, Any]) -> dict[str, Any]:
+    """decision 生效 verify/web 轮的 state 增量：decision 回填三分类字段 + light
+    瘦身字段合并；queries 经 type_query_map 夹取（夹取键 = decision 的 query_type，
+    下游读取点零变化）。"""
+    strategy = outcome.search_strategy
+    return {
+        "query_type": outcome.query_type,
+        "answerable_from_knowledge": _aligned_answerable(strategy, outcome.answerable),
+        "search_strategy": strategy,
+        "time_range": slim.time_range,
+        "rewritten_queries": _clamp_queries(slim.queries, spec, outcome.query_type),
+        "degraded": False,
+    }
 
 
 def _dedupe_queries(queries: list[str]) -> list[str]:
@@ -330,7 +469,10 @@ def _fallback_update(
 
 
 def _aligned_answerable(strategy: str, answerable: bool) -> bool:
-    """策略↔answerable 对齐（nacos-config.md §1 v1.20 纪律：两字段必须一致）。
+    """策略↔answerable 对齐（nacos-config.md §1 v1.20 纪律：两字段必须一致）——
+    v1.62 混合规则护栏：委托 `decision_client.align_answerable` 单一事实源
+    （解析侧回填已对齐 + 本消费侧复判的幂等双防线；护栏介入由 outcome 的
+    `answerable_source=guard` 标注）。
 
     - `verify`：强制 True（模型判 verify 但答 false 时以 strategy 为准修正）；
     - `direct`：强制 False（零事实面轮；synthesis 变体消费 strategy，不读该位）；
@@ -339,11 +481,7 @@ def _aligned_answerable(strategy: str, answerable: bool) -> bool:
     - `web`：**保留原值**——回滚态（web + answerable=true）仍切「先知识后取证」段，
       旧提示词 + 新代码的合成行为零变化（ARCH §8 B9① 明文）。
     """
-    if strategy == "verify":
-        return True
-    if strategy in ("direct", "recall"):
-        return False
-    return answerable
+    return align_answerable(strategy, answerable)
 
 
 def _success_update(parsed: RewriteOutput, spec: Mapping[str, Any]) -> dict[str, Any]:
@@ -407,7 +545,13 @@ async def _safety_gate(
 
 async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """rewrite 节点（fast 子图）：stage(rewrite, done) 收口（running 由 TurnRunner
-    图前同步发布——ARCH §4.3 首 stage ≤1s 且无重复 seq）。"""
+    图前同步发布——ARCH §4.3 首 stage ≤1s 且无重复 seq）。
+
+    三阶段（v1.33 ADR-016 串行先判，拓扑零改动）：
+    ① decision 前置步骤（kill switch 缺省跳过）——direct/recall 生效轮跳过 light
+      直接收口；② verify/web 生效轮 light 瘦身调用；③ light 全职责路径（kill
+      switch / decision 失败 / shadow / 瘦身失败兜底——现状代码路径逐字保留）。
+    """
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
 
     query = str(state.get("query") or "")
@@ -426,15 +570,213 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
 
     configurable = (config or {}).get("configurable") or {}
     mapping = configurable.get("model_mapping")
+
+    # ---- 阶段① decision 前置步骤（ADR-016；kill switch 缺省关闭——params None 直通）----
+    params = resolve_decision_params(mapping)
+    decision_source: str | None = None
+    extra_parts: dict[str, Any] = {}
+    update: dict[str, Any] | None = None
+    #: Layer 2 判读对象（B13）——仅成功路径非 None；兜底路径置 None 即不判 safety
+    accepted: Any | None = None
+    outcome = None
+    if params is not None:
+        outcome = await run_decision(
+            query=query,
+            history=state.get("history"),
+            params=params,
+            budget=budget,
+            config=config,
+        )
+        if outcome is None:
+            decision_source = "light_fallback"  # 失败/超时/解析失败 → light 全职责兜底
+        elif params.shadow:
+            # shadow 双跑：decision 只观测不生效（light 全职责照常），双结果落
+            # stage extra（decision 侧观测载荷）与 Langfuse generation metadata
+            decision_source = "shadow"
+            extra_parts["decision_shadow"] = outcome.extra_observation
+            outcome = None
+        elif outcome.search_strategy in ("direct", "recall"):
+            # decision 判免检索轮 → 跳过 light 调用直达 synthesis（省 1.5~6s）；
+            # safety 不判读（零 light 判读面——Layer 1 已前置覆盖，safety_shadow 仅观测）
+            update = _decision_update(outcome)
+            emit_stage(
+                "rewrite",
+                "done",
+                extra={"strategy": outcome.search_strategy, "decision_source": "decision"},
+            )
+            return update
+        else:
+            decision_source = "decision"  # verify/web 生效轮 → 瘦身调用
+
+    # ---- 阶段② decision 生效 verify/web 轮：light 瘦身调用（queries/time_range/ ----
+    # ---- memory_directive/safety——三分类字段由 decision 回填）                  ----
+    if decision_source == "decision" and outcome is not None:
+        try:
+            update, accepted, slim_parts = await _light_slim_phase(
+                state,
+                query,
+                query_lang,
+                spec,
+                mapping,
+                policy=policy,
+                llm_timeout=llm_timeout,
+                budget=budget,
+                config=config,
+                outcome=outcome,
+            )
+            extra_parts.update(slim_parts)
+        except (TurnCanceledSignal, ContentRejectedError):
+            raise  # 取消非故障 / 安全拒绝直达 TurnRunner（不在兜底族内吞掉）
+        except Exception:
+            # 瘦身调用终局失败 → light 全职责路径接管（零能力回退；轮判定源以最终
+            # 产出方为准）
+            decision_source = "light_fallback"
+            update = None
+            accepted = None
+
+    # ---- 阶段③ light 全职责路径（kill switch / decision 失败 / shadow / 瘦身失败）----
+    if update is None:
+        update, accepted, extra_parts = await _light_full_phase(
+            state,
+            query,
+            query_lang,
+            spec,
+            mapping,
+            policy=policy,
+            llm_timeout=llm_timeout,
+            budget=budget,
+            config=config,
+            extra_parts=extra_parts if decision_source == "shadow" else {},
+        )
+
+    # Layer 2 安全拦截门（B13）：仅 LLM 成功路径判 safety；命中即 emit failed +
+    # raise ContentRejectedError——raise 点在兜底 except 族之外（该异常属
+    # Exception 族，兜底 try 内上抛会被传输兜底吞掉），直达 TurnRunner 拒绝轮；
+    # 兜底路径与 decision direct/recall 轮 accepted=None 自然跳过（Layer 1 已前置
+    # 覆盖，见 _safety_gate）
+    if accepted is not None:
+        await _safety_gate(accepted, spec, query_lang, config)
+
+    # strategy 恒随 done.extra 留痕（direct 形态为 api.md §7.4 钉死形态；verify/web
+    # 轮为观测增量）+ 分支标注（fallback / memory_directive / decision_source /
+    # decision_shadow）合并——decision_source 仅 decision 启用轮携带（api.md v1.26
+    # 键可省略口径：kill switch 轮与存量轮零携带）
+    extra = {"strategy": update["search_strategy"], **extra_parts}
+    if decision_source is not None:
+        extra["decision_source"] = decision_source
+    emit_stage("rewrite", "done", extra=extra)
+    return update
+
+
+async def _light_slim_phase(
+    state: Any,
+    query: str,
+    query_lang: str,
+    spec: Mapping[str, Any],
+    mapping: Any,
+    *,
+    policy: Any,
+    llm_timeout: float,
+    budget: TurnDeadline,
+    config: RunnableConfig | None,
+    outcome: Any,
+) -> tuple[dict[str, Any], RewriteSlimOutput, dict[str, Any]]:
+    """decision 生效 verify/web 轮的 light 瘦身调用（ADR-016②）。
+
+    减面模板渲染（零分类判据注入——判据面已迁 decision）；失败语义对齐全职责路径：
+    校验失败修复回喂 1 次，仍失败/传输耗尽上抛 `_LightPhaseFailure`（调用方回退
+    light 全职责路径）。safety 初判随瘦身输出产出（判定面留 light——契约 v1.33
+    冻结钉注），Layer 2 门在 rewrite 主函数对瘦身输出照常判读。
+    """
+    chain = build_light_model(mapping if isinstance(mapping, Mapping) else None).with_structured_output(
+        RewriteSlimOutput, method="function_calling"
+    )
+    prompt_text = _render_prompt(state, query_lang)
+    try:
+        raw = await _invoke_with_retry(
+            chain,
+            prompt_text,
+            policy=policy,
+            llm_timeout=llm_timeout,
+            budget=budget,
+            config=config,
+        )
+        slim = _extract_slim(raw)
+    except (OutputParserException, ValidationError) as exc:
+        # 修复回喂 1 次（§6.2 P1）：校验错误文本回喂 LLM 修复 → 仍失败回退全职责
+        AgentLog(
+            message=(
+                f"rewrite 瘦身调用结构化输出校验失败（进修复回喂）："
+                f"{type(exc).__name__}: {str(exc)[:800]}"
+            ),
+            graph="fast",
+            node="rewrite",
+        ).warning()
+        repair_prompt = (
+            f"{prompt_text}\n\n上一次输出未通过校验，错误信息：{exc}。"
+            "请调用结构化输出工具重新提交结果，严格按 schema 填写每个字段；"
+            "不要在文本回复里书写 JSON。"
+        )
+        try:
+            slim = _extract_slim(
+                await _invoke(chain, repair_prompt, timeout_s=llm_timeout, config=config)
+            )
+        except Exception as repair_exc:
+            AgentLog(
+                message=(
+                    f"rewrite 瘦身调用修复回喂仍失败（回退 light 全职责路径）："
+                    f"{type(repair_exc).__name__}: {str(repair_exc)[:200]}"
+                ),
+                graph="fast",
+                node="rewrite",
+            ).warning()
+            raise _LightPhaseFailure("slim repair failed") from repair_exc
+    except Exception as exc:
+        # 传输类重试耗尽 → 回退 light 全职责路径（不在此降级单发——分类能力需保留）
+        AgentLog(
+            message=(
+                f"rewrite 瘦身调用失败（回退 light 全职责路径）："
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            ),
+            graph="fast",
+            node="rewrite",
+        ).warning()
+        raise _LightPhaseFailure("slim transport failed") from exc
+
+    update = _decision_slim_update(outcome, slim, spec)
+    extra_parts: dict[str, Any] = {}
+    if slim.memory_directive:
+        extra_parts = {"memory_directive": slim.memory_directive}
+    return update, slim, extra_parts
+
+
+async def _light_full_phase(
+    state: Any,
+    query: str,
+    query_lang: str,
+    spec: Mapping[str, Any],
+    mapping: Any,
+    *,
+    policy: Any,
+    llm_timeout: float,
+    budget: TurnDeadline,
+    config: RunnableConfig | None,
+    extra_parts: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+    """light 全职责路径（kill switch 关闭态 / decision 失败兜底态——现状代码路径）。
+
+    prompt = 原五件事全量模板渲染（`_render_full_prompt`——v1.33 前现状逐字节，
+    含 {{type_rules}} 判据热更面）；七字段全由 light 判定（含三分类字段与 safety
+    初判）。失败语义（机制兜底/传输降级）与本函数重构前逐字节一致（kill switch
+    关闭态 = 现状行为回归锁）。
+    `extra_parts` 透传（shadow 轮的 decision_shadow 观测载荷随 done.extra 续留）。
+    """
     chain = build_light_model(mapping if isinstance(mapping, Mapping) else None).with_structured_output(
         RewriteOutput, method="function_calling"
     )
-    prompt_text = _render_prompt(state, query_lang)
+    prompt_text = _render_full_prompt(state, query_lang)
 
-    update: dict[str, Any]
-    extra_parts: dict[str, Any] = {}
-    #: Layer 2 判读对象（B13）——仅成功路径非 None；两兜底路径置 None 即不判 safety
-    accepted: RewriteOutput | None = None
+    parts: dict[str, Any] = dict(extra_parts or {})
     try:
         raw = await _invoke_with_retry(
             chain,
@@ -445,10 +787,10 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             config=config,
         )
         parsed = _extract(raw)
-        accepted = parsed
         update = _success_update(parsed, spec)
         if parsed.memory_directive:
-            extra_parts = {"memory_directive": parsed.memory_directive}
+            parts = {**parts, "memory_directive": parsed.memory_directive}
+        return update, parsed, parts
     except (OutputParserException, ValidationError) as exc:
         # 修复回喂 1 次（§6.2 P1）：校验错误文本回喂 LLM 修复 → 仍失败走机制兜底
         AgentLog(
@@ -461,7 +803,7 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
         ).warning()
         repair_prompt = (
             f"{prompt_text}\n\n上一次输出未通过校验，错误信息：{exc}。"
-            "请调用 RewriteOutput 工具重新提交结果，严格按 schema 填写每个字段；"
+            "请调用结构化输出工具重新提交结果，严格按 schema 填写每个字段；"
             "不要在文本回复里书写 JSON。"
         )
         repaired: RewriteOutput | None
@@ -482,19 +824,19 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
                 node="rewrite",
             ).warning()
         if repaired is not None:
-            accepted = repaired  # 修复回喂成功路径同判 safety（B13）
             update = _success_update(repaired, spec)
             if repaired.memory_directive:
-                extra_parts = {"memory_directive": repaired.memory_directive}
-        else:
-            # 机制兜底：factoid 档 / 3 query 固定（显式常量，不经夹取，不终止）
-            update = _fallback_update(
-                query,
-                query_type=MECHANISM_FALLBACK_QUERY_TYPE,
-                count=MECHANISM_FALLBACK_QUERY_COUNT,
-                reason="structured_output_invalid",
-            )
-            extra_parts = {"fallback": "mechanism"}
+                parts = {**parts, "memory_directive": repaired.memory_directive}
+            return update, repaired, parts
+        # 机制兜底：factoid 档 / 3 query 固定（显式常量，不经夹取，不终止）
+        update = _fallback_update(
+            query,
+            query_type=MECHANISM_FALLBACK_QUERY_TYPE,
+            count=MECHANISM_FALLBACK_QUERY_COUNT,
+            reason="structured_output_invalid",
+        )
+        parts = {**parts, "fallback": "mechanism"}
+        return update, None, parts
     except Exception as exc:
         # LLM 调用重试耗尽（传输类经 RetryPolicy + deadline 门控）→ 降级原始 query 单发
         AgentLog(
@@ -511,17 +853,5 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
             count=1,
             reason="llm_retry_exhausted",
         )
-        extra_parts = {"fallback": "degraded"}
-
-    # Layer 2 安全拦截门（B13）：仅 LLM 成功路径判 safety；命中即 emit failed +
-    # raise ContentRejectedError——raise 点在上方兜底 except 族之外（该异常属
-    # Exception 族，兜底 try 内上抛会被传输兜底吞掉），直达 TurnRunner 拒绝轮；
-    # 两兜底路径 accepted=None 自然跳过（Layer 1 已前置覆盖，见 _safety_gate）
-    if accepted is not None:
-        await _safety_gate(accepted, spec, query_lang, config)
-
-    # strategy 恒随 done.extra 留痕（direct 形态为 api.md §7.4 钉死形态；verify/web
-    # 轮为观测增量）+ 分支标注（fallback / memory_directive）合并
-    extra = {"strategy": update["search_strategy"], **extra_parts}
-    emit_stage("rewrite", "done", extra=extra)
-    return update
+        parts = {**parts, "fallback": "degraded"}
+        return update, None, parts

@@ -3,7 +3,7 @@
 wf-level: T2 -- 跨域工单（基建/网关 + 后端图编排 + Nacos 契约 + 评测线），含契约增量预清单
 wf-gate: contract
 
-> **执行状态**：批次 0 已闭环（2026-11-18，dwfrun-b0565119，四件套全过，落档 docs/litellm-upgrade-batch0-20261118.md v1.2）；批次 1 R19 探针已 PASS（2026-11-18，报告 docs/research/decision-model-r19-probe-20261118.md——**端点定案=token-plan 同域同 Key，无需 Workspace ID，.env 预期零新增**，§10 用户参与点②③相应作废）；批次 2 待开工。
+> **执行状态**：批次 0 已闭环（2026-11-18，dwfrun-b0565119，四件套全过，落档 docs/litellm-upgrade-batch0-20261118.md v1.2）；批次 1 R19 探针已 PASS（2026-11-18，报告 docs/research/decision-model-r19-probe-20261118.md——**端点定案=token-plan 同域同 Key，无需 Workspace ID，.env 预期零新增**，§10 用户参与点②③相应作废）；**批次 2 已闭环（2026-11-19，dwfrun-e8587269）**：契约三件升版 nacos-config v1.33 / api v1.26 / ARCHITECTURE v1.62〔ADR-016——计划 §7 原称「ADR-015/R19」编号冲突已由架构师按既有序顺延钉正〕+ PRD v1.28 / frontend-api v1.29 / data-model v1.18 判定零变更；实现面=decision_client.py 薄客户端（httpx 打网关 /v1/systemone、kill switch=`model.mapping.decision` 缺省空串关闭、单次零重试、deadline-aware、四约定题键+逐字段阈值闸、Langfuse generation `decision.systemone`）+ rewrite 节点前置 decision 步骤（strategy∈{direct,recall} 免 light、verify/web 瘦身、**safety 分案保守口径=判定面本批留 light、safety_shadow 仅观测**）+ validator 白名单定向扩容与方言硬校验 + defaults/nacos_init/内置 prompts 四源同步（本巡检程序化比对逐字节一致）；评测报告 docs/eval-decision-batch2-20261118.md **gateVerdict=fail**（147 条金标：overall(macro) 78.57%<90% ✗ / search_strategy 56.46%<95% ✗ / 最小单类 0%<80% ✗——三条件全破，题面热更迭代清单七条归批次 3，走 Nacos `fast.decision.*` 热更后以同脚本回归）；评审 P0/P1 已闭环、P2/P3=9 条留档；巡检 DEV v1.26→v1.27 + PROGRESS v1.49→v1.50 + AGENTS.md 地图同步；交付落档 docs/decision-model-batch2-20261118.md（含批次 3 前置清单）；**批次 2.5 判据迭代已收口（2026-11-19，评测线批次——用户裁决四条全落）**：题面热更迭代四轮 **单调劣化终局**（v0 79.25% → v1 76.53% → v2 65.48% → v3/v4 68.03%，macro 四维平均；清单化规则堆叠与 decision-model-preview「一次前向四题」指令遵循形态不匹配——评测报告 `docs/eval-decision-iter-20261119.md` 含全部轮次与混淆矩阵）→ 混合规则终态三件：①**判据回滚 v0**——`fast.decision.questions_json` 双源（defaults.py + 内置 `prompts/fast/decision_questions_json.txt`，997B）逐字节回滚至契约 §1 v1.33 示例原文〔占位摘要形态，全量判据回 `common/type_rules.txt` 由 test_type_rules_* 锁；round 0 判据文本已不可复现、判据承载差如实注记（评测报告 Round5）〕，`test_prompts.py` **38 passed** 全绿（评测时刻曾 3 failed 双源漂移红，提示词分区当批修复）；②**verify→answerable=True 代码护栏**——`decision_client.align_answerable`（decision_client.py:342：verify→True / direct·recall→False / web 保留原值）+ `fast_rewrite._aligned_answerable`（fast_rewrite.py:471）幂等双防线，decision 关闭态零行为影响；护栏定向测试第一方实跑 **50 passed**；③**light 现任者公平基线补测**（生产 build_light_model + rewrite_full.txt/type_rules + RewriteOutput function_calling，147 条串行 P50 5.6s，4 error 分母 143）：**macro 83.92%**（query_type 90.91% / search_strategy 71.33% / answerable 77.62% / safety_shadow 95.80%）vs decision+护栏终态 **66.16%**（gate=fail 三条件全破）——Δ -17.76pp，**decision 胜 1 维**（answerable +1.29pp，低于误差水位）**/ light 胜 3 维**（query_type -23.56 / search_strategy -14.87 / safety_shadow -33.90pp）；④**批次 3 去留按维度级对照裁决（用户裁决④，不套绝对门槛）→ 终局建议：暂缓 decision-model 路线**——kill switch 维持关闭（`model.mapping.decision=""`），判据/阈值闸投入转技术储备；若未来重启，前置三件=SystemOne 题面判据按「一次前向四题」重写（非 type_rules 长文迁移）+ confidence 校准重标定（现行 0.5 floor 双维净负：判错均值 39.73% vs 判对 53.16%）+ `fast.decision.shadow=true` 先行观测。收口落档 `docs/decision-iter-batch-20261119.md`；巡检 PROGRESS v1.51 + AGENTS.md 地图同步；**契约面零变更**（六契约件 + ARCHITECTURE 全零变更）。**批次 3 改判（批次 2.5 终局建议）**：灰度切换**暂缓**——原前置「题面热更达标〔总体 ≥90% 且 strategy ≥95%〕」四轮实证不可达（判据形态与模型指令遵循不匹配）；且切换门禁是 decision 替代 light 的门槛，light 现任者基线本身 83.92% 亦未达 90%——绝对门槛对现任者同样不成立，去留判据已按用户裁决④改维度级对照；若未来重启 decision-model 路线，须先过重启前置三件另行立项裁决。**工单终态（2026-11-19 用户裁决）：采纳暂缓建议——搁置 decision-model 路线、light 留任，批次 3 不立项；kill switch 维持关闭（`model.mapping.decision=""`）=现状即安全态、零回退动作；已落代码/契约/评测资产休眠保留，重启前置三件满足时另行立项。**
 
 ## 0. 背景与动机
 
@@ -120,8 +120,7 @@ verdict=pass 才进批次 2）：
   增面双源同步）；strategy ∈ {direct, recall} 时跳过 light（省调用）；
 - Langfuse generation 接入 + shadow 双跑开关（Nacos 单键：shadow 模式下 decision 只观测
   不生效，双结果落 trace metadata）；
-- 发布次序硬前置（B12 教训）：**先发 Nacos（model.mapping.decision 键 + prompts
-  fast.decision.* 题面键）再上代码**。
+- 发布次序【v1.33 契约门禁评审钉正，与本契约 v1.31/v1.32 型**方向相反**】：**先上代码（kill switch 缺省关闭、合并零行为变化）后发 Nacos v1.33**——反向窗口〔新配置+旧代码〕旧 validator 对 prompts 非字符串键（confidence_floor/timeout_ms/shadow）整份拒收（nacos-config v1.33 §6/§8 注）；批次 3 灰度窗：发 Nacos → 控制台单键热更 `model.mapping.decision` 激活（须与 config.yaml decision-model 别名同窗就位）。
 
 ### 5.2 评测线（eval-engineer，与 5.1 并行）
 
@@ -155,7 +154,7 @@ verdict=pass 才进批次 2）：
 | `docs/ARCHITECTURE.md` | §4.1 rewrite 行（decision 前置步骤）、§6.7 网关、R17 注（判据载体迁移机制不变）、新 R19 风险行、ADR-015（决策模型接入，拓扑零改动第四例） | — |
 | `docs/DEVELOPMENT-PROCESS.md` | §3.3 R19 探针条 + 工单编号 | — |
 | `docs/contract/api.md` | 预期零变更；stage extra 若新增 `decision_source` 观测字段则钉文字 | 前端 stage_key 面不变 |
-| `frontend-api.md` / `api.d.ts` | 预期零变更（前端零改动） | 判定后记「无需更新」+理由 |
+| `frontend-api.md` / `api.d.ts` | 预期零变更（前端零改动） | 判定后记「无需更新」+理由。**【批次 2 勘误，评审闭环】**`api.d.ts` 随 api.md v1.26 镜像钉注执行（`StageExtra.decision_source?: string`，工作区已落 2 行）——「契约冻结 > 计划预判」以 api.md 为准，本行「预期零变更」预判作废 |
 | `data-model.md` | 零 DDL 预期 | 判定后记「无需更新」+理由 |
 | `docs/PRD.md` | 视需要挂 OQ（兜底吞噬率观察等归 M4 评测线） | architect 定 |
 | `README.md` / `docs/PROGRESS.md` | 收尾巡检 | §10.1 硬规范 |

@@ -7,9 +7,9 @@
 #   （make infra-up 或 docker compose --project-directory . -f deploy/docker-compose.yml up -d litellm），
 #   不是热更通道——运行时热更走 Nacos model.mapping（切换别名，nacos-config.md §5），与本文件解耦：
 #   别名是稳定契约面，上游真实 model id 是可变值。
-# 别名契约面（9 个）：chat-standard / chat-standard-glm / chat-standard-deepseek +
+# 别名契约面（10 个）：chat-standard / chat-standard-glm / chat-standard-deepseek +
 #   chat-speed / chat-speed-glm / chat-speed-deepseek + qwen3.5-4b-ollama（light）+
-#   text-embedding-v4 + qwen3-rerank。
+#   text-embedding-v4 + qwen3-rerank + decision-model（System One 决策模型，意图识别）。
 # 上游引用纪律：api_key 一律 os.environ/<VAR>（值来自 .env 经 compose 注入 litellm 容器，可空占位
 #   不阻塞起栈）；api_base 同理（DeepSeek 单一官方地址除外——.env 不设该变量，见下注）。
 #   上游真实 model id 为「当前已知值」，S0-B 组逐字核对后更新（以各家控制台为准，尤其 DeepSeek
@@ -134,6 +134,24 @@ model_list:
       mode: rerank
       input_cost_per_token: 7.042e-08       # ¥0.5/M 仅输入计费 @7.1（2026-11-06 百炼价页）
       output_cost_per_token: 0
+
+  # ── decision（意图识别决策模型；plan-decision-model-20261118 批次 2，R19 探针 PASS 后接线）──
+  # 百炼 TypeSafe System One 私有协议（POST /compatible-mode/v1/systemone，非 OpenAI 兼容）；
+  # litellm typesafe provider get_complete_url 会剥掉 api_base 尾部 /v1 再拼 /v1/systemone
+  # （1.106.4 base_llm/decisions/transformation.py:513），故 DASHSCOPE_TOKEN_PLAN_BASE_URL
+  # 的 /compatible-mode/v1 尾缀原样可用，恰好落回 R19 实测端点。单上游不配 fallback
+  # （对齐 embedding/rerank 处理，ARCH §6.2/R3；decision 失败由 app 侧回退 light 全职责路径）。
+  - model_name: decision-model
+    litellm_params:
+      model: typesafe/decision-model-preview        # 百炼决策模型 id（preview 期；协议变更面 R8/R16 同型）
+      api_base: os.environ/DASHSCOPE_TOKEN_PLAN_BASE_URL
+      api_key: os.environ/DASHSCOPE_TOKEN_PLAN_API_KEY
+      allowed_fails: 3
+      cooldown_time: 60
+    model_info:
+      mode: decisions                               # litellm 1.106.4 原生 decisions 模式（asystemone 健康检查走此 mode）
+      input_cost_per_token: 0                       # 限时免费（2026-11-18 立项口径；转收费前复核套餐覆盖面——成本观测挂 plan §2.5）
+      output_cost_per_token: 0                      # 输出长度 0（不生成文本），恒 0
 
 router_settings:
   num_retries: 0                                    # v1.3：网关重试去重——重试归 guards 代码层（Agent Spec retry），网关不重复重试

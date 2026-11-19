@@ -9,6 +9,7 @@
 - 单条规则与契约逐条对应（见各用例 docstring 的 § 标注）。
 """
 import copy
+import json
 import re
 
 import pytest
@@ -426,10 +427,16 @@ class TestModelMappingRules:
 
 
 class TestPromptsSearchStrategyRules:
-    """§3 v1.20 两条 prompts 校验（检索策略增量防热更漂移）。"""
+    """§3 v1.20 两条 prompts 校验（检索策略增量防热更漂移）。
 
-    def test_rewrite_template_without_search_strategy_rejected(self):
-        """fast.rewrite 输出 schema 串缺 search_strategy → 整版拒收（防漂移至旧契约）。"""
+    **v1.33 退役注**：fast.rewrite schema 枚举串硬校验已退役（减面后判据唯一事实源 =
+    fast.decision.questions_json——方言硬校验见 TestDecisionPromptsRules；策略枚举
+    options 防漂移软告警见 decision_prompts_warnings）。synthesis 两条结构性校验保留。
+    """
+
+    def test_slim_rewrite_without_strategy_schema_accepted(self):
+        """v1.33 减面形态：fast.rewrite 无 search_strategy schema 串 → 合法通过
+        （分类判据面迁 questions_json——slim 形态即契约形态）。"""
         payload = _mutated(
             PROMPTS_DATA_ID,
             lambda p: p["prompts"].update(
@@ -440,8 +447,7 @@ class TestPromptsSearchStrategyRules:
                 }
             ),
         )
-        with pytest.raises(AssetValidationError, match="search_strategy"):
-            validate_asset(PROMPTS_DATA_ID, payload)
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
     def test_synthesis_template_missing_direct_prefix_rejected(self):
         """fast.synthesis 缺「免检索直答路径」行前缀 → 整版拒收（行级切分结构性校验）。"""
@@ -582,32 +588,41 @@ class TestRecallNavigationalRules:
         with pytest.raises(AssetValidationError, match="回顾整理路径"):
             validate_asset(PROMPTS_DATA_ID, payload)
 
-    def test_rewrite_template_enum_without_recall_rejected(self):
-        """fast.rewrite 全文缺 recall 字样 → 整版拒收（沿 v1.20 防漂移先例；模拟漂移回
-        v1.20 文本形态——schema 枚举串与判定正文同时回退）。"""
-        payload = _mutated(
-            PROMPTS_DATA_ID,
-            lambda p: p["prompts"].update(
-                {"fast.rewrite": p["prompts"]["fast.rewrite"].replace("recall", "")}
-            ),
-        )
-        with pytest.raises(AssetValidationError, match="recall"):
-            validate_asset(PROMPTS_DATA_ID, payload)
+    def test_rewrite_template_without_recall_accepted_after_slim(self):
+        """【v1.33 退役翻正】减面后 fast.rewrite 全文无 recall/navigational 字样 →
+        合法通过（分类判据面迁 questions_json——防漂移载体 = search_strategy options
+        软告警；synthesis/type_query_map 侧校验保留不变）。"""
+        slim = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]["fast.rewrite"]
+        assert "recall" not in slim and "navigational" not in slim  # 减面前置
+        payload = _mutated(PROMPTS_DATA_ID, lambda p: None)
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
-    def test_rewrite_template_enum_without_navigational_rejected(self):
-        """fast.rewrite 枚举串缺 navigational 字样 → 整版拒收。"""
+    def test_strategy_options_missing_recall_warns_not_rejected(self):
+        """防漂移迁移载体：questions_json.search_strategy options 缺 recall → 软告警
+        不拒收（decision 永不产出 recall 的 R17 漂移面应当被看见）。"""
+        from app.config_center.validator import decision_prompts_warnings
+        import json as _json
+
+        questions = {
+            "search_strategy": {
+                "type": "choice",
+                "options": ["direct", "verify", "web"],
+                "criteria": {"direct": "x", "verify": "y", "web": "z"},
+            }
+        }
+        prompts = {
+            "fast.decision.questions_json": _json.dumps(questions, ensure_ascii=False)
+        }
+        warnings = decision_prompts_warnings(prompts)
+        assert any("recall" in warning for warning in warnings)
+        # 软校验不拒收：整份 payload 仍可发布
         payload = _mutated(
             PROMPTS_DATA_ID,
             lambda p: p["prompts"].update(
-                {
-                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
-                        "how_to|navigational|other", "how_to|other"
-                    )
-                }
+                {"fast.decision.questions_json": _json.dumps(questions, ensure_ascii=False)}
             ),
         )
-        with pytest.raises(AssetValidationError, match="navigational"):
-            validate_asset(PROMPTS_DATA_ID, payload)
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
     @pytest.mark.parametrize("prefix", SYNTHESIS_VARIANT_PREFIXES)
     def test_synthesis_any_variant_prefix_missing_rejected(self, prefix):
@@ -628,45 +643,52 @@ class TestRecallNavigationalRules:
 
 
 class TestValidatorProseBypassHardening:
-    """评审修复轮（security P3②/③ + 评审 P3④）：枚举串精确形态 + history_block 占位符。"""
+    """评审修复轮（security P3②/③ + 评审 P3④）：枚举串精确形态 + history_block 占位符。
 
-    def test_enum_recall_removed_but_prose_mentions_recall_still_rejected(self):
-        """散文绕过探针：枚举串删 recall、正文仍多处提及 recall → 必须拒收。
+    **v1.33 退役注**：fast.rewrite 枚举串散文绕过硬校验已随减面退役（判据唯一事实源 =
+    fast.decision.questions_json——questions_json 的 search_strategy options 缺策略
+    枚举值走 decision_prompts_warnings 软告警，见 TestRecallNavigationalRules）；
+    history_block 占位符校验保留不变。
+    """
 
-        修复前 token 匹配全文子串（`"recall" in rewrite`）——散文提及即可蒙混，
-        热更漂移回三值枚举时静默放过（recall 边永不触发）。
-        """
+    def test_enum_recall_removed_prose_mentions_still_accepted_after_slim(self):
+        """【v1.33 退役翻正】旧全量形态（v1.32 文本——枚举串含 recall + 散文提及）
+        亦合法通过（发布过渡窗容忍：Nacos 旧值 + 新代码，判据双份冗余无害；
+        防漂移面迁移至 questions_json options 软告警）。"""
+        legacy_full_rewrite = (
+            "你是检索查询改写器（light 模型）。一次完成五件事……\n"
+            '{"queries":["..."],"query_type":"factoid|list|comparison|multi_facet|'
+            'temporal|how_to|navigational|other","answerable_from_knowledge":false,'
+            '"search_strategy":"direct|verify|web|recall","safety":'
+            '"none|danger|profanity|privacy|politics","time_range":null,'
+            '"memory_directive":null}\n'
+            "④ 检索策略判定——recall 仅限回顾整理请求（散文面提及 recall）。"
+        )
         payload = _mutated(
             PROMPTS_DATA_ID,
-            lambda p: p["prompts"].update(
-                {
-                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
-                        '"search_strategy":"direct|verify|web|recall"',
-                        '"search_strategy":"direct|verify|web"',
-                        # 正文保留 recall 字样（④ 检索策略判定句 = 散文面）
-                    )
-                }
-            ),
+            lambda p: p["prompts"].update({"fast.rewrite": legacy_full_rewrite}),
         )
-        text = payload["prompts"]["fast.rewrite"]
-        assert "recall" in text  # 前置：散文面确实还提到 recall
-        with pytest.raises(AssetValidationError, match="recall"):
-            validate_asset(PROMPTS_DATA_ID, payload)
+        assert "recall" in payload["prompts"]["fast.rewrite"]
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
-    def test_enum_navigational_removed_but_prose_mentions_it_still_rejected(self):
-        """散文绕过探针（题型侧）：枚举串删 navigational、正文仍提及 → 必须拒收。"""
+    def test_enum_navigational_removed_prose_mentions_it_still_accepted_after_slim(self):
+        """【v1.33 退役翻正】旧全量形态缺 navigational 枚举尾段 → 合法通过（同上——
+        判据面迁移，synthesis/type_query_map 侧校验保留不变）。"""
+        legacy_full_rewrite = (
+            "你是检索查询改写器（light 模型）。一次完成五件事……\n"
+            '{"queries":["..."],"query_type":"factoid|list|comparison|multi_facet|'
+            'temporal|how_to|other","answerable_from_knowledge":false,'
+            '"search_strategy":"direct|verify|web","safety":'
+            '"none|danger|profanity|privacy|politics","time_range":null,'
+            '"memory_directive":null}\n'
+            "导航型题目在正文提及 navigational 判定（散文面）。"
+        )
         payload = _mutated(
             PROMPTS_DATA_ID,
-            lambda p: p["prompts"].update(
-                {
-                    "fast.rewrite": p["prompts"]["fast.rewrite"].replace(
-                        "how_to|navigational|other", "how_to|other"
-                    )
-                }
-            ),
+            lambda p: p["prompts"].update({"fast.rewrite": legacy_full_rewrite}),
         )
-        with pytest.raises(AssetValidationError, match="navigational"):
-            validate_asset(PROMPTS_DATA_ID, payload)
+        assert "navigational" in payload["prompts"]["fast.rewrite"]
+        assert validate_asset(PROMPTS_DATA_ID, payload) == payload
 
     def test_synthesis_template_without_history_block_placeholder_rejected(self):
         """fast.synthesis 缺 `{{history_block}}` 占位符 → 拒收（security P3③）。
@@ -1122,3 +1144,223 @@ class TestFastLlmTimeout:
 
     def test_deep_llm_timeout_stays_60(self):
         assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]["llm_timeout_s"] == 60
+
+
+# ==== 决策模型接入键组（v1.33 Decision Model 工单批次 2，ADR-016）====
+#
+# 钉住的语义（nacos-config.md §1/§5 v1.33）：
+# - `model.mapping.decision` 缺省空串 = kill switch 关闭——**映射键唯一允许空串者**
+#   （其余五键 min_length=1 惯例不变）；非空值不做别名白名单校验（灰度安全）；
+# - prompts `fast.decision.*` 标量键组白名单定向扩容（home.suggest_pool 先例）——
+#   questions_json=JSON 字符串（方言硬校验：type∈{noul,choice,score}/choice.criteria=
+#   对象/score.criteria=数组，违规拒收——发上去必 400，坏配置不上线沿 ADR-005 语义）；
+#   confidence_floor/timeout_ms/shadow 类型越界拒收该 dataId；
+# - **灰度安全（硬约束）**：四键全部可选——旧 Nacos payload（无 decision 键组）+ 新
+#   validator 启动零拒收（专项测试）；
+# - 软校验：四约定题键齐备与 query_type other 兜底（告警不拒收；v1.33 原文口径——
+#   strategy/safety_shadow 选项为契约原值不含 other）。
+
+
+class TestDecisionMappingRules:
+    """§5 v1.33：model.mapping.decision 键——空串例外 + 非空别名容忍。"""
+
+    def test_defaults_decision_key_empty_kill_switch(self):
+        assert BUILTIN_DEFAULTS[MODEL_DATA_ID]["decision"] == ""
+
+    def test_empty_decision_accepted(self):
+        """decision=""（缺省 kill switch）→ 通过（映射键唯一空串例外）。"""
+        payload = _mutated(MODEL_DATA_ID, lambda p: p.update({"decision": ""}))
+        validate_asset(MODEL_DATA_ID, payload)
+
+    def test_legacy_mapping_without_decision_key_accepted(self):
+        """旧 Nacos payload（无 decision 键）+ 新 validator → 零拒收（extra=allow +
+        可选缺省——kill switch 缺省关闭，灰度安全专项）。"""
+        payload = _mutated(MODEL_DATA_ID, lambda p: p.pop("decision", None))
+        validate_asset(MODEL_DATA_ID, payload)  # 不抛即过
+
+    def test_nonempty_decision_alias_accepted_without_whitelist(self):
+        """非空别名不做白名单校验（别名注册面在 litellm config.yaml 网关静态层）——
+        未知别名值容忍不拒收（调用时网关报错 → decision 失败兜底回 light）。"""
+        payload = _mutated(MODEL_DATA_ID, lambda p: p.update({"decision": "decision-model"}))
+        validate_asset(MODEL_DATA_ID, payload)
+        payload = _mutated(MODEL_DATA_ID, lambda p: p.update({"decision": "unknown-alias"}))
+        validate_asset(MODEL_DATA_ID, payload)
+
+    def test_other_keys_empty_still_rejected(self):
+        """五键 min_length=1 惯例不变（decision 是唯一空串例外）。"""
+        payload = _mutated(MODEL_DATA_ID, lambda p: p.update({"memory": ""}))
+        with pytest.raises(AssetValidationError):
+            validate_asset(MODEL_DATA_ID, payload)
+
+
+class TestDecisionPromptsRules:
+    """§1 v1.33：fast.decision.* 标量键组——questions_json 方言硬校验 + 标量类型闸。"""
+
+    def test_defaults_decision_keys_validate(self):
+        """内置默认（含四键）整份通过（四源同步目标形态）。"""
+        validate_asset(PROMPTS_DATA_ID, copy.deepcopy(BUILTIN_DEFAULTS[PROMPTS_DATA_ID]))
+
+    def test_valid_questions_json_accepted(self):
+        import json
+
+        questions = {
+            "query_type": {
+                "type": "choice",
+                "options": ["a", "other"],
+                "criteria": {"a": "判据", "other": "兜底"},
+            },
+            "answerable": {"type": "noul", "instructions": "是否判据"},
+        }
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {"fast.decision.questions_json": json.dumps(questions, ensure_ascii=False)}
+            ),
+        )
+        validate_asset(PROMPTS_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("mutate", "reason"),
+        [
+            (
+                lambda prompts: prompts.update({"fast.decision.questions_json": "not-json{{{"}),
+                "非法 JSON",
+            ),
+            (
+                lambda prompts: prompts.update(
+                    {"fast.decision.questions_json": '{"q": {"type": "box", "criteria": {}}}'}
+                ),
+                "box 方言（上游 400 拒收）",
+            ),
+            (
+                lambda prompts: prompts.update(
+                    {
+                        "fast.decision.questions_json": json.dumps(
+                            {"q": {"type": "choice", "options": ["a"], "criteria": "字符串判据"}},
+                            ensure_ascii=False,
+                        )
+                    }
+                ),
+                "choice criteria 须为对象",
+            ),
+            (
+                lambda prompts: prompts.update(
+                    {
+                        "fast.decision.questions_json": json.dumps(
+                            {"q": {"type": "choice", "options": ["a"]}},
+                            ensure_ascii=False,
+                        )
+                    }
+                ),
+                "choice 缺 criteria",
+            ),
+            (
+                lambda prompts: prompts.update(
+                    {
+                        "fast.decision.questions_json": json.dumps(
+                            {"q": {"type": "score", "criteria": {"0": "锚"}}},
+                            ensure_ascii=False,
+                        )
+                    }
+                ),
+                "score criteria 须为数组",
+            ),
+            (
+                lambda prompts: prompts.update({"fast.decision.questions_json": '{"q": "平铺字符串"}'}),
+                "题对象须为对象",
+            ),
+        ],
+    )
+    def test_questions_json_dialect_violations_rejected(self, mutate, reason):
+        """方言硬校验违规 → 整份拒收（发上去必 400——坏配置不上线沿 ADR-005 语义）。"""
+        payload = _mutated(PROMPTS_DATA_ID, lambda p: mutate(p["prompts"]))
+        with pytest.raises(AssetValidationError) as exc_info:
+            validate_asset(PROMPTS_DATA_ID, payload)
+        assert "fast.decision.questions_json" in str(exc_info.value)
+
+    def test_legacy_prompts_without_decision_keys_accepted(self):
+        """旧 Nacos prompts payload（无 fast.decision.* 键）+ 新 validator → 零拒收
+        （四键全部可选、键缺失回落代码内置默认=旧行为——灰度安全专项）。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].pop("fast.decision.questions_json", None)
+            or p["prompts"].pop("fast.decision.confidence_floor", None),
+        )
+        payload["prompts"].pop("fast.decision.timeout_ms", None)
+        payload["prompts"].pop("fast.decision.shadow", None)
+        validate_asset(PROMPTS_DATA_ID, payload)  # 不抛即过
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda prompts: prompts.update({"fast.decision.confidence_floor": 1.5}),  # 越上界
+            lambda prompts: prompts.update({"fast.decision.confidence_floor": 0}),  # 越下界
+            lambda prompts: prompts.update({"fast.decision.confidence_floor": "0.5"}),  # 字符串
+            lambda prompts: prompts.update({"fast.decision.timeout_ms": 50}),  # 低于下界
+            lambda prompts: prompts.update({"fast.decision.timeout_ms": 20000}),  # 越上界
+            lambda prompts: prompts.update({"fast.decision.timeout_ms": "1000"}),  # 字符串
+            lambda prompts: prompts.update({"fast.decision.shadow": "false"}),  # 字符串形态
+            lambda prompts: prompts.update({"fast.decision.shadow": 0}),  # 数字形态
+        ],
+    )
+    def test_scalar_type_violations_rejected(self, mutate):
+        """标量键类型/范围越界 → 拒收该 dataId（validator 白名单扩容的类型闸面）。"""
+        payload = _mutated(PROMPTS_DATA_ID, lambda p: mutate(p["prompts"]))
+        with pytest.raises(AssetValidationError):
+            validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_scalar_valid_values_accepted(self):
+        """合法标量值（含边界 1 与 10000）→ 通过。"""
+        payload = _mutated(
+            PROMPTS_DATA_ID,
+            lambda p: p["prompts"].update(
+                {
+                    "fast.decision.confidence_floor": 1,
+                    "fast.decision.timeout_ms": 10000,
+                    "fast.decision.shadow": True,
+                }
+            ),
+        )
+        validate_asset(PROMPTS_DATA_ID, payload)
+
+    def test_decision_prompts_warnings_missing_question_keys(self):
+        """软校验：questions_json 缺约定题键 → 告警不拒收（decision 侧该题保守缺省）。"""
+        from app.config_center.validator import decision_prompts_warnings
+        import json
+
+        prompts = {
+            "fast.decision.questions_json": json.dumps(
+                {"query_type": {"type": "choice", "options": ["a", "other"], "criteria": {"a": "x"}}},
+                ensure_ascii=False,
+            )
+        }
+        warnings = decision_prompts_warnings(prompts)
+        assert any("search_strategy" in warning for warning in warnings)
+        assert any("answerable" in warning for warning in warnings)
+
+    def test_decision_prompts_warnings_choice_without_other(self):
+        """软校验：choice 缺 other 兜底选项 → 告警不拒收（百炼官方建议）。"""
+        from app.config_center.validator import decision_prompts_warnings
+        import json
+
+        prompts = {
+            "fast.decision.questions_json": json.dumps(
+                {
+                    "query_type": {
+                        "type": "choice",
+                        "options": ["a", "b"],
+                        "criteria": {"a": "x", "b": "y"},
+                    }
+                },
+                ensure_ascii=False,
+            )
+        }
+        warnings = decision_prompts_warnings(prompts)
+        assert any("other" in warning for warning in warnings)
+
+    def test_decision_prompts_no_warning_for_valid_questions(self):
+        """内置题面（四题键齐备 + other 兜底齐备）→ 零告警。"""
+        from app.config_center.validator import decision_prompts_warnings
+
+        prompts = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]
+        assert decision_prompts_warnings(prompts) == []

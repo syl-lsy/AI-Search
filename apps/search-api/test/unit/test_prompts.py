@@ -35,8 +35,10 @@ def _placeholders(text: str) -> set[str]:
 
 
 def test_rewrite_placeholder_union_locked() -> None:
-    """fast.rewrite 占位符并集恰为五变量（nacos-config §1 fast.rewrite 行，单测锁死）。"""
-    expected = {"type_rules", "query_lang", "memory_hints", "history", "query"}
+    """fast.rewrite 占位符并集恰为四变量（nacos-config §1 v1.33 减面版——{{type_rules}}
+    占位符退役：分类判据面迁 fast.decision.questions_json，fast.rewrite 从此不引用
+    type_rules；common.type_rules 由 deep.planner 继续引用）。"""
+    expected = {"query_lang", "memory_hints", "history", "query"}
     assert _placeholders(PROMPTS_CONFIG["prompts"]["fast.rewrite"]) == expected
     assert _placeholders(load_builtin_prompt("fast.rewrite")) == expected
 
@@ -183,14 +185,31 @@ def test_type_rules_contains_search_strategy_section() -> None:
     assert load_builtin_prompt("common.type_rules") == text
 
 
-def test_rewrite_prompt_schema_string_contains_search_strategy() -> None:
-    """fast.rewrite 输出 schema 串含 search_strategy 与四值枚举（validator 条 1 模板面来源；
-    v1.51 起枚举串含 recall）。"""
+def test_rewrite_prompt_slimmed_v1_33() -> None:
+    """fast.rewrite 减面锚点（nacos-config.md §1 v1.33 批次 2 实施指引）：
+    三件事（指代消解/产出 queries/输入安全初判）；分类判据面零残留——无 {{type_rules}}
+    引用、无类型判定标准段、schema 串无 query_type/answerable_from_knowledge/search_strategy
+    三字段、坏例无两枚举行；safety/time_range/memory_directive 保留（safety 判定面
+    留 light——契约冻结钉注）。"""
     for text in (
         PROMPTS_CONFIG["prompts"]["fast.rewrite"],
         load_builtin_prompt("fast.rewrite"),
     ):
-        assert '"search_strategy":"direct|verify|web|recall"' in text
+        assert "一次完成三件事" in text
+        assert "① 指代消解" in text
+        assert "② 产出 queries" in text
+        assert "③ 输入安全初判" in text
+        assert "{{type_rules}}" not in text
+        assert "类型判定标准" not in text
+        assert "参数可答判定标准" not in text
+        assert "检索策略判定标准" not in text
+        assert '"query_type"' not in text
+        assert '"answerable_from_knowledge"' not in text
+        assert '"search_strategy"' not in text
+        # safety 判定面留 light（契约 v1.33 冻结钉注）——判据段整段保留
+        assert '"safety":"none|danger|profanity|privacy|politics"' in text
+        assert "拿不准一律 none" in text
+        assert '"time_range"' in text and '"memory_directive"' in text
 
 
 def test_synthesis_prompt_has_four_variant_prefixes() -> None:
@@ -252,14 +271,30 @@ def _prompt_texts(key: str) -> list[str]:
     return [PROMPTS_CONFIG["prompts"][key], load_builtin_prompt(key)]
 
 
-def test_rewrite_schema_string_contains_recall_and_navigational() -> None:
-    """fast.rewrite 输出 schema 串含 navigational 与 recall 字样（validator v1.27 校验面来源）。"""
-    for text in _prompt_texts("fast.rewrite"):
-        assert '"search_strategy":"direct|verify|web|recall"' in text
-        assert (
-            '"query_type":"factoid|list|comparison|multi_facet|temporal|how_to|navigational|other"'
-            in text
-        )
+def test_rewrite_schema_string_migration_carrier_questions_json() -> None:
+    """【v1.33 迁移】fast.rewrite 枚举串判据迁 questions_json（判据唯一事实源）：
+    四约定题键齐备、方言合法、枚举选项为契约原文形态。
+
+    判据回滚 v0（2026-11-19 用户裁决——批次 2.5 迭代 v1~v4 单调劣化）：questions_json
+    逐字节回滚至契约 §1 v1.33 示例原文（判据=占位摘要形态，全量判据回 common.type_rules，
+    由 test_type_rules_* 用例锁）；本用例只锁迁移结构面（题键/方言/枚举），不锁判据正文。
+    """
+    import json as _json
+
+    for text in (PROMPTS_CONFIG["prompts"]["fast.decision.questions_json"],
+                 load_builtin_prompt("fast.decision.questions_json")):
+        questions = _json.loads(text)
+        assert set(questions) >= {"query_type", "search_strategy", "answerable", "safety_shadow"}
+        strategy = questions["search_strategy"]
+        # 回滚态四值枚举（other 兜底仅 query_type——策略拿不准回落 web 在代码侧保守缺省）
+        assert set(strategy["options"]) == {"direct", "recall", "verify", "web"}
+        query_type = questions["query_type"]
+        assert "navigational" in query_type["options"]
+        assert "other" in query_type["options"]  # 百炼官方建议兜底选项仅 query_type（v1.33 原文）
+        # v1.33 原文判据锚点（占位摘要形态——全量判据回 common.type_rules）
+        assert "对话回顾三类" in strategy["criteria"]["recall"]
+        assert "空历史护栏在代码侧" in strategy["criteria"]["recall"]
+        assert "默认含拿不准" in strategy["criteria"]["web"]
 
 
 def test_rewrite_bad_example_drops_navigation_token() -> None:
@@ -308,18 +343,24 @@ def test_type_rules_navigational_replaces_factoid_merge_rule() -> None:
         assert "deep.planner 判导航型问题时输出 factoid" in text
 
 
-def test_rewrite_body_fourth_task_carries_recall_semantics() -> None:
-    """fast.rewrite 五件事正文第 ④ 件事含 recall 判定语义（U2-8 锚点）。
+def test_rewrite_body_recall_semantics_migrated_to_decision_questions() -> None:
+    """【v1.33 迁移】fast.rewrite 五件事改三件事——recall 判定语义不在 rewrite 正文、
+    载体为 questions_json search_strategy criteria（题面判据）与 common.type_rules
+    （全量判据，test_type_rules_recall_rules_present 锁）。
 
-    只测 schema 枚举串不够：模型按正文第 ④ 件事决策（direct/recall/verify/web 四选一 +
-    recall 的前置条件「历史非空、不含时敏事实断言」），该段缺失即 recall 永不产出。
+    判据回滚 v0（2026-11-19 用户裁决）：questions_json 判据=契约 §1 v1.33 原文占位
+    摘要形态——本用例锁 v1.33 锚点（三类概述 + 时敏硬规则占位 + 空历史护栏落代码侧），
+    时敏硬规则/重复提问比对指引的正文锚点归 common.type_rules。
     """
-    for text in _prompt_texts("fast.rewrite"):
-        assert "④ 检索策略判定" in text
-        assert "只能取 direct / verify / web / recall 之一" in text
-        assert "recall 仅限回顾整理请求" in text
-        assert "历史非空" in text and "时敏事实断言" in text
-        assert "8 个枚举值之一" in text  # 题型判定的 8 值口径（navigational 已入枚举）
+    import json as _json
+
+    for source in (PROMPTS_CONFIG["prompts"]["fast.decision.questions_json"],
+                   load_builtin_prompt("fast.decision.questions_json")):
+        criteria = _json.loads(source)["search_strategy"]["criteria"]
+        recall_text = criteria["recall"]
+        assert "对话回顾三类" in recall_text  # v1.33 原文占位锚点（三类概述）
+        assert "时敏硬规则" in recall_text  # 时敏/事实新题硬规则占位指引
+        assert "空历史护栏在代码侧" in recall_text  # 空历史护栏（护栏落代码侧的契约声明）
 
 
 def test_synthesis_recall_section_carries_five_guard_points() -> None:

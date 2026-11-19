@@ -29,6 +29,10 @@ QueryType = Literal[
 #: 时效信号（rewrite/planner 产出，透传 Tavily time_range）
 TimeRange = Literal["day", "week", "month", "year"] | None
 
+#: 检索策略四值（v1.44 B9 三值 / v1.51 +recall——与 `nodes/fast_rewrite.SearchStrategy`
+#: 逐字一致，test_stub_graphs 锁双源；决策模型题面 search_strategy choice options 同源）
+SearchStrategy = Literal["direct", "verify", "web", "recall"]
+
 #: 历史装配条目（ARCH §6.5：最近 6 轮 {q, a_head≤200 chars}，TurnRunner 注入）
 HistoryItem = dict[str, str]
 
@@ -64,7 +68,7 @@ class MainState(TypedDict, total=False):
     answer_md: str
     query_type: QueryType
     answerable_from_knowledge: bool
-    search_strategy: Literal["direct", "verify", "web", "recall"]  # v1.51 四值（与 fast_rewrite.SearchStrategy 逐字一致）
+    search_strategy: SearchStrategy  # v1.51 四值（与 fast_rewrite.SearchStrategy 逐字一致）
     time_range: TimeRange
     rewritten_queries: list[str]
     candidates: list[Candidate]
@@ -123,7 +127,7 @@ class FastState(TypedDict, total=False):
     # rewrite 产出（light 模型结构化输出，S14/S15）
     query_type: QueryType
     answerable_from_knowledge: bool
-    search_strategy: Literal["direct", "verify", "web", "recall"]  # v1.44 B9② 三值 + v1.51 recall 第四值：direct/recall 条件边 + synthesis 变体消费（缺省/非法=web）
+    search_strategy: SearchStrategy  # v1.44 B9② 三值 + v1.51 recall 第四值：direct/recall 条件边 + synthesis 变体消费（缺省/非法=web）
     time_range: TimeRange
     rewritten_queries: list[str]
     # 检索产出（Send 扇出并行写入 → merge_dedupe 消费）

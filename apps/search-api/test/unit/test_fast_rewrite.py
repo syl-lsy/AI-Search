@@ -234,7 +234,8 @@ async def test_rewrite_stage_events_and_extra_for_memory_directive(
 async def test_rewrite_prompt_renders_contract_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """渲染锁死：prompt 含 query_lang/type_rules 内置全文/历史 Q/A/query；memory_hints 空串（M5 前）。"""
+    """渲染锁死：prompt 含 query_lang/历史 Q/A/query；memory_hints 空串（M5 前）；
+    减面形态无 type_rules 引用（v1.33——分类判据面迁 questions_json）。"""
     chain = _FakeChain([_OK_OUTPUT])
     _install(monkeypatch, chain)
 
@@ -243,8 +244,8 @@ async def test_rewrite_prompt_renders_contract_variables(
     prompt = chain.prompts[0]
     assert _STATE["query"] in prompt
     assert "zh" in prompt  # query_lang（前置纯代码判定，改写不改判）
-    assert "参数可答判定" in prompt  # type_rules 内置全文注入
     assert "Q: 什么是向量数据库" in prompt and "A: 向量数据库是…" in prompt
+    assert "{{type_rules}}" not in prompt  # 减面：fast.rewrite 不再引用 type_rules
 
 
 async def test_rewrite_receives_mapping_snapshot_via_configurable(

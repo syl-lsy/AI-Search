@@ -156,6 +156,8 @@ export interface StageExtra {
   layer?: string
   /** api.md §7.4/§2.5 v1.25 B14 兜底收束轮留痕（synthesis_digest=来源速览兜底 | synthesis_partial=部分正文收束——stage(write,done) extra 携带，评测/审计判兜底轮型与 M4 采样排除依据〔digest 轮不计入 P50/P90〕；前端零消费不展示——degraded 渲染走 done/2.5 的 status/degraded 字段；宽松 string 同 strategy/safety 先例，值域扩容零类型形状变更） */
   fallback?: string
+  /** api.md §7.2/§2.5 v1.26 决策模型判定源留痕（Decision Model 工单批次 2）：decision=决策模型判定生效 | light_fallback=decision 失败/超时/结构异常/低置信回退 light 全职责（不置 degraded） | shadow=shadow 双跑观测态（decision 只记录不生效）——仅 stage(rewrite, done) 携带；decision 未启用〔model.mapping.decision 缺省空串 kill switch〕与存量轮不携带该键（键可省略不置 null，沿 v1.12 images 先例）；前端零渲染义务（观测/评测判读键，extra.strategy v1.14 先例同款——宽松 string 同 strategy/safety/fallback 先例，值域扩容零类型形状变更） */
+  decision_source?: string
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */

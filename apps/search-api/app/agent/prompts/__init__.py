@@ -36,6 +36,9 @@ PROMPTS_DATA_ID = "ai_search.agent.prompts.json"
 #: 内置默认文件注册表（键 = nacos-config §1 契约键；值 = 本目录相对路径）
 BUILTIN_PROMPT_FILES: dict[str, str] = {
     "fast.rewrite": "fast/rewrite.txt",
+    # v1.33 决策模型题面载体（纯 JSON 无占位符——「未提供变量渲染报错」规则对本键不适用；
+    # 消费方为 decision_client.load_questions，不经 render_prompt）
+    "fast.decision.questions_json": "fast/decision_questions_json.txt",
     "fast.synthesis": "fast/synthesis.txt",
     "common.type_rules": "common/type_rules.txt",
     "common.citation_rules": "common/citation_rules.txt",
