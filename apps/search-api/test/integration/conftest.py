@@ -56,9 +56,23 @@ os.environ.setdefault("LOG_FILE_DIR", "tmp/logs")
 #: `test_threads_turns` 的「等待轮次到达 completed」用例成批贴边超时（形态＝
 #: 「等待超时（30.0s）：轮次 … 到达 ['completed']」）；`test_reject_strategy_409001`
 #: 的 turn_count==2 红为前序轮未终态的连带时序污染（单跑复验绿）。
-#: 语义纪律：本常量只放大 **完成等待** 的物理窗口，测试断言（状态集合/字段对账/
+#: **60s → 120s 依据（M2 批次 4 第二次数据点，同款修复纪律）**：批次 2/3 起 deep 分流
+#: 桩流轮真跑 planner+reflect（真 LLM 结构化输出，含修复回喂的次数方差），实测单轮
+#: 46~58s 贴边、并行负载下超 60s 窗——`test_get_thread_detail_has_report_deep_positive`
+#: 在全文件批次跑中成间歇性红（单跑复验恒绿、同批 full 重跑绿，三批两红两绿实证）。
+#: 语义纪律不变：本常量只放大 **完成等待** 的物理窗口，测试断言（状态集合/字段对账/
 #: 时序不变量）一字不动。
-TURN_COMPLETION_TIMEOUT_S = 60.0
+TURN_COMPLETION_TIMEOUT_S = 120.0
+
+#: deep writer 流式假体报告（M2 批次 4——deep 分流桩流测试的确定性报告；两片正文含
+#: 分节标题，writer 分节 label 推进面确定；**零引用标记**——research 零派发桩形态
+#: 账本为空，finalize 引用核对会把 [n] 作越界剔除；deep REST 断言基准
+#: answer_md==拼接值）
+DEEP_WRITER_FAKE_PIECES: list[str] = [
+    "# 调研报告\n\n## 摘要\n\n核心发现。\n\n## 目录\n\n- 背景\n- 结论\n\n",
+    "## 背景\n\n背景内容。\n\n## 结论\n\n结论。",
+]
+DEEP_WRITER_FAKE_ANSWER_MD = "".join(DEEP_WRITER_FAKE_PIECES)
 
 from app.main import app  # noqa: E402 —— 必须在 DB_ 强注入之后导入，让 settings 单例取到测试库连接
 
@@ -446,6 +460,23 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
         deep_research_module,
         "_subagent_model",
         lambda alias, index: _ResearchMainModel(messages=iter([AIMessage(content="保留。")])),
+    )
+
+    # deep writer 假体（M2 批次 4）：writer 接真后，deep 分流桩流测试同样不得触真
+    # 报告流式（单调用包络 60s 内再叠 planner/reflect，轮次易撞 60s 终态等待窗——
+    # 同 research 假体口径；writer 节点语义由 unit test_deep_writer.py 与 requires_llm
+    # 反思循环冒烟承担）。流式假体两片正文（含分节标题——label 推进面确定可断言）。
+    from app.agent.nodes import deep_writer as deep_writer_module
+
+    class _WriterStreamModel:
+        async def astream(self, prompt: Any, config: Any = None, **kw: Any) -> Any:
+            from langchain_core.messages import AIMessageChunk
+
+            for piece in DEEP_WRITER_FAKE_PIECES:
+                yield AIMessageChunk(content=piece)
+
+    monkeypatch.setattr(
+        deep_writer_module, "build_chat_model", lambda alias, **kw: _WriterStreamModel()
     )
 
     # followups 图外钩子假体（REQ-046；v1.22 起 spec 默认 enabled=true）：桩流测试不得

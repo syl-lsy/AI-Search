@@ -13,7 +13,8 @@
 - fast 事件序列（B3 节点 1-3/5 接真后）：rewrite（LLM 假体）→ search 扇出
   （running×1 + done×N 带 progress）→ sources(batch=归并候选) → write 桩 token 流；
   web_search 走假 registry（可冻结链经 configurable 注入，零网络）；
-- deep 序列（M2 批次 2：planner 接真 + write 桩）：plan done 带 extra.subtopics
+- deep 序列（M2 批次 4：planner/research/reflect/supplement/guards/writer 接真——write
+  桩已被 writer 真节点替换，LLM 假体直注）：plan done 带 extra.subtopics
   （api.md §7.4 钉死形态），planner LLM 假体直注（test_deep_planner.py 锁节点语义）；
 - 状态契约（R14①）：MainState 投影薄壳 ⊇ FastState 输入字段（TurnRunner 注入面），
   产出键同名声明经顶层 updates 回填；candidates/errors 带 add、degraded 带或 reducer
@@ -37,7 +38,6 @@ from typing import Any
 
 import pytest
 
-from app.agent.graphs.deep import STUB_DEEP_ANSWER_MD, STUB_DEEP_TOKEN_DELTAS
 from app.agent.graphs.main import DEFAULT_GRAPH, graph as main_graph, route_by_mode
 from app.agent.graphs.registry import GRAPH_REGISTRY
 from app.agent.nodes import fuse_rerank as fuse_module
@@ -89,17 +89,22 @@ _ROUTING_SPEC: dict[str, Any] = {
 
 @pytest.fixture(autouse=True)
 def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rewrite/synthesis/deep planner/deep research 已接真（fast 节点 1/5+5/5 + deep
-    planner+research）：路由/序列测试不依赖真 LLM——fixture 假体直注（rewrite/planner
-    结构化输出 + synthesis 流式 content + research 派发桩，零网络）。
+    """rewrite/synthesis/deep planner/deep research/deep reflect 已接真（fast 节点
+    1/5+5/5 + deep planner+research+reflect）：路由/序列测试不依赖真 LLM——fixture
+    假体直注（rewrite/planner/reflect 结构化输出 + synthesis 流式 content + research
+    派发桩，零网络）。
 
     research 桩形态：主协调器模型单帧纯文本收尾（零 task 派发）→ research 节点零子代理
-    运行（序列测试只验事件骨架——子代理语义由 test_deep_research.py 锁定）。"""
+    运行（序列测试只验事件骨架——子代理语义由 test_deep_research.py 锁定）。
+    reflect 桩形态：首判 sufficient（gaps 清空）→ 回路退出发 reflect done（补搜回路
+    循环语义由 test_deep_reflect.py 锁定）。"""
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage
 
     from app.agent.nodes import deep_planner as deep_planner_module
+    from app.agent.nodes import deep_reflect as deep_reflect_module
     from app.agent.nodes import deep_research as deep_research_module
+    from app.agent.nodes import deep_writer as deep_writer_module
     from app.agent.nodes import fast_rewrite as rewrite_module
     from app.agent.nodes import synthesis as synthesis_module
 
@@ -138,6 +143,16 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
         ) -> _PlanChain:
             return _PlanChain()
 
+    class _ReflectChain:
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {"sufficient": True, "gaps": []}  # 首判 sufficient → 回路退出
+
+    class _ReflectModel:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _ReflectChain:
+            return _ReflectChain()
+
     class _SynthModel:
         async def astream(self, messages: Any, config: Any = None, **kw: Any) -> Any:
             from langchain_core.messages import AIMessageChunk
@@ -145,15 +160,27 @@ def _mock_llm_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
             for piece in ("综合回答正文[1]。", "结论[2]。"):
                 yield AIMessageChunk(content=piece)
 
+    class _WriterModel:
+        """deep writer 流式假体（批次 4 writer 接真）：三片报告正文，标题与 planner
+        假体大纲逐字一致（背景/分析——分节 label 推进可观测）。"""
+
+        async def astream(self, prompt: Any, config: Any = None, **kw: Any) -> Any:
+            from langchain_core.messages import AIMessageChunk
+
+            for piece in DEEP_WRITER_PIECES:
+                yield AIMessageChunk(content=piece)
+
     class _ResearchMainModel(GenericFakeChatModel):
-        """派发桩：单帧纯文本收尾（零 task 调用）——bind_tools 返回 self（探针同款）。"""
+        """派发桩：单帧纯文本收尾（零 task 派发）——bind_tools 返回 self（探针同款）。"""
 
         def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
             return self
 
     monkeypatch.setattr(rewrite_module, "build_light_model", lambda mapping: _RewriteModel())
-    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
     monkeypatch.setattr(synthesis_module, "build_chat_model", lambda alias, **kw: _SynthModel())
+    monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
+    monkeypatch.setattr(deep_reflect_module, "build_chat_model", lambda alias, **kw: _ReflectModel())
+    monkeypatch.setattr(deep_writer_module, "build_chat_model", lambda alias, **kw: _WriterModel())
     monkeypatch.setattr(
         deep_research_module,
         "build_chat_model",
@@ -188,6 +215,17 @@ def _route_warnings(log_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 #: synthesis 假体答案（fixture astream 拼接；引用 [1][2] 对应假候选两条）
 SYNTH_MOCK_ANSWER_MD = "综合回答正文[1]。结论[2]。"
+
+#: deep writer 假体报告（批次 4 writer 接真——分片含「## 背景」「## 分析」标题，
+#: 与 planner 假体大纲逐字一致 → 分节 label 推进可观测；**零引用标记**——research
+#: 零派发桩形态账本为空，finalize 引用核对会把 [n] 作越界剔除，假体正文按无源
+#: 报告形态构造）
+DEEP_WRITER_PIECES: list[str] = [
+    "# 调研报告\n\n## 摘要\n\n核心发现。\n\n## 目录\n\n- 背景\n- 分析\n\n",
+    "## 背景\n\n背景内容。\n\n",
+    "## 分析\n\n分析内容。\n\n## 结论\n\n收束。",
+]
+DEEP_WRITER_MOCK_ANSWER_MD = "".join(DEEP_WRITER_PIECES)
 
 #: 假 tavily 结果（确定性两候选；a/b 两 URL 供归并断言）
 FAKE_TAVILY_RESULTS: list[dict[str, Any]] = [
@@ -554,22 +592,27 @@ async def test_route_fast_to_fast_subgraph(log_records: list[dict[str, Any]]) ->
 
 
 async def test_route_deep_to_deep_subgraph(log_records: list[dict[str, Any]]) -> None:
-    """路由二：轮内 spec.routing 快照 mode=deep → deep 子图（M2 批次 2 planner+research
-    接真）；序列对齐 §7.4（plan done 带 extra.subtopics → search running 带
-    extra.subagents——派发桩零 task，无后续 read/sources 帧）；产出经顶层 updates 回填；
-    零告警。"""
+    """路由二：轮内 spec.routing 快照 mode=deep → deep 子图（M2 批次 4 planner+
+    research+reflect+writer 接真——reflect 桩首判 sufficient → 回路退出发 done，条件边
+    guards 出口经 guards 直通 writer）；序列对齐 §7.4（plan done 带 extra.subtopics
+    → search running 带 extra.subagents——派发桩零 task，无后续 read/sources 帧 →
+    reflect done → write 分节 running×2 + done extra.sections）；产出经顶层 updates
+    回填；零告警。"""
     signals, final = await _run(
         {"mode": "deep", "query": "多框架对比研究报告", "spec": _ROUTING_SPEC},
         config=_deep_config(),
     )
 
-    assert final["answer_md"] == STUB_DEEP_ANSWER_MD
+    assert final["answer_md"] == DEEP_WRITER_MOCK_ANSWER_MD
     assert final["subtopics"] == ["deep planner 桩期子课题一", "deep planner 桩期子课题二"]
     assert final["query_type"] == "multi_facet"
     # research 桩零派发：五产出键全量回写（空集——覆盖语义下显式空投影）
     assert final["subagent_reports"] == []
     assert final["visited_urls"] == [] and final["searched_queries"] == []
     assert final["snapshots"] == [] and final["collected_sources"] == []
+    # reflect 桩首判 sufficient：gaps 清空、回路退出（supplement 未运行 → reflect_round 不落 state）
+    assert final["gaps"] == []
+    assert "reflect_round" not in final
     assert signals == _deep_expected()
     assert all(signal["type"] != "sources" for signal in signals)
     assert _warnings(log_records) == []
@@ -611,7 +654,7 @@ async def test_routing_section_missing_uses_builtin_table_with_warning(
     modes={fast:fast, deep:deep}——mode 按表命中各自子图（default_mode=fast 仅兜未命中行）。"""
     cases = [
         ("fast", SYNTH_MOCK_ANSWER_MD),
-        ("deep", STUB_DEEP_ANSWER_MD),
+        ("deep", DEEP_WRITER_MOCK_ANSWER_MD),
     ]
     for mode, answer_md in cases:
         log_records.clear()
@@ -651,7 +694,7 @@ async def test_default_mode_resolved_via_modes(log_records: list[dict[str, Any]]
     spec = {"routing": {"default_mode": "deep", "modes": {"fast": "fast", "deep": "deep"}}}
     signals, final = await _run({"query": "x", "spec": spec}, config=_deep_config())
 
-    assert final["answer_md"] == STUB_DEEP_ANSWER_MD
+    assert final["answer_md"] == DEEP_WRITER_MOCK_ANSWER_MD
     warnings = _route_warnings(log_records)
     assert len(warnings) == 1
     assert "deep" in warnings[0]["message"]
@@ -762,9 +805,11 @@ async def test_sources_payload_matches_api_contract() -> None:
 
 
 def _deep_expected() -> list[dict[str, Any]]:
-    """api.md §7.4 深度模式主干（701-708 行）的现行展开（M2 批次 2：planner+research
-    接真——plan done 带 extra.subtopics、search running 带 extra.subagents；write 仍
-    为桩；派发桩零 task → 无 read/sources 后续帧）。
+    """api.md §7.4 深度模式主干（701-708 行）的现行展开（M2 批次 3：planner+research+
+    reflect 接真——plan done 带 extra.subtopics、search running 带 extra.subagents、
+    reflect 桩首判 sufficient → 回路退出发 reflect done（api.md §7.4:866「reflect
+    done」帧，补搜回路循环语义由 test_deep_reflect.py 锁定）；supplement/guards/write
+    仍为桩；派发桩零 task → 无 read/sources 后续帧）。
 
     M2 批次 1 起：plan running 归 TurnRunner 图前发布（同 fast rewrite 先例——§7.4
     序列的 stage(plan,running) 仍在，但发射源改为 TurnRunner，图内 plan 只发 done，
@@ -789,7 +834,13 @@ def _deep_expected() -> list[dict[str, Any]]:
                 ]
             },
         },
-        {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"},
-        *({"type": "token", "delta": d} for d in STUB_DEEP_TOKEN_DELTAS),
-        {"type": "stage", "stage_key": "write", "status": "done"},
+        # reflect 桩首判 sufficient（gaps 空）→ 回路退出：仅 done 帧（§7.4:866 形态；
+        # running 帧仅在进补搜轮时发射——test_deep_reflect 锁定）
+        {"type": "stage", "stage_key": "reflect", "status": "done"},
+        # writer 接真（批次 4）：入口 running(label=撰写第 1 节) → 分节标题出现推进
+        # running(撰写第 2 节) → done(extra.sections=2)——api.md §7.4:867 形态；
+        # token 走 messages 流域（custom 流零 token——signals.py:13-24 深桩期形态已废）
+        {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写第 1 节"},
+        {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写第 2 节"},
+        {"type": "stage", "stage_key": "write", "status": "done", "extra": {"sections": 2}},
     ]

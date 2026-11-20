@@ -180,10 +180,15 @@ class DeepState(TypedDict, total=False):
     gaps: list[dict[str, Any]]  # [{gap, query, origin: "web"|"kb"}]
     # writer/finalize 产出
     report_md: str
-    answer_md: str  # TurnRunner 终态落库统一读该键（桩期即由 write 桩产出）
+    answer_md: str  # TurnRunner 终态落库统一读该键（批次 4 起由 writer 真节点产出）
     # 横切
-    usage_total: int
-    degraded: bool  # 维持普通布尔——批次 3 guards 再定（2026-11-16 批次 2 派单裁决）
+    usage_total: int  # guards 检查点快照（collector.total()["total_tokens"]——
+    #   deep_guards.py 注入面写入；done.usage 仍走 collector（turn_service:1467），
+    #   终值回填归批次 4 finalize——ARCH §4.2 finalize 行）
+    degraded: bool  # **D2 收敛口径（批次 3 guards 定案）**：deep 节点零写入（骨架
+    #   声明保留——ARCH §4.2:503 结构决策不私改）；deep 降级单一事实源=
+    #   degraded_reason（guards 产 timeout|budget），degraded=True→source_failure
+    #   派生分支（turn_service elif）deep 轮结构性不可达
     degraded_reason: str | None  # "timeout" | "budget" | "source_failure"（api.md §7.2 枚举）
     errors: Annotated[list[dict[str, Any]], add]  # M2 批次 2 reducer 改造：扇出合流
     #   （注解与 MainState 既有横切声明同型——两侧自此一致，R14① 对齐域内）

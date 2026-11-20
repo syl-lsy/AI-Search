@@ -47,11 +47,13 @@ BUILTIN_PROMPT_FILES: dict[str, str] = {
     "common.safety_check": "common/safety_check.txt",
     "common.safety_reply": "common/safety_reply.txt",
     "fast.followups": "fast/followups.txt",
-    # deep 四键（M2 批次 1 骨架终稿；占位符集按契约锁死，文案随批次 2~4 节点打磨）
+    # deep 五键（M2 批次 1 四键骨架终稿 + 批次 4 degraded_writer 增量；占位符集按契约
+    # 锁死，文案随批次 2~4 节点打磨）
     "deep.planner": "deep/planner.txt",
     "deep.subagent.system": "deep/subagent_system.txt",
     "deep.reflect": "deep/reflect.txt",
     "deep.report_writer": "deep/report_writer.txt",
+    "deep.degraded_writer": "deep/degraded_writer.txt",
 }
 
 _BUILTIN_DIR = Path(__file__).resolve().parent

@@ -9,7 +9,7 @@ from sqlalchemy import select
 from starlette.exceptions import HTTPException
 
 from app.agent.tools.registry import get_tools_registry, start_tools_registry
-from app.api.v1 import models, threads, turns
+from app.api.v1 import artifacts, models, sources, threads, turns
 from app.api.v1.health import router as health_router
 from app.config_center import start_asset_center
 from app.core.config import common_settings, nacos_settings
@@ -231,8 +231,11 @@ app.add_exception_handler(Exception, exception_handler)
 # /health/ready 就绪（四组件并行探活，实现在 app/api/v1/health.py）。
 app.include_router(health_router)
 
-# REST 路由（api.md §2/§3，B2 工单）：threads / turns / models——prefix=/api/v1
-# 在各 router 模块内声明（/api/ 前缀触发成功信封包装，core/middleware/response.py）。
+# REST 路由（api.md §2/§3/§5，B2 工单 + M2 批次 4 §5 增量）：threads / turns /
+# models / artifacts / sources——prefix=/api/v1 在各 router 模块内声明（/api/ 前缀
+# 触发成功信封包装，core/middleware/response.py；artifacts 下载自设 is_stream 逃逸）。
 app.include_router(threads.router)
 app.include_router(turns.router)
 app.include_router(models.router)
+app.include_router(artifacts.router)
+app.include_router(sources.router)

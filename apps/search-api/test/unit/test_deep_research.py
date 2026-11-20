@@ -876,7 +876,14 @@ async def test_read_tool_snapshots_and_records_visited_url(
     assert snapshot_calls[0]["content"].startswith("# 正文 https://a.dev/1")  # 全量正文
     assert update["visited_urls"] == ["https://a.dev/1"]
     assert update["snapshots"] == [
-        {"url": "https://a.dev/1", "object_key": "snapshots/u/th/t/https://a.dev/1", "size": 1234}
+        {
+            "url": "https://a.dev/1",
+            "object_key": "snapshots/u/th/t/https://a.dev/1",
+            "size": 1234,
+            # M2 批次 4（批次 2 注⑦闭合）：snapshot_id 入账（save_snapshot._meta
+            # 返回面）——TurnRunner 终态回填 sources.snapshot_id 的 state 键
+            "snapshot_id": "00000000-0000-0000-0000-00000000000a",
+        }
     ]
     read_frames = emitters.stage_frames("read")
     assert read_frames[0]["status"] == "running" and "阅读第 1 篇" in read_frames[0]["label"]

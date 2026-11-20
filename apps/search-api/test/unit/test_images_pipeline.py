@@ -550,3 +550,39 @@ def test_registry_module_exports_unchanged_surface() -> None:
     from app.agent.tools.registry import __all__ as registry_all
 
     assert sorted(registry_all) == EXPECTED_REGISTRY_ALL
+
+
+# ---- 评审修复第 1 轮：发现 7（registry 归一层 URL 协议白名单统一收口）----
+
+
+def test_normalize_filters_non_http_url_schemes() -> None:
+    """发现 7：归一层逐条过滤非常规 scheme（file/ftp/javascript/data 等）——fast/
+    deep/supplement 三消费面一次覆盖（与 fuse_rerank._url_allowed 同判据：http/https
+    +netloc）；白名单外条目丢弃不抛（缺 url 条目 continue 同款），其余候选保留。"""
+    raw = {
+        "results": [
+            {"url": "https://ok.example/1", "title": "合法", "content": "c", "score": 0.9},
+            {"url": "file:///etc/passwd", "title": "本地文件", "content": "c", "score": 0.8},
+            {"url": "javascript:alert(1)", "title": "脚本", "content": "c", "score": 0.7},
+            {"url": "ftp://files.example/x", "title": "FTP", "content": "c", "score": 0.6},
+            {"url": "data:text/html;base64,PHNjcmlwdD4=", "title": "data", "content": "c", "score": 0.5},
+            {"url": "https://ok.example/2", "title": "合法二", "content": "c", "score": 0.4},
+        ]
+    }
+    out = _normalize_search_output("searxng", raw)
+    urls = [item["url"] for item in out]
+    assert urls == ["https://ok.example/1", "https://ok.example/2"]  # 白名单外全部过滤
+    assert all(item["url"].startswith("https://") for item in out)
+
+
+def test_normalize_filters_scheme_only_and_relative_urls() -> None:
+    """无 netloc（相对路径/纯 scheme）同判据过滤——绝对 URL 才入册。"""
+    raw = {
+        "results": [
+            {"url": "/relative/path", "title": "相对", "content": "c", "score": 0.9},
+            {"url": "https:", "title": "纯 scheme", "content": "c", "score": 0.8},
+            {"url": "HTTPS://UPPER.EXAMPLE/ok", "title": "大写 scheme", "content": "c", "score": 0.7},
+        ]
+    }
+    out = _normalize_search_output("searxng", raw)
+    assert [item["url"] for item in out] == ["HTTPS://UPPER.EXAMPLE/ok"]  # 大写 scheme 放行（判据 lower()）

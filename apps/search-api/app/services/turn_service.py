@@ -52,7 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.graphs.main import graph as main_graph
 from app.agent.graphs.regenerate import graph as regenerate_graph
-from app.agent.guards import ContentRejectedError, TurnCanceledSignal
+from app.agent.guards import ContentRejectedError, TurnCanceledSignal, TurnDeadline
 from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
 from app.agent.safety import SafetyConfig, detect_pii, load_safety_config, sanitize
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
@@ -305,6 +305,52 @@ def history_statement(thread_id: str, turn_id: str) -> Any:
         .order_by(Turn.created_at.desc(), Turn.id.desc())
         .limit(HISTORY_WINDOW_TURNS)
     )
+
+
+async def backfill_source_snapshot_ids(
+    session_factory: Any, turn_id: str, snapshots: Any
+) -> int:
+    """deep 轮终态快照回填（M2 批次 4——批次 2 注⑦闭合）：state.snapshots
+    （url→snapshot_id，research record_snapshot 读后回写落 state）→ sources
+    .snapshot_id（只补空——ref_no 账本与其余列零触碰；§2.5 snapshot_available 推导
+    翻真、§5.1 快照查看可达）。
+
+    **短事务例外**（铁律 10 同 TurnRunner 口径）：自管 commit——回填发生在轮终态
+    （图完成、EventBus 收尾前的图外段），非请求级事务面。返回回填行数；畸形
+    snapshot_id / 非本轮 URL / 已回填行防御跳过（幂等——二次调用零新增）。
+    """
+    pairs: list[tuple[str, uuid.UUID]] = []
+    if isinstance(snapshots, list):
+        for item in snapshots:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            snapshot_id = item.get("snapshot_id")
+            if not (isinstance(url, str) and url and isinstance(snapshot_id, str) and snapshot_id):
+                continue
+            try:
+                snapshot_uuid = uuid.UUID(snapshot_id)
+            except ValueError:
+                continue  # 畸形 id 跳过（防御——state 键非契约校验面）
+            pairs.append((url, snapshot_uuid))
+    if not pairs:
+        return 0
+    turn_uuid = uuid.UUID(turn_id)
+    filled = 0
+    async with session_factory() as session:
+        for url, snapshot_uuid in pairs:
+            result = await session.execute(
+                update(Source)
+                .where(
+                    Source.turn_id == turn_uuid,
+                    Source.url == url,
+                    Source.snapshot_id.is_(None),  # 只补空（幂等）
+                )
+                .values(snapshot_id=snapshot_uuid)
+            )
+            filled += result.rowcount or 0
+        await session.commit()
+    return filled
 
 
 def _rebuild_images_briefs(image_event_row: TurnEvent | None) -> list[ImageBrief]:
@@ -1452,6 +1498,16 @@ class ThreadScheduler:
         else:
             degraded_reason = None
         finish = "degraded" if guard_degraded else "completed"
+        # deep 快照回填（M2 批次 4——批次 2 注⑦闭合）：state.snapshots（url→
+        # snapshot_id，research 读后回写经 record_snapshot 落 state）→ sources
+        # .snapshot_id（只补空——ref_no 账本/其余列零触碰；§2.5 snapshot_available
+        # 推导翻真、§5.1 快照查看可达）。短事务（TurnRunner 例外先例同款）。
+        if ctx.mode == "deep":
+            snapshots = final_state.get("snapshots")
+            if isinstance(snapshots, list) and snapshots:
+                await backfill_source_snapshot_ids(
+                    self._session_factory, ctx.turn_id, snapshots
+                )
         self._log_search_strategy(ctx, final_state, degraded=degraded)
         self._log_safety(final_state)
         raw_queries = final_state.get("rewritten_queries")
@@ -2111,6 +2167,16 @@ class ThreadScheduler:
                             "search_chain": search_chain,
                             "read_chain": read_chain,
                             "tools_registry": tools_registry,
+                            # M2 批次 3（deep guards 预算/超时图内通路——cancel_flags
+                            # 进程级引用注入先例同款；deep 消费、fast 节点零消费零影响）：
+                            # - usage_collector：轮级累计 collector 引用（deep_guards 读
+                            #   total()["total_tokens"] vs spec.deep.token_budget 快照）
+                            # - turn_deadline：轮级 deadline 锚点（与下方 asyncio.timeout
+                            #   同值同钟——deep_guards 读 remaining ≤ 30+15s（包络+裕量）
+                            #   trip；
+                            #   轮启动一次建立，不可节点内重建否则回路重入会重置预算）
+                            "usage_collector": ctx.usage_collector,
+                            "turn_deadline": TurnDeadline(timeout_s),
                         },
                         # Langfuse trace root=轮（ARCH §6.6）：trace_id=turn_id 对账、
                         # session=thread_id 经 langfuse_* metadata 键承载（v3 契约键）。

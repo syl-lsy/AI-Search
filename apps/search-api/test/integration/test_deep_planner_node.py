@@ -59,6 +59,7 @@ async def test_planner_real_llm_structure_via_deep_graph(monkeypatch: pytest.Mon
     from langchain_core.messages import AIMessage
 
     from app.agent.graphs.deep import graph as deep_graph
+    from app.agent.nodes import deep_reflect as deep_reflect_module
     from app.agent.nodes import deep_research as deep_research_module
     from app.agent.state import DeepState
     from app.agent.tools.registry import ReadChain, SearchChain
@@ -70,6 +71,20 @@ async def test_planner_real_llm_structure_via_deep_graph(monkeypatch: pytest.Mon
         def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
             return self
 
+    class _ReflectChain:
+        """M2 批次 3 增量：deep 子图 reflect 已接真——本测试唯一真依赖面是 planner，
+        reflect 段以桩替代（首判 sufficient 回路退出；其真 LLM 行为由
+        test_deep_reflect_node.py 冒烟承担）。"""
+
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {"sufficient": True, "gaps": []}
+
+    class _ReflectModel:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _ReflectChain:
+            return _ReflectChain()
+
     monkeypatch.setattr(
         deep_research_module,
         "build_chat_model",
@@ -80,6 +95,7 @@ async def test_planner_real_llm_structure_via_deep_graph(monkeypatch: pytest.Mon
         "_subagent_model",
         lambda alias, index: _ResearchMainModel(messages=iter([AIMessage(content="保留。")])),
     )
+    monkeypatch.setattr(deep_reflect_module, "build_chat_model", lambda alias, **kw: _ReflectModel())
 
     state: dict[str, Any] = {
         "query": "LangGraph 和 deepagents 是什么关系？各自适合什么场景？",
@@ -112,7 +128,11 @@ async def test_planner_real_llm_structure_via_deep_graph(monkeypatch: pytest.Mon
                 plan_signals.append(chunk)
         elif stream_mode == "updates":
             for node_update in chunk.values():
-                final.update(node_update)
+                # M2 批次 3：guards 桩返回空 dict → LangGraph updates 记 {node: None}
+                # （R14 实测形态）——None 非 state 增量，跳过（同 TurnRunner
+                # turn_service 合并循环与 test_deep_research/reflect_node 守卫）。
+                if isinstance(node_update, dict):
+                    final.update(node_update)
 
     # stage 信号：done 帧恒带 extra.subtopics（running 已由 TurnRunner 图前发布——§4.3）
     assert [(s["status"]) for s in plan_signals] == ["done"]

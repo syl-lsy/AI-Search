@@ -40,7 +40,7 @@ from datetime import datetime
 import pytest
 from sqlalchemy import select
 
-from app.agent.graphs import deep as deep_graph
+from test.integration.conftest import DEEP_WRITER_FAKE_ANSWER_MD
 from test.integration import stub_flow
 from app.agent.tools import registry as _tools_registry_module
 from app.db.models import Source, Turn, TurnEvent
@@ -518,7 +518,9 @@ async def test_get_thread_detail_has_report_deep_positive(
     thread_id, turn_id = data["thread_id"], data["turn_id"]
     turn = await b2_rest.wait_turn_status(turn_id, {"completed"})
     assert turn["mode"] == "deep"
-    assert turn["answer_md"] == deep_graph.STUB_DEEP_ANSWER_MD  # 桩期固定报告（非空）
+    # 批次 4 writer 接真：deep 分流桩流测试走 conftest writer 假体（确定性报告——
+    # 零真 LLM，同 research 假体口径）；has_report 判据面不变
+    assert turn["answer_md"] == DEEP_WRITER_FAKE_ANSWER_MD  # 假体固定报告（非空）
 
     detail = _assert_ok_envelope(
         await async_client.get(f"/api/v1/threads/{thread_id}")
@@ -544,7 +546,7 @@ async def test_get_turn_detail_deep_completed_export_available(
         )
     )
     turn = await b2_rest.wait_turn_status(data["turn_id"], {"completed"})
-    assert turn["answer_md"] == deep_graph.STUB_DEEP_ANSWER_MD  # 非空
+    assert turn["answer_md"] == DEEP_WRITER_FAKE_ANSWER_MD  # 假体固定报告（非空）
     assert turn["export_available"] is True
 
 

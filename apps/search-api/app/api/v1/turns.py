@@ -23,8 +23,10 @@ from app.schemas import (
     FeedbackResponse,
     TurnCancelResult,
     TurnDetail,
+    TurnExportResult,
     TurnRegenerateResult,
 )
+from app.services.artifact_service import ArtifactService
 from app.services.event_bus import (
     FOLLOWUPS_EVENT_TYPE,
     TERMINAL_EVENT_TYPE,
@@ -128,6 +130,32 @@ async def submit_feedback(
     return await service.upsert_feedback(
         turn_id, helpful=payload.helpful, user_id=user_id
     )
+
+
+def get_artifact_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ArtifactService:
+    """快照与产物域服务（api.md §5）：请求级会话注入（get_db——service 只 flush 不
+    commit，事务边界统一在请求级）；单测经 dependency_overrides 替换。"""
+    return ArtifactService(db)
+
+
+@router.post("/turns/{turn_id}/export", response_model=TurnExportResult)
+async def export_turn(
+    turn_id: str,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[ArtifactService, Depends(get_artifact_service)],
+) -> TurnExportResult:
+    """导出报告 Markdown（api.md §2.8 v1.27 面，REQ-016）：深度轮报告写线程产物目录
+    并登记 artifacts 行。
+
+    路由层零业务逻辑：归属校验（404001）/ 导出门禁（409003——非深度轮或未到
+    completed|degraded）/ 同分钟跨轮碰撞检查（409003——同线程不同轮同分钟已导出，
+    防物理文件覆写污染首产物行）/ 文件写入与登记均在 ArtifactService.export_turn_report；
+    completed|degraded 均可导出（§0:43），同轮重复导出按次登记新产物行。前端仅消费
+    download_path 原样请求（§5.3）。
+    """
+    return await service.export_turn_report(turn_id, user_id=user_id)
 
 
 # ---- SSE 事件流（api.md §2.6/§7.1——重放 + 心跳 + 保活窗口收口）----

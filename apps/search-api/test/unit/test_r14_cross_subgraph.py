@@ -33,7 +33,6 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
-from app.agent.graphs.deep import graph as deep_graph
 from app.agent.graphs.main import graph as main_graph
 from app.agent.nodes import fast_rewrite as rewrite_module
 from app.agent.nodes import fuse_rerank as fuse_module
@@ -317,23 +316,25 @@ async def test_real_main_graph_messages_frames_only_from_synthesis(
     assert inner_update_nodes == {"rewrite", "web_search", "merge_dedupe", "fuse_rerank", "synthesis"}
 
 
-async def test_deep_stub_zero_messages_and_runner_zero_token_events(
+async def test_deep_writer_messages_surface_and_runner_token_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """deep 零泄漏基线（R14③，M2 批次 2 修订：planner+research 接真 + write 桩形态）：
-    (a) 真 deep 子图经主图壳运行，messages 帧零 writer 帧（实测帧形态：research 协调器
-    为 deepagents 编译体，其 LLM 帧 langgraph_node="model"（内层节点名，子代理同形）、
-    namespace 多段——`_is_deep_writer_messages` 只放行 deep 顶层单段 namespace 的
-    writer，帧全被门控拦；planner 结构化输出桩为零回调帧形态）；writer 放行语义由
-    下方模拟 namespace 门控测试单独锁定（批次 4 writer 实装后本基线由真 writer 帧形态
-    接通）；
-    (b) TurnRunner 侧零 token/thinking SSE 事件（stage 序列 + done 正常——含 research
-    零派发桩形态的 search running 帧）。"""
+    """deep writer 接真基线（R14③，M2 批次 4：writer 实装——桩期零泄漏基线由真
+    writer 帧形态接通）：
+    (a) 真 deep 子图经主图壳运行，messages 帧含 writer 帧（真 BaseChatModel 假体经
+    callback tap 冒泡，metadata.langgraph_node="writer"——`_is_deep_writer_messages`
+    的放行对象；research 协调器帧 langgraph_node="model"（内层节点名，子代理同形）、
+    namespace 多段——门控拦截面不变；planner/reflect 结构化输出桩为零回调帧形态）；
+    (b) TurnRunner 侧 token 事件恰为 writer 帧增量（门控放行面实测）、零 thinking
+    （假体纯 text 块）——stage 序列 + done 正常（research 零派发桩形态的 search
+    running 帧与 reflect 桩 sufficient 形态的 reflect done 帧）。"""
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage
 
     from app.agent.nodes import deep_planner as deep_planner_module
+    from app.agent.nodes import deep_reflect as deep_reflect_module
     from app.agent.nodes import deep_research as deep_research_module
+    from app.agent.nodes import deep_writer as deep_writer_module
 
     class _PlanChain:
         async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
@@ -354,13 +355,28 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
         ) -> _PlanChain:
             return _PlanChain()
 
+    class _ReflectChain:
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {"sufficient": True, "gaps": []}  # 首判 sufficient → 回路退出（批次 3 形态）
+
+    class _ReflectModel:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _ReflectChain:
+            return _ReflectChain()
+
     class _ResearchMainModel(GenericFakeChatModel):
         """派发桩：单帧纯文本收尾（零 task 调用）——bind_tools 返回 self（探针同款）。"""
 
         def bind_tools(self, tools: Any, **kwargs: Any) -> "_ResearchMainModel":  # noqa: ANN201
             return self
 
+    writer_model = _HookedFakeChatModel(
+        pieces=[("报告正文片段[1]。", "text"), ("## 背景\n\n背景内容[1]。", "text")]
+    )
     monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
+    monkeypatch.setattr(deep_reflect_module, "build_chat_model", lambda alias, **kw: _ReflectModel())
+    monkeypatch.setattr(deep_writer_module, "build_chat_model", lambda alias, **kw: writer_model)
     monkeypatch.setattr(
         deep_research_module,
         "build_chat_model",
@@ -378,7 +394,7 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
         "thread_id": "r14-thread",
         "user_id": "00000000-0000-4000-8000-000000000001",
         "mode": "deep",
-        "query": "R14 deep 桩零泄漏实测",
+        "query": "R14 deep writer 帧形态实测",
         "chat_model_key": "qwen",
         "history": [],
         "query_lang": "zh",
@@ -400,21 +416,27 @@ async def test_deep_stub_zero_messages_and_runner_zero_token_events(
             meta = chunk[1] if isinstance(chunk, tuple) and len(chunk) > 1 else None
             node = meta.get("langgraph_node") if isinstance(meta, dict) else None
             message_nodes.add(str(node))
-    assert "writer" not in message_nodes  # R14③：writer 门控外零放行（帧全部被拦）
+    assert "writer" in message_nodes  # R14③ 放行对象：writer 顶层帧在 raw 流在场
+    assert "plan" not in message_nodes and "reflect" not in message_nodes  # 结构化桩零回调帧
 
-    # (b) TurnRunner 侧
+    # (b) TurnRunner 侧：token 事件恰为 writer 帧增量（门控放行实测）。生产主图壳
+    # 形态（main_graph + subgraphs=True）——deep 子图嵌套段 namespace ('deep:<run_id>',)
+    # 单段、节点名 metadata.langgraph_node="writer"（批次 5 R14① 实测形态）；直跑
+    # deep 子图形态 namespace=() 被门控按非顶层拦（:276-277 钉死语义）
     bus = _bus()
     turn = _TurnRow(status="running", mode="deep")
     session = _FakeSession(turn=turn)
-    scheduler = _r14_scheduler(bus, session, graph=deep_graph)
+    scheduler = _r14_scheduler(bus, session, graph=main_graph)
     await scheduler._execute_turn(turn)
     published = await _drain_all(bus, str(turn.id))
-    assert [e.event_type for e in published if e.event_type in ("token", "thinking")] == []
+    tokens = [e.data.get("delta") for e in published if e.event_type == "token"]
+    assert tokens == ["报告正文片段[1]。", "## 背景\n\n背景内容[1]。"]
+    assert [e.event_type for e in published if e.event_type == "thinking"] == []
     assert published[-1].event_type == "done" and published[-1].data["finish"] == "completed"
-    assert turn.status == "completed"  # write 桩答案经 updates 回填（custom token 被丢弃不影响终态）
-    # research 零派发桩形态：plan/search 两 stage 帧在时间线（search running 带 extra.subagents）
+    assert turn.status == "completed"  # writer 报告经 updates 回填
     stages = [e.data.get("stage_key") for e in published if e.event_type == "stage"]
-    assert "plan" in stages and "search" in stages
+    assert "plan" in stages and "search" in stages  # research 零派发桩形态
+    assert "write" in stages  # writer 分节事件面在时间线
 
 
 class _ScriptedTripleGraph:

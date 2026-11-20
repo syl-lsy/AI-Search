@@ -158,6 +158,8 @@ export interface StageExtra {
   fallback?: string
   /** api.md §7.2/§2.5 v1.26 决策模型判定源留痕（Decision Model 工单批次 2）：decision=决策模型判定生效 | light_fallback=decision 失败/超时/结构异常/低置信回退 light 全职责（不置 degraded） | shadow=shadow 双跑观测态（decision 只记录不生效）——仅 stage(rewrite, done) 携带；decision 未启用〔model.mapping.decision 缺省空串 kill switch〕与存量轮不携带该键（键可省略不置 null，沿 v1.12 images 先例）；前端零渲染义务（观测/评测判读键，extra.strategy v1.14 先例同款——宽松 string 同 strategy/safety/fallback 先例，值域扩容零类型形状变更） */
   decision_source?: string
+  /** api.md §7.2/§2.5 v1.27 finalize 越界引用剔除计数留痕：deep 轮 stage(write,done) extra 携带剔除处数（**仅 >0 时携带**，零剔除零键——键可省略不置 null，沿 v1.12 images 先例）；观测/评测判读键、前端零渲染义务（宽松 number 类型；值本身即计数无值域扩容面） */
+  citation_dropped?: number
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */

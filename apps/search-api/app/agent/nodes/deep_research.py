@@ -293,7 +293,10 @@ class _Recorder:
             if not isinstance(url, str) or not url or url in self.ref_by_url:
                 continue
             self.ref_by_url[url] = len(self.ref_by_url) + 1
-            self.candidates.append(candidate)
+            # M2 批次 3 增量：state 侧候选附 ref_no（增量键）——ref_no 冻结账本入 state，
+            # supplement（deep_supplement._next_ref_no）与 finalize（批次 4）跨节点续编
+            # 消费；批次 payload 形态零变更（下方 batch 仍 9 键）
+            self.candidates.append({**candidate, "ref_no": self.ref_by_url[url]})
             batch.append(
                 {
                     "source_id": str(uuid_module.uuid4()),  # 占位——TurnRunner 以行 id 回写
@@ -326,6 +329,10 @@ class _Recorder:
             "url": url,
             "object_key": str(meta.get("object_key") or ""),
             "size": int(meta.get("size_bytes") or 0),
+            # M2 批次 4（批次 2 注⑦闭合）：snapshot_id 入账——state.snapshots 四键
+            # 形态，TurnRunner 终态回填 sources.snapshot_id（backfill_source_snapshot_ids）
+            # 消费；save_snapshot._meta 返回面已有该键（save_snapshot.py:110）
+            "snapshot_id": str(meta.get("snapshot_id") or ""),
         }
 
     def record_error(self, error: dict[str, Any]) -> None:
@@ -831,7 +838,7 @@ async def research(state: Any, config: RunnableConfig | None = None) -> dict[str
 
     事件面（api.md §7.4 深度主干子集）：stage(search,running,extra.subagents) 推进 +
     stage(read,running/done)；sources 批次由 web_search 工具即时发射。空 subtopics
-    静默直通（planner 兜底残缺形态——write 桩照常收口）。
+    静默直通（planner 兜底残缺形态——writer 照常收口）。
     """
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②）
 

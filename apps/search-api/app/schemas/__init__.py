@@ -6,6 +6,7 @@ Kb* / Artifact* / Sse*；Suggestion*（v1.17）。B2 已落地 Thread* / Turn*�
 §2.1~§2.5），在此统一重导出（api/ 层 `from app.schemas import ...` 单一出口；
 枚举口径随 common 一并出）。
 """
+from app.schemas.artifact import SnapshotDetail, TurnExportResult
 from app.schemas.common import (
     OnConflict,
     PageRequest,
@@ -49,6 +50,7 @@ __all__ = [
     "PageRequest",
     "PageResponse",
     "SearchMode",
+    "SnapshotDetail",
     "SourceBrief",
     "StageBrief",
     "ThreadBrief",
@@ -63,6 +65,7 @@ __all__ = [
     "TurnDetail",
     "TurnRegenerateResult",
     "TurnError",
+    "TurnExportResult",
     "TurnSkeleton",
     "TurnStatus",
     "UsageBrief",

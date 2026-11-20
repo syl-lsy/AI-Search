@@ -30,6 +30,8 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from urllib.parse import urlparse
+
 from pydantic import SecretStr
 from typing import Any
 
@@ -374,8 +376,28 @@ def _unwrap_mcp_content(raw: Any) -> Any:
     return raw
 
 
+def _url_allowed(url: str) -> bool:
+    """URL 协议白名单（评审修复 1——发现 7）：http/https 且带主机（绝对 URL）。
+
+    与 fuse_rerank._url_allowed 同判据——在归一层统一收口（fast/deep/supplement
+    三消费面一次覆盖）；白名单外条目逐条丢弃不抛（缺 url 条目 continue 同款）。
+    tools 局不 import nodes（依赖方向 nodes→tools），故本地实现同判据。
+    """
+    parsed = urlparse(url)
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+
+
+def _allowlisted(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """候选列表协议白名单过滤（发现 7——三出口 bocha/anysearch/通用统一收口）。"""
+    return [item for item in candidates if _url_allowed(str(item.get("url") or ""))]
+
+
 def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
     """各源 MCP 搜索出参 → candidates 归一（url 必备；content/snippet 兜底；score 数值化）。
+
+    URL 协议白名单（评审修复 1——发现 7）：全部出口逐条过滤非常规 scheme（file/
+    ftp/javascript/data 等与无 netloc 相对形态），白名单外丢弃——防非常规 URL 进
+    collected_sources/sources 表/SSE 来源卡（后端契约面防线）。
 
     图片字段增量透传（A6，REQ-004 / api.md §7.2 v1.12；现有键零改动）：
     - SearXNG `img_src`（+ `img_width`/`img_height` 数值型）逐条附带——主通道，天然带相关性；
@@ -391,7 +413,7 @@ def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
             text = "\n\n".join(str(t) for t in blocks)
         if not isinstance(text, str) or "URL:" not in text:
             raise ValueError("bocha 出参非 Title/URL/Description 文本形态")
-        return [{**item, "origin": source} for item in _parse_bocha_text(text)]
+        return _allowlisted([{**item, "origin": source} for item in _parse_bocha_text(text)])
     if source == "anysearch":
         text = raw if isinstance(raw, str) else None
         if text is None and isinstance(raw, list):
@@ -399,7 +421,7 @@ def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
             text = "\n\n".join(str(t) for t in blocks)
         if not isinstance(text, str) or "**URL**" not in text:
             raise ValueError("anysearch 出参非 markdown 搜索结果文本形态")
-        return [{**item, "origin": source} for item in _parse_anysearch_text(text)]
+        return _allowlisted([{**item, "origin": source} for item in _parse_anysearch_text(text)])
 
     items: Any = _unwrap_mcp_content(raw)
     if isinstance(items, str):
@@ -449,7 +471,7 @@ def _normalize_search_output(source: str, raw: Any) -> list[dict[str, Any]]:
                 pool.append(pool_entry)
         if pool:
             out[0]["query_images"] = pool
-    return out
+    return _allowlisted(out)
 
 
 def _search_args(source: str, query: str, time_range: str | None, top_k: int) -> dict[str, Any]:

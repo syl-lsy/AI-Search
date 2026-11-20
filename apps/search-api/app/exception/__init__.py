@@ -14,8 +14,10 @@ from app.exception.conflict import (
     TurnTerminalException,
 )
 from app.exception.database import DatabaseException
+from app.exception.export import ExportNotAvailableException
 from app.exception.feedback import FeedbackTurnNotFoundException
 from app.exception.not_found import NotFoundException
+from app.exception.snapshot import SnapshotNotFoundException
 
 __all__ = [
     "BadRequestException",
@@ -23,8 +25,10 @@ __all__ = [
     "ConfigCenterException",
     "ConflictException",
     "DatabaseException",
+    "ExportNotAvailableException",
     "FeedbackTurnNotFoundException",
     "NotFoundException",
+    "SnapshotNotFoundException",
     "ThreadBusyException",
     "TurnNotRegenerableException",
     "TurnTerminalException",

@@ -220,10 +220,15 @@ def _snapshot(payload: dict[str, Any]) -> AssetSnapshot:
 
 
 #: R14 用 spec 快照：带 routing（路由正常路径）+ fast 节（synthesis max_answer_chars）
+#: + deep 节 turn_timeout_s=300（契约值——批次 3 guards 真节点后 TurnRunner 注入
+#: TurnDeadline(timeout_s)：_SPEC_PAYLOAD.deep=8s 短超时下 remaining≤30s 包络必 trip
+#: timeout→done degraded，deep 桩零泄漏基线的 completed 预期被击穿；300s 契约值下
+#: 剩余≈300>30 正常直通。guards trip 语义本身由 test_deep_guards.py 锁定）
 _R14_SPEC: dict[str, Any] = {
     **_SPEC_PAYLOAD,
     "routing": {"default_mode": "fast", "modes": {"fast": "fast", "deep": "deep"}},
     "fast": {**_SPEC_PAYLOAD["fast"], "max_answer_chars": 3000},
+    "deep": {**_SPEC_PAYLOAD["deep"], "turn_timeout_s": 300},
 }
 
 

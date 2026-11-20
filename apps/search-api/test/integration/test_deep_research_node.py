@@ -88,6 +88,7 @@ async def test_research_real_llm_structure_via_deep_graph(
 
     from app.agent.graphs.deep import graph as deep_graph
     from app.agent.nodes import deep_planner as deep_planner_module
+    from app.agent.nodes import deep_reflect as deep_reflect_module
     from app.agent.nodes import deep_research as deep_research_module
     from app.agent.state import DeepState
 
@@ -122,7 +123,22 @@ async def test_research_real_llm_structure_via_deep_graph(
             "oversize": False,
         }
 
+    class _ReflectChain:
+        """M2 批次 3 增量：deep 子图 reflect 已接真——本测试唯一真依赖面是 research，
+        reflect 段以桩替代（首判 sufficient 回路退出；其真 LLM 行为由
+        test_deep_reflect_node.py 冒烟承担）。"""
+
+        async def ainvoke(self, prompt: Any, config: Any = None) -> dict[str, Any]:
+            return {"sufficient": True, "gaps": []}
+
+    class _ReflectModel:
+        def with_structured_output(
+            self, schema: Any, *, method: str | None = None, **kw: Any
+        ) -> _ReflectChain:
+            return _ReflectChain()
+
     monkeypatch.setattr(deep_planner_module, "build_chat_model", lambda alias, **kw: _PlannerModel())
+    monkeypatch.setattr(deep_reflect_module, "build_chat_model", lambda alias, **kw: _ReflectModel())
     monkeypatch.setattr(deep_research_module, "save_snapshot", fake_snapshot)
 
     subtopic = "LangGraph 与 deepagents 的定位差异与各自适用场景"

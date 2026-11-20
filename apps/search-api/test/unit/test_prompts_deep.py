@@ -1,8 +1,9 @@
-"""unit 层：deep 四键提示词骨架（M2 批次 1——nacos-config.md §1 deep.* 键位/占位符集）。
+"""unit 层：deep 五键提示词骨架（M2 批次 1 四键 + 批次 4 deep.degraded_writer 增量
+——nacos-config.md §1 deep.* 键位/占位符集）。
 
 钉住的语义（占位符集与结构段按契约一次到位；文案骨架终稿，批次 2~4 逐节点打磨，
 键位与变量集不再动——需新占位符须走契约增量）：
-- 四键注册进 BUILTIN_PROMPT_FILES（键 → prompts/deep/ 同名 .txt）；
+- 五键注册进 BUILTIN_PROMPT_FILES（键 → prompts/deep/ 同名 .txt）；
 - 占位符并集恰为契约集（单测锁死惯例，同 test_prompts.py fast 形态）：
   deep.planner         = {type_rules, max_subagents, memory_hints, query, history}
   （query/history 为 M2 批次 2 增量：planner 接收问题与历史做指代消解——ARCH §4.2
@@ -13,6 +14,9 @@
                           sources_block, cite_rules}
   （cite_rules 承载 common.citation_rules 注入——契约 §1「引用规则公共片段（被上述模板
   {{cite_rules}} 引用）」；fast.synthesis 同款先例）
+  deep.degraded_writer = {reason_note, query_lang, memory_block, subagent_reports_block,
+                          sources_block, cite_rules}（批次 4 增量——degraded_writer 节点
+  降级报告；reason_note=中断原因注入，其余与 report_writer 同构；cite_rules 同款）
 - 双源同步：defaults.py PROMPTS_CONFIG 与内置文件逐字节一致（nacos_init.py ≡ defaults.py
   由 test_config_center.py TestNacosInitScriptParity 另锁，本文件不重复）；
 - 渲染 fail-fast：全占位符可解析（渲染后零残留 {{var}}）；缺变量 / 未知占位符 →
@@ -20,7 +24,7 @@
 - 结构段钉死：planner 输出 schema 五字段（deep 不产出 answerable_from_knowledge /
   search_strategy——nacos §1 v1.20「deep 零波及」钉死）/ subagent_system 的
   <external_content> 隔离语义 / reflect 输出 schema {sufficient, gaps:[{gap,query,origin}]} /
-  writer「摘要→目录→分节→结论」结构 + 全程 [n] 引用。
+  writer「摘要→目录→分节→结论」结构 + 全程 [n] 引用 / degraded_writer 如实呈现纪律。
 """
 
 import re
@@ -42,6 +46,7 @@ DEEP_KEYS = (
     "deep.subagent.system",
     "deep.reflect",
     "deep.report_writer",
+    "deep.degraded_writer",
 )
 
 #: 各键契约占位符集（nacos-config.md §1 deep.* 行；单测锁死）
@@ -57,6 +62,14 @@ DEEP_EXPECTED_PLACEHOLDERS: dict[str, set[str]] = {
         "sources_block",
         "cite_rules",
     },
+    "deep.degraded_writer": {
+        "reason_note",
+        "query_lang",
+        "memory_block",
+        "subagent_reports_block",
+        "sources_block",
+        "cite_rules",
+    },
 }
 
 #: 各键内置文件相对路径（BUILTIN_PROMPT_FILES 注册面）
@@ -65,6 +78,7 @@ DEEP_EXPECTED_FILES: dict[str, str] = {
     "deep.subagent.system": "deep/subagent_system.txt",
     "deep.reflect": "deep/reflect.txt",
     "deep.report_writer": "deep/report_writer.txt",
+    "deep.degraded_writer": "deep/degraded_writer.txt",
 }
 
 #: 各键全变量渲染表（值取合法形态；空串合法——同 fast 系 memory_hints 先例）
@@ -83,6 +97,14 @@ DEEP_RENDER_VARS: dict[str, dict[str, str]] = {
     "deep.reflect": {},
     "deep.report_writer": {
         "sections_hint": "第一节 背景；第二节 对比；第三节 选型建议",
+        "query_lang": "zh",
+        "memory_block": "",
+        "subagent_reports_block": "",
+        "sources_block": "",
+        "cite_rules": "1. 编号对应：[n] 对应来源列表第 n 条。",
+    },
+    "deep.degraded_writer": {
+        "reason_note": "轮次超时",
         "query_lang": "zh",
         "memory_block": "",
         "subagent_reports_block": "",

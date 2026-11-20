@@ -15,8 +15,10 @@ from app.exception.conflict import (
     TurnTerminalException,
 )
 from app.exception.database import DatabaseException
+from app.exception.export import ExportNotAvailableException
 from app.exception.feedback import FeedbackTurnNotFoundException
 from app.exception.not_found import NotFoundException
+from app.exception.snapshot import SnapshotNotFoundException
 
 ERROR_MAP: dict[type, tuple[str, int, str]] = {
     # 校验失败（api.md §0 400001「请求参数错误」：query 为空/超 2000 字、枚举非法等）
@@ -26,6 +28,10 @@ ERROR_MAP: dict[type, tuple[str, int, str]] = {
     # 数据库故障=内部错误（api.md §0 500001；422001 让位给「URL 非法」M3 口径，本批不实现 KB）
     DatabaseException: ("500001", 500, "内部错误"),
     NotFoundException: ("404001", 404, "资源不存在"),
+    # 该来源无快照（api.md §0 404002 行：快速模式来源、或深度来源未抓原文——REQ-015）
+    SnapshotNotFoundException: ("404002", 404, "该来源无快照"),
+    # 不满足导出条件（api.md §0 409003 行：非深度轮、或轮次未到 completed/degraded——REQ-016）
+    ExportNotAvailableException: ("409003", 409, "不满足导出条件"),
     # 轮反馈端点专属（api.md §0 v1.16 增：语义同 404001 turn 维度，独立码便于反馈面
     # 埋点/客户端区分——轮被删或失效时的单独处置）
     FeedbackTurnNotFoundException: ("404004", 404, "轮次不存在"),
