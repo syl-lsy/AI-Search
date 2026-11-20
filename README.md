@@ -61,7 +61,7 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 |---|---|
 | `make dev` | 后端 uvicorn 热重载 :8300 |
 | `make dev-frontend` | 前端 Vite :5173（批次 7 已落位；启动与环境变量说明见上方「前端」节） |
-| `make studio` | LangGraph Studio 开发期图观测（langgraph dev :2024；`LANGSMITH_TRACING=false` 显式导出——trace 不出本机，观测主通道为自托管 Langfuse；图调试流程见 `docs/DEVELOPMENT-PROCESS.md` §5.3） |
+| `make studio` | LangGraph Studio 开发期图观测（langgraph dev :2024；`STUDIO_LANGFUSE=1` 门控下 run 落自托管 Langfuse 散点 trace〔无 session/thread 关联，仅调试观测〕；`LANGSMITH_TRACING=false` 显式导出——不上报 LangSmith；图调试流程见 `docs/DEVELOPMENT-PROCESS.md` §5.3） |
 | `make test` | 质量门禁：后端 unit+integration + 前端三层，双端各 80% 覆盖率（e2e 不计） |
 | `make test-unit` / `make test-integration` / `make test-e2e` | 后端分层单跑（读 `.env.test`，缺凭证用例按需 skip） |
 | `make test-frontend` | 前端三层一次跑全（unit/integration/component，含 80% 覆盖率门禁） |

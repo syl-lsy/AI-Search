@@ -1364,3 +1364,214 @@ class TestDecisionPromptsRules:
 
         prompts = BUILTIN_DEFAULTS[PROMPTS_DATA_ID]["prompts"]
         assert decision_prompts_warnings(prompts) == []
+
+
+class TestContentGuardSpecRules:
+    """§3 B15（v1.37）：safety.url_guard / safety.injection_filter 两子节校验面——
+    嵌套模型挂 SafetySpec（缺失=None 合法）；正则共用 check_regex_rule（compile +
+    ReDoS 灾难性回溯形态硬拒收，复用 grey_rules 逻辑）；范围越界拒收。"""
+
+    def test_defaults_seed_content_guard_sections_conservative(self):
+        """L4 种子自合法：url_guard 空黑名单 + max_url_length 2048；injection_filter
+        种子（8~20 条）可编译非灾难形态 + on_hit=flag + max_scan_chars 16000。"""
+        safety = BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]
+        url_guard = safety["url_guard"]
+        injection = safety["injection_filter"]
+        assert url_guard["enabled"] is True
+        assert url_guard["blocked_hosts"] == []
+        assert url_guard["blocked_host_patterns"] == []
+        assert url_guard["max_url_length"] == 2048
+        assert injection["enabled"] is True
+        assert 8 <= len(injection["patterns"]) <= 20
+        for pattern in injection["patterns"]:
+            re.compile(pattern)  # 不抛即合法
+        assert injection["on_hit"] == "flag"
+        assert injection["max_scan_chars"] == 16000
+
+    def test_content_guard_sections_missing_allowed(self):
+        """两子节缺失 = 合法（None；运行面 loader 回落 defaults 种子——部署即启用）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: (
+                p["safety"].pop("url_guard"),
+                p["safety"].pop("injection_filter"),
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_content_guard_full_sections_accepted(self):
+        """两子节全键合法形态：黑名单/正则/on_hit=drop/范围边界值全部通过。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"].update(
+                {
+                    "url_guard": {
+                        "enabled": True,
+                        "blocked_hosts": ["evil.example", "badsite.cn"],
+                        "blocked_host_patterns": [r"\.internal\.corp$", "^gw\\."],
+                        "max_url_length": 8192,
+                    },
+                    "injection_filter": {
+                        "enabled": True,
+                        "patterns": [r"acme_payload_marker", r"(?i)evil\s+corp"],
+                        "on_hit": "drop",
+                        "max_scan_chars": 20000,
+                    },
+                }
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    @pytest.mark.parametrize("value", ["false", "0", 1, None])
+    @pytest.mark.parametrize("section", ["url_guard", "injection_filter"])
+    def test_subsection_enabled_non_bool_rejected(self, section, value):
+        """子节 enabled 严格布尔（kill switch 防 `"false"` 形态漂移——SafetySpec
+        enabled 同款双防线之一）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, s=section, v=value: p["safety"][s].update({"enabled": v}),
+        )
+        with pytest.raises(AssetValidationError, match="布尔"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("value", ["kill", "reject", "FLAG", ""])
+    def test_injection_on_hit_literal_rejected(self, value):
+        """on_hit Literal["flag","drop"]：枚举外形态整版拒收。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, v=value: p["safety"]["injection_filter"].update({"on_hit": v}),
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("value", "legal"),
+        [(32, False), (8193, False), (64, True), (8192, True), (2048, True)],
+    )
+    def test_max_url_length_bounds(self, value, legal):
+        """max_url_length 范围 64~8192（含端点）：越界拒收、边界值合法。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, v=value: p["safety"]["url_guard"].update({"max_url_length": v}),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("value", "legal"),
+        [(999, False), (20001, False), (1000, True), (20000, True), (8000, True)],
+    )
+    def test_max_scan_chars_bounds(self, value, legal):
+        """max_scan_chars 范围 1000~20000（含端点）：越界拒收、边界值合法。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, v=value: p["safety"]["injection_filter"].update(
+                {"max_scan_chars": v}
+            ),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    def test_blocked_hosts_over_200_rejected(self):
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["url_guard"].update(
+                {"blocked_hosts": ["h.example"] * 201}
+            ),
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_blocked_hosts_entry_over_253_chars_rejected(self):
+        """单条 ≤253 字符（DNS 主机名上限）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["url_guard"]["blocked_hosts"].append("x" * 254),
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_blocked_hosts_empty_entry_rejected(self):
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["url_guard"]["blocked_hosts"].append(""),
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_blocked_host_patterns_bad_regex_rejected(self):
+        """blocked_host_patterns 共用正则校验：编译失败拒收（消息带定位）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["url_guard"]["blocked_host_patterns"].append("("),
+        )
+        with pytest.raises(AssetValidationError, match="blocked_host_patterns"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_blocked_host_patterns_catastrophic_rejected(self):
+        """blocked_host_patterns ReDoS 灾难性回溯形态拒收（与 grey_rules 同判据）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["url_guard"]["blocked_host_patterns"].append(
+                "(a|aa)+$"
+            ),
+        )
+        with pytest.raises(AssetValidationError, match="灾难性回溯"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["(", "(a+)+$", "x" * 121],
+    )
+    def test_injection_patterns_invalid_rejected(self, pattern):
+        """injection_filter.patterns 共用正则校验：编译失败/ReDoS/超长（≤120）拒收。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, r=pattern: p["safety"]["injection_filter"]["patterns"].append(r),
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_injection_patterns_over_fifty_rejected(self):
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p["safety"]["injection_filter"].update(
+                {"patterns": ["x"] * 51}
+            ),
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_check_regex_rule_shared_helper_direct(self):
+        """抽取的公共函数直测：长度/编译/ReDoS 三类消息齐备且带定位标签。"""
+        from app.config_center.validator import check_regex_rule
+
+        with pytest.raises(ValueError, match="≤60 字符"):
+            check_regex_rule("x" * 61, label="grey_rules", max_len=60)
+        with pytest.raises(ValueError, match="编译失败"):
+            check_regex_rule("(", label="acme.label", max_len=120)
+        with pytest.raises(ValueError, match="灾难性回溯"):
+            check_regex_rule("(a+)+$", label="acme.label", max_len=120)
+        check_regex_rule("(a|b)?c", label="acme.label", max_len=120)  # 合法不抛
+
+    def test_content_guard_seed_entries_avoid_secret_prefix(self):
+        """命名纪律（§2 嗅探联动）：种子条目零密钥前缀形态（sk-/tvly-/fc-/as_sk-）。"""
+        patterns = BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["injection_filter"][
+            "patterns"
+        ]
+        for pattern in patterns:
+            assert not re.match(r"^(sk-|tvly-|fc-|as_sk-)", pattern), pattern
+        for field in BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["url_guard"]:
+            assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), (
+                field
+            )
+        for field in BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]["injection_filter"]:
+            assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), (
+                field
+            )

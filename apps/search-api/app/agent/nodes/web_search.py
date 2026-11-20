@@ -11,6 +11,12 @@ search_query_index/total——额外键经 Send 输入投影进节点、不回�
 - 冻结链为空（主位+备位全断）→ SearchChainUnavailable → TurnRunner 500201 收轮；
 - 全部副本零候选且 errors 非空 → merge_dedupe 短路（A1 情形 3，synthesis 前短路）。
 
+B15 内容侧护栏（写 candidates 处逐候选扫 title+snippet+content——内容进上下文的
+最早公共点）：flag=保留+errors 留痕（injection_blocked）、drop=丢弃（来源卡/[n]
+自然一致）；护栏动作**不置 degraded**（degraded_reason 枚举封闭，errors[] 非封闭
+诊断通道）；spec 经 Send 输入投影进节点（不回写 state），缺失回落 defaults 种子
+（部署即启用）。
+
 stage 事件（api.md §7.2/§7.4）：index 0 副本发 running（detail=链摘要——主干单对），
 每副本发 done（progress={current: idx+1, total} + detail 源摘要，降级标注在 detail；
 B11 P1b：发生同源延迟重试时 done 的 `extra.source_retries` 携带 `{源名: 次数}`——
@@ -25,6 +31,7 @@ B11 P1b：发生同源延迟重试时 done 的 `extra.source_retries` 携带 `{�
 """
 
 import asyncio
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -32,6 +39,8 @@ from langgraph.types import Send
 
 from app.agent.graphs.signals import emit_stage
 from app.agent.guards import ensure_not_canceled
+from app.agent.safety.content_guard import filter_candidates
+from app.agent.safety.config import load_content_guard_config
 from app.agent.tools.registry import SearchChainUnavailable
 
 __all__ = ["WEB_SEARCH_TOP_K", "search_fanout", "web_search"]
@@ -68,6 +77,10 @@ def search_fanout(state: Any) -> list[Send] | str:
                 "time_range": state.get("time_range"),
                 "search_query_index": index,
                 "search_query_total": total,
+                # B15 内容侧护栏：spec 随 Send 输入投影进节点（不回写 state）——
+                # web_search 写 candidates 处逐候选注入扫描的配置源（fast 子图 state
+                # 的 spec 键不进 Send 输入，节点侧只能自携）
+                "spec": state.get("spec"),
             },
         )
         for index, query in enumerate(queries)
@@ -108,17 +121,29 @@ async def web_search(state: Any, config: RunnableConfig | None = None) -> dict[s
     candidates: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     ok_summary: list[str] = []
+    # B15 内容侧护栏：逐候选注入扫描（title+snippet+content）——flag=保留+留痕、
+    # drop=丢弃（来源卡/[n] 自然一致）；护栏动作不置 degraded（degraded_reason 枚举
+    # 封闭 timeout|budget|source_failure，护栏留痕走 errors[] injection_blocked）；
+    # spec 缺失/形态漂移回落 defaults 种子（部署即启用，load_content_guard_config）
+    spec = state.get("spec")
+    guards = load_content_guard_config(spec if isinstance(spec, Mapping) else None)
     for source, outcome in zip(chain.sources, outcomes):
         if isinstance(outcome, BaseException):
             errors.append({"stage": "search", "reason": "source_failure", "source": source})
         else:
-            candidates.extend(outcome)
-            ok_summary.append(f"{source}×{len(outcome)}")
+            filtered, filter_errors = filter_candidates(outcome, guards, stage="search")
+            candidates.extend(filtered)
+            errors.extend(filter_errors)
+            ok_summary.append(f"{source}×{len(filtered)}")
 
-    degraded = bool(errors)
+    degraded = bool(
+        [e for e in errors if e.get("reason") == "source_failure"]
+    )  # B15：degraded 只由 source_failure 派生（护栏留痕 injection_blocked 非降级语义）
     detail = " / ".join(ok_summary) or "全部源失败"
     if degraded:
-        failed = ",".join(item["source"] for item in errors)
+        failed = ",".join(
+            item["source"] for item in errors if item.get("reason") == "source_failure"
+        )
         detail += f"（降级：失败源 {failed}）"
     emit_stage(
         "search",

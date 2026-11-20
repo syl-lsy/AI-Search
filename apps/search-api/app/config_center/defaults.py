@@ -132,9 +132,11 @@ MCP_CONFIG: dict[str, Any] = {
 
 # §3 ai_search.agent.spec.json（含 v1.6 turn / v1.10 followups / v1.13 routing / kb 现行口径 /
 #    v1.4 compact / v1.1 memory / v1.24 retry.connection / v1.25 fast.turn_timeout_s=120
-#    ——deep 300 不动 / B13 safety 节置于 followups 与 kb 之间 / **v1.32（B14）：
+#    ——deep 300 不动 / B13 safety 节置于 followups 与 kb 之间 / v1.32（B14）：
 #    fast.llm_timeout_s 30→60、retry.connection.total_window_s 20→60、thinking 两键
-#    〔fast=off / deep=on〕、safety.enabled true + politics_terms 空初值）**）
+#    〔fast=off / deep=on〕、safety.enabled true + politics_terms 空初值 /
+#    **v1.37（B15）：safety 节增 url_guard / injection_filter 两子节（内容侧安全
+#    护栏——与 safety.enabled 解耦，缺子节运行时回落本种子=部署即启用）**）
 SPEC_CONFIG: dict[str, Any] = {
     "schema_version": 1,
     "updated_at": _UPDATED_AT,
@@ -244,6 +246,38 @@ SPEC_CONFIG: dict[str, Any] = {
         "classify_timeout_ms": 1500,
         "reply_timeout_ms": 2000,
         "reply_max_chars": 300,
+        # §3 B15 内容侧安全护栏两子节（v1.37）：**与 safety.enabled 解耦**——输入
+        # 安全链关闸（enabled=false）不打灭 SSRF/注入护栏；本节种子即运行时回落源
+        # （缺子节 → load_content_guard_config 回落此处 = 部署即启用，单一事实源
+        # 与 scripts/nacos_init.py 逐字同步）。代码硬底线（scheme/私网判定、种子
+        # 并集）在 app/agent/safety/——黑名单与 patterns 是运营加强面，只能加强
+        # 不能削弱；injection on_hit=flag 观察先行（命中仅告警保留，跑出误判基线
+        # 后 Nacos 单键热切 drop）。
+        "url_guard": {
+            "enabled": True,
+            "blocked_hosts": [],
+            "blocked_host_patterns": [],
+            "max_url_length": 2048,
+        },
+        "injection_filter": {
+            "enabled": True,
+            "patterns": [
+                "<\\|system\\|>",
+                "<\\|im_start\\|>",
+                "\\[inst\\]",
+                "</\\s*external_content\\s*>",
+                "\\b(?:ignore|disregard)\\s+(?:all\\s+|any\\s+|the\\s+|your\\s+)?(?:previous|prior|earlier|above|preceding)\\s+instructions?\\b",
+                "\\b(?:reveal|show|print|output|display|leak)\\s+(?:your\\s+|the\\s+)?system\\s+(?:prompt|instructions?)\\b",
+                "\\byou\\s+are\\s+now\\b",
+                "忽略(?:以上|之前|上述|前面|先前|以前)(?:所有|全部|任何|的){0,3}(?:指令|规则|要求|设定)",
+                "无视(?:以上|之前|上述|前面|先前|以前)(?:所有|全部|任何|的){0,3}(?:指令|规则|要求|设定)",
+                "(?:输出|泄露|打印|透露|展示|给我)(?:你的|系统的|一下)?(?:系统提示词|系统指令|初始(?:提示词|指令))",
+                "你现在(?:扮演|成为)",
+                "忘记(?:以上|之前|上述|先前)?(?:所有|全部|任何|的){0,3}(?:指令|规则|要求|设定)",
+            ],
+            "on_hit": "flag",
+            "max_scan_chars": 16000,
+        },
     },
     "kb": {"top_k_per_query": 8, "rerank_timeout_s": 2},
     "history": {"window_turns": 6, "answer_head_chars": 200},

@@ -587,3 +587,32 @@ def test_safety_lexicon_seed_terms_follow_contract_example() -> None:
 
     for rule in safety["grey_rules"]:
         _re.compile(rule)
+
+
+def test_safety_content_guard_defaults_present() -> None:
+    """SPEC_CONFIG safety.url_guard / injection_filter 种子齐备（B15 v1.37 内容侧
+    护栏，部署即启用）：两子节 enabled=True；url_guard 空黑名单 + max_url_length
+    2048；injection_filter 种子 8~20 条可编译 + on_hit=flag（flag 观察先行裁决）+
+    max_scan_chars 16000；种子条目零密钥前缀形态（sk-/tvly-/fc-/as_sk-——§2 嗅探
+    联动纪律）且键名零敏感词（key/secret/token/password）。"""
+    import re as _re
+
+    safety = SPEC_CONFIG["safety"]
+    url_guard = safety["url_guard"]
+    injection = safety["injection_filter"]
+    assert url_guard["enabled"] is True
+    assert url_guard["blocked_hosts"] == []
+    assert url_guard["blocked_host_patterns"] == []
+    assert url_guard["max_url_length"] == 2048
+    assert injection["enabled"] is True
+    assert 8 <= len(injection["patterns"]) <= 20
+    for pattern in injection["patterns"]:
+        _re.compile(pattern)
+        assert not pattern.startswith(("sk-", "tvly-", "fc-", "as_sk-"))
+    assert injection["on_hit"] == "flag"
+    assert injection["max_scan_chars"] == 16000
+    for section in (url_guard, injection):
+        for field_name in section:
+            assert not _re.search(
+                r"key|secret|token|password", field_name, _re.IGNORECASE
+            ), field_name

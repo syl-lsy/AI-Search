@@ -67,10 +67,19 @@ dev:
 dev-frontend:
 	pnpm --filter frontend dev
 
-# LangGraph Studio：开发期图观测（langgraph dev :2024；TRACING=false 显式导出=防御性
-# 执行不出域裁决——不给 Smith 上报任何 trace，纯本地 in-mem 观测）
+# LangGraph Studio：开发期图观测（langgraph dev :2024）。观测语义（2026-11-20
+# 边界反转，ARCH §6.6 v1.67）：STUDIO_LANGFUSE=1 门控激活全局 configure hook（langchain
+# _configure 实时判定）→ Studio run 落自托管 Langfuse（散点 trace，无 session/thread
+# 关联）。STUDIO_LANGFUSE 属 Makefile 级开发开关：不进 .env 不进 Nacos；凭据经
+# langgraph.json "env": ".env" 注入仓库根 .env（langgraph-cli inmem 按进程 CWD 解析，
+# 本 target 从仓库根跑）。
+# ⚠️ LANGSMITH_TRACING 前缀导出仅是「无 env 键时」的兜底缺省：langgraph dev 的
+# patch_environment（langgraph_api/cli.py）会把 langgraph.json "env" 指向的仓库根
+# .env 文件值**无条件覆盖**进程前缀值（仅 LANGGRAPH_* 基建键豁免）——实际生效值=
+# 仓库根 .env 的 LANGSMITH_TRACING（当前=false，LangSmith 云仍禁的真防线在 .env）；
+# 改 .env 该键=真开关，改本行前缀拦不住。
 studio:
-	LANGSMITH_TRACING=false uv run --package search-api langgraph dev --config apps/search-api/langgraph.json --no-browser
+	STUDIO_LANGFUSE=1 LANGSMITH_TRACING=false uv run --package search-api langgraph dev --config apps/search-api/langgraph.json --no-browser
 
 # ── 测试 ─────────────────────────────────────────────────────────────
 

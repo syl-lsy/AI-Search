@@ -85,6 +85,23 @@ async def async_client():
         yield client
 
 
+@pytest.fixture(autouse=True)
+def _offline_url_guard_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B15 内容侧护栏：URL 校验 DNS 注入缝的套件级离线化（integration 零网络纪律）。
+
+    `content_guard.DEFAULT_RESOLVER` 是接线面 `validate_url_async` 的缺省 resolver
+    （生产 = socket.getaddrinfo）；测试统一换成确定性公网假体（任意主机 → 公网 IP）。
+    护栏的字面 IP / 短主机名 / 保留后缀判定不经 DNS、不受本假体影响（假 registry 的
+    fixture 域名据此直判放行）；需要 NXDOMAIN / 私网解析语义的用例在本测内对同一缝
+    后置覆盖。requires_llm 真依赖冒烟同样吃本假体——真实解析行为归 e2e/活体验收面。
+    """
+    from app.agent.safety import content_guard  # noqa: PLC0415 —— fixture 局部导入
+
+    monkeypatch.setattr(
+        content_guard, "DEFAULT_RESOLVER", lambda host: ["93.184.216.34"]
+    )
+
+
 # ---- 真库 fixture（requires_db 用例专用；管理面操作用同步 psycopg2，避免事件循环耦合）----
 
 import psycopg2  # noqa: E402 —— dev 依赖（ARCH 锚点项），建库/断言用；运行时引擎仍为 asyncpg

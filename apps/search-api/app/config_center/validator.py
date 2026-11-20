@@ -798,18 +798,128 @@ def _has_catastrophic_form(rule: str) -> bool:
     return False
 
 
+def check_regex_rule(rule: str, *, label: str, max_len: int) -> None:
+    """运营正则单条硬校验（B15 抽取公共函数：grey_rules / injection_filter.
+    patterns / url_guard.blocked_host_patterns 共用同一判据）：
+
+    - 长度上限（超限拒收）；
+    - re.compile 可编译（编译失败=拒收 violation，消息只含定位与原因不含原文）；
+    - 灾难性回溯（ReDoS）形态静态拒收（`_has_catastrophic_form`）——量词分组内嵌
+      量词/交替（如 `(a+)+`、`(a|aa)+`）对短 payload 即指数级回溯，运行面扫描在
+      async 节点内执行、可挂死事件循环，必须在发布口拦截。
+    """
+    if len(rule) > max_len:
+        raise ValueError(f"{label} 单条 ≤{max_len} 字符")
+    try:
+        re.compile(rule)
+    except re.error as exc:
+        raise ValueError(f"{label} 正则编译失败（violation）：{exc}") from exc
+    if _has_catastrophic_form(rule):
+        raise ValueError(
+            f"{label} 疑似灾难性回溯形态（量词分组内嵌量词/交替，ReDoS "
+            "violation）：请改写为有界量词形态"
+        )
+
+
+def _strict_bool_or_raise(value: Any) -> Any:
+    """enabled 严格布尔共用判定（SafetySpec / UrlGuardSpec / InjectionFilterSpec
+    ——非 bool 一律拒收：pydantic 默认会把 "false"/0 等形态 coerce 成布尔，导致
+    validator 通过而运行面读到原始字符串（bool("false")=True，kill switch 反向
+    失效）。validator 拒收 + 运行面严格判定的双防线之一。"""
+    if not isinstance(value, bool):
+        raise ValueError(
+            "enabled 须为布尔（JSON true/false；字符串/数字形态拒收——"
+            "kill switch 单键热更防形态漂移）"
+        )
+    return value
+
+
+class UrlGuardSpec(BaseModel):
+    """§3 B15（v1.37）safety.url_guard 子节：SSRF 防护黑名单加强面。
+
+    代码硬底线（scheme ∈ {http,https} / 私网与元数据判定 / localhost 与短主机名）
+    在 app/agent/safety/url_guard.py——本节黑名单是运营加强面，只能加强不能削弱。
+    校验：enabled 严格布尔；blocked_hosts ≤200 条、每条非空 ≤253 字符（DNS 主机名
+    上限）；blocked_host_patterns ≤50 条、逐条 check_regex_rule（compile + ReDoS
+    静态拒收）；max_url_length 64~8192（含端点）。子节缺失=None 合法（运行面
+    loader 回落 defaults 种子=部署即启用）。键名严禁含 token/key/secret/password
+    （撞密钥嗅探，§2 安全条款）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = True
+    blocked_hosts: list[str] = Field(default_factory=list, max_length=200)
+    blocked_host_patterns: list[str] = Field(default_factory=list, max_length=50)
+    max_url_length: int = Field(default=2048, ge=64, le=8192)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _check_enabled_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+    @field_validator("blocked_hosts")
+    @classmethod
+    def _check_blocked_hosts(cls, value: list[str]) -> list[str]:
+        for host in value:
+            if not host:
+                raise ValueError("blocked_hosts 条目不得为空串")
+            if len(host) > 253:
+                raise ValueError("blocked_hosts 单条 ≤253 字符（DNS 主机名上限）")
+        return value
+
+    @field_validator("blocked_host_patterns")
+    @classmethod
+    def _check_blocked_patterns_compilable(cls, value: list[str]) -> list[str]:
+        for rule in value:
+            check_regex_rule(rule, label="url_guard.blocked_host_patterns", max_len=120)
+        return value
+
+
+class InjectionFilterSpec(BaseModel):
+    """§3 B15（v1.37）safety.injection_filter 子节：网页内容注入特征过滤配置。
+
+    运行面匹配集 = 内置种子 ∪ 本表 patterns（Nacos 削不掉种子——loader 层并集
+    去重）；on_hit=flag 观察先行（命中仅告警保留，跑出误判基线后单键热切 drop）。
+    校验：enabled 严格布尔；patterns ≤50 条、逐条 check_regex_rule（compile +
+    ReDoS 静态拒收，同 grey_rules——恶意正则可挂死事件循环，发布口拦截）；
+    on_hit Literal["flag","drop"]；max_scan_chars 1000~20000（含端点）。键名严禁
+    含 token/key/secret/password（§2）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = True
+    patterns: list[str] = Field(default_factory=list, max_length=50)
+    on_hit: Literal["flag", "drop"] = "flag"
+    max_scan_chars: int = Field(default=16000, ge=1000, le=20000)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _check_enabled_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+    @field_validator("patterns")
+    @classmethod
+    def _check_patterns_compilable(cls, value: list[str]) -> list[str]:
+        for rule in value:
+            check_regex_rule(rule, label="injection_filter.patterns", max_len=120)
+        return value
+
+
 class SafetySpec(BaseModel):
     """§3 B13 输入安全节（fail-open 语义——节缺失=合法 None，安全检查不挡检索）。
 
-    词表纪律（§3 校验规则 v1.31）：danger_terms/profanity_terms/privacy_terms
-    ≤200 条、每条非空 ≤64 字符且条目去重；enabled=true 时三表至少其一非空；
-    grey_rules ≤50 条、每条
+    词表纪律（§3 校验规则 v1.31→v1.32 四表口径）：danger_terms/profanity_terms/
+    privacy_terms/politics_terms ≤200 条、每条非空 ≤64 字符且条目去重；enabled=true
+    时四表至少其一非空；grey_rules ≤50 条、每条
     ≤120 字符且逐条 re.compile 校验（编译失败=拒收 violation），并做灾难性回溯
     （ReDoS）形态静态拒收——量词分组内嵌量词/交替（如 `(a+)+`、`(a|aa)+`）对短
     payload 即指数级回溯，运行面扫描在 async 节点内执行、可挂死事件循环，必须在
     发布口拦截。enabled 严格布尔：JSON 字符串/数字形态一律拒收（kill switch 单键
     热更防 `"false"` 字符串漂移——validator 拒收 + 运行面严格判定的双防线之一）。
     字段命名严禁含 token/key/secret/password（撞密钥嗅探，§2 安全条款）。
+
+    §3 B15（v1.37）增：url_guard / injection_filter 两嵌套子节（内容侧护栏——
+    与 safety.enabled 解耦，缺失=None 合法，运行面回落 defaults 种子）。
     """
 
     model_config = ConfigDict(extra="allow")
@@ -826,19 +936,17 @@ class SafetySpec(BaseModel):
     classify_timeout_ms: int = Field(default=2000, ge=200, le=10000)
     reply_timeout_ms: int = Field(default=4000, ge=200, le=10000)
     reply_max_chars: int = Field(default=500, ge=100, le=1000)
+    #: §3 B15（v1.37）：内容侧护栏两子节——与 safety.enabled 解耦（输入安全链关闸
+    #: 不打灭 SSRF/注入护栏）；缺失=None 合法，运行面 loader 回落 defaults 种子
+    url_guard: UrlGuardSpec | None = None
+    injection_filter: InjectionFilterSpec | None = None
 
     @field_validator("enabled", mode="before")
     @classmethod
     def _check_enabled_strict_bool(cls, value: Any) -> Any:
-        """enabled 严格布尔（§3 校验规则「enabled 布尔」）：非 bool 拒收——pydantic
-        默认会把 "false"/0 等形态 coerce 成布尔，导致 validator 通过而运行面读到
-        原始字符串（bool("false")=True，kill switch 反向失效）。"""
-        if not isinstance(value, bool):
-            raise ValueError(
-                "enabled 须为布尔（JSON true/false；字符串/数字形态拒收——"
-                "kill switch 单键热更防形态漂移）"
-            )
-        return value
+        """enabled 严格布尔（§3 校验规则「enabled 布尔」）——判定逻辑抽公共函数
+        `_strict_bool_or_raise`（B15：三个安全节共用同一判据与文案）。"""
+        return _strict_bool_or_raise(value)
 
     @field_validator(
         "danger_terms", "profanity_terms", "privacy_terms", "politics_terms"
@@ -875,19 +983,10 @@ class SafetySpec(BaseModel):
     @field_validator("grey_rules")
     @classmethod
     def _check_grey_rules_compilable(cls, value: list[str]) -> list[str]:
+        # B15：长度/编译/ReDoS 三判据抽公共函数（blocked_host_patterns 与
+        # injection_filter.patterns 复用同一实现——消息文案保持既有形态）
         for rule in value:
-            if len(rule) > 120:
-                raise ValueError("grey_rules 单条 ≤120 字符")
-            try:
-                re.compile(rule)
-            except re.error as exc:
-                # 违规描述只含定位与原因，不含规则原文（校验错误会进日志，值不外泄）
-                raise ValueError(f"grey_rules 正则编译失败（violation）：{exc}") from exc
-            if _has_catastrophic_form(rule):
-                raise ValueError(
-                    "grey_rules 疑似灾难性回溯形态（量词分组内嵌量词/交替，ReDoS "
-                    "violation）：请改写为有界量词形态"
-                )
+            check_regex_rule(rule, label="grey_rules", max_len=120)
         return value
 
 

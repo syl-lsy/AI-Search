@@ -114,6 +114,14 @@ from app.agent.guards import TurnCanceledSignal, ensure_not_canceled
 from app.agent.llm import build_chat_model, resolve_chat_alias
 from app.agent.nodes.web_search import WEB_SEARCH_TOP_K
 from app.agent.prompts import render_prompt, resolve_prompt
+from app.agent.safety.config import ContentGuardConfig, load_content_guard_config
+from app.agent.safety.content_guard import (
+    filter_candidates,
+    filter_report,
+    scan_text_async,
+    url_host,
+    validate_url_async,
+)
 from app.agent.tools.registry import (
     ReadChain,
     SearchChain,
@@ -238,6 +246,9 @@ class _Deps:
     thread_id: str
     turn_id: str
     time_range: str | None = None
+    #: B15 内容侧护栏（research() 装载一次：load_content_guard_config(spec)——缺子节
+    #: 回落 defaults 种子=部署即启用；None=直构测试面护栏关闭）
+    guards: ContentGuardConfig | None = None
 
 
 class _Recorder:
@@ -355,8 +366,31 @@ class _Recorder:
 # ---- 契约工具（deepagents 暴露面）----
 
 
-def _read_guidance_or_none(url: str, deps: _Deps) -> str | None:
-    """读取前置守卫：链空/协议白名单外 → 引导文本（None=放行）。"""
+async def _url_guard_rejection_reason(url: str, deps: _Deps) -> str | None:
+    """URL 护栏校验（B15）：None=放行；拒收返回 reason 枚举词并落 safety 域告警
+    （只记 reason/host——零完整 URL）。guard 关/None → 放行零成本。"""
+    guards = deps.guards
+    if guards is None or guards.url_guard is None:
+        return None
+    result = await validate_url_async(url, guards.url_guard)
+    if result.ok:
+        return None
+    AgentLog(
+        message=(
+            f"url_guard 拒收（reason={result.reason}，host={url_host(url)}）——"
+            "零物理调用零熔断计数"
+        ),
+        graph="deep",
+        node="research",
+    ).warning()
+    return result.reason
+
+
+async def _read_guidance_or_none(url: str, deps: _Deps) -> str | None:
+    """读取前置守卫：链空/协议白名单外 → 引导文本；**B15 全量校验**（scheme-only →
+    validate_url 全判据——字面私网/元数据/短主机名/黑名单），拒收 → 系统注 + errors
+    url_rejected 留痕——**registry.read 之前返回，零物理调用、零熔断计数**。None=放行。
+    """
     if deps.read_chain is None or not deps.read_chain.sources:
         return _READ_EMPTY_GUIDANCE
     if not url.strip():
@@ -365,14 +399,24 @@ def _read_guidance_or_none(url: str, deps: _Deps) -> str | None:
     scheme = parsed.split("://", 1)[0].lower() if "://" in parsed else ""
     if scheme not in _URL_PROTOCOLS:
         return f"（系统注：仅支持 http/https URL，已跳过：{url[:120]}）"
+    rejected = await _url_guard_rejection_reason(url.strip(), deps)
+    if rejected is not None:
+        deps.recorder.record_error({"stage": "read", "reason": "url_rejected"})
+        return (
+            f"（系统注：该 URL 未通过安全校验（{rejected}），已拦截——"
+            "请跳过并继续研究其他来源。）"
+        )
     return None
 
 
-def _window_block(text: str, *, url: str, offset: int, limit: int | None, deep_spec: Mapping[str, Any]) -> str:
-    """正文窗口 → 中性化 → `<external_content>` 包裹 → 非全文追加截断注记。
+def _window_span(
+    text: str, *, offset: int, limit: int | None, deep_spec: Mapping[str, Any]
+) -> tuple[str, int, int, int]:
+    """head 限幅解析 + token 窗口切分 → (窗口文本, start, end, total)。
 
-    head 限幅解析与窗口语义复用 url_reader（token_window/estimate_tokens/_neutralize_content
-    同包安全助手——批次 1 已单测锁死，零复制漂移）。
+    head 限幅解析与窗口语义复用 url_reader（token_window/estimate_tokens 同包安全
+    助手——批次 1 已单测锁死，零复制漂移）。B15：窗口切分独立成步——注入扫描作用于
+    原始窗口文本（先于转义包裹，顺序锁）。
     """
     compact = ((deep_spec.get("compact") or {}) if isinstance(deep_spec, Mapping) else {}) or {}
     try:
@@ -382,7 +426,11 @@ def _window_block(text: str, *, url: str, offset: int, limit: int | None, deep_s
     if head <= 0:
         head = DEFAULT_URL_READ_HEAD_TOKENS
     window, start, end = token_window(text, offset=offset, limit=head if limit is None else limit)
-    total = estimate_tokens(text)
+    return window, start, end, estimate_tokens(text)
+
+
+def _wrap_window(window: str, *, url: str, start: int, end: int, total: int) -> str:
+    """窗口 → 中性化 → `<external_content>` 包裹 → 非全文追加截断注记。"""
     wrapped = external_content(_neutralize_content(window), source=url, kind="web")
     if end < total:
         wrapped += (
@@ -390,6 +438,16 @@ def _window_block(text: str, *, url: str, offset: int, limit: int | None, deep_s
             f"全文约 {total} token；携带 offset={end} 可续读后续内容。]"
         )
     return wrapped
+
+
+def _window_block(text: str, *, url: str, offset: int, limit: int | None, deep_spec: Mapping[str, Any]) -> str:
+    """正文窗口 → 中性化 → `<external_content>` 包裹 → 非全文追加截断注记。
+
+    B15 起为 `_window_span` + `_wrap_window` 的组合便利（firecrawl_read 主路径拆两步
+    以在中间插入注入扫描——顺序锁「过滤先于转义包裹」）；本函数保持既有签名不变。
+    """
+    window, start, end, total = _window_span(text, offset=offset, limit=limit, deep_spec=deep_spec)
+    return _wrap_window(window, url=url, start=start, end=end, total=total)
 
 
 def _build_contract_tools(deps: _Deps) -> list[Any]:
@@ -432,7 +490,12 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
                     {"stage": "search", "reason": "source_failure", "source": source}
                 )
             else:
-                candidates.extend(outcome)
+                # B15：add_candidates 前逐候选注入扫描——drop 不占 ref_no（ref_no 首现
+                # 冻结发生在 add_candidates，过滤先于入册即来源卡/[n] 自然一致）
+                filtered, filter_errors = filter_candidates(outcome, deps.guards, stage="search")
+                for error in filter_errors:
+                    recorder.record_error(error)
+                candidates.extend(filtered)
         recorder.add_candidates(candidates)
         if not candidates:
             return "（系统注：检索无结果，请调整检索词或直接沉淀已有信息。）"
@@ -450,7 +513,7 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
     @tool
     async def firecrawl_read(url: str, offset: int = 0, limit: int | None = None) -> str:
         """读取 URL 页面正文（token 窗口；外部内容包裹；读取成功自动保存网页快照）。"""
-        guidance = _read_guidance_or_none(url, deps)
+        guidance = await _read_guidance_or_none(url, deps)
         if guidance is not None:
             return guidance
         url = url.strip()
@@ -469,6 +532,38 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
                 node="research",
             ).warning()
             return f"（系统注：该 URL 读取失败（{type(exc).__name__}），请跳过并继续研究其他来源。）"
+        deep_spec = (deps.spec.get("deep") or {}) if isinstance(deps.spec, Mapping) else {}
+        window, start, end, total = _window_span(
+            text, offset=offset, limit=limit, deep_spec=deep_spec
+        )
+        # B15 顺序锁：注入扫描作用于**原始窗口文本**（先于转义包裹——原始闭合标记是
+        # 结构种子，转义后不可检出）；drop=跳过快照/登记+系统注（零 payload 进上下文），
+        # flag=照常包裹+errors 留痕
+        inj = deps.guards.injection_filter if deps.guards is not None else None
+        scan = await scan_text_async(window, inj) if inj is not None else None
+        if inj is not None and scan is not None and scan.hits and inj.on_hit == "drop":
+            recorder.record_error({"stage": "read", "reason": "injection_blocked"})
+            AgentLog(
+                message=(
+                    "子代理读窗注入命中已整页拦截（on_hit=drop）："
+                    f"rule_id={','.join(scan.hits)} 字符数={len(window)} "
+                    f"truncated={scan.truncated}"
+                ),
+                graph="deep",
+                node="research",
+            ).warning()
+            return (
+                "（系统注：该页正文命中注入特征（injection_blocked），已整页拦截——"
+                "请跳过并继续研究其他来源。）"
+            )
+        # 体二次校验（B15 纵深）：入口守卫与快照/登记使用点之间再验——拒收零快照零登记
+        rejected_again = await _url_guard_rejection_reason(url, deps)
+        if rejected_again is not None:
+            recorder.record_error({"stage": "read", "reason": "url_rejected"})
+            return (
+                f"（系统注：该 URL 二次校验未通过（{rejected_again}），已拦截——"
+                "请跳过并继续研究其他来源。）"
+            )
         # 读后回写快照（OQ-33 探针建议 2：节点侧登记而非依赖模型自发调用；失败非阻断）
         try:
             meta = await save_snapshot(
@@ -487,12 +582,30 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
                 node="research",
             ).warning()
         recorder.record_visited(url)
-        deep_spec = (deps.spec.get("deep") or {}) if isinstance(deps.spec, Mapping) else {}
-        return _window_block(text, url=url, offset=offset, limit=limit, deep_spec=deep_spec)  # type: ignore[arg-type]
+        wrapped = _wrap_window(window, url=url, start=start, end=end, total=total)
+        if scan is not None and scan.hits:
+            recorder.record_error({"stage": "read", "reason": "injection_blocked"})
+            AgentLog(
+                message=(
+                    "子代理读窗注入命中（on_hit=flag 保留留痕）："
+                    f"rule_id={','.join(scan.hits)} 字符数={len(window)} "
+                    f"truncated={scan.truncated}"
+                ),
+                graph="deep",
+                node="research",
+            ).warning()
+        return wrapped
 
     @tool("save_snapshot")
     async def save_snapshot_tool(url: str, content: str) -> str:
         """显式保存网页快照（读取成功时已自动保存；仅补存未快照内容时调用）。"""
+        rejected = await _url_guard_rejection_reason(url.strip(), deps)
+        if rejected is not None:
+            recorder.record_error({"stage": "read", "reason": "url_rejected"})
+            return (
+                f"（系统注：url 未通过安全校验（{rejected}），快照未保存——"
+                "请提供公开可访问的 http/https 页面。）"
+            )
         meta = await save_snapshot(
             url=url,
             content=content,
@@ -622,6 +735,7 @@ class _SubagentGate:
         recorder: _Recorder,
         cancel_flags: dict[str, str] | None,
         turn_id: str | None,
+        guards: ContentGuardConfig | None = None,
     ) -> None:
         self.name = name
         self.subtopic = subtopic
@@ -630,6 +744,7 @@ class _SubagentGate:
         self._recorder = recorder
         self._cancel_flags = cancel_flags
         self._turn_id = turn_id
+        self._guards = guards  # B15：报告回传面注入扫描（子代理报告→协调器裸面）
 
     def _boundary_cancel(self) -> None:
         """子任务边界取消感知（pop 即感知+清理——guards.pop_cancel_flag 同语义）。"""
@@ -676,6 +791,24 @@ class _SubagentGate:
                 ).warning()
                 return self._failed_state(f"子代理执行失败：{type(exc).__name__}")
             report = _extract_report(result, self.subtopic)
+            # B15：报告回传面注入扫描（summary/hard_facts/quotes——子代理报告→协调器
+            # 是无包裹裸面）；drop=报告置 failed:true 占位（失败隔离消费——不阻断其余），
+            # flag=保留+errors 留痕（rule_id 只进告警——零 payload）
+            report, injection_hits = filter_report(report, self._guards)
+            if injection_hits:
+                self._recorder.record_error(
+                    {
+                        "stage": "research",
+                        "reason": "injection_blocked",
+                        "subagent": self.name,
+                    }
+                )
+                if (
+                    self._guards is not None
+                    and self._guards.injection_filter is not None
+                    and self._guards.injection_filter.on_hit == "drop"
+                ):
+                    report = _failed_report(self.subtopic)
             self._recorder.complete(self.name, report)
             return result
 
@@ -880,6 +1013,8 @@ async def research(state: Any, config: RunnableConfig | None = None) -> dict[str
         thread_id=str(state.get("thread_id") or ""),
         turn_id=str(state.get("turn_id") or ""),
         time_range=state.get("time_range") if isinstance(state.get("time_range"), str) else None,
+        # B15：内容侧护栏轮内装载一次（缺子节回落 defaults 种子=部署即启用）
+        guards=load_content_guard_config(spec),
     )
 
     sem = asyncio.Semaphore(_max_subagents(deep_spec))
@@ -889,7 +1024,8 @@ async def research(state: Any, config: RunnableConfig | None = None) -> dict[str
         spec_dict = subagent_spec(subtopic, index=index, model=sub_model, deps=deps)
         compiled = create_sub_agent(spec_dict)
         gate = _SubagentGate(
-            f"research-{index}", subtopic, compiled, sem, recorder, cancel_flags, turn_id
+            f"research-{index}", subtopic, compiled, sem, recorder, cancel_flags, turn_id,
+            guards=deps.guards,
         )
         subagents.append(
             {"name": gate.name, "description": f"研究子课题：{subtopic}", "runnable": gate.runnable()}

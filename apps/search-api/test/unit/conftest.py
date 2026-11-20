@@ -35,3 +35,19 @@ def log_records() -> Iterator[list[dict]]:
         logger.remove(sink_id)
     except ValueError:  # setup_logging 已 logger.remove() 全清（sink 不存在属预期）
         pass
+
+
+@pytest.fixture(autouse=True)
+def _offline_url_guard_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B15 内容侧护栏：URL 校验 DNS 注入缝的套件级离线化（unit 零网络纪律）。
+
+    `content_guard.DEFAULT_RESOLVER` 是接线面 `validate_url_async` 的缺省 resolver
+    （生产 = socket.getaddrinfo）；测试统一换成确定性公网假体（任意主机 → 公网 IP）。
+    护栏的字面 IP / 短主机名 / 保留后缀判定不经 DNS、不受本假体影响；需要 NXDOMAIN /
+    私网解析语义的用例在本测内对同一缝后置覆盖（monkeypatch 后写生效）。
+    """
+    from app.agent.safety import content_guard  # noqa: PLC0415 —— fixture 局部导入
+
+    monkeypatch.setattr(
+        content_guard, "DEFAULT_RESOLVER", lambda host: ["93.184.216.34"]
+    )

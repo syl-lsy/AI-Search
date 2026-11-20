@@ -21,6 +21,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from app.agent.external_content import external_content
+from app.agent.safety.content_guard import (
+    UrlRejectedError,
+    scan_text_async,
+    validate_url_async,
+)
+from app.agent.safety.config import load_content_guard_config
 from app.agent.tools.registry import (
     READ_BACKUP_CHAIN,
     READ_PRIMARY_SOURCES,
@@ -38,6 +44,7 @@ __all__ = [
     "READ_PRIMARY_SOURCES",
     "READ_SOURCE_NAMES",
     "READ_TOOL_NAMES",
+    "UrlRejectedError",
     "estimate_tokens",
     "firecrawl_read",
     "resolve_read_chain",
@@ -132,12 +139,16 @@ async def firecrawl_read(
 ) -> str:
     """读取 URL 正文（deep 子代理工具；批次 2 research 经 deepagents 暴露）。
 
-    流程：读取链取可用源（主 firecrawl / 备 crawl4ai）→ registry.read 全量正文 →
-    token 窗口（limit 缺省 = head 限幅）→ 开/闭标记中性化 → `<external_content>`
-    包裹 → 窗口非全文时追加系统截断注记（模型必须知道只读到局部，续读带 offset）。
+    流程：读取链取可用源（主 firecrawl / 备 crawl4ai）→ **URL 护栏全量校验（B15——
+    拒收抛 UrlRejectedError，零物理调用零熔断计数）** → registry.read 全量正文 →
+    **窗口注入扫描（B15——drop 返回系统注零包裹；顺序锁：先扫描后转义）** → token
+    窗口（limit 缺省 = head 限幅）→ 开/闭标记中性化 → `<external_content>` 包裹 →
+    窗口非全文时追加系统截断注记（模型必须知道只读到局部，续读带 offset）。
 
     编程错误（offset<0 / limit<1 / url 空白）→ ValueError，零物理调用；链不可用
-    → SearchChainUnavailable（调用方决定跳过读原文——nacos §2 v1.8）。
+    → SearchChainUnavailable（调用方决定跳过读原文——nacos §2 v1.8）；URL 被护栏
+    拒收 → UrlRejectedError（B15 未接线工具面同判据——防未来接线漂移，接线方捕转
+    系统注 + errors 留痕，deep_research.firecrawl_read 闭包即此形态）。
     """
     url = url.strip()
     if not url:
@@ -150,6 +161,13 @@ async def firecrawl_read(
         raise SearchChainUnavailable(
             read_chain.detail or "读取链不可用（主位与备位链全部不可用）"
         )
+    guards = load_content_guard_config(spec if isinstance(spec, Mapping) else None)
+    if guards.url_guard is not None:
+        result = await validate_url_async(url, guards.url_guard)
+        if not result.ok:
+            raise UrlRejectedError(
+                f"url 被安全护栏拒绝（{result.reason}）——零物理调用"
+            )
 
     source = read_chain.sources[0]
     text = await registry.read(url, source)
@@ -158,6 +176,17 @@ async def firecrawl_read(
         text, offset=offset, limit=head_tokens if limit is None else limit
     )
     total = estimate_tokens(text)
+    # B15 顺序锁：注入扫描作用于原始窗口文本（先于中性化转义——转义后结构种子不可
+    # 检出）；drop=零包裹返回系统注（零 payload 进上下文），flag=照常包裹（留痕由
+    # 接线方 errors 面承担）
+    injection = guards.injection_filter
+    if injection is not None:
+        scan = await scan_text_async(window, injection)
+        if scan.hits and injection.on_hit == "drop":
+            return (
+                "（系统注：该页正文命中注入特征（injection_blocked），已整页拦截——"
+                "请改读其他来源。）"
+            )
     wrapped = external_content(_neutralize_content(window), source=url, kind="web")
     if end < total:
         wrapped += (

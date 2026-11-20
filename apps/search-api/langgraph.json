@@ -1,5 +1,6 @@
 {
   "dependencies": ["."],
+  "env": ".env",
   "graphs": {
     "main": "app.agent.graphs.main:graph",
     "fast": "app.agent.graphs.fast:graph",

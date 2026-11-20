@@ -421,7 +421,9 @@ async def test_fuse_rerank_emits_images_right_after_sources(
 ) -> None:
     """§7.4 快速序列：images 发射紧邻 emit_sources 之后（topN 截断后同节点尾部）——
     TurnRunner 按发射次序翻译，sources → images → stage(write,running) 落位成立。"""
-    fused = [_cand(f"https://a/{i}", img_src=f"https://i/{i}.png") for i in range(5)]
+    # fixture URL 用点分域名（B15 起节点尾部对 images 条目过 url_guard——无点短主机名
+    # 会被保留主机名禁令拒收；纯 select_images 直调用例不受影响，仍可用短形态）
+    fused = [_cand(f"https://a.example/{i}", img_src=f"https://i.example/{i}.png") for i in range(5)]
     captured = _capture_emits(monkeypatch)
 
     update = await fuse_module.fuse_rerank(
@@ -435,9 +437,9 @@ async def test_fuse_rerank_emits_images_right_after_sources(
     assert kinds.index("images") == kinds.index("sources") + 1
     (images_payload,) = [payload for kind, payload in captured if kind == "images"]
     assert [item["url"] for item in images_payload] == [
-        "https://i/0.png",
-        "https://i/1.png",
-        "https://i/2.png",
+        "https://i.example/0.png",
+        "https://i.example/1.png",
+        "https://i.example/2.png",
     ]
     assert "images" not in update  # 选图发射不产 state 写入（images_raw 归 merge_dedupe）
 
@@ -460,10 +462,11 @@ async def test_fuse_rerank_images_follow_post_rerank_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """KB 命中 rerank 重排后：选图跟随重排后的 fused 序（§7.4「沿 fused 序」口径）。"""
+    # fixture URL 用点分域名（B15 起节点尾部 images 条目过 url_guard——同 emits 测试注）
     fused = [
-        _cand("https://low/1", img_src="https://i/low.png", origin=["kb", "tavily"]),
-        _cand("https://kb/2", img_src="https://i/kb.png", origin=["kb"]),
-        _cand("https://mid/3", img_src="https://i/mid.png", origin=["kb"]),
+        _cand("https://low.example/1", img_src="https://i.example/low.png", origin=["kb", "tavily"]),
+        _cand("https://kb.example/2", img_src="https://i.example/kb.png", origin=["kb"]),
+        _cand("https://mid.example/3", img_src="https://i.example/mid.png", origin=["kb"]),
     ]
     seen: list[list[str]] = []
 
@@ -478,9 +481,9 @@ async def test_fuse_rerank_images_follow_post_rerank_order(
         {
             "fused": fused,
             "images_raw": [
-                {"url": "https://i/low.png", "source_url": "https://low/1", "title": "t:low"},
-                {"url": "https://i/kb.png", "source_url": "https://kb/2", "title": "t:kb"},
-                {"url": "https://i/mid.png", "source_url": "https://mid/3", "title": "t:mid"},
+                {"url": "https://i.example/low.png", "source_url": "https://low.example/1", "title": "t:low"},
+                {"url": "https://i.example/kb.png", "source_url": "https://kb.example/2", "title": "t:kb"},
+                {"url": "https://i.example/mid.png", "source_url": "https://mid.example/3", "title": "t:mid"},
             ],
             "query": "用户原始问题",
             "spec": {"fast": {"fuse_top_n": 10}, "kb": {"rerank_timeout_s": 2}},
@@ -490,9 +493,9 @@ async def test_fuse_rerank_images_follow_post_rerank_order(
 
     (images_payload,) = [payload for kind, payload in captured if kind == "images"]
     assert [item["url"] for item in images_payload] == [
-        "https://i/kb.png",
-        "https://i/mid.png",
-        "https://i/low.png",
+        "https://i.example/kb.png",
+        "https://i.example/mid.png",
+        "https://i.example/low.png",
     ]
 
 
@@ -500,11 +503,11 @@ async def test_fuse_rerank_still_writes_only_faststate_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """images 发射不扩 state 写入面（images_raw 归 merge_dedupe 填充——断点 2 单一落点）。"""
-    fused = [_cand("https://a/1", img_src="https://i/1.png")]
+    fused = [_cand("https://a.example/1", img_src="https://i.example/1.png")]
     _capture_emits(monkeypatch)
 
     update = await fuse_module.fuse_rerank(
-        {"fused": fused, "images_raw": [{"url": "https://i/1.png"}], "query": "q",
+        {"fused": fused, "images_raw": [{"url": "https://i.example/1.png"}], "query": "q",
          "spec": {"fast": {"fuse_top_n": 10}}},
         None,
     )
@@ -512,6 +515,53 @@ async def test_fuse_rerank_still_writes_only_faststate_keys(
     from app.agent.state import FastState
 
     assert set(update) <= set(FastState.__annotations__)
+
+
+# ---- B15 内容侧护栏：图片收口（images 事件出侧 url_guard 全判据）----
+
+
+async def test_fuse_rerank_image_source_url_metadata_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """池条目 source_url 指向元数据端点 → 该图剔除（url 已校验面之外的新判据——
+    此前只查主 url）；errors url_rejected 留痕；干净图照常发射。"""
+    fused = [_cand("https://a.example/1", img_src="https://i.example/ok.png")]
+    images_raw = [
+        {"url": "https://i.example/bad.png", "source_url": "http://169.254.169.254/x", "title": "t:bad"},
+    ]
+    captured = _capture_emits(monkeypatch)
+
+    update = await fuse_module.fuse_rerank(
+        {"fused": fused, "images_raw": images_raw, "query": "q",
+         "spec": {"fast": {"fuse_top_n": 10}}},
+        None,
+    )
+
+    (images_payload,) = [payload for kind, payload in captured if kind == "images"]
+    assert [item["url"] for item in images_payload] == ["https://i.example/ok.png"]
+    assert update["errors"] == [{"stage": "search", "reason": "url_rejected", "count": 1}]
+    assert "degraded" not in update  # 护栏动作不置 degraded（errors 路径零 degraded 键）
+
+
+async def test_fuse_rerank_image_main_url_private_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主 url 字面私网 → 剔除（既有协议白名单之外的 SSRF 判据）；全图被剔 → 零
+    images 事件（合法）。"""
+    fused = [
+        _cand("https://a.example/1", img_src="http://10.0.0.5/x.png"),
+        _cand("https://a.example/2", img_src="https://i.example/ok.png"),
+    ]
+    captured = _capture_emits(monkeypatch)
+
+    await fuse_module.fuse_rerank(
+        {"fused": fused, "images_raw": [], "query": "q",
+         "spec": {"fast": {"fuse_top_n": 10}}},
+        None,
+    )
+
+    (images_payload,) = [payload for kind, payload in captured if kind == "images"]
+    assert [item["url"] for item in images_payload] == ["https://i.example/ok.png"]
 
 
 # ---- 模块防呆：registry 导出面不被误改 ----

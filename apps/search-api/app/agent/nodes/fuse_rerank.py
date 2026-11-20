@@ -21,6 +21,8 @@ sources 事件发射点 = 本节点（最终集经 topN 截断/rerank 重排定�
 **images 事件发射点 = 本节点尾部（A6，REQ-004）**：选图沿 fused 序取前 ≤IMAGES_MAX_COUNT
 （ARCH:413「按相关度取 3（OQ-6）」——3 为语义化代码常量，不进 Nacos），协议白名单
 http/https + URL 去重 + 池殿后补位，过滤后为空则不发射（轮内零 images 事件合法）；
+**B15 图片收口**：发射前逐条 url_guard 全判据（url + source_url——字面私网/元数据/
+短主机名等 SSRF 判据），拒收剔除 + errors url_rejected 留痕、不置 degraded；
 发射紧邻 emit_sources 之后——§7.4 快速序列 images(可选) 位于 sources 与
 stage(write,running) 之间。节点纯函数：rerank 客户端可 mock，零 DB/EventBus。
 """
@@ -38,6 +40,8 @@ from langchain_core.runnables import RunnableConfig
 from app.agent.graphs.signals import emit_images, emit_sources, emit_stage
 from app.agent.guards import ensure_not_canceled
 from app.agent.nodes.merge_dedupe import image_descriptor_from_candidate
+from app.agent.safety.config import load_content_guard_config
+from app.agent.safety.content_guard import filter_image_items
 from app.agent.state import Candidate
 from app.config_center.defaults import MODEL_MAPPING_CONFIG
 from app.core.config import litellm_settings
@@ -296,6 +300,14 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
     # A6：images 事件（可选）紧邻 sources 之后发射——§7.4 快速序列 sources → images(可选)
     # → stage(write,running)；无图不发（过滤后为空=轮内零 images 事件，合法）
     images = select_images(fused, state.get("images_raw") or [])
+    # B15 图片收口：images 出侧逐条 url_guard 全判据（url + source_url——此前只查主
+    # url 协议白名单）；拒收条目剔除（topN 已选不回补——安全优先），errors url_rejected
+    # 留痕；护栏动作不置 degraded（枚举封闭面零触碰）
+    spec = state.get("spec")
+    guards = load_content_guard_config(spec if isinstance(spec, Mapping) else None)
+    if images and guards.url_guard is not None:
+        images, image_errors = await filter_image_items(images, guards.url_guard, stage="search")
+        errors.extend(image_errors)
     if images:
         emit_images(images)
     if extra is not None:
