@@ -106,6 +106,9 @@ def _state(
     chat_model_key: str = "qwen",
     strategy: str | None = None,
     query_type: str | None = None,
+    parent_turn_id: str | None = None,
+    parent_sources: list[dict[str, Any]] | None = None,
+    history_recall: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "query": query,
@@ -120,6 +123,12 @@ def _state(
         state["search_strategy"] = strategy
     if query_type is not None:
         state["query_type"] = query_type
+    if parent_turn_id is not None:
+        state["parent_turn_id"] = parent_turn_id
+    if parent_sources is not None:
+        state["parent_sources"] = parent_sources
+    if history_recall is not None:
+        state["history_recall"] = history_recall
     return state
 
 
@@ -1331,3 +1340,284 @@ class TestSynthesisFallbackSignal:
         assert excinfo.value.kind == "synthesis_digest"
         assert excinfo.value.failure == "non_retryable"  # 无 last_error 形态
         assert tokens == [excinfo.value.answer_md]
+
+
+# ---- REQ-017 深度后追问消费面：{{history_block}} 条件扩容 + 引用映射 ----
+#
+# 契约钉字（api.md §2.4 v1.28 / nacos-config §1 v1.38 / PRD REQ-017 v1.30）：
+# {{history_block}} 渲染条件自「仅 recall」扩为「recall ∨ parented 轮」；
+# 引用映射口径：答案引用命中父轮来源 URL 时复用父轮来源卡并重映射为轮内编号
+# （[n]↔sources 双向核对与越界剔除机制不变）。
+
+_PARENT_TURN_ID = "0b1f3a2e-0000-4000-8000-0000000000aa"
+
+
+def _parent_card(url: str, title: str) -> dict[str, Any]:
+    return {
+        "url": url,
+        "title": title,
+        "snippet": "父轮来源片段",
+        "source_type": "web",
+        "score": 0.8,
+    }
+
+
+async def test_synthesis_renders_history_block_for_parented_non_recall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """{{history_block}} 渲染条件扩容（recall ∨ parented）：parented web 轮历史块非空。
+
+    断言价值：父轮摘要块+URL 表经 history_recall 末行进 {{history_block}}——非 recall
+    变体此前恒空串，parented 轮扩容后父轮上下文可见（direct/verify/web 非父轮变体仍
+    恒空串，nacos-config §1 v1.38）。
+    """
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        history_recall=[
+            {"q": "RAG 检索方案怎么选？", "a": "上一轮深度报告摘要：混合检索方案，来源见 URL 表。"},
+        ],
+    )
+
+    await synthesis(state, _config())
+
+    system = model.prompts[0][0].content
+    assert "上一轮深度报告摘要" in system  # 父轮块经历史块进提示词
+    assert "来源见 URL 表" in system
+
+
+async def test_synthesis_history_block_stays_empty_for_non_parented_non_recall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非父轮非 recall 变体恒空串不变（扩容不含非父轮 direct/verify/web）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案")])
+    state = _state(
+        strategy="web",
+        history_recall=[{"q": "旧问", "a": "旧答骨架内容XYZ"}],
+    )
+
+    await synthesis(state, _config())
+
+    assert "旧答骨架内容XYZ" not in model.prompts[0][0].content
+
+
+async def test_synthesis_parent_extension_supplied_and_returned_single_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """引用映射：父轮卡并入可引用来源面（URL 命中既有卡不重复供给），
+    生成后**全部扩展卡随 fused 返回**（v1.70 供给面语义——不再按引用紧缩）。
+
+    断言价值：① 供给面编号连续（[N+1..]）——[n]↔sources 双向核对口径不变；② URL
+    命中轮内既有来源（PRD「URL 相同的复用同一卡片」）→ 不重复供给；③ 被引用的父轮
+    卡以轮内编号（=供给编号）随 fused 返回，TurnRunner 按 fused 位置补行对齐。
+    """
+    base = [_cand("https://a/1"), _cand("https://b/2")]
+    model, _, _ = _install(
+        monkeypatch, [_text_chunks("结论[1]。补充父轮报告的混合检索结论[3]。")]
+    )
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[
+            _parent_card("https://c/3", "父轮来源C"),
+            _parent_card("https://b/2", "与轮内同URL"),  # URL 命中轮内既有来源 [2]
+        ],
+    )
+
+    update = await synthesis(state, _config())
+
+    system = model.prompts[0][0].content
+    assert "[3] 父轮来源C" in system  # 供给面：父轮卡编入 [N+1]（编号连续）
+    assert "与轮内同URL" not in system  # URL dupe 不重复供给（复用既有卡片）
+    assert update["answer_md"] == "结论[1]。补充父轮报告的混合检索结论[3]。"
+    assert update["fused"] == [*base, _parent_card("https://c/3", "父轮来源C")]  # 轮内编号 [3]=供给编号
+
+
+async def test_synthesis_parent_extension_skip_citation_keeps_numbering_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0（v1.70）：多扩展卡**跳引**（只引靠后的卡）→ 全部扩展卡仍随 fused 返回。
+
+    缺陷（评审实证）：旧实现按「被引用」紧缩扩展卡——fused=2 + 扩展 2 卡供给 [3][4]，
+    只引 [4] 时返回 fused 长 3，TurnRunner 按位置补行 ref_no=3，正文 [4] 悬空。
+    修复断言：返回 fused 含**全部**扩展卡（长 4），正文 [4] ↔ 落库位置 4 恒等。
+    """
+    base = [_cand("https://a/1"), _cand("https://b/2")]
+    model, _, _ = _install(monkeypatch, [_text_chunks("结论[1]。补充父轮报告的第二张卡[4]。")])
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[
+            _parent_card("https://c/3", "父轮来源C"),
+            _parent_card("https://d/4", "父轮来源D"),
+        ],
+    )
+
+    update = await synthesis(state, _config())
+
+    system = model.prompts[0][0].content
+    assert "[3] 父轮来源C" in system and "[4] 父轮来源D" in system  # 供给面完整
+    assert update["answer_md"].endswith("[4]。")  # 合法引用保留（≤供给面 4）
+    # 跳引不紧缩：两张扩展卡都在返回 fused（位置 3/4 = 正文引用编号 3/4）
+    assert update["fused"] == [
+        *base,
+        _parent_card("https://c/3", "父轮来源C"),
+        _parent_card("https://d/4", "父轮来源D"),
+    ]
+    assert len(update["fused"]) >= 4  # 编号稳定零重编号（[4] ↔ fused[3]）
+
+
+async def test_synthesis_uncited_parent_card_still_persisted_out_of_range_stripped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未引用父轮卡仍随 fused 返回（供给面非引用面，v1.70）；越界引用沿既有机制剔除。"""
+    base = [_cand("https://a/1"), _cand("https://b/2")]
+    model, _, _ = _install(monkeypatch, [_text_chunks("正文[1]。引用父轮[4]。")])
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[_parent_card("https://c/3", "父轮来源C")],
+    )
+
+    update = await synthesis(state, _config())
+
+    assert update["answer_md"] == "正文[1]。引用父轮。"  # [4] 越界剔除（供给面仅到 [3]）
+    assert update["fused"] == [*base, _parent_card("https://c/3", "父轮来源C")]
+    assert "[4]" not in update["answer_md"]
+
+
+async def test_synthesis_partial_fallback_keeps_parent_citation_within_supply_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3（v1.70）：partial 兜底剔除基准=供给面（含父轮扩展卡）——合法父轮引用不被误剔。
+
+    缺陷：旧实现按 len(fused)（不含扩展卡）剔除，parented 轮正文引用 [3] 被误删。
+    """
+    _tokens(monkeypatch)
+    _install(
+        monkeypatch,
+        [[_text_chunks("部分正文引用父轮[3]。")[0], ConnectionError("断")], [ConnectionError("再断")]],
+    )
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[_parent_card("https://c/3", "父轮来源C")],
+    )
+
+    with pytest.raises(SynthesisFallback) as excinfo:
+        await synthesis(state, _config())
+
+    fallback = excinfo.value
+    assert fallback.kind == "synthesis_partial"
+    assert "[3]" in fallback.answer_md  # 供给面 3 卡 → [3] 合法，不误剔
+
+
+async def test_synthesis_metadata_sources_compact_includes_parent_extension_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3（v1.70）：sources_compact 观测投影取最终供给面（含父轮扩展卡，M4 分桶需要）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案[3]。")])
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[_parent_card("https://c/3", "父轮来源C")],
+    )
+
+    await synthesis(state, _config())
+
+    metadata = (model.configs[0] or {}).get("metadata") or {}
+    compact = metadata.get("sources_compact")
+    assert compact is not None
+    assert [item["ref_no"] for item in compact] == [1, 2, 3]
+    assert compact[2]["url"] == "https://c/3"  # 父轮扩展卡进观测投影
+
+
+async def test_synthesis_partial_fallback_signal_carries_supply_fused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3（2026-11-21 终审留档兑现）：partial 兜底信号携带**供给面 fused**（含父轮
+    扩展卡）——与成功路径返回值同口径。
+
+    缺陷面：兜底信号此前只带 `source_count`（=本轮自有 fused 计数），TurnRunner
+    `_finish_synthesis_fallback` 无 fused 可补行 → partial 正文合法保留的父轮编号
+    [N+1..] 在终态 sources 里没有对应卡（[n]↔sources 悬空，持久化后不可自愈）。
+    修复断言：信号 fused 全量含扩展卡，TurnRunner 据其位置补行 ref_no。
+    """
+    base = [_cand("https://a/1"), _cand("https://b/2")]
+    _tokens(monkeypatch)
+    _install(
+        monkeypatch,
+        [[_text_chunks("部分正文引用父轮[3]。")[0], ConnectionError("断")], [ConnectionError("再断")]],
+    )
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[_parent_card("https://c/3", "父轮来源C")],
+    )
+
+    with pytest.raises(SynthesisFallback) as excinfo:
+        await synthesis(state, _config())
+
+    fallback = excinfo.value
+    assert fallback.kind == "synthesis_partial"
+    assert fallback.fused == [*base, _parent_card("https://c/3", "父轮来源C")]
+    assert fallback.source_count == 2  # 轮末观测口径不变（本轮自有 fused 条数）
+
+
+async def test_synthesis_digest_fallback_signal_carries_supply_fused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """digest 兜底信号同样携带供给面 fused（与成功路径对齐）：digest 正文只列本轮
+    自有来源（[1..N]）不产生悬空，但持久化面仍应与成功路径同口径（sources=供给面）。"""
+    base = [_cand("https://a/1"), _cand("https://b/2")]
+    _tokens(monkeypatch)
+    _install(monkeypatch, [[ConnectionError("断")], [ConnectionError("再断")]])
+    state = _state(
+        strategy="web",
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[_parent_card("https://c/3", "父轮来源C")],
+    )
+
+    with pytest.raises(SynthesisFallback) as excinfo:
+        await synthesis(state, _config())
+
+    fallback = excinfo.value
+    assert fallback.kind == "synthesis_digest"
+    assert fallback.fused == [*base, _parent_card("https://c/3", "父轮来源C")]
+
+
+async def test_synthesis_fallback_without_parent_extension_carries_no_fused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非父轮兜底：信号 fused=None（零补行面——常规轮终态 sources 已由事件批落库，
+    兜底路径零新增写入；防「无扩展卡也走补行」的重复建行面）。"""
+    _tokens(monkeypatch)
+    _install(monkeypatch, [[ConnectionError("断")], [ConnectionError("再断")]])
+
+    with pytest.raises(SynthesisFallback) as excinfo:
+        await synthesis(_state(), _config())
+
+    assert excinfo.value.fused is None
+
+
+@pytest.mark.parametrize("strategy", ["direct", "recall"])
+async def test_synthesis_parent_extension_not_offered_for_zero_source_strategies(
+    monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    """direct/recall parented 轮：历史块可见（条件扩容面）但父轮卡不进供给面——
+    零源轮契约钉字保护（direct 轮 2.5 sources[] 恒空、recall 轮 source_count=0）。"""
+    model, _, _ = _install(monkeypatch, [_text_chunks("答案正文，无需引用。")])
+    state = _state(
+        strategy=strategy,
+        parent_turn_id=_PARENT_TURN_ID,
+        parent_sources=[_parent_card("https://c/3", "父轮来源C")],
+        history_recall=[{"q": "旧问", "a": "父轮报告摘要标记文本"}],
+    )
+
+    update = await synthesis(state, _config())
+
+    system = model.prompts[0][0].content
+    assert "父轮报告摘要标记文本" in system  # 条件扩容：parented 轮历史块可见
+    assert "父轮来源C" not in system  # 供给面不扩（零源轮 source_count=0 契约保护）
+    assert "fused" not in update  # 零映射零 state 回写

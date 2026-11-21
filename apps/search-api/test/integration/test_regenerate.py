@@ -5,7 +5,8 @@
 
 - 状态机：degraded → running → completed；再失败 → degraded（可再次 regenerate）；
   failed-with-sources（崩溃孤儿形态）同可重生成；
-- 前置 409006 全前置面：completed / canceled / 零源 degraded / deep / 进行中重复点击；
+- 前置 409006 全前置面：completed / canceled / 零源 degraded / 零源 deep / 进行中
+  重复点击（v1.28：deep 有源 degraded/failed 放开——deep 正形态专项用例）；
   归属 404001：不存在 / 越权 / 非法 UUID 同码；
 - SSE 同通道续推（决策 11/15）：reopen 后旧事件重放 → stage(write,running) → token…
   → 第二个 done（seq 更大、finish=completed、source_count 沿该轮累计不变）；无
@@ -320,13 +321,82 @@ async def test_regenerate_zero_source_degraded_409006(
     assert response.json()["code"] == "409006"
 
 
-async def test_regenerate_deep_turn_409006(
+async def test_regenerate_deep_zero_source_409006(
     migrated_db: Any, async_client: Any, b2_runtime: Any
 ) -> None:
-    await _seed_and_sync(migrated_db, status="degraded", mode="deep")
+    """§2.12 v1.28：deep 零源 degraded → 409006（前置第 2 条同判据单码覆盖；
+    deep 有源 degraded/failed 已放开——正形态见 test_regenerate_deep_turn_completes）。"""
+    await _seed_and_sync(migrated_db, status="degraded", mode="deep", with_sources=False)
     response = await async_client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
     assert response.status_code == 409
     assert response.json()["code"] == "409006"
+
+
+async def test_regenerate_deep_turn_completes_and_reconciles(
+    migrated_db: Any, async_client: Any, b2_runtime: Any, b2_rest: Any
+) -> None:
+    """§2.12 v1.28 + §7.4 深度 regenerate 形态：deep 有源 degraded 轮 → 200 running →
+    completed；事件面无 plan/search/read/reflect 段（stage_key 仅 write）、token 流经
+    messages（writer 帧）、第二 done（finish=completed、source_count 沿轮累计不变）；
+    收尾 answer_md 原地更新、stages 追加 write 段、duration_ms 不覆写、
+    error/degraded_reason 清空。"""
+    await _seed_and_sync(migrated_db, status="degraded", mode="deep")
+    response = await async_client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "running"
+
+    detail = await b2_rest.wait_turn_status(str(_TURN_ID), {"completed"})
+    assert detail["answer_md"] == stub_flow.FAKE_DEEP_REGENERATE_ANSWER_MD
+    assert detail["degraded"] is False and detail["degraded_reason"] is None
+    assert detail["error"] is None
+    assert detail["duration_ms"] == _DURATION_MS  # 不覆写
+    assert len(detail["sources"]) == 2  # 不重检索
+    stages = detail["stages"]
+    assert len(stages) == len(_OLD_STAGES) + 1  # 追加不覆写
+    assert stages[-1]["stage_key"] == "write"
+
+    stream = await async_client.get(f"/api/v1/turns/{_TURN_ID}/events")
+    assert stream.status_code == 200
+    frames, _ = parse_sse_frames(stream.text)
+    for frame in frames:
+        _assert_sse_envelope(frame, str(_TURN_ID))
+    names = [frame["event"] for frame in frames]
+    assert names.count("done") >= 1 and names[-1] == "done"
+    dones = [frame["data"] for frame in frames if frame["event"] == "done"]
+    assert dones[-1]["finish"] == "completed"
+    assert dones[-1]["source_count"] == 2
+    assert "token" in names
+    assert "sources" not in names and "images" not in names  # 不重检索
+    stage_keys = {
+        frame["data"].get("stage_key") for frame in frames if frame["event"] == "stage"
+    }
+    assert stage_keys == {"write"}  # 无 plan/search/read/reflect 段
+    write_running = next(
+        frame["data"]
+        for frame in frames
+        if frame["event"] == "stage" and frame["data"].get("status") == "running"
+    )
+    assert write_running["label"] == "撰写报告"  # 无大纲回落 label（§7.4:944）
+
+
+async def test_regenerate_deep_turn_fallback_degrades_without_error(
+    migrated_db: Any, async_client: Any, b2_runtime: Any, b2_rest: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§7.4:946 deep 再失败形态：writer 兜底标记 → 兜底产出收束（零 error 事件、
+    status=degraded、degraded_reason=None、answer_md=兜底全文、duration 不覆写）。"""
+    digest = "报告撰写未能完成（生成超时或失败），以下是本次研究收集到的来源速览。"
+    monkeypatch.setattr(stub_flow, "FAKE_DEEP_REGENERATE_FALLBACK", digest)
+    await _seed_and_sync(migrated_db, status="degraded", mode="deep")
+    response = await async_client.post(f"/api/v1/turns/{_TURN_ID}/regenerate")
+    assert response.status_code == 200
+
+    detail = await b2_rest.wait_turn_status(str(_TURN_ID), {"degraded"})
+    assert detail["error"] is None  # 兜底轮无错误卡
+    assert detail["degraded_reason"] is None  # 枚举零扩容
+    assert detail["answer_md"] == digest
+    assert detail["duration_ms"] == _DURATION_MS
+    assert len(detail["sources"]) == 2
 
 
 async def test_regenerate_not_found_and_cross_user_404001(

@@ -14,6 +14,7 @@ cancel 两态 + 409002；resolve_chat_model 非法键 400001；B13 拒绝轮（e
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -54,6 +55,7 @@ from test.unit.turn_fakes import (
     _FakeSession,
     _FakeSessionFactory,
     _MessageChunk,
+    _QueuedFakeSession,
     _TurnRow,
     _bus,
     _drain_all,
@@ -1126,6 +1128,108 @@ async def test_synthesis_fallback_finishes_degraded_without_error(kind: str, ans
     assert "token" not in {e.event_type for e in events}
     channel = bus._channels.get(str(turn.id))
     assert channel is not None and channel.terminal is True
+
+
+class _ParentedFallbackGraph(_FakeGraph):
+    """parented 兜底假图：sources 批（本轮自有 2 卡）→ stage(write running) →
+    stage(write done, extra.fallback=synthesis_partial) → 抛 SynthesisFallback
+    （fused=供给面 3 卡=本轮 2 卡 + 父轮首卡，与 synthesis 成功路径返回同口径）。"""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def astream(self, payload: Any, config: Any = None, stream_mode: Any = None,
+                subgraphs: bool = False) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+        self_cards = [
+            {"url": "https://a/1", "title": "A", "snippet": "s", "source_type": "web", "score": 0.9},
+            {"url": "https://b/2", "title": "B", "snippet": "s", "source_type": "web", "score": 0.8},
+        ]
+        batch = [
+            {**card, "ref_no": idx} for idx, card in enumerate(self_cards, start=1)
+        ]
+        parent_card = dict(payload["parent_sources"][0])  # 父轮首卡（state 注入形态）
+
+        async def gen():
+            yield (("fast:r1",), "custom", {"type": "sources", "batch": batch, "total": 2})
+            yield (
+                ("fast:r1",), "custom",
+                {"type": "stage", "stage_key": "write", "status": "running", "label": "综合中"},
+            )
+            yield (
+                ("fast:r1",), "custom",
+                {"type": "stage", "stage_key": "write", "status": "done",
+                 "extra": {"fallback": "synthesis_partial"}},
+            )
+            raise SynthesisFallback(
+                answer_md="部分正文：父轮报告的评测结论[3]。",
+                kind="synthesis_partial",
+                failure="timeout",
+                attempts=2,
+                source_count=2,
+                fused=[*self_cards, parent_card],
+            )
+
+        return gen()
+
+
+class _ParentAwareSession(_QueuedFakeSession):
+    """按主键分派 get 的假会话：父轮键→父轮行（completed），本运行轮键→运行行。
+
+    单行假体（`_FakeSession.get` 恒返 self.turn）在 parented 用例里会让父轮装载拿到
+    运行行（status=running → 父轮上下文判 None）；本假体只区分两行、其余行为沿父类。
+    """
+
+    def __init__(self, *, turn: Any, parent: Any, **kw: Any) -> None:
+        super().__init__(turn=turn, **kw)
+        self._parent = parent
+
+    async def get(self, model: Any, key: Any, *, with_for_update: bool = False) -> Any:
+        if str(key) == str(self._parent.id):
+            return self._parent
+        return await super().get(model, key, with_for_update=with_for_update)
+
+
+async def test_parented_synthesis_fallback_persists_parent_extension_cards() -> None:
+    """P3（2026-11-21 终审留档兑现）：parented 轮走 SynthesisFallback 兜底时，终态
+    sources 必须补建父轮扩展卡（与成功路径 `_persist_parent_source_appends` 同判据）。
+
+    缺陷面：partial 正文保留合法父轮编号 [N+1..]（剔除基准=供给面），但兜底路径此前
+    不补行 → 终态 sources 只有本轮自有卡，[3] 悬空（§2.5「[n]↔sources 双向核对」
+    持久化后不可自愈）。修复断言：① 补建行 ref_no=fused 位置（=正文编号）；②
+    done.source_count ↔ sources 行数一致；③ 正文引用编号集合 ⊆ 落库 ref_no 集合
+    （零悬空）。
+    """
+    bus = _bus()
+    turn = _parented_turn()
+    session = _ParentAwareSession(
+        turn=turn,  # 行锁取回=本运行轮（非父轮行：父轮行 status=completed 会被终态判据拦下）
+        parent=_parent_row(),
+        execute_queue=[
+            [(_PARENT_QUERY, _PARENT_REPORT_MD)],  # history 行集（父轮即最近一轮）
+            list(_PARENT_SOURCE_ROWS),  # 父轮 sources 行集（ref_no 序）
+        ],
+    )
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), _ParentedFallbackGraph())
+
+    await scheduler._execute_turn(turn)
+
+    sources = [row for row in session.added if isinstance(row, Source)]
+    ref_nos = sorted(row.ref_no for row in sources)
+    assert ref_nos == [1, 2, 3]  # 2 张本轮自有卡 + 1 张父轮扩展卡（位置编号）
+    parent_row = next(row for row in sources if row.ref_no == 3)
+    assert parent_row.url == "https://docs.example.com/hybrid"  # 父轮首卡原位补行
+    assert parent_row.title == "混合检索综述"
+    # 正文引用编号 ↔ 落库 ref_no：零悬空（[3] 有卡可对）
+    cited = {int(n) for n in re.findall(r"\[(\d+)\]", str(turn.answer_md))}
+    assert cited == {3}
+    assert cited <= set(ref_nos)
+    done = next(e for e in await _drain_all(bus, str(turn.id)) if e.event_type == "done")
+    assert done.data["finish"] == "degraded"
+    assert done.data["source_count"] == len(ref_nos) == 3  # done ↔ sources[] 一致
+    assert turn.status == "degraded"
+    assert turn.answer_md == "部分正文：父轮报告的评测结论[3]。"
 
 
 async def test_synthesis_error_zero_source_fails_with_500101() -> None:
@@ -2217,3 +2321,400 @@ def test_sanitize_history_rows_passthrough_when_safety_none() -> None:
     rows: list[Any] = [(_HISTORY_PII_QUERY, _HISTORY_PII_ANSWER)]
 
     assert ThreadScheduler._sanitize_history_rows(rows, None) == rows
+
+
+# ---- REQ-017 深度后追问消费面：父轮上下文经 history 通道注入（api.md §2.4 v1.28）----
+#
+# 契约钉字（api.md §2.4 v1.28 / PRD REQ-017 v1.30）：带 parent_turn_id 的 fast 轮启动时
+# 服务端装配父轮上下文——父轮 answer_md 摘要块 + sources URL 表经 history 通道注入
+# rewrite/planner（{{history}} {{history_block}} 均既有占位符承载）；父轮块经 history
+# 既有脱敏管道；引用映射口径：答案引用命中父轮来源 URL 时复用父轮来源卡并重映射为轮内编号。
+
+_PARENT_ID = "0b1f3a2e-0000-4000-8000-0000000000aa"
+_PARENT_REPORT_MD = (
+    "先说结论：RAG 检索用混合方案。\n\n"
+    "## 检索层设计\n\n"
+    "向量检索与 BM25 并行召回，融合排序。此处中段细节不应搬运进摘要。\n\n"
+    "## 评测结论\n\n"
+    "召回率提升 18%。\n"
+)
+_PARENT_QUERY = "RAG 检索方案怎么选？"
+_PARENT_SOURCE_ROWS = [
+    (1, "混合检索综述", "https://docs.example.com/hybrid", "混合检索概述", "web", 0.91),
+    (2, "Rerank 实践", "https://docs.example.com/rerank", "重排实践", "web", 0.87),
+]
+
+
+def _parent_row(
+    *, status: str = "completed", answer_md: str | None = _PARENT_REPORT_MD
+) -> Any:
+    """父轮（深度轮）行假体：id 钉 _PARENT_ID、同线程默认值、answer_md=报告全文。"""
+    row = _TurnRow(status=status, mode="deep", query=_PARENT_QUERY)
+    row.id = uuid.UUID(_PARENT_ID)
+    row.answer_md = answer_md
+    return row
+
+
+def _parented_turn() -> Any:
+    """parented fast 追问轮假体（thread_service 自动挂载后的形态，§2.4）。"""
+    turn = _TurnRow(status="running", mode="fast", query="报告第二部分的评测结论展开讲讲")
+    turn.parent_turn_id = _PARENT_ID
+    return turn
+
+
+async def test_parented_turn_injects_parent_context_into_history_channels() -> None:
+    """父轮上下文消费面：parented fast 轮 initial_state 装配三面。
+
+    断言价值：① state 注入 parent_turn_id + parent_sources（仅 parented 轮）；② 父轮块
+    作为**附加条目**进通道一 {{history}}（a_head≤200 既有口径）；③ 通道二 history_recall
+    末行=父轮块**原样**（不二次骨架化——块自带摘要形态+URL 表，超 200 字头的摘要块形态
+    +URL 表供 [n] 引用，api.md §2.4 v1.28）。
+    """
+    bus = _bus()
+    turn = _parented_turn()
+    session = _QueuedFakeSession(
+        turn=_parent_row(),
+        execute_queue=[
+            [(_PARENT_QUERY, _PARENT_REPORT_MD)],  # history 行集（父轮即最近一轮：窗口内自然行）
+            list(_PARENT_SOURCE_ROWS),  # 父轮 sources 行集（ref_no 序）
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert payload["parent_turn_id"] == _PARENT_ID
+    assert payload["parent_sources"] == [
+        {
+            "url": "https://docs.example.com/hybrid",
+            "title": "混合检索综述",
+            "snippet": "混合检索概述",
+            "source_type": "web",
+            "score": 0.91,
+        },
+        {
+            "url": "https://docs.example.com/rerank",
+            "title": "Rerank 实践",
+            "snippet": "重排实践",
+            "source_type": "web",
+            "score": 0.87,
+        },
+    ]
+    # 通道一：窗口自然行形态零变化 + 父轮块附加条目（同 q 双条目=附加条目语义）
+    assert payload["history"][0] == {
+        "q": _PARENT_QUERY,
+        "a_head": _PARENT_REPORT_MD[:200],
+    }
+    block_entry = payload["history"][-1]
+    assert block_entry["q"] == _PARENT_QUERY
+    assert block_entry["a_head"].startswith("（上一轮深度报告")  # 块头标注（身份框定）
+    assert "先说结论：RAG 检索用混合方案。" in block_entry["a_head"]  # 摘要块=骨架形态
+    # 通道二：窗口行仍走骨架配方（中段细节不搬运）+ 父轮块原样进末行
+    assert "此处中段细节不应搬运进摘要" not in payload["history_recall"][0]["a"]
+    parent_block = payload["history_recall"][-1]  # 父轮块行（已脱敏，原样进通道二）
+    assert parent_block["q"] == _PARENT_QUERY
+    assert "先说结论：RAG 检索用混合方案。" in parent_block["a"]  # 首段（结论先行）
+    assert "## 评测结论" in parent_block["a"]  # 标题骨架在场
+    assert "召回率提升 18%。" in parent_block["a"]  # 每节首句
+    assert "此处中段细节不应搬运进摘要" not in parent_block["a"]  # 中段细节不搬运
+    # URL 表仅列 URL 供核对（v1.70 修复后不呈现任何父轮编号锚点形态）
+    assert "https://docs.example.com/hybrid" in parent_block["a"]
+    assert "混合检索综述" in parent_block["a"]
+    assert not re.search(r"[\[［]\s*\d{1,3}\s*[\]］]", parent_block["a"])
+
+
+# ---- REQ-017 父轮块「去引用锚点形态」修复（ARCH §6.5 v1.70 / api.md §2.4 v1.28）----
+#
+# 缺陷（M2 批次 5 活体实锤，docs/m2-batch5-live-20261120.md 探针②-② 注 1）：父轮 answer_md
+# 骨架里的 [n] 指向**父轮** ref_no，而 synthesis 的父轮扩展卡按本轮接续编号（[N+1..]）落库
+# ——模型照引父轮编号 → 答案文本与本轮 sources 的 ref_no 错位（§2.5 [n]↔ref_no 一一对应失效，
+# 前端 [n]↔sources 联动断）。轮内接续编号取决于 web_search 后的 fused 数量、装配期不可预知，
+# 故修法=父轮块内不呈现父轮编号锚点（摘要去 [n] + URL 表不带编号）+ 引用指引句让模型从本轮
+# sources_block 取号；编号重映射仍由 synthesis 供给面（`_parent_source_extension`）承担。
+
+_PARENT_CITED_REPORT_MD = (
+    "先说结论：混合检索在召回率上领先 18% [18][21]。\n\n"
+    "## 检索层设计\n\n"
+    "向量与 BM25 并行召回后融合排序 [31][68]。\n\n"
+    "## 评测结论\n\n"
+    "召回率提升 18% [71]。\n"
+)
+
+
+async def test_parent_block_strips_parent_citation_anchors_and_guides_to_turn_numbers() -> None:
+    """父轮块去引用锚点形态：摘要 [n] 剔除 + 指引句 + URL 表无编号（v1.70 修复面）。
+
+    断言价值：父轮块内不得出现任何 `[数字]` 形态（父轮 ref_no 锚点会让模型照引、与本轮
+    sources 的 ref_no 错位）；指引句必须把引用指向「本轮来源列表的 [n]」；URL 表保留 URL
+    供核对但**不提供编号**；正文里与引用无关的数字（18%）不受影响。
+    """
+    bus = _bus()
+    turn = _parented_turn()
+    session = _QueuedFakeSession(
+        turn=_parent_row(answer_md=_PARENT_CITED_REPORT_MD),
+        execute_queue=[
+            [(_PARENT_QUERY, _PARENT_CITED_REPORT_MD)],
+            list(_PARENT_SOURCE_ROWS),
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    block = graph.payloads[0]["history_recall"][-1]["a"]
+    # ① 父轮 ref_no 锚点一律不呈现（正文数字不受影响）
+    assert not re.search(r"[\[［]\s*\d{1,3}\s*[\]］]", block)
+    assert "18%" in block  # 非引用数字保留
+    # ② 引用指引句（指向本轮来源列表编号；直接/回顾 parented 轮零源 → 限定语兜住）
+    assert "父轮来源已并入本轮来源列表" in block
+    assert "（如本轮存在来源列表）" in block
+    assert "引用一律使用本轮来源列表的 [n] 编号" in block
+    assert "[n]" in block  # 指引句里的字面占位（字母 n，非数字锚点）
+    # ③ URL 表无编号（"- 标题：URL" 形态，供核对不供取号）
+    assert "- 混合检索综述：https://docs.example.com/hybrid" in block
+    assert "- Rerank 实践：https://docs.example.com/rerank" in block
+
+
+async def test_parent_block_passes_through_history_pipeline_unchanged() -> None:
+    """父轮块经 _sanitize_history_rows 管道原样透传（safety 关=直通，v1.70 装配面语义）。
+
+    断言价值：修复只改装配（`_load_parent_context` 产出的块形态），不得在管道里二次骨架化/
+    二次改写——通道二末行与装配函数直产块逐字相等。
+    """
+    bus = _bus()
+    turn = _parented_turn()
+    parent = _parent_row(answer_md=_PARENT_CITED_REPORT_MD)
+    session = _QueuedFakeSession(
+        turn=parent,
+        execute_queue=[
+            [(_PARENT_QUERY, _PARENT_CITED_REPORT_MD)],
+            list(_PARENT_SOURCE_ROWS),
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+    await scheduler._execute_turn(turn)
+    piped = graph.payloads[0]["history_recall"][-1]["a"]
+
+    direct_scheduler = _scheduler(
+        _bus(),
+        _FakeSessionFactory(
+            _QueuedFakeSession(turn=parent, execute_queue=[list(_PARENT_SOURCE_ROWS)])
+        ),
+        _FakeGraph([]),
+    )
+    direct = await direct_scheduler._load_parent_context(turn)
+    assert direct is not None
+    assert piped == direct["block"]
+
+
+async def test_parent_block_summary_budget_unchanged_and_no_table_without_sources() -> None:
+    """摘要块 ≤2000 字纪律不变 + 无父轮来源时零表零指引（零锚点形态的双向边界）。"""
+    long_answer = "先说结论：" + "长" * 5000 + "\n\n## 尾节\n\n尾节首句。\n"
+    bus = _bus()
+    turn = _parented_turn()
+    # 形态一：有父轮来源 → 块 = 块头 + 摘要（≤预算）+ 指引与表
+    session = _QueuedFakeSession(
+        turn=_parent_row(answer_md=long_answer),
+        execute_queue=[[(_PARENT_QUERY, long_answer)], list(_PARENT_SOURCE_ROWS)],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+    await scheduler._execute_turn(turn)
+    block_with_table = graph.payloads[0]["history_recall"][-1]["a"]
+    assert len(block_with_table) < turn_service.PARENT_CONTEXT_SUMMARY_CHARS + 400
+
+    # 形态二：父轮零来源 → 仅摘要块（无表无指引句）
+    session = _QueuedFakeSession(
+        turn=_parent_row(answer_md=long_answer),
+        execute_queue=[[(_PARENT_QUERY, long_answer)], []],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+    await scheduler._execute_turn(turn)
+    block_no_table = graph.payloads[0]["history_recall"][-1]["a"]
+    assert block_no_table.startswith("（上一轮深度报告")
+    assert "父轮来源已并入本轮来源列表" not in block_no_table
+    assert len(block_no_table) <= turn_service.PARENT_CONTEXT_SUMMARY_CHARS + 60
+
+
+async def test_non_parented_turn_state_has_zero_parent_keys() -> None:
+    """无父轮轮零波及：parent 两键不出现，既有键集与值形态零变化。"""
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="普通追问")
+    session = _FakeSession(turn=turn, execute_rows=[("上一问", "上一答。")])
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert "parent_turn_id" not in payload
+    assert "parent_sources" not in payload
+    assert payload["history"] == [{"q": "上一问", "a_head": "上一答。"}]
+    assert payload["history_recall"] == [{"q": "上一问", "a": "上一答。"}]
+
+
+@pytest.mark.parametrize(
+    ("parent_kwargs", "reason"),
+    [
+        pytest.param({"__missing__": True}, "parent_missing", id="parent_missing"),
+        pytest.param({"status": "running"}, "parent_not_terminal", id="parent_not_terminal"),  # 非终态父轮不合资格（§2.4 completed/degraded）
+        pytest.param({"answer_md": None}, "parent_answer_empty", id="parent_answer_empty"),
+        pytest.param({"answer_md": "   "}, "parent_answer_blank", id="parent_answer_blank"),
+    ],
+)
+async def test_parent_context_unavailable_falls_back_cleanly(
+    parent_kwargs: dict[str, Any], reason: str
+) -> None:
+    """父轮上下文不可得（父轮行缺失/非终态/空答案）→ 零注入零波及，轮照常启动。"""
+    bus = _bus()
+    turn = _parented_turn()
+    parent = None if reason == "parent_missing" else _parent_row(**parent_kwargs)
+    session = _QueuedFakeSession(
+        turn=parent,
+        execute_queue=[[("上一问", "上一答。")], []],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    assert "parent_turn_id" not in payload
+    assert "parent_sources" not in payload
+    assert payload["history"] == [{"q": "上一问", "a_head": "上一答。"}]
+    assert payload["history_recall"] == [{"q": "上一问", "a": "上一答。"}]
+
+
+async def test_parented_turn_block_sanitized_through_history_pipeline() -> None:
+    """父轮块经 history 既有脱敏管道（api.md §2.4 v1.28）：safety 开 → 父轮 q/块 PII 占位化。
+
+    断言价值：父轮块并入行集必须发生在 sanitize **之前**（与线程历史行同一管道）——
+    父轮报告/查询里的 PII 不得经 {{history}}/{{history_block}} 出域 LLM。
+    """
+    bus = _bus()
+    turn = _parented_turn()
+    parent = _parent_row(answer_md="报告结论：手机号 13812345678 的查询记录已归档。")
+    parent.query = "我的手机号 13812345678 能查到什么？"  # 父轮 query 自带 PII（块条目 q 面）
+    session = _QueuedFakeSession(
+        turn=parent,
+        execute_queue=[
+            [("更早一问", "更早答案。")],  # 窗口行零 PII（隔离父轮侧断言面）
+            [(1, "存证页", "https://docs.example.com/e", "alice@example.com 索引", "web", 0.9)],
+        ],
+    )
+    graph = _FakeGraph([_updates({"write": {"answer_md": "答案"}})])
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph, spec=_SAFETY_ON_SPEC)
+
+    await scheduler._execute_turn(turn)
+
+    payload = graph.payloads[0]
+    # 通道一附加条目（末行）：q=父轮 query 脱敏、块=父轮答案脱敏
+    assert payload["history"][-1]["q"] == "我的手机号 [手机号] 能查到什么？"
+    assert "[手机号]" in payload["history"][-1]["a_head"]
+    # 通道二末行（原样块）：同样脱敏
+    assert payload["history_recall"][-1]["q"] == "我的手机号 [手机号] 能查到什么？"
+    assert "[手机号]" in payload["history_recall"][-1]["a"]
+    # 出域面终检：两通道序列化后零原文号码/邮箱（URL 表 title/snippet 同管道覆盖）
+    serialized = json.dumps(
+        {"history": payload["history"], "history_recall": payload["history_recall"]},
+        ensure_ascii=False,
+    )
+    assert "13812345678" not in serialized
+    assert "alice@example.com" not in serialized
+
+
+async def test_parented_turn_persists_cited_parent_cards_and_aligns_source_count() -> None:
+    """引用映射持久化面：synthesis 更新的 fused 超出 sources 事件累计数 → 补建 sources 行
+    + ctx.sources_count 对齐（done.source_count ↔ §2.5 sources[] 一致；零 SSE 事件面变更）。
+
+    生产触发面=REQ-017 引用映射（synthesis 把命中的父轮卡并入 fused 返回）；本用例以假图
+    直返 fused 锁 TurnRunner 消费面语义（generic：超出即补行；常规轮事件批=fused 全量
+    结构性不触发——uq_sources_turn_ref 唯一约束语义零冲突）。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="追问")
+    session = _FakeSession(turn=turn)
+    graph = _FakeGraph(
+        [
+            _updates(
+                {
+                    "write": {
+                        "answer_md": "结论[1]。",
+                        "fused": [
+                            {
+                                "url": "https://a/1",
+                                "title": "A",
+                                "snippet": "s",
+                                "source_type": "web",
+                                "score": 0.9,
+                            },
+                            {
+                                "url": "https://docs.example.com/hybrid",
+                                "title": "混合检索综述",
+                                "snippet": "混合检索概述",
+                                "source_type": "web",
+                                "score": 0.91,
+                            },
+                        ],
+                    }
+                }
+            )
+        ]
+    )
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    added_sources = [row for row in session.added if isinstance(row, Source)]
+    assert len(added_sources) == 2  # 超出事件累计数（0）的两条全部补建
+    assert [row.ref_no for row in added_sources] == [1, 2]  # 轮内编号=fused 位置
+    by_url = {row.url: row for row in added_sources}
+    assert by_url["https://docs.example.com/hybrid"].title == "混合检索综述"  # 复用父轮来源卡
+    done = [e for e in await _drain_all(bus, str(turn.id)) if e.event_type == "done"]
+    assert len(done) == 1
+    assert done[0].data["source_count"] == 2  # done ↔ sources 表行数一致
+
+
+async def test_turn_without_source_surplus_persists_zero_extra_rows() -> None:
+    """零盈余零波及：sources 事件批=fused 全量（既有 fuse_rerank 形态）→ 不补行。
+
+    意义：补行面只在「final fused > 事件累计数」时触发——常规轮结构性不触发，
+    防御重复建行（uq_sources_turn_ref 唯一约束语义）。
+    """
+    bus = _bus()
+    turn = _TurnRow(status="running", mode="fast", query="普通轮")
+    session = _FakeSession(turn=turn)
+    batch = [
+        {"ref_no": 1, "source_type": "web", "title": "A", "url": "https://a/1", "snippet": "s", "score": 0.9},
+        {"ref_no": 2, "source_type": "web", "title": "B", "url": "https://b/2", "snippet": "s", "score": 0.8},
+    ]
+    graph = _FakeGraph(
+        [
+            _custom({"type": "sources", "batch": batch}),
+            _updates(
+                {
+                    "write": {
+                        "answer_md": "结论[1][2]。",
+                        "fused": [
+                            {"url": "https://a/1", "title": "A", "snippet": "s", "source_type": "web", "score": 0.9},
+                            {"url": "https://b/2", "title": "B", "snippet": "s", "source_type": "web", "score": 0.8},
+                        ],
+                    }
+                }
+            ),
+        ]
+    )
+    scheduler = _scheduler(bus, _FakeSessionFactory(session), graph)
+
+    await scheduler._execute_turn(turn)
+
+    added_sources = [row for row in session.added if isinstance(row, Source)]
+    assert len(added_sources) == 2  # 仅事件路径自身建行（batch=2）——补行面零触发零盈余
+    assert sorted(row.ref_no for row in added_sources) == [1, 2]
+    done = [e for e in await _drain_all(bus, str(turn.id)) if e.event_type == "done"]
+    assert done[0].data["source_count"] == 2

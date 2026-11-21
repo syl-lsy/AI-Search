@@ -23,8 +23,13 @@ from collections.abc import AsyncIterator
 import pytest
 
 import app.services.event_bus as event_bus_module
+from app.agent.graphs.signals import CONTEXT_COMPACT
 from app.core.config import SseSettings
-from app.services.event_bus import EventBus, SseEvent
+from app.services.event_bus import (
+    CONTEXT_COMPACT_EVENT_TYPE,
+    EventBus,
+    SseEvent,
+)
 
 
 class FakeClock:
@@ -464,3 +469,83 @@ async def test_reopen_channel_missing_turn_is_noop() -> None:
     bus = _bus(FakeClock())
     assert bus.reopen_channel("never-seen") is False
     assert bus.terminal_seq("never-seen") is None
+
+
+# ---- context_compact 重放边界（api.md §7.2/§7.3 v1.3 增注——M2 批次 5）----
+
+
+async def test_context_compact_boundary_clamps_early_cursor() -> None:
+    """游标早于最近一次 context_compact → 旧游标失效：自该事件起重放，压缩前
+    事件不再重放（以 §2.3/§2.5 REST 对账——api.md §7.2 断线续传条）。"""
+    bus = _bus(FakeClock())
+    seqs: list[int] = []
+    for event_type in ("stage", "sources", "context_compact", "stage"):
+        stamped = await bus.publish("t-compact", _ev(event_type=event_type, k=event_type))
+        seqs.append(stamped.seq)
+    compact_seq = seqs[2]
+
+    gen = bus.subscribe("t-compact", last_seq=seqs[0])  # 游标早于 compact
+    first = await _next(gen)
+    second = await _next(gen)
+    assert (first.event_type, first.seq) == ("context_compact", compact_seq)
+    assert (second.event_type, second.seq) == ("stage", seqs[3])
+    with pytest.raises(asyncio.TimeoutError):
+        await _next(gen, timeout=0.2)  # 压缩前事件（seq ≤ 游标）不再重放
+    await gen.aclose()
+
+
+async def test_context_compact_boundary_latest_compact_wins() -> None:
+    """多轮压缩取最近一次：游标早于两次 compact 时以第二次为边界（第一次之前的
+    压缩前缀不重放）。"""
+    bus = _bus(FakeClock())
+    first_compact = (await bus.publish("t-compact2", _ev(event_type="context_compact"))).seq
+    await bus.publish("t-compact2", _ev(event_type="stage", k="between"))
+    second_compact = (await bus.publish("t-compact2", _ev(event_type="context_compact"))).seq
+    after = (await bus.publish("t-compact2", _ev(event_type="stage", k="after"))).seq
+
+    gen = bus.subscribe("t-compact2", last_seq=0)  # 早于两次 compact
+    assert [(await _next(gen)).seq, (await _next(gen)).seq] == [second_compact, after]
+    with pytest.raises(asyncio.TimeoutError):
+        await _next(gen, timeout=0.2)
+    await gen.aclose()
+    assert second_compact > first_compact
+
+
+async def test_context_compact_boundary_does_not_affect_later_cursor() -> None:
+    """游标 ≥ 最近一次 compact seq → 既有语义不变（严格大于重放，自游标后补帧）。"""
+    bus = _bus(FakeClock())
+    compact_seq = (await bus.publish("t-compact3", _ev(event_type="context_compact"))).seq
+    tail_seq = (await bus.publish("t-compact3", _ev(event_type="stage", k="tail"))).seq
+
+    gen = bus.subscribe("t-compact3", last_seq=compact_seq)
+    only = await _next(gen)
+    assert (only.event_type, only.seq) == ("stage", tail_seq)
+    await gen.aclose()
+
+
+async def test_no_compact_cursor_semantics_unchanged() -> None:
+    """无 compact 的轮：既有重放语义零变化（回归面——钳制分支不误触）。"""
+    bus = _bus(FakeClock())
+    seqs = [(await bus.publish("t-plain", _ev())).seq for _ in range(4)]
+
+    gen = bus.subscribe("t-plain", last_seq=seqs[0])
+    assert [(await _next(gen)).seq, (await _next(gen)).seq, (await _next(gen)).seq] == seqs[1:]
+    with pytest.raises(asyncio.TimeoutError):
+        await _next(gen, timeout=0.2)
+    await gen.aclose()
+
+
+# ---- 跨层双字面量 parity（分层不反向 import → 以测试锁同值）----
+
+
+def test_context_compact_event_type_matches_signals_constant() -> None:
+    """`context_compact` 双字面量 parity：services 层判据常量必须与图内信号常量同值。
+
+    为什么要在测试里锁：两处常量**故意**独立（services 层不反向 import agent 域，
+    TERMINAL/FOLLOWUPS 同款先例），代价是漂移无编译期保护。漂移后果是**静默**的——
+    EventBus 的 `compact_seq` 只按本层字面量记账（publish 分支 + 订阅重放钳制），
+    图内若发另一个串则该分支永不命中：压缩事件不记边界 → 旧游标重放出压缩前事件，
+    前端上下文窗口与模型侧实际窗口不一致，且无事件、无日志、无告警可察觉。
+    比较字面**值**（非对象 identities），分层零破。
+    """
+    assert CONTEXT_COMPACT == CONTEXT_COMPACT_EVENT_TYPE == "context_compact"

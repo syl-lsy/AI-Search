@@ -100,12 +100,13 @@ async def regenerate_turn(
     user_id: Annotated[str, Depends(get_current_user)],
     scheduler: Annotated[ThreadScheduler, Depends(get_thread_scheduler)],
 ) -> TurnRegenerateResult:
-    """degraded/failed-with-sources 快速轮「仅重新生成」（api.md §2.12 v1.19，REQ-063）。
+    """degraded/failed-with-sources 快速/深度轮「仅重新生成」（api.md §2.12 v1.19+v1.28，REQ-063）。
 
     路由层零业务逻辑：归属校验（404001）/ 前置裁决与条件推进（409006）/ 通道重开
-    均在 `ThreadScheduler.regenerate_turn`；微图执行（单节点 synthesis，非
-    GRAPH_REGISTRY）为 BackgroundTask——条件推进已在请求内 commit（scheduler 短事务），
-    任务读到 running 行即可执行。SSE 同通道 seq 续推，前端重订阅后按
+    均在 `ThreadScheduler.regenerate_turn`；微图执行（fast=单节点 synthesis 微图 /
+    deep=deep_regenerate 微图〔重放起点=write〕，均非 GRAPH_REGISTRY）为
+    BackgroundTask——条件推进已在请求内 commit（scheduler 短事务），任务读到
+    running 行即可执行。SSE 同通道 seq 续推，前端重订阅后按
     `stage(write,running)` 清空重渲（frontend-api §3 生命周期 14）。
     """
     result = await scheduler.regenerate_turn(turn_id, user_id=user_id)
@@ -196,7 +197,12 @@ def _format_sse(event: SseEvent, *, turn_id: str) -> bytes:
 
 
 async def _event_stream(
-    bus: EventBus, turn_id: str, last_seq: int, *, heartbeat_seconds: int
+    bus: EventBus,
+    turn_id: str,
+    last_seq: int,
+    *,
+    heartbeat_seconds: int,
+    enforce_compact_boundary: bool = True,
 ) -> AsyncIterator[bytes]:
     """SSE 帧流：EventBus.subscribe（重放 + 跟随）泵入队列，消费侧织入心跳。
 
@@ -229,7 +235,7 @@ async def _event_stream(
             return  # 客户端已持有 done 且无未取事件：零帧关闭
 
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    iterator = bus.subscribe(turn_id, last_seq)
+    iterator = bus.subscribe(turn_id, last_seq, enforce_compact_boundary=enforce_compact_boundary)
 
     async def _pump() -> None:
         try:
@@ -312,20 +318,28 @@ async def stream_turn_events(
     纯心跳段直到首个 stage 事件（api.md §7.1 517 行）。is_stream 标志必须自设
     （统一信封中间件据此跳过流式响应，core/middleware/response.py）。
 
+    context_compact 重放边界（api.md §7.2/§7.3 v1.3 增注）只作用于「客户端显式
+    携带数字游标」的重连——首连（无 header）与非法游标（§7.1 513 行宽路径，等同
+    首次连接）恒全量重放；边界钳制语义在 EventBus.subscribe（M2 批次 5）。
+
     db 依赖以 scope="function" 解析（评审 P2）：teardown（归还连接）在端点返回
     后、流式响应消费前执行——request 作用域会把池连接以 idle-in-transaction 占满
     整条流生命周期，多订阅并发下耗尽 pool（10+5）。StreamingResponse 装配不依赖
     请求级 session（事件流走 EventBus，归属校验一条 SELECT 即完成）。
     """
     await ensure_turn_owner(db, turn_id, user_id=user_id)
+    raw_cursor = request.headers.get("last-event-id")
     try:
-        last_seq = int(request.headers.get("last-event-id") or 0)
+        last_seq = int(raw_cursor) if raw_cursor is not None else 0
     except ValueError:
         last_seq = 0  # 非数字游标按首连全量重放（§7.1 513 行宽路径）
+    # 数字游标=重连（compact 边界生效）；无 header/非法游标=首连语义（恒全量重放）
+    has_numeric_cursor = raw_cursor is not None and raw_cursor.strip().isdigit()
     request.state.is_stream = True
     return StreamingResponse(
         _event_stream(
-            bus, turn_id, last_seq, heartbeat_seconds=sse_settings.heartbeat_seconds
+            bus, turn_id, last_seq, heartbeat_seconds=sse_settings.heartbeat_seconds,
+            enforce_compact_boundary=has_numeric_cursor,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},

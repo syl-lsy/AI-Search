@@ -39,6 +39,7 @@ get_thread_scheduler() 消费（未启动 fail-fast，与 event_bus/config_cente
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -50,6 +51,13 @@ from typing import Any, cast
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.graphs.deep_regenerate import (
+    graph as deep_regenerate_graph,
+)
+from app.agent.graphs.deep_regenerate import (
+    has_writer_fallback,
+    is_writer_fallback_digest,
+)
 from app.agent.graphs.main import graph as main_graph
 from app.agent.graphs.regenerate import graph as regenerate_graph
 from app.agent.guards import ContentRejectedError, TurnCanceledSignal, TurnDeadline
@@ -85,7 +93,11 @@ from app.schemas.turn import (
     UsageBrief,
 )
 from app.services.event_bus import EventBus, SseEvent, get_event_bus
-from app.utils.history_recall import assemble_history_recall
+from app.utils.history_recall import (
+    HISTORY_RECALL_RECENT_ANSWER_CHARS,
+    assemble_history_recall,
+    extract_answer_skeleton,
+)
 from app.services.followups_service import (
     FOLLOWUPS_SOURCES_MAX,
     FollowupsSettings,
@@ -99,6 +111,7 @@ __all__ = [
     "FINAL_STATUSES",
     "HISTORY_WINDOW_TURNS",
     "QUEUE_DEPTH_LIMIT",
+    "REGENERABLE_MODES",
     "REGENERABLE_STATUSES",
     "SubmitDecision",
     "ThreadScheduler",
@@ -122,6 +135,11 @@ FINAL_STATUSES = ("completed", "degraded", "failed", "canceled")
 # 「degraded→running(regenerate)→进程崩溃→孤儿清理置 failed」使 failed-with-sources
 # 可达，且语义安全（有来源即可只重跑 synthesis）；零源 failed 被 sources 条件拦截。
 REGENERABLE_STATUSES = ("degraded", "failed")
+
+# regenerate 可进模式（api.md §2.12 v1.28 前置第 3 条放开——REQ-063 deep 形态扩展）：
+# fast（synthesis 微图）+ deep（deep_regenerate 微图，重放起点=write）双分支共用
+# 同一前置判据/条件 UPDATE/错误面（409006 同码同路径零新分支）。
+REGENERABLE_MODES = ("fast", "deep")
 
 # per-thread 排队深度上限（PRD OQ-20，代码常量）：queued 存在即「排队位已满」→ 409001
 QUEUE_DEPTH_LIMIT = 1
@@ -147,6 +165,43 @@ HISTORY_ANSWER_HEAD_CHARS = 200
 # 进历史装配，ARCH §6.1）；rolled_back 整体排除（内容回退语义，ARCH §6.1——由
 # cancel_reason 过滤承担）；failed/无答案轮不产 a_head，由 answer_md IS NOT NULL 排除。
 _HISTORY_STATUSES = ("completed", "degraded", "canceled")
+
+# REQ-017 父轮上下文（api.md §2.4 v1.28）：父轮 answer_md 摘要块字符预算——骨架形态
+# （extract_answer_skeleton），预算与 history_recall 近轮预算同源（父轮即最近一轮）；
+# URL 表行数随父轮 sources 行集（≤ fuse_rerank topN），块整体经 _sanitize_history_rows
+# 同一脱敏管道。摘要有界、URL 表随行集有界 → 块自界（history_recall 6000 软顶之外
+# 的 REQ-017 增量，M4 评测线观察）。
+PARENT_CONTEXT_SUMMARY_CHARS = HISTORY_RECALL_RECENT_ANSWER_CHARS
+# 父轮上下文装载体资格（api.md §2.4：上一深度轮 completed/degraded 时 fast 轮自动挂；
+# 消费面同口径——仅终态父轮装载体，非终态/空答案父轮零注入零波及）。
+_PARENT_CONTEXT_STATUSES = ("completed", "degraded")
+
+# 父轮块「去引用锚点形态」（ARCH §6.5 v1.70 / api.md §2.4 v1.28）：父轮 answer_md 里的
+# [n] 指向**父轮** ref_no，而 synthesis 的父轮扩展卡按本轮接续编号（[N+1..]，N 取决于
+# 本轮 web_search 后的 fused 数量——TurnRunner 装配期不可预知）落库。呈现父轮编号会让
+# 模型照引 → 答案文本与本轮 sources 的 ref_no 错位（§2.5 [n]↔ref_no 一一对应失效）。
+# 故父轮块内只保留正文（数字锚点及其全角 ［n］ 变体一并覆盖，不呈现任何编号），编号一律
+# 由本轮来源块承担；指引句把取号面指向「本轮来源列表」。
+_CITATION_ANCHOR_RE = re.compile(r"[\[［]\s*\d{1,3}\s*[\]］]")
+#: 父轮 URL 表表头兼引用指引（仅在父轮有来源行时追加）
+# 限定语「（如本轮存在来源列表）」：parented direct/recall 轮按契约不扩供给面（零源轮，
+# direct §2.5 sources[] 恒空、recall source_count=0）且 recall 变体禁 [n]（B12）——
+# 绝对句式在这些轮次会误导模型取号；有来源列表的轮次该限定语不改变语义。
+PARENT_SOURCE_GUIDANCE = (
+    "该报告引用来源（父轮来源已并入本轮来源列表（如本轮存在来源列表），引用一律使用"
+    "本轮来源列表的 [n] 编号，勿沿用上文报告中出现的编号；下表仅列 URL 供核对，不提供编号）："
+)
+
+
+def _strip_citation_anchors(text: str) -> str:
+    """父轮块正文 → 去引用锚点形态（`[数字]` / `［数字］` 剔除，其余字符原样）。
+
+    纯函数（零 IO / 零全局态）：只在父轮块装配面使用，本轮的 sources_block 与 synthesis
+    引用核对口径零变化——编号重映射仍由供给面（synthesis `_parent_source_extension`
+    的 [N+1..] 接续）承担。
+    """
+    return _CITATION_ANCHOR_RE.sub("", text)
+
 
 # 中文判定阈值（PRD OQ-2：CJK 字符占比 ≥30% 判 zh——实现层常量，不进 Nacos）
 CJK_RATIO_THRESHOLD = 0.30
@@ -279,9 +334,24 @@ def _is_deep_writer_messages(namespace: Any, chunk_pair: Any) -> bool:
     return isinstance(meta, Mapping) and meta.get("langgraph_node") == "writer"
 
 
-def _messages_gate(mode: str, namespace: Any, chunk_pair: Any) -> bool:
+def _is_regenerate_writer_messages(namespace: Any, chunk_pair: Any) -> bool:
+    """regenerate deep 微图的 messages 放行门控：writer 节点帧（langgraph_node 判定，
+    与 namespace 形态无关）。微图直跑顶层帧 namespace 为零段（()）——与主图壳嵌套
+    委派的单段 `('deep:<run_id>',)` 形态不同；微图无子代理嵌套面（writer 单节点
+    LLM 调用），多段帧结构性不产生，故此处按节点标识放行、不做段数过滤
+    （_is_fast_synthesis_messages 同款口径——fast regenerate 微图既有先例）。"""
+    meta = chunk_pair[1] if isinstance(chunk_pair, tuple) and len(chunk_pair) > 1 else None
+    return isinstance(meta, Mapping) and meta.get("langgraph_node") == "writer"
+
+
+def _messages_gate(
+    mode: str, namespace: Any, chunk_pair: Any, *, regenerate: bool = False
+) -> bool:
     """messages 帧放行门控（mode 感知，§6.1）：fast 仅 synthesis（口径不变零回退）；
-    deep 仅 writer 顶层帧（writer 形态基线，M2 批次 1）。"""
+    deep 仅 writer 顶层帧（writer 形态基线，M2 批次 1）；deep regenerate 微图直跑
+    零段 namespace 的 writer 帧（regenerate 微图专用——常规 deep 门控段数判据不适用）。"""
+    if regenerate and mode == "deep":
+        return _is_regenerate_writer_messages(namespace, chunk_pair)
     if mode == "deep":
         return _is_deep_writer_messages(namespace, chunk_pair)
     return _is_fast_synthesis_messages(namespace, chunk_pair)
@@ -304,6 +374,27 @@ def history_statement(thread_id: str, turn_id: str) -> Any:
         )
         .order_by(Turn.created_at.desc(), Turn.id.desc())
         .limit(HISTORY_WINDOW_TURNS)
+    )
+
+
+def parent_sources_statement(parent_turn_id: str) -> Any:
+    """父轮 sources 行集查询（REQ-017 引用映射供给面，api.md §2.4 v1.28）：
+    `(ref_no, title, url, snippet, source_type, score)` 按 ref_no 序。
+
+    全部条件参数绑定（`history_statement` 同风格，无字符串拼接）；ref_no 序保持
+    父轮来源卡的原编号次序——synthesis 供给面扩展（[N+1..] 连续编号）依此对齐。
+    """
+    return (
+        select(
+            Source.ref_no,
+            Source.title,
+            Source.url,
+            Source.snippet,
+            Source.source_type,
+            Source.score,
+        )
+        .where(Source.turn_id == uuid.UUID(parent_turn_id))
+        .order_by(Source.ref_no.asc())
     )
 
 
@@ -604,6 +695,9 @@ class _RunContext:
     # fused/search_strategy 为重建输入（不重检索；synthesis 变体选择与 followups 来源面）
     regenerate: bool = False
     fused: list[dict[str, Any]] = field(default_factory=list)
+    # deep regenerate 输入（api.md §2.12 v1.28）：collected_sources=ref_no 账本重建
+    # （writer 来源块 [n]=ref_no、finalize 引用核对账本）；fast 分支零消费恒空
+    collected_sources: list[dict[str, Any]] = field(default_factory=list)
     search_strategy: str = "web"
     # 轮级 usage 累计（M2 批次 1 方案 A——docs/m2-usage-probe-batch0.md §3/§4）：
     # UsageCollector 随 build_turn_callbacks 并列注入 astream callbacks（fast/deep
@@ -631,6 +725,7 @@ class ThreadScheduler:
         mapping_snapshot: AssetSnapshot | None = None,
         tools_registry: ToolRegistry | None = None,
         regenerate_graph_override: Any = None,
+        deep_regenerate_graph_override: Any = None,
     ) -> None:
         self._bus = bus
         self._session_factory = (
@@ -638,8 +733,9 @@ class ThreadScheduler:
         )
         self._graph: Any = graph if graph is not None else main_graph
         # regenerate 微图（api.md §2.12 / 决策 10）：None = 用模块级单例（import 一次
-        # 编译一次）；单测/联装可注入假体
+        # 编译一次）；单测/联装可注入假体。deep 分支同构注入面（§2.12 v1.28）
         self._regenerate_graph = regenerate_graph_override
+        self._deep_regenerate_graph = deep_regenerate_graph_override
         self._spec_snapshot = spec_snapshot
         self._mapping_snapshot = mapping_snapshot
         self._tools_registry = tools_registry
@@ -873,17 +969,20 @@ class ThreadScheduler:
         """regenerate 请求面：归属校验（404001）+ 前置裁决 + 条件推进 + 通道重开。
 
         - 归属：id+user 双条件（不存在/越权/非法 UUID 一律 404001，不泄漏存在性）；
-        - 前置（全满足才 200，任一不满足 `409006`，§2.12 三条）：`status ∈
-          {degraded, failed}`、`mode=fast`、sources 非空（显式校验——degraded 蕴含
-          非空的实现不变式之外，failed-with-sources 仅崩溃孤儿路径可达故显式兜住）；
+        - 前置（全满足才 200，任一不满足 `409006`，§2.12 v1.28）：`status ∈
+          {degraded, failed}`、`mode ∈ {fast, deep}`（v1.28 前置第 3 条放开——deep
+          分支前置同第 1/2 条判据）、sources 非空（显式校验——degraded 蕴含非空的
+          实现不变式之外，failed-with-sources 仅崩溃孤儿路径可达故显式兜住）；
         - **线程行锁串行化**：进会话后 `select(Thread).with_for_update()`（与
           resolve_conflict_on_submit 同型、锁序 Thread→Turn 一致）再查活跃轮——
           否则并发 ask 未提交的 running 轮在 READ COMMITTED 下对预检与条件 UPDATE
           均不可见，同线程会两轮并行（不变式破坏 + 双份 LLM 成本）；
-        - **条件 UPDATE 防双击**：`WHERE status IN ('degraded','failed') AND mode='fast'
-          AND EXISTS(sources) AND NOT EXISTS(同线程其他 pending/running/queued)`——
-          并发双击落败方 rowcount=0 → 409006（与 `_promote_running` 同型）；推进同时
-          清 `error`/`degraded_reason`/`finished_at`（running 期不携带上一轮终态留痕）
+        - **条件 UPDATE 防双击**：`WHERE status IN ('degraded','failed') AND
+          mode IN ('fast','deep') AND EXISTS(sources) AND NOT EXISTS(同线程其他
+          pending/running/queued)`——并发双击落败方 rowcount=0 → 409006（与
+          `_promote_running` 同型）；deep 分支完全复用同码同路径零新分支（§2.12
+          v1.28：deep 零源/进行中重复点击形态仍单码覆盖）；推进同时清
+          `error`/`degraded_reason`/`finished_at`（running 期不携带上一轮终态留痕）
           并刷 started_at；
         - **通道重开先于响应**（§7.1 regenerate 注）：客户端收到 200 后立即重订阅——
           若等 BackgroundTask 再 reopen，重订阅可能撞 terminal_seq 短路被零帧关闭；
@@ -914,12 +1013,17 @@ class ThreadScheduler:
                     select(Source.id).where(Source.turn_id == turn_uuid).limit(1)
                 )
             ).first() is not None
-            if row.status not in REGENERABLE_STATUSES or row.mode != "fast" or not has_sources:
+            if (
+                row.status not in REGENERABLE_STATUSES
+                or row.mode not in REGENERABLE_MODES
+                or not has_sources
+            ):
                 raise TurnNotRegenerableException(
                     "轮次不支持重新生成",
                     detail=(
                         f"turn {turn_id} status={row.status} mode={row.mode} "
-                        f"has_sources={has_sources}（前置：degraded/failed + fast + 有来源）"
+                        f"has_sources={has_sources}"
+                        "（前置：degraded/failed + fast/deep + 有来源，§2.12 v1.28）"
                     ),
                 )
             # 线程级单轮不变式（api.md §0「每线程同时一轮」）：同线程另有进行中/排队轮时
@@ -959,7 +1063,7 @@ class ThreadScheduler:
                 .where(
                     Turn.id == turn_uuid,
                     Turn.user_id == user_uuid,
-                    Turn.mode == "fast",
+                    Turn.mode.in_(REGENERABLE_MODES),
                     Turn.status.in_(REGENERABLE_STATUSES),
                     select(Source.id).where(Source.turn_id == turn_uuid).exists(),
                     # 线程级单轮不变式（并发面兜底：预检与推进之间他轮已被推进）
@@ -995,19 +1099,24 @@ class ThreadScheduler:
         return {"turn_id": turn_id, "status": "running"}
 
     async def execute_regenerate(self, turn_id: str) -> None:
-        """regenerate 执行体（BackgroundTask 入口）：微图只重跑 synthesis，同通道续推。
+        """regenerate 执行体（BackgroundTask 入口）：微图只重跑终段，同通道续推。
+
+        fast=synthesis 微图（口径不变零回退）；deep=deep_regenerate 微图
+        （重放起点=write——不重跑 planner/research/reflect，§2.12 v1.28）。
 
         - 输入重建（不重新检索，§2.12）：`query/query_lang/chat_model_key` 读 turns 列；
-          `fused` 自 sources 行重建（url/title/snippet/score）；`search_strategy` 自
-          turn_events 的 `stage(rewrite,done).extra.strategy`（缺省 web）；
-          `answerable_from_knowledge` 缺省 false（保守）；`spec/mapping` 捕获**当次
-          新快照**（「重新生成」用热更后的提示词/模型映射）；
+          fast `fused` 自 sources 行重建（url/title/snippet/score）；deep
+          `collected_sources` 自 sources 行重建（ref_no 账本，[n] 映射稳定）；
+          `search_strategy` 自 turn_events 的 `stage(rewrite,done).extra.strategy`
+          （缺省 web）；`answerable_from_knowledge` 缺省 false（保守）；
+          `spec/mapping` 捕获**当次新快照**（「重新生成」用热更后的提示词/模型映射）；
         - 事件面：custom(stage)+messages(token/thinking) 走既有翻译器；updates 仅用于
-          取 synthesis 最终 `answer_md`（不发布——事件面与常规轮零差异）；
+          取终段最终 `answer_md`（不发布——事件面与常规轮零差异）；
         - 终态：成功 → completed（stages 追加 write 段、duration_ms 不覆写、清旧
           error）；再失败 → **兜底产出收束**（v1.59 增量 A：synthesis 节点产 digest/partial
           → done(finish=degraded, degraded_reason=null)，零 error；regenerate 轮恒有
-          sources 故 500101 不可达）/ 500301/500001 仍有防御分支；取消 → canceled（merge stages）；
+          sources 故 500101 不可达——deep 分支经 errors 兜底标记分流同构收束
+          §7.4:946）/ 500301/500001 仍有防御分支；取消 → canceled（merge stages）；
         - 竞态：推进后被取消/删除（status≠running）→ 零事件退出（canceled 已由
           cancel_turn 收口）。
         - **加载段同在异常收口面**（评审 P3）：`_load_turn` 的 DB 瞬断若在 try 外会
@@ -1038,7 +1147,7 @@ class ThreadScheduler:
                     turn_id=str(turn.id),
                     thread_id=str(turn.thread_id),
                     user_id=turn.user_id,
-                    mode="fast",
+                    mode=str(turn.mode),
                     query=str(turn.query),
                     query_lang=str(turn.query_lang or "en"),
                     regenerate=True,
@@ -1072,10 +1181,20 @@ class ThreadScheduler:
             )
 
     async def _run_regenerate_graph(self, turn: Any, ctx: _RunContext) -> None:
-        """微图 astream 消费：翻译器复用 + 终态收尾（success / canceled）。"""
+        """微图 astream 消费：翻译器复用 + 终态收尾（success / canceled）。
+
+        **deep 分支（api.md §2.12 v1.28 / §7.4 深度 regenerate 形态）**：微图换
+        deep_regenerate（START→writer→finalize|fallback_done），初始 state 走
+        DeepState 子集（collected_sources=ref_no 账本重建；outline/subagent_reports
+        缺省空——writer 以 sources 元数据自组织分节）；轮级超时读 spec.deep 节；
+        messages 门控走 regenerate 专用 writer 判据（微图直跑零段 namespace）。
+        writer 兜底轮（errors 标记，D2 兜底不置 degraded）→ 兜底产出收束
+        （_finish_synthesis_fallback——§7.4:946 再失败形态对 deep 同构适用）。
+        """
         turn_id = ctx.turn_id
         thread_id = ctx.thread_id
-        timeout_s = self._turn_timeout_s(ctx.spec_payload, "fast")
+        mode = ctx.mode
+        timeout_s = self._turn_timeout_s(ctx.spec_payload, mode)
         cancel_reason = self._cancel_flags.pop(turn_id, None)
         if cancel_reason is not None:  # 推进后、开跑前已取消
             await self._finish_canceled(
@@ -1087,30 +1206,53 @@ class ThreadScheduler:
         chat_model_key, _ = resolve_chat_model(
             str(turn.chat_model_key), ctx.mapping_payload
         )
-        initial_state: dict[str, Any] = {
-            "turn_id": turn_id,
-            "thread_id": thread_id,
-            "user_id": str(turn.user_id),
-            "mode": "fast",
-            "query": ctx.query,
-            "chat_model_key": chat_model_key,
-            "history": [],  # synthesis 不消费历史（不重检索、不改写）
-            "query_lang": ctx.query_lang,
-            "spec": dict(ctx.spec_payload),
-            "images": [],  # images 不重发（§2.12）
-            "fused": ctx.fused,
-            "search_strategy": ctx.search_strategy,
-            "answerable_from_knowledge": False,  # 保守缺省（决策 10）
-        }
-        final_state: dict[str, Any] = {
-            "search_strategy": ctx.search_strategy,
-            "fused": ctx.fused,
-        }
-        graph = (
-            self._regenerate_graph
-            if self._regenerate_graph is not None
-            else regenerate_graph
-        )
+        if mode == "deep":
+            initial_state: dict[str, Any] = {
+                "turn_id": turn_id,
+                "thread_id": thread_id,
+                "user_id": str(turn.user_id),
+                "mode": "deep",
+                "query": ctx.query,
+                "chat_model_key": chat_model_key,
+                "history": [],  # 不重跑 planner（指代消解不适用——query 原样撰写）
+                "query_lang": ctx.query_lang,
+                "spec": dict(ctx.spec_payload),
+                "images": [],
+                # ref_no 账本重建（[n]↔sources 映射稳定，§2.12 v1.28）；
+                # outline/subagent_reports 缺省空——state-only 不落库结构性不可重建
+                "collected_sources": list(ctx.collected_sources),
+            }
+            final_state: dict[str, Any] = {"collected_sources": ctx.collected_sources}
+            graph = (
+                self._deep_regenerate_graph
+                if self._deep_regenerate_graph is not None
+                else deep_regenerate_graph
+            )
+        else:
+            initial_state = {
+                "turn_id": turn_id,
+                "thread_id": thread_id,
+                "user_id": str(turn.user_id),
+                "mode": "fast",
+                "query": ctx.query,
+                "chat_model_key": chat_model_key,
+                "history": [],  # synthesis 不消费历史（不重检索、不改写）
+                "query_lang": ctx.query_lang,
+                "spec": dict(ctx.spec_payload),
+                "images": [],  # images 不重发（§2.12）
+                "fused": ctx.fused,
+                "search_strategy": ctx.search_strategy,
+                "answerable_from_knowledge": False,  # 保守缺省（决策 10）
+            }
+            final_state = {
+                "search_strategy": ctx.search_strategy,
+                "fused": ctx.fused,
+            }
+            graph = (
+                self._regenerate_graph
+                if self._regenerate_graph is not None
+                else regenerate_graph
+            )
         async with asyncio.timeout(timeout_s):
             graph_stream = graph.astream(
                 initial_state,
@@ -1129,16 +1271,16 @@ class ThreadScheduler:
                             thread_id=thread_id,
                             turn_id=turn_id,
                             user_id=str(turn.user_id),
-                            mode="fast",
+                            mode=mode,
                         ),
                         ctx.usage_collector,
                     ],
                     "metadata": {
                         "langfuse_session_id": thread_id,
                         "langfuse_user_id": str(turn.user_id),
-                        "langfuse_tags": ["mode:fast", "regenerate"],
+                        "langfuse_tags": [f"mode:{mode}", "regenerate"],
                         "turn_id": turn_id,
-                        "mode": "fast",
+                        "mode": mode,
                     },
                 },
                 stream_mode=["messages", "updates", "custom"],
@@ -1158,10 +1300,11 @@ class ThreadScheduler:
                 if stream_mode == "custom":
                     await self._translate_custom(ctx, chunk)
                 elif stream_mode == "messages" and _messages_gate(
-                    ctx.mode, namespace, chunk
+                    ctx.mode, namespace, chunk, regenerate=True
                 ):
-                    # regenerate 恒 fast（§2.12 mode=fast 前置）——门控分派等价
-                    # _is_fast_synthesis_messages；统一走 mode 感知门控
+                    # regenerate 微图直跑（无子图嵌套）：fast 门控=synthesis 节点帧
+                    # （口径不变零回退）；deep 门控=writer 节点帧（零段 namespace——
+                    # _is_regenerate_writer_messages 专用判据）
                     await self._translate_message_chunk(ctx, chunk)
                 elif stream_mode == "updates" and not namespace:
                     for update in chunk.values():
@@ -1174,6 +1317,32 @@ class ThreadScheduler:
                 source_count=ctx.sources_count, stages=ctx.stages, merge_stages=True,
             )
             self._nudge_thread(thread_id)
+            return
+        # deep 再失败分流（§2.12 v1.28：兜底产出收束对 deep 同构适用——deep_writer
+        # 失败语义兜底不终止、不置 degraded，errors 标记为判据；零 error 事件，
+        # done(finish=degraded, degraded_reason=None)，regenerate 轮恒有 sources →
+        # 500101 不可达口径通用）。fast 分支该形态经 SynthesisFallback 异常收口，
+        # final_state 无标记——分支不可达，零回退。
+        if ctx.mode == "deep" and has_writer_fallback(final_state.get("errors")):
+            answer_md = final_state.get("answer_md")
+            await self._finish_synthesis_fallback(
+                ctx,
+                SynthesisFallback(
+                    answer_md=str(answer_md) if isinstance(answer_md, str) else "",
+                    kind=(
+                        "synthesis_digest"
+                        if is_writer_fallback_digest(answer_md)
+                        else "synthesis_partial"
+                    ),
+                    # failure 取值来源：deep writer 兜底轮的失败类别来自图内 errors[] 标记
+                    # （非流内异常，无 classify_failure_kind 可分类）→ 固定标注
+                    # llm_call_failed（枚举文档见 SynthesisFallback docstring）。
+                    # 不传 fused：deep 轮无 parent_sources 消费面（register 零补行）。
+                    failure="llm_call_failed",
+                    attempts=1,
+                    source_count=ctx.sources_count,
+                ),
+            )
             return
         await self._finish_completed(ctx, final_state)
 
@@ -1224,7 +1393,7 @@ class ThreadScheduler:
                 turn_id=str(turn.id),
                 thread_id=str(turn.thread_id),
                 user_id=turn.user_id,
-                mode="fast",
+                mode=str(turn.mode),
                 query=str(turn.query),
                 query_lang=str(turn.query_lang or "en"),
                 regenerate=True,
@@ -1266,7 +1435,7 @@ class ThreadScheduler:
             turn_id=str(turn.id),
             thread_id=str(turn.thread_id),
             user_id=turn.user_id,
-            mode="fast",
+            mode=str(turn.mode),
             query=query,
             query_lang=str(turn.query_lang or "en"),
             spec_payload=spec_payload,
@@ -1283,6 +1452,20 @@ class ThreadScheduler:
                 "score": float(row.score) if row.score is not None else 0.0,
             }
             for row in source_rows
+        ]
+        # deep 分支输入（§2.12 v1.28）：collected_sources=ref_no 账本重建（writer
+        # 来源块 [n]=ref_no、finalize 引用核对账本——行 ref_no 原值直取不重编号）；
+        # fast 分支零消费（fused 即综合上下文，零回退）
+        ctx.collected_sources = [
+            {
+                "ref_no": int(row.ref_no) if row.ref_no is not None else index,
+                "url": row.url,
+                "title": row.title,
+                "snippet": row.snippet or "",
+                "source_type": str(row.source_type or "web"),
+                "score": float(row.score) if row.score is not None else 0.0,
+            }
+            for index, row in enumerate(source_rows, start=1)
         ]
         ctx.search_strategy = strategy
         return ctx
@@ -1409,6 +1592,62 @@ class ThreadScheduler:
             await session.commit()
             return now, int(row.duration_ms or 0)
 
+    async def _persist_parent_source_appends(
+        self, ctx: _RunContext, final_state: dict[str, Any]
+    ) -> None:
+        """成功收束侧的引用映射持久化面（REQ-017，api.md §2.4 v1.28）——取
+        final_state["fused"] 交给 `_persist_supply_appends`（判据/语义见该函数）。"""
+        await self._persist_supply_appends(ctx, final_state.get("fused"))
+
+    async def _persist_supply_appends(self, ctx: _RunContext, fused: Any) -> None:
+        """供给面超出事件累计数的条目补建 sources 行（success 与兜底收束共用入口）。
+
+        synthesis 把**供给面**父轮来源卡并入 fused 返回（v1.70：全部扩展卡，不按引用
+        紧缩）后，fused 超出 sources 事件累计数（ctx.sources_count）的尾部条目=父轮
+        扩展卡——补建 sources 行（ref_no=fused 轮内位置）并同步 ctx.sources_count，
+        done.source_count ↔ §2.5 sources[] 双向一致。
+
+        - **零 SSE 事件面变更**：不补发 sources 事件（§7.4 快速序列 sources→images→
+          write 的钉序不破、无第二批次），前端零新增消费面——补行行仅在终态 REST 面
+          （§2.5 sources[] 自表重建）可见；流式期 [n] 落在父轮卡段时卡片待终态补齐
+          （AnswerRenderer 既有 [n]↔sources 联动按 ref_no 匹配，缺卡不炸）；
+        - generic 判据=「fused > 事件累计数」：常规轮事件批=fused 全量
+          （fuse_rerank `enumerate(fused, start=1)`）结构性不触发；regenerate 轮门禁
+          （`ctx.regenerate`——微图 fused 自 sources 行重建，补行会撞
+          uq_sources_turn_ref 唯一约束；done.source_count 沿轮累计口径由
+          _build_regenerate_context 现场补查承担）；
+        - **兜底收束同口径**（2026-11-21 终审 P3 兑现）：parented 轮走
+          `_finish_synthesis_fallback` 时传 `fallback.fused`（供给面，含父轮扩展卡）
+          ——partial 正文合法保留的 [N+1..] 与补行 ref_no 恒等，悬空差集为空；
+          非父轮/deep/regenerate 兜底该值为 None → 零补行面；
+        - 短事务例外（铁律 10 同 TurnRunner 口径）：图终态后的图外段自管 commit；
+          列语义与 _publish_and_persist 的 Source 构造同源（score Decimal 化）。
+        """
+        if ctx.regenerate:
+            return
+        if not isinstance(fused, list) or len(fused) <= ctx.sources_count:
+            return
+        pending = fused[ctx.sources_count:]
+        async with self._session_factory() as session:
+            for offset, item in enumerate(pending, start=ctx.sources_count + 1):
+                card = item if isinstance(item, Mapping) else {}
+                score = card.get("score")
+                session.add(
+                    Source(
+                        id=uuid.uuid4(),
+                        turn_id=uuid.UUID(ctx.turn_id),
+                        user_id=uuid.UUID(str(ctx.user_id)),
+                        ref_no=int(offset),
+                        source_type=str(card.get("source_type") or "web"),
+                        title=str(card.get("title") or ""),
+                        url=card.get("url"),
+                        snippet=card.get("snippet"),
+                        score=Decimal(str(score)) if score is not None else None,
+                    )
+                )
+            await session.commit()
+        ctx.sources_count = len(fused)
+
     async def _publish_and_persist(
         self,
         ctx: _RunContext,
@@ -1508,6 +1747,10 @@ class ThreadScheduler:
                 await backfill_source_snapshot_ids(
                     self._session_factory, ctx.turn_id, snapshots
                 )
+        # REQ-017 引用映射持久化面：synthesis 命中父轮来源卡并入 fused 返回 →
+        # 超出事件累计数的条目补建 sources 行 + ctx.sources_count 对齐
+        # （done.source_count ↔ §2.5 sources[] 双向一致；零 SSE 事件面变更）。
+        await self._persist_parent_source_appends(ctx, final_state)
         self._log_search_strategy(ctx, final_state, degraded=degraded)
         self._log_safety(final_state)
         raw_queries = final_state.get("rewritten_queries")
@@ -1751,6 +1994,11 @@ class ThreadScheduler:
           语义（ARCH §6.2 二分口径；误置 source_failure 会把来源完好的轮标成「研究未完成」）；
         - regenerate 口径同失败收束：stages 追加 / duration_ms 不覆写 / 清旧 error
           （最新一次 done 判读——兜底轮无错误，旧错误卡不再与答案并现）；
+        - 引用映射持久化面（2026-11-21 终审 P3 兑现）：信号随带供给面 fused 时
+          （parented fast 轮）经 `_persist_supply_appends` 补建父轮扩展卡 sources 行
+          ——partial 正文保留的 [N+1..] 与落库 ref_no 恒等、done.source_count 同步；
+          零 SSE 事件面变更（同成功路径）；其余形态（非父轮/deep/regenerate）该值
+          为 None → 零写入。
         - 观测（ARCH §6.6 v1.59 兜底观测条②）：轮末 AgentLog 结构化字段（fallback kind /
           终局失败类别 / 物理尝试次数 / partial 字符数 / digest 来源条数）。
         - followups 不触发（`should_generate_followups` 仅 status=completed——degraded 轮
@@ -1782,6 +2030,11 @@ class ThreadScheduler:
         if outcome is None:
             return  # 终态竞态落败：winner 已发布终态事件，本方零事件退出
         _, duration_ms = outcome
+        # 兜底收束的引用映射持久化面（2026-11-21 终审 P3）：parented 轮 partial 正文
+        # 可保留合法父轮编号 [N+1..]，信号随带供给面 fused → 补建扩展卡 sources 行，
+        # 与成功路径同判据（非父轮/deep/regenerate 为 None → 零写入）。置于终态竞态
+        # 判定之后：竞态落败轮已有 winner 收尾，不为其补行。
+        await self._persist_supply_appends(ctx, fallback.fused)
         await self._publish_and_persist(
             ctx,
             "done",
@@ -1905,6 +2158,73 @@ class ThreadScheduler:
         async with self._session_factory() as session:
             rows = (await session.execute(history_statement(thread_id, turn_id))).all()
         return list(reversed(rows))
+
+    async def _load_parent_context(self, turn: Any) -> dict[str, Any] | None:
+        """父轮上下文装载（REQ-017 消费面，api.md §2.4 v1.28）——短事务只读一次。
+
+        带 `parent_turn_id` 的 fast 轮启动时装配父轮上下文：父轮 `answer_md` 摘要块
+        （骨架形态——首段+标题+节首句，即「超 200 字头的摘要块」增量）+ `sources[]`
+        URL 表（供 [n] 引用）。返回 `{"query", "block", "sources"}`；不可得（父轮行
+        缺失/非终态/空答案/跨线程数据异常）返回 None——零注入零波及，轮照常启动。
+
+        - 装载体资格同 §2.4 挂载口径（completed/degraded，`_PARENT_CONTEXT_STATUSES`）；
+        - 父轮块并入 history 行集（调用方）→ `_sanitize_history_rows` 同一脱敏管道
+          （契约「父轮块经 history 既有脱敏管道」，与线程历史行同源）；
+        - `sources` 卡片为 sources 事件批同形 dict（url/title/snippet/source_type/
+          score）——synthesis 引用映射供给面与补行持久化
+          （`_persist_parent_source_appends`）共用同形状，零二次映射。
+
+        **去引用锚点形态（ARCH §6.5 v1.70）**：块内不呈现父轮 ref_no 编号——摘要在
+        `extract_answer_skeleton` 后剔除 `[n]`/`［n］` 锚点（`_strip_citation_anchors`），
+        URL 表以「- 标题：URL」无编号形态列出，并在表头附引用指引（父轮来源已并入本轮
+        来源列表、引用一律用本轮 [n]）。轮内接续编号取决于本轮 web_search 后的 fused
+        数量，装配期不可预知——编号映射由 synthesis 供给面承担，父轮块只供内容。
+        """
+        parent_id = getattr(turn, "parent_turn_id", None)
+        if not parent_id:
+            return None
+        async with self._session_factory() as session:
+            parent = await session.get(Turn, uuid.UUID(str(parent_id)))
+            if (
+                parent is None
+                or str(parent.thread_id) != str(turn.thread_id)
+                or str(parent.status) not in _PARENT_CONTEXT_STATUSES
+                or not str(parent.answer_md or "").strip()
+            ):
+                return None
+            rows = (await session.execute(parent_sources_statement(str(parent.id)))).all()
+        summary = _strip_citation_anchors(
+            extract_answer_skeleton(
+                str(parent.answer_md), max_chars=PARENT_CONTEXT_SUMMARY_CHARS
+            )
+        ).strip()
+        # URL 表无编号（去引用锚点形态）：仅 URL 供核对，取号面=本轮来源列表
+        table = [
+            f"- {title}：{url}"
+            for _ref_no, title, url, _snippet, _source_type, _score in rows
+            if url
+        ]
+        sections: list[str] = []
+        if summary:
+            sections.append(f"（上一轮深度报告摘要，供追问参考）\n{summary}")
+        if table:
+            sections.append(PARENT_SOURCE_GUIDANCE + "\n" + "\n".join(table))
+        if not sections:
+            return None
+        return {
+            "query": str(parent.query),
+            "block": "\n\n".join(sections),
+            "sources": [
+                {
+                    "url": url if url is not None else None,
+                    "title": str(title or ""),
+                    "snippet": str(snippet or ""),
+                    "source_type": str(source_type or "web"),
+                    "score": float(score) if score is not None else None,
+                }
+                for _ref_no, title, url, snippet, source_type, score in rows
+            ],
+        }
 
     @staticmethod
     def _format_history(rows: list[Any]) -> list[dict[str, str]]:
@@ -2109,6 +2429,17 @@ class ThreadScheduler:
             # 指代消解）恒装配；通道二（recall 轮 synthesis 消费）仅 fast 轮装配（deep 轮
             # DeepState 不消费、total=False 缺键合法——不白付骨架解析成本，评审 P2-2 门控）。
             history_rows = await self._load_history_rows(thread_id, turn_id)
+            # REQ-017 父轮上下文消费面（api.md §2.4 v1.28）：parented fast 轮把父轮
+            # 摘要块+sources URL 表作为**附加条目**并入 history 行集（父轮 answer_md
+            # 本就经 _load_history_rows 进 6 轮窗口、200 字头自然注入——本批增量=超
+            # 200 字头的摘要块形态+URL 表）；父轮 query/块随后与线程历史行同过
+            # _sanitize_history_rows 统一脱敏后进两通道。
+            parent_ctx = await self._load_parent_context(turn)
+            if parent_ctx is not None:
+                history_rows = [
+                    *history_rows,
+                    (str(parent_ctx["query"]), str(parent_ctx["block"])),
+                ]
             # history 出域缺口修复：前轮 PII 原文不得经两通道提示词出域（trace
             # 6cdec1eb 实证）——行集层统一脱敏，safety 关（kill switch）原样直通。
             history_rows = self._sanitize_history_rows(
@@ -2128,7 +2459,25 @@ class ThreadScheduler:
                 "images": [],  # M4 视觉轮预留（REQ 视觉面），本批恒空
             }
             if is_fast_mode:
-                initial_state["history_recall"] = self._format_history_recall(history_rows)
+                # 通道二骨架配方只吃窗口行——父轮块**原样**追加末行（不二次骨架化：
+                # 块自带摘要形态+URL 表，二次骨架化会截断 URL 表）。
+                window_rows = (
+                    history_rows[:-1] if parent_ctx is not None else history_rows
+                )
+                recall_rows = self._format_history_recall(window_rows)
+                if parent_ctx is not None:
+                    recall_rows = [
+                        *recall_rows,
+                        {"q": history_rows[-1][0], "a": history_rows[-1][1]},
+                    ]
+                initial_state["history_recall"] = recall_rows
+                # REQ-017 state 注入（仅 parented fast 轮——非父轮零新键零波及）：
+                # parent_turn_id=synthesis {{history_block}} 渲染条件扩容判定键
+                # （recall ∨ parented）；parent_sources=引用映射供给面（web/verify 扩展）。
+                if parent_ctx is not None:
+                    initial_state["parent_turn_id"] = str(turn.parent_turn_id)
+                    if parent_ctx["sources"]:
+                        initial_state["parent_sources"] = parent_ctx["sources"]
             # 首 stage 图前同步发布（ARCH §4.3「首个 stage ≤1s」的结构性保证：不等 LLM/
             # 图首帧——rewrite/plan 节点内不再发 running，避免重复 seq）。M2 批次 1：
             # 首 stage 按 mode——deep=plan（api.md §7.4 深度序列首事件 + §7.4 v1.4 注

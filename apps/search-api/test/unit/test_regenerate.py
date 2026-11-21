@@ -1,16 +1,23 @@
-"""unit 层：regenerate 端点服务面（B11 P2 / api.md §2.12 v1.19 / REQ-063 / A47）。
+"""unit 层：regenerate 端点服务面（B11 P2 / api.md §2.12 v1.19+v1.28 / REQ-063 / A47）。
 
 钉住的语义（冻结契约，逐条对应测试）：
-- 前置三条件（全满足才推进，任一不满足 409006）：`status ∈ {degraded, failed}` ∧
-  `mode=fast` ∧ sources 非空；归属校验 id+user 双条件（404001 同款）；
-- 条件 UPDATE 防双击（WHERE status IN (...) AND mode=fast AND EXISTS(sources)）：
-  落败方 409006；推进同时清 error/degraded_reason 并刷 started_at；
+- 前置条件（全满足才推进，任一不满足 409006）：`status ∈ {degraded, failed}` ∧
+  `mode ∈ {fast, deep}`【v1.28 放开 deep——deep 分支前置同 1/2 条判据】 ∧ sources
+  非空；归属校验 id+user 双条件（404001 同款）；
+- 条件 UPDATE 防双击（WHERE status IN (...) AND mode IN (fast,deep) AND
+  EXISTS(sources)）：落败方 409006；推进同时清 error/degraded_reason 并刷 started_at；
 - 通道重开在请求内完成（terminal 解除——客户端 200 后立即重订阅不被短路）；
-- 微图执行输入重建：fused 自 sources 行（不重检索）/ search_strategy 自
-  turn_events stage(rewrite,done).extra / spec 当次新快照；
+- 微图执行输入重建：fast=fused 自 sources 行（不重检索）/ search_strategy 自
+  turn_events stage(rewrite,done).extra / spec 当次新快照；deep=collected_sources
+  自 sources 行（ref_no 账本重建——[n] 映射稳定）、outline/subagent_reports 缺省空
+  （state-only 不落库结构性不可重建——writer 以 sources 元数据自组织分节）；
 - 收尾口径（决策 14）：成功 → completed + answer_md 原地更新 + stages 追加 +
   duration_ms 不覆写 + error 清除；再失败 → degraded + error(500101)；
-  取消 → canceled（stages 追加）。
+  取消 → canceled（stages 追加）；
+- **deep 分支（v1.28）**：事件面无 plan/search/read/reflect 段（stage_key 集合仅
+  write）；messages 门控放行 writer 帧（微图直跑零段 namespace）；writer 兜底轮
+  （errors 标记）→ 兜底产出收束（零 error、done(finish=degraded,
+  degraded_reason=None)）；轮级超时读 spec.deep.turn_timeout_s。
 
 零网络：EventBus 真内存实现、session/graph 假体（test.unit.turn_fakes 提供共享假体）。
 """
@@ -21,7 +28,6 @@ from typing import Any
 import pytest
 
 from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
-from app.agent.tools.registry import SearchChain
 from app.config_center.cache import AssetSnapshot
 from app.db.models import Source, Thread, Turn, TurnEvent, TurnFeedback
 from app.exception import NotFoundException, TurnNotRegenerableException
@@ -221,6 +227,7 @@ def _scheduler(
     *,
     bus: Any = None,
     graph: Any = None,
+    deep_graph: Any = None,
     spec_payload: dict[str, Any] | None = None,
 ) -> ThreadScheduler:
     return ThreadScheduler(
@@ -230,6 +237,7 @@ def _scheduler(
         mapping_snapshot=_snapshot(_MAPPING_PAYLOAD, "ai_search.model.mapping.json"),
         tools_registry=None,
         regenerate_graph_override=graph,
+        deep_regenerate_graph_override=deep_graph,
     )
 
 
@@ -279,15 +287,19 @@ async def test_regenerate_turn_not_found_404001() -> None:
         ("completed", "fast", [1]),  # 非 {degraded, failed} 终态
         ("canceled", "fast", [1]),
         ("running", "fast", [1]),  # 进行中重复点击（预检面）
-        ("degraded", "deep", [1]),  # deep 轮
+        ("completed", "deep", [1]),  # deep 非 {degraded, failed} 终态（v1.28 同判据）
+        ("canceled", "deep", [1]),
+        ("running", "deep", [1]),
         ("degraded", "fast", []),  # 零来源
         ("failed", "fast", []),  # 零源 failed（500201 等）
+        ("degraded", "deep", []),  # deep 零源（v1.28 前置第 2 条同判据）
     ],
 )
 async def test_regenerate_turn_prerequisite_409006(
     status: str, mode: str, sources: list[int]
 ) -> None:
-    """§2.12 前置三条件任一不满足 → 409006（单码覆盖语义族）。"""
+    """§2.12 前置条件任一不满足 → 409006（单码覆盖语义族；deep 有源 degraded/failed
+    为 200 放行面——专项用例见下）。"""
     turn = _turn(status=status, mode=mode)
     session = _RegenSession(
         turn=turn,
@@ -298,6 +310,63 @@ async def test_regenerate_turn_prerequisite_409006(
     with pytest.raises(TurnNotRegenerableException):
         await scheduler.regenerate_turn(_TURN_ID, user_id=_USER_ID)
     assert session.commits == 0
+
+
+async def test_regenerate_turn_deep_degraded_allowed() -> None:
+    """§2.12 v1.28：deep degraded 有源轮 → 200 running（前置第 3 条放开 mode=deep）；
+    条件 UPDATE 同码同路径（mode IN (fast,deep)），通道重开先于响应。"""
+    bus = _bus()
+    turn = _turn(mode="deep")
+    from app.services.event_bus import SseEvent
+
+    await bus.publish(_TURN_ID, SseEvent(thread_id=_THREAD_ID, event_type="done", data={"finish": "degraded"}))
+    assert bus.terminal_seq(_TURN_ID) is not None
+    session = _RegenSession(
+        turn=turn,
+        sources=[_source(1, "https://a/1")],
+        precheck=type("Row", (), {"id": turn.id, "thread_id": turn.thread_id, "status": "degraded", "mode": "deep"})(),
+        update_rowcount=1,
+    )
+    scheduler = _scheduler(session, bus=bus)
+
+    result = await scheduler.regenerate_turn(_TURN_ID, user_id=_USER_ID)
+
+    assert result == {"turn_id": _TURN_ID, "status": "running"}
+    assert bus.terminal_seq(_TURN_ID) is None  # 通道重开
+    assert session.commits == 1
+    stmt = session.executed[-1]
+    update_sql = str(stmt)
+    assert update_sql.strip().upper().startswith("UPDATE")
+    assert "POSTCOMPILE_mode" in update_sql  # 条件 UPDATE 含 mode 守卫（in_ 展开参数）
+    mode_values = next(v for k, v in stmt.compile().params.items() if k.startswith("mode"))
+    assert set(mode_values) == {"fast", "deep"}  # 双模同条件（v1.28 零新分支）
+
+
+async def test_regenerate_turn_deep_failed_with_sources_allowed() -> None:
+    """§2.12 v1.28：deep failed-with-sources（孤儿清理/兜底路径可达形态）→ 200 running。"""
+    turn = _turn(status="failed", mode="deep")
+    session = _RegenSession(
+        turn=turn,
+        sources=[_source(1, "https://a/1")],
+        precheck=type("Row", (), {"id": turn.id, "thread_id": turn.thread_id, "status": "failed", "mode": "deep"})(),
+    )
+    scheduler = _scheduler(session)
+    result = await scheduler.regenerate_turn(_TURN_ID, user_id=_USER_ID)
+    assert result["status"] == "running"
+
+
+async def test_regenerate_turn_deep_double_click_409006() -> None:
+    """deep 并发双击：条件 UPDATE rowcount=0 落败方 → 409006（同码同路径零新分支）。"""
+    turn = _turn(mode="deep")
+    session = _RegenSession(
+        turn=turn,
+        sources=[_source(1, "https://a/1")],
+        precheck=type("Row", (), {"id": turn.id, "thread_id": turn.thread_id, "status": "degraded", "mode": "deep"})(),
+        update_rowcount=0,
+    )
+    scheduler = _scheduler(session)
+    with pytest.raises(TurnNotRegenerableException):
+        await scheduler.regenerate_turn(_TURN_ID, user_id=_USER_ID)
 
 
 async def test_regenerate_turn_failed_with_sources_allowed() -> None:
@@ -540,6 +609,247 @@ async def test_execute_regenerate_canceled_mid_stream() -> None:
     assert [e.event_type for e in events] == ["stage", "done"]
     assert events[0].data["status"] == "running"  # 取消前的 stage 已发布
     assert events[-1].data["cancel_reason"] == "user"
+
+
+# ---- deep regenerate（api.md §2.12 v1.28 / §7.4 深度 regenerate 形态）----
+
+
+class _FakeDeepRegenGraph:
+    """deep regenerate 微图假体（对标真 deep_regenerate 微图事件面）：
+
+    stage(write,running,label=撰写报告) custom → writer token messages（微图直跑
+    零段 namespace + metadata.langgraph_node="writer"——R14③ 门控判据的 regenerate
+    形态）→ stage(write,done,extra.sections|extra.fallback) custom →
+    updates(writer.answer_md[,errors 兜底标记])。fallback 旋钮非 None 时走
+    §7.4:946 再失败形态（digest=fallback_token 整块；partial=内容已随流式 token
+    出域、只发 stage done extra.fallback=synthesis_partial）。
+    """
+
+    def __init__(
+        self,
+        *,
+        answer: str = "新的深度报告[1]。",
+        deltas: tuple[str, ...] = ("新的", "深度报告[1]。"),
+        sections: int = 0,
+        fallback: str | None = None,
+    ) -> None:
+        self.answer = answer
+        self.deltas = list(deltas)
+        self.sections = sections
+        self.fallback = fallback
+        self.payloads: list[Any] = []
+        self.configs: list[Any] = []
+
+    def astream(
+        self, payload: Any, config: Any = None, stream_mode: Any = None, subgraphs: bool = False
+    ) -> Any:
+        self.payloads.append(payload)
+        self.configs.append(config)
+        answer = self.answer
+        deltas = self.deltas
+        sections = self.sections
+        fallback = self.fallback
+
+        async def gen():
+            yield ((), "custom", {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"})
+            for delta in deltas:
+                yield ((), "messages", (_MessageChunk(delta), {"langgraph_node": "writer"}))
+            if fallback is not None:
+                is_digest = fallback.startswith("报告撰写未能完成")
+                if is_digest:  # 内容未流式过 → fallback_token 整块补发（fast :641 同构）
+                    yield ((), "custom", {"type": "fallback_token", "delta": fallback})
+                yield ((), "custom", {
+                    "type": "stage", "stage_key": "write", "status": "done",
+                    "extra": {"fallback": "synthesis_digest" if is_digest else "synthesis_partial"},
+                })
+                yield ((), "updates", {
+                    "writer": {
+                        "answer_md": fallback,
+                        "errors": [{"stage": "write", "reason": "llm_call_failed"}],
+                    },
+                })
+                return
+            yield ((), "custom", {"type": "stage", "stage_key": "write", "status": "done", "extra": {"sections": sections}})
+            yield ((), "updates", {"writer": {"answer_md": answer}})
+
+        return gen()
+
+
+async def test_execute_regenerate_deep_success_contract_events() -> None:
+    """§7.4 深度 regenerate 形态（v1.28）：stage(write,running,label=撰写报告) →
+    token…token → stage(write,done) → done(completed)；无 plan/search/read/reflect
+    段；messages 门控放行 writer 帧（微图直跑零段 namespace）；输入重建走
+    collected_sources（ref_no 账本）、无 outline/fused；Langfuse metadata mode:deep。"""
+    bus = _bus()
+    turn = _turn(status="running", mode="deep")
+    session = _RegenSession(
+        turn=turn,
+        sources=[_source(1, "https://a/1"), _source(2, "https://b/2")],
+        events=[],
+    )
+    graph = _FakeDeepRegenGraph()
+    scheduler = _scheduler(session, bus=bus, deep_graph=graph)
+
+    await scheduler.execute_regenerate(_TURN_ID)
+
+    payload = graph.payloads[0]
+    assert payload["mode"] == "deep"
+    assert payload["history"] == []  # 不重跑 planner（指代消解不适用）
+    assert payload["collected_sources"] == [
+        {"ref_no": 1, "url": "https://a/1", "title": "来源 1", "snippet": "片段",
+         "source_type": "web", "score": 0.0},
+        {"ref_no": 2, "url": "https://b/2", "title": "来源 2", "snippet": "片段",
+         "source_type": "web", "score": 0.0},
+    ]  # ref_no 账本重建（[n] 映射稳定）
+    assert "outline" not in payload and "subagent_reports" not in payload  # 缺省空
+    assert "fused" not in payload  # deep 态无 fused 键
+    config = graph.configs[0]
+    assert config["metadata"]["mode"] == "deep"
+    assert "mode:deep" in config["metadata"]["langfuse_tags"]
+    assert "regenerate" in config["metadata"]["langfuse_tags"]
+
+    assert turn.status == "completed"
+    assert turn.answer_md == "新的深度报告[1]。"
+    assert turn.duration_ms == 9000  # 不覆写
+    assert turn.error is None and turn.degraded_reason is None
+    stages = turn.timing["stages"]
+    assert stages[0] == _OLD_STAGE  # 原时间线保留
+    assert stages[-1]["stage_key"] == "write" and stages[-1]["status"] == "done"
+
+    events = await _drain_all(bus, _TURN_ID)
+    kinds = [e.event_type for e in events]
+    assert kinds[0] == "stage" and events[0].data["status"] == "running"
+    assert events[0].data["label"] == "撰写报告"  # 无大纲回落 label（§7.4:944）
+    assert "token" in kinds  # writer 帧经门控放行（零段 namespace + langgraph_node=writer）
+    assert "error" not in kinds
+    stage_keys = {
+        e.data.get("stage_key") for e in events if e.event_type == "stage"
+    }
+    assert stage_keys == {"write"}  # 无 plan/search/read/reflect 段
+    done = next(e for e in events if e.event_type == "done")
+    assert done.data["finish"] == "completed"
+    assert done.data["source_count"] == 2  # 沿该轮累计不变
+    assert done.data["duration_ms"] == 9000
+
+
+async def test_execute_regenerate_deep_writer_digest_fallback_degrades() -> None:
+    """deep 再失败（writer 兜底标记）→ 兜底产出收束（§7.4:946 digest 形态）：
+    零 error 事件、status=degraded、degraded_reason=None（枚举零扩容）、
+    answer_md=兜底全文、duration 不覆写；fallback_token 整块已由图内发射。"""
+    bus = _bus()
+    turn = _turn(status="running", mode="deep")
+    turn.error = {"code": "500301", "message": "轮次执行超时，请稍后重试", "stage_key": None}
+    turn.degraded_reason = "timeout"
+    digest = "报告撰写未能完成（生成超时或失败），以下是本次研究收集到的来源速览，可先参考来源面板获取完整信息。\n\n- [1] 来源 1：片段"
+    session = _RegenSession(
+        turn=turn,
+        sources=[_source(1, "https://a/1"), _source(2, "https://b/2")],
+        events=[],
+    )
+    graph = _FakeDeepRegenGraph(fallback=digest)
+    scheduler = _scheduler(session, bus=bus, deep_graph=graph)
+
+    await scheduler.execute_regenerate(_TURN_ID)
+
+    assert turn.status == "degraded"
+    assert turn.answer_md == digest  # 兜底全文持久化
+    assert turn.error is None  # 兜底轮无错误卡（清旧 error）
+    assert turn.degraded_reason is None  # 枚举零扩容（timeout/budget 不误置）
+    assert turn.duration_ms == 9000
+    events = await _drain_all(bus, _TURN_ID)
+    kinds = [e.event_type for e in events]
+    assert "error" not in kinds  # 零 error 事件
+    assert "token" in kinds  # fallback_token 整块 → token 事件（前端拼接渲染零新路径）
+    stage_done = [e for e in events if e.event_type == "stage" and e.data["status"] == "done"]
+    assert stage_done[-1].data["extra"] == {"fallback": "synthesis_digest"}
+    done = next(e for e in events if e.event_type == "done")
+    assert done.data["finish"] == "degraded"
+    assert done.data["degraded"] is True
+    assert done.data["degraded_reason"] is None
+    assert done.data["source_count"] == 2
+
+
+async def test_execute_regenerate_deep_writer_partial_fallback_degrades() -> None:
+    """deep 再失败 partial 形态：部分正文已随流式 token 出域 → stage done
+    extra.fallback=synthesis_partial（fast :632 同构——不重发已流式内容）、
+    done(finish=degraded, degraded_reason=None)。"""
+    bus = _bus()
+    turn = _turn(status="running", mode="deep")
+    session = _RegenSession(turn=turn, sources=[_source(1, "https://a/1")], events=[])
+    graph = _FakeDeepRegenGraph(
+        deltas=("研究方法部分已成文。",), fallback="研究方法部分已成文。"
+    )
+    scheduler = _scheduler(session, bus=bus, deep_graph=graph)
+
+    await scheduler.execute_regenerate(_TURN_ID)
+
+    assert turn.status == "degraded"
+    assert turn.answer_md == "研究方法部分已成文。"
+    assert turn.degraded_reason is None
+    events = await _drain_all(bus, _TURN_ID)
+    kinds = [e.event_type for e in events]
+    assert "error" not in kinds
+    stage_done = [e for e in events if e.event_type == "stage" and e.data["status"] == "done"]
+    assert stage_done[-1].data["extra"] == {"fallback": "synthesis_partial"}
+    done = next(e for e in events if e.event_type == "done")
+    assert done.data["finish"] == "degraded" and done.data["degraded_reason"] is None
+
+
+async def test_execute_regenerate_deep_timeout_uses_deep_turn_budget() -> None:
+    """轮级硬超时读 spec.deep.turn_timeout_s（mode 感知——不落 fast 预算）→
+    500301 + degraded_reason=timeout 降级收束。"""
+    import asyncio
+
+    class _SlowDeepGraph:
+        def astream(self, payload: Any, config: Any = None, stream_mode: Any = None, subgraphs: bool = False) -> Any:
+            async def gen():
+                await asyncio.sleep(0.2)
+                yield ((), "custom", {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"})
+
+            return gen()
+
+    bus = _bus()
+    turn = _turn(status="running", mode="deep")
+    session = _RegenSession(turn=turn, sources=[_source(1, "https://a/1")], events=[])
+    spec = {**_SPEC_PAYLOAD, "deep": {"turn_timeout_s": 0.02}}
+    scheduler = _scheduler(session, bus=bus, deep_graph=_SlowDeepGraph(), spec_payload=spec)
+
+    await scheduler.execute_regenerate(_TURN_ID)
+
+    assert turn.status == "degraded"
+    assert turn.error["code"] == "500301"
+    assert turn.degraded_reason == "timeout"
+    assert turn.duration_ms == 9000
+    events = await _drain_all(bus, _TURN_ID)
+    assert [e.event_type for e in events] == ["error", "done"]
+    assert events[0].data["code"] == "500301"
+
+
+async def test_build_regenerate_context_deep_mode_carries_collected_sources() -> None:
+    """deep 输入重建：ctx.mode=deep + collected_sources 自 sources 行（ref_no 账本序）；
+    fast 分支 ctx.mode 仍为 fast（零回退）。"""
+    turn = _turn(mode="deep")
+    session = _RegenSession(
+        turn=turn,
+        sources=[_source(1, "https://a/1"), _source(2, "https://b/2")],
+        events=[],
+    )
+    scheduler = _scheduler(session)
+
+    ctx = await scheduler._build_regenerate_context(turn)
+
+    assert ctx.mode == "deep"
+    assert ctx.regenerate is True
+    assert [item["ref_no"] for item in ctx.collected_sources] == [1, 2]
+    assert ctx.collected_sources[0]["url"] == "https://a/1"
+    assert len(ctx.fused) == 2  # fused 两模同建（deep 初始 state 不消费——执行面断言锁）
+
+    fast_ctx = await scheduler._build_regenerate_context(_turn())
+    assert fast_ctx.mode == "fast"  # fast 分支零回退
+    # collected_sources 两模同源一次装配（fast 初始 state 不引用——零分叉成本），
+    # 消费面「fast 不引用」由 test_execute_regenerate_success 的 fused 断言锁死
+    assert [item["ref_no"] for item in fast_ctx.collected_sources] == [1, 2]
+    assert len(fast_ctx.fused) == 2
 
 
 # ---- 双评审修复：线程行锁 / 加载段收口 ----

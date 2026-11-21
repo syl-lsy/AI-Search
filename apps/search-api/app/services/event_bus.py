@@ -19,6 +19,11 @@
 - **regenerate 通道重开**（api.md §7.1 v1.19 / ADR-003 v1.19 增注）：`reopen_channel`
   解除 terminal/closed、清 followups 状态，**历史缓冲保留**——同通道 seq 续推，
   第二个 done 发布后重新终态。
+- **context_compact 重放边界**（api.md §7.2 context_compact 断线续传条 / §7.3 v1.3
+  增注，M2 批次 5 实装）：深度轮发布 context_compact（仅 deep，publish-only 不落
+  turn_events——ADR-003 第 4 条子集不变）时记通道级 `compact_seq`（多轮压缩取
+  最近一次）；订阅游标早于该值时**旧游标失效**——服务端自该事件起重放，压缩前
+  内容不再重放（以 §2.3/§2.5 REST 对账）。
 
 生命周期：main.py lifespan（B2 接线）调 start_event_bus()；api/ 层经
 app/dependencies.py 的 get_event_bus 消费（未启动即取 fail-fast，与
@@ -43,6 +48,7 @@ from typing import Any
 from app.core.config import SseSettings, sse_settings
 
 __all__ = [
+    "CONTEXT_COMPACT_EVENT_TYPE",
     "FOLLOWUPS_EVENT_TYPE",
     "TERMINAL_EVENT_TYPE",
     "EventBus",
@@ -57,6 +63,16 @@ TERMINAL_EVENT_TYPE = "done"
 
 # done 后保活窗口内可能出现的事件（api.md §7.1/§7.2：实验增强层，必然晚于 done）
 FOLLOWUPS_EVENT_TYPE = "followups"
+
+# 深度研究上下文压缩通知（api.md §7.2 v1.3，仅 deep）——重放边界判据事件（§7.3
+# v1.3 增注）。与 app/agent/graphs/signals.py CONTEXT_COMPACT 同值；此处为字面量
+# 常量（services 层不反向 import agent 域，TERMINAL/FOLLOWUPS 同款先例）。
+# **两处字面量必须同值**（漂移无告警）：本值只驱动下方的 `compact_seq` 记账与订阅
+# 重放钳制——图内若发另一个串则该分支永不命中，压缩边界静默失效（旧游标重放出压缩
+# 前事件，前端上下文窗口与模型侧不一致）。故 parity 由单测锁死
+# （test/unit/test_event_bus.py::test_context_compact_event_type_matches_signals_constant
+# ——比较字面值，不引反向 import）。
+CONTEXT_COMPACT_EVENT_TYPE = "context_compact"
 
 # 后台清扫周期（秒）：环境无关节奏值，代码常量判据；TTL 判定粒度 ≤ 本周期。
 SWEEP_INTERVAL_SECONDS = 60.0
@@ -103,6 +119,9 @@ class _TurnChannel:
     # 据此决定 done 后是否继续跟随；未登记（开关关闭/非达标轮）= done 后立即收口。
     followups_hold_deadline: float | None = None
     followups_seq: int | None = None  # followups 事件已发布时的 seq（重放/late-subscriber 判据）
+    # 最近一次 context_compact 的 seq（重放边界判据——多轮压缩取最近一次；None=该轮
+    # 未压缩）。publish 时更新（api.md §7.2/§7.3 v1.3 增注：游标早于该值即失效）。
+    compact_seq: int | None = None
 
 
 class EventBus:
@@ -149,6 +168,9 @@ class EventBus:
         elif event.event_type == FOLLOWUPS_EVENT_TYPE:
             # followups 已发布：记录 seq（重放/late-subscriber 的「还有事件可取」判据）
             channel.followups_seq = seq
+        elif event.event_type == CONTEXT_COMPACT_EVENT_TYPE:
+            # context_compact 已发布：记录 seq（订阅重放边界判据——多轮压缩取最近）
+            channel.compact_seq = seq
 
         async with channel.cond:  # 持锁唤醒（notify 要求持锁）；缓冲变更本身无竞争
             channel.cond.notify_all()
@@ -177,13 +199,18 @@ class EventBus:
     # ---- 订阅 ----
 
     async def subscribe(
-        self, turn_id: str, last_seq: int = 0
+        self, turn_id: str, last_seq: int = 0, *, enforce_compact_boundary: bool = True
     ) -> AsyncGenerator[SseEvent, None]:
         """订阅轮事件流：重放缓冲中 seq > last_seq 者 → 实时跟随，直至消费方停止。
 
         - 惰性启动：首次 __anext__ 才登记订阅者并取重放快照（登记与快照间无 await，
           无缝隙）；订阅先行（轮无事件）合法，挂在跟随态等待；
         - last_seq 早于现存缓冲最早事件时缺口静默跳过（ADR-003 v1.7 增注 2）；
+        - **context_compact 重放边界**（api.md §7.2/§7.3 v1.3 增注）：`enforce_
+          compact_boundary=True`（重连显式游标）且游标早于通道最近一次 compact_seq
+          时旧游标失效——钳到 compact_seq-1，自该事件起重放（压缩前内容不再重放，
+          以 §2.3/§2.5 REST 对账）；多轮压缩取最近一次。首连（无 Last-Event-ID）
+          与非法游标（§7.1 513 行「等同首次连接」）由调用方传 False——恒全量重放；
         - 各订阅者独立游标互不干扰；断开/停止迭代即从订阅者集合移除自身；
         - 不因 done 自动结束——done 后保活窗口（followups，ADR-003 v1.16）与
           流关闭时机归 SSE 端点（B2）裁决，消费方自行 break/aclose（async 生成器，
@@ -199,6 +226,16 @@ class EventBus:
                 last_activity=self._clock(),
             )
             self._channels[turn_id] = channel
+        if (
+            enforce_compact_boundary
+            and channel.compact_seq is not None
+            and last_seq < channel.compact_seq
+        ):
+            # 重放边界（api.md §7.2 context_compact 断线续传条）：压缩改变上下文
+            # 形态，早于压缩点的流前缀对重连客户端不再有意义——旧游标失效、自该
+            # 事件起补帧；「客户端已持有 done 即零帧关闭」端点短路不受影响
+            # （compact 恒先于 done，游标 ≥ done.seq 蕴含 ≥ compact_seq）。
+            last_seq = channel.compact_seq - 1
         sub = _Subscriber(cursor=channel.appended)
         channel.subscribers.add(sub)
         try:

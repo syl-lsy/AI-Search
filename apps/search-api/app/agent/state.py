@@ -62,6 +62,11 @@ class MainState(TypedDict, total=False):
     history: list[HistoryItem]
     history_recall: list[HistoryItem]  # v1.51：回顾装配第二通道（recall 轮 synthesis 消费，
     #                                   骨架配方见 utils/history_recall.py + ARCH §6.5）
+    parent_turn_id: str  # REQ-017：深度报告后的 fast 追问自动挂（api.md §2.4）——
+    #                     父轮上下文消费面判定键（synthesis {{history_block}} 渲染条件
+    #                     扩容「recall ∨ parented」）；仅 parented fast 轮注入，缺省零波及
+    parent_sources: list[Candidate]  # REQ-017：父轮 sources URL 表（引用映射供给面——
+    #                                synthesis 编入 [N+1..] 可引用来源、命中才复用）
     images: list[str]
     query_lang: Literal["zh", "en"]
     # 子图产出回填（顶层 updates 同名键合并）
@@ -123,6 +128,9 @@ class FastState(TypedDict, total=False):
     history: list[HistoryItem]
     history_recall: list[HistoryItem]  # v1.51 回顾装配第二通道（仅 fast recall 轮消费；
     #                                    deep 侧声明保持「输入字段同构」契约，deep 不消费——P1 裁决）
+    parent_turn_id: str  # REQ-017：父轮上下文消费面判定键（synthesis {{history_block}}
+    #                     渲染条件「recall ∨ parented」）；仅 parented fast 轮注入
+    parent_sources: list[Candidate]  # REQ-017：父轮 sources URL 表（引用映射供给面）
     images: list[str]  # M4 预留：data URL ≤3，触发 vision 模型（本批恒空）
     spec: dict[str, Any]
     query_lang: Literal["zh", "en"]
@@ -160,6 +168,9 @@ class DeepState(TypedDict, total=False):
     chat_model_key: str
     history: list[HistoryItem]
     history_recall: list[HistoryItem]  # v1.51 声明保「输入字段同构」（deep 不消费——P1 裁决）
+    parent_turn_id: str  # REQ-017 声明保「输入字段同构」（parented 只挂 fast 轮——§2.4；
+    #                     deep 轮结构性无父轮注入，deep 零消费）
+    parent_sources: list[Candidate]  # REQ-017 声明保「输入字段同构」（deep 零消费，同上）
     images: list[str]
     spec: dict[str, Any]
     query_lang: Literal["zh", "en"]

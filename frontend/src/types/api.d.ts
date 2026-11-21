@@ -1,11 +1,13 @@
 /**
- * src/types/api.d.ts — api.md（v1.25）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.28）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.25（REST + SSE 协议唯一事实源；本批 B14 随批镜像 = §2.5/§7.2
- *     stages[].extra 可选键 fallback（synthesis_digest | synthesis_partial，§7.4 v1.25 兜底收束
- *     形态留痕）——frontend-api.md §8.5 v1.29 §8.5 登记行；thinking/token/done/error 事件面
- *     契约零变更）
+ *   - docs/contract/api.md v1.28（REST + SSE 协议唯一事实源；本批 M2 批次 5 随批镜像 =
+ *     注释级同步（零类型形状变更）——§2.12 regenerate 前置放开 mode∈{fast,deep}（deep 有源
+ *     degraded/failed 轮可重生成，api.md §7.4 v1.28 深度 regenerate 形态）：RegenerateTurnData
+ *     docstring 与 ErrorCode 409006 触发场景注释同步；§2.4 REQ-017 parented 轮消费面
+ *     （TurnDetail.parent_turn_id 既有镜像不变，frontend/src 无新增类型）。B14 批已落镜像：
+ *     §2.5/§7.2 stages[].extra 可选键 fallback——frontend-api.md §8.5 登记行）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
  *   - frontend-api.md §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
@@ -38,7 +40,7 @@ export type ErrorCode =
   | '409003' // 不满足导出条件
   | '409004' // 该线程已有进行中的记忆抽取任务
   | '409005' // 线程有进行中轮次，不可删除（api.md §0 v1.18，REQ-059）
-  | '409006' // 轮次不支持重新生成（api.md §0 v1.19，REQ-063——非 {degraded,failed} 终态/零来源/deep 轮/regenerate 进行中重复点击单码覆盖）
+  | '409006' // 轮次不支持重新生成（api.md §0 v1.28，REQ-063——非 {degraded,failed} 终态/零来源/regenerate 进行中重复点击单码覆盖；deep 有源 degraded/failed 轮 v1.28 起可重生成，原「deep 轮一律拒收」收窄为 deep 零源/进行中形态）
   | '413001' // 文件超过大小上限
   | '415001' // 不支持的文件类型
   | '422001' // URL 非法
@@ -441,10 +443,12 @@ export interface CancelTurnData {
  * ----------------------------------------------------------- */
 
 /**
- * §2.12 响应 data（v1.19 增，REQ-063/A47）：degraded/failed-with-sources fast 轮「仅重新生成」
- * ——复用既有 sources 只重跑 synthesis（sources/[n] 映射稳定、images 不动不重发），请求体空、
- * 无参数。轮已置 running、SSE 续发同一 turn 既有通道（前端重订阅 + 清空重渲约定，
- * frontend-api.md §3 生命周期 14）；错误 404001/409006/500001。
+ * §2.12 响应 data（v1.19 增，REQ-063/A47；v1.28 前置放开 mode∈{fast,deep}）：degraded/
+ * failed-with-sources fast/deep 轮「仅重新生成」——复用既有 sources 只重跑 synthesis
+ * （sources/[n] 映射稳定、images 不动不重发），请求体空、无参数。deep 分支重放起点=write
+ * （无 plan/search/read/reflect 段，api.md §7.4 v1.28 深度 regenerate 形态）。轮已置 running、
+ * SSE 续发同一 turn 既有通道（前端重订阅 + 清空重渲约定，frontend-api.md §3 生命周期 14）；
+ * 错误 404001/409006/500001。
  */
 export interface RegenerateTurnData {
   turn_id: Uuid

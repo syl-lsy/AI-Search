@@ -383,6 +383,8 @@ _FAST_INPUT_KEYS = {
     "chat_model_key",
     "history",
     "history_recall",  # v1.51：回顾装配第二通道（recall 轮 synthesis 消费）
+    "parent_turn_id",  # REQ-017：深度报告后的 fast 追问自动挂（§2.4）——synthesis 渲染条件扩容判定面
+    "parent_sources",  # REQ-017：父轮 sources URL 表（引用映射供给面；仅 parented fast 轮注入）
     "images",
     "spec",
     "query_lang",

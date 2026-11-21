@@ -80,6 +80,24 @@ class _FakeSession:
         return False
 
 
+class _QueuedFakeSession(_FakeSession):
+    """多语句装配假体：execute 按调用次序出队行集（REQ-017 父轮上下文用例——
+    history 行集与父轮 sources 行集是两条独立语句，单行集假体无法区分）。
+
+    get()/scalars()/add()/commit() 行为零变化；出队耗尽后返回空行集（防静默错配
+    ——语句次数超预期时后续语句拿到空集，断言面显式暴露）。
+    """
+
+    def __init__(self, *, execute_queue: list[list[Any]], **kw: Any) -> None:
+        super().__init__(**kw)
+        self._execute_queue = list(execute_queue)
+
+    async def execute(self, statement: Any) -> _FakeResult:
+        self.executed.append(statement)
+        rows = self._execute_queue.pop(0) if self._execute_queue else []
+        return _FakeResult(rows)
+
+
 class _FakeSessionFactory:
     """短事务假工厂：每次 async with 返回同一假会话（跨事务累积写入记录）。"""
 
@@ -104,6 +122,7 @@ class _TurnRow:
         self.mode = mode
         self.query = query
         self.chat_model_key = chat_model_key
+        self.parent_turn_id: str | None = None  # REQ-017：深度报告后的 fast 追问自动挂（§2.4）
         self.query_lang: str | None = None  # TurnRunner 运行时写入（§2.5 事实源）
         self.rewritten_queries: list[Any] = []
         self.created_at = datetime.now(UTC)

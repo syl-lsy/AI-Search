@@ -111,8 +111,16 @@ class SynthesisFallback(Exception):
     字段：
     - `answer_md`：兜底全文（digest 全文 / 句界清理后的部分正文）；
     - `kind`：∈ {synthesis_digest, synthesis_partial}（stage extra 与 M4 采样判据同源）；
-    - `failure`：终局失败类别 ∈ {timeout, connection, non_retryable}（轮末 AgentLog 留痕）；
-    - `attempts`：物理尝试次数；`source_count`：fused 来源条数（digest 截断前总量）。
+    - `failure`：终局失败类别 ∈ {timeout, connection, non_retryable, llm_call_failed}
+      （轮末 AgentLog 留痕）。前三值由本节点 `_raise_terminal_failure` 经
+      `classify_failure_kind(last_error)` 分类产出（流内异常分类）；`llm_call_failed`
+      仅由 TurnRunner 的 **deep regenerate 分流**构造（turn_service `_run_regenerate_graph`
+      ——deep writer 兜底轮的失败类别来自图内 `errors[]` 标记而非流内异常，无异常可分类，
+      固定标注 llm_call_failed，语义=writer 阶段 LLM 调用失败）；
+    - `attempts`：物理尝试次数；`source_count`：fused 来源条数（digest 截断前总量）；
+    - `fused`：供给面 fused（含 REQ-017 父轮扩展卡，与成功路径返回值同口径）；仅
+      parented fast 轮的终局失败携带——TurnRunner `_finish_synthesis_fallback` 据此补建
+      父轮扩展卡 sources 行（[N+1..] 引用不悬空）；None=无补行面（非父轮/deep/regenerate）。
     """
 
     def __init__(
@@ -123,12 +131,14 @@ class SynthesisFallback(Exception):
         failure: str,
         attempts: int,
         source_count: int,
+        fused: list[Any] | None = None,
     ) -> None:
         self.answer_md = answer_md
         self.kind = kind
         self.failure = failure
         self.attempts = attempts
         self.source_count = source_count
+        self.fused = fused
         super().__init__(
             f"synthesis 兜底收束（kind={kind}, failure={failure}, attempts={attempts}）"
         )
@@ -297,7 +307,9 @@ def _sources_compact(fused: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
+def _strategy_metadata(
+    state: Mapping[str, Any], *, fused_for_prompt: list[Any] | None = None
+) -> dict[str, Any]:
     """轮策略观测元数据（ARCH §6.6 v1.44：search_strategy 与 query_type 同通道）。
 
     时序约束：本决策在 rewrite 之后才可知，而 Langfuse 轮级 trace 属性只能随 span
@@ -308,8 +320,11 @@ def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
     Option B 增补键（装配面如实口径——v1.53 评审修正）：
     - `user_query`：本轮用户原始问题（state.query，不取改写后的 rewritten_queries；
       截断 ≤200 字符，同 v1.43 metadata 单值口径）；
-    - `sources_compact`：fused 非空时的紧凑来源投影 [{ref_no,url,title,snippet≤200}]，
-      ref_no 与 [n] 引用编号对齐；**fused 为空时键省略**（键可省口径，同 api.md images 行）。
+    - `sources_compact`：来源供给面非空时的紧凑投影 [{ref_no,url,title,snippet≤200}]，
+      ref_no 与 [n] 引用编号对齐；**供给面为空时键省略**（键可省口径，同 api.md images 行）。
+      v1.70 修订：**supply 口径传 `fused_for_prompt`**（含 REQ-017 父轮扩展卡——
+      parented 轮 [N+1..] 编号的卡进 metadata，M4 引用有效性分桶需要完整供给面）；
+      缺省回落 `state.fused`（非父轮轮零变化）。
 
     **消费面限制（如实，不夸大）**：
     - **序列化形态**：本函数返回结构化值（list/dict），但 Langfuse SDK 对非 str 值经
@@ -328,7 +343,7 @@ def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
         "search_strategy": _resolve_strategy(state),
         "user_query": str(state.get("query") or "")[:_METADATA_VALUE_MAX_CHARS],
     }
-    fused = state.get("fused") or []
+    fused = fused_for_prompt if fused_for_prompt is not None else state.get("fused") or []
     if fused:
         metadata["sources_compact"] = _sources_compact(fused)
     query_type = state.get("query_type")
@@ -338,12 +353,19 @@ def _strategy_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _with_strategy_metadata(
-    config: RunnableConfig | None, state: Mapping[str, Any]
+    config: RunnableConfig | None,
+    state: Mapping[str, Any],
+    *,
+    fused_for_prompt: list[Any] | None = None,
 ) -> RunnableConfig:
-    """config 浅拷贝 + metadata 合并（callbacks/configurable 原样保留）。"""
+    """config 浅拷贝 + metadata 合并（callbacks/configurable 原样保留）。
+
+    `fused_for_prompt` 透传 sources_compact 的供给面口径（含 REQ-017 父轮扩展卡，
+    见 `_strategy_metadata` v1.70 注）；None 回落 state.fused（非父轮轮零变化）。
+    """
     base: dict[str, Any] = dict(config or {})
     metadata = dict((config or {}).get("metadata") or {})
-    metadata.update(_strategy_metadata(state))
+    metadata.update(_strategy_metadata(state, fused_for_prompt=fused_for_prompt))
     base["metadata"] = metadata
     return base  # type: ignore[return-value]
 
@@ -380,6 +402,42 @@ def _strip_out_of_range_citations(text: str, source_count: int) -> str:
         return match.group(0) if 1 <= n <= source_count else ""
 
     return _CITATION_RE.sub(_replace, text)
+
+
+def _parent_source_extension(
+    fused: list[Any], state: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """REQ-017 引用映射供给面装配（api.md §2.4 v1.28 / PRD REQ-017 v1.30）。
+
+    parented **web/verify** 轮：父轮来源卡（state.parent_sources）URL 去重后并入
+    可引用来源面——URL 命中轮内既有来源（或父轮集内先行条目）的卡片不重复供给
+    （PRD「URL 相同的复用同一卡片」：同一 URL 经既有卡片引用）；其余卡片按父轮
+    ref_no 序接续（调用方 `_sources_block` enumerate 承载 [N+1..] 连续编号——轮内
+    重映射编号；[n]↔sources 双向核对口径不变）。
+
+    direct/recall parented 轮**不扩供给面**（零源轮契约钉字保护：direct 轮 §2.5
+    sources[] 恒空、recall 轮 source_count=0——父轮块仍经 {{history_block}} 可见，
+    供组织回答，不供引用）；非父轮轮返回空表（零波及——供给面零变化）。
+    """
+    if state.get("parent_turn_id") is None or _resolve_strategy(state) not in (
+        "web",
+        "verify",
+    ):
+        return []
+    parent_sources = state.get("parent_sources")
+    if not isinstance(parent_sources, list):
+        return []
+    seen = {str(item.get("url") or "") for item in fused if isinstance(item, Mapping)}
+    extension: list[dict[str, Any]] = []
+    for card in parent_sources:
+        if not isinstance(card, Mapping):
+            continue
+        url = str(card.get("url") or "")
+        if not url or url in seen:
+            continue  # URL 命中既有来源：复用同一卡片（不重复供给、不产生第二张卡）
+        seen.add(url)
+        extension.append(dict(card))
+    return extension
 
 
 def _text_of(chunk: Any) -> str:
@@ -428,6 +486,13 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
         # v1.59 增量 C：fast 档缺省 off（spec.fast.thinking 热更可切 on）
         thinking=resolve_thinking(spec, "fast"),
     )
+    # REQ-017 引用映射供给面（api.md §2.4 v1.28）：parented web/verify 轮父轮来源卡
+    # URL 去重后接续编号并入可引用来源面（[N+1..]——轮内重映射编号）；direct/recall
+    # 不扩（零源轮契约保护）；非父轮零变化。**全部扩展卡进供给面与返回 fused**
+    # （v1.70 P0 修复：不再按「被引用」紧缩——编号稳定性优先于紧缩，供给面语义与
+    # 本轮自有 fused 卡全量落库一致；紧缩会让正文引用编号与补行 ref_no 错位）。
+    parent_extension = _parent_source_extension(fused, state)
+    fused_for_prompt = fused + parent_extension
 
     template = _apply_answerable_variant(
         resolve_prompt("fast.synthesis"),
@@ -440,16 +505,18 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
             "max_answer_chars": str(max_chars),
             "query_lang": str(state.get("query_lang") or "en"),
             "cite_rules": resolve_prompt("common.citation_rules"),
-            # 回顾装配第二通道（ARCH §6.5 v1.51）：**仅 recall 变体注入非空**，
-            # direct/verify/web 恒空串（token 纪律——非 recall 轮零增量）。
+            # 回顾装配第二通道（ARCH §6.5 v1.51）：注入条件自「仅 recall 变体」扩为
+            # 「recall ∨ REQ-017 parented 轮」（api.md §2.4 v1.28 / nacos-config §1
+            # v1.38）——parented fast 轮的父轮摘要块+URL 表经本通道进提示词；
+            # direct/verify/web **非父轮**变体仍恒空串（token 纪律零变化）。
             # 模板缺 recall 段时回落 direct 形态，历史仍注入（历史在场则可见——D4）。
             "history_block": (
                 render_history_recall(state.get("history_recall"))
-                if _resolve_strategy(state) == "recall"
+                if (_resolve_strategy(state) == "recall" or state.get("parent_turn_id"))
                 else ""
             ),
             "memory_block": "",  # M5 记忆→prompt 通道；启用前恒空（memory-api.md §2）
-            "sources_block": _sources_block(fused),
+            "sources_block": _sources_block(fused_for_prompt),
             "query": query,
         },
     )
@@ -483,7 +550,10 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
             )
             async with asyncio.timeout(per_call):
                 async for chunk in model.astream(
-                    messages, config=_with_strategy_metadata(config, state)
+                    messages,
+                    config=_with_strategy_metadata(
+                        config, state, fused_for_prompt=fused_for_prompt
+                    ),
                 ):
                     accumulated.append(_text_of(chunk))
             answer = "".join(accumulated)
@@ -532,16 +602,29 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
     if not answer:
         _raise_terminal_failure(
             fused=fused,
+            # 兜底信号随带供给面 fused（与成功路径返回值同口径，2026-11-21 终审）：
+            # 无扩展卡时传 None——非父轮兜底零补行面。
+            supply_fused=fused_for_prompt if parent_extension else None,
             best_partial=best_partial,
             last_error=last_error,
             attempts=total_attempts,
             max_chars=max_chars,
             query_lang=state.get("query_lang"),
+            # 剔除基准=供给面（含父轮扩展卡）——parented 轮合法父轮引用不被误剔（v1.70）
+            citation_count=len(fused_for_prompt),
         )
 
     answer = answer[:max_chars]
-    answer = _strip_out_of_range_citations(answer, len(fused))
+    answer = _strip_out_of_range_citations(answer, len(fused_for_prompt))
     emit_stage("write", "done")
+    # REQ-017 供给面语义（api.md §2.4 v1.28，v1.70 P0 修复——编号稳定零重编号）：
+    # **全部**父轮扩展卡随 fused 返回（不按「被引用」紧缩）——本轮自有 fused 卡本就
+    # 全量落库（sources=供给面非引用面），扩展卡同口径；TurnRunner
+    # `_persist_parent_source_appends` 按 fused 轮内位置补行 ref_no，与提示词供给编号
+    # [N+offset] 恒等。若按引用紧缩，模型跳过前置父轮卡只引后面编号时补行 ref_no
+    # 会前移、正文编号悬空（评审实证：fused=2+扩展 2 卡只引 [4] → 旧实现补行 ref_no=3）。
+    if parent_extension:
+        return {"answer_md": answer, "degraded": False, "fused": fused_for_prompt}
     return {"answer_md": answer, "degraded": False}
 
 
@@ -553,14 +636,22 @@ def _raise_terminal_failure(
     attempts: int,
     max_chars: int,
     query_lang: Any,
+    citation_count: int | None = None,
+    supply_fused: list[Any] | None = None,
 ) -> None:
     """终局失败二分收束（v1.59 增量 A）：fused 非空 → SynthesisFallback；零源 → SynthesisError。
 
     - **partial 路径**：最长跨尝试前缀先过 [n] 越界剔除、按 max_chars 截断、再句界清理
       （硬上限不得留下残句）——清理后非空即 partial；不足一句按零可用正文走 digest；
+      剔除基准=**供给面计数**（`citation_count`，缺省 len(fused)；parented 轮传
+      `len(fused_for_prompt)`——合法父轮编号 [N+1..] 不得被误剔，v1.70）；
     - **digest 路径**：`_build_digest` 机械装配 → `emit_fallback_token` **单事件整块**发射 →
       `stage(write, done, extra={"fallback": kind})`（事件序：token → stage done → done）；
-    - 两条路径均抛 `SynthesisFallback`（零 error 事件，TurnRunner 落 degraded）。
+    - **两条路径均抛 `SynthesisFallback`**（零 error 事件，TurnRunner 落 degraded）；
+      `supply_fused` 非空时（parented 轮，= `fused_for_prompt`）随信号携带——TurnRunner
+      兜底收束按其在轮内位置补建父轮扩展卡 sources 行，与成功路径
+      `_persist_parent_source_appends` 同口径（2026-11-21 终审：partial 正文保留的
+      [N+1..] 不再悬空）。
     """
     if not fused:
         raise SynthesisError(
@@ -569,8 +660,9 @@ def _raise_terminal_failure(
             else "综合生成失败（空输出）"
         )
     failure = classify_failure_kind(last_error) if last_error is not None else "non_retryable"
+    limit = len(fused) if citation_count is None else citation_count
     partial = _clip_to_sentence_boundary(
-        _strip_out_of_range_citations(best_partial, len(fused))[:max_chars]
+        _strip_out_of_range_citations(best_partial, limit)[:max_chars]
     )
     if partial:
         emit_stage("write", "done", extra={"fallback": "synthesis_partial"})
@@ -580,6 +672,7 @@ def _raise_terminal_failure(
             failure=failure,
             attempts=attempts,
             source_count=len(fused),
+            fused=supply_fused,
         )
     digest = _build_digest(query_lang, fused)
     emit_fallback_token(digest)  # 单事件整块（前端既有拼接渲染零新路径）
@@ -590,4 +683,5 @@ def _raise_terminal_failure(
         failure=failure,
         attempts=attempts,
         source_count=len(fused),
+        fused=supply_fused,
     )

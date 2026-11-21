@@ -394,6 +394,12 @@ def _stub_rewrite_llm_for_stub_flows(request: pytest.FixtureRequest, monkeypatch
         "app.services.turn_service.regenerate_graph",
         stub_flow.RegenerateFakeGraph(),
     )
+    # deep regenerate 微图假体（api.md §2.12 v1.28 / §7.4 深度 regenerate 形态）：
+    # 只重跑 writer→finalize 的确定性替身（真 writer 需 LLM）
+    monkeypatch.setattr(
+        "app.services.turn_service.deep_regenerate_graph",
+        stub_flow.DeepRegenerateFakeGraph(),
+    )
 
     # 搜索链假体：registry.resolve 恒 [tavily]、search 恒确定性候选（TurnRunner 轮启动
     # resolve 面兜底——假图下节点不执行，此处保 resolve 不抛）
