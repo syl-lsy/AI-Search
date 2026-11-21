@@ -8,7 +8,8 @@
   ["total_tokens"] 快照）≥ spec.deep.token_budget（缺省 500000——nacos-config.md §3
   deep 节契约初值，validator 之外的图运行面第二道防线）→ trip budget；
 - **硬超时注入**：turn_deadline（TurnDeadline 实例，轮启动建立注入——轮级锚点不可
-  节点内重建，否则回路重入会重置 300s 预算）remaining ≤ DEGRADED_WRITER_ENVELOPE_S(30)
+  节点内重建，否则回路重入会重置 600s 预算〔nacos-config §3 v1.40〕）remaining ≤
+  DEGRADED_WRITER_ENVELOPE_S(30)
   + TRIP_MARGIN_S(15) → trip timeout（降级包络=min(30, max(remaining−15, 5))——
   deep_guards.py 常量权威注释）；优先级 timeout > budget（轮级硬超时=最后防线语义）；
 - **触发语义**：trip → {"degraded_reason": "timeout"|"budget"}（api.md §7.2:803
@@ -203,6 +204,26 @@ async def test_timeout_not_tripped_beyond_margin_band() -> None:
     update = await guards(_state_with(), _config(deadline=deadline))
 
     assert "degraded_reason" not in update
+
+
+async def test_trip_point_scales_with_deep_turn_budget_600() -> None:
+    """熔断判据是 remaining 相对量：deep 轮预算 600s（nacos-config §3 v1.40）下熔断点
+    = 600−45=555s 附近，而非旧 300s 预算的 ~255s。
+
+    批次 6 探针 completed 轮 239.6s 在新预算下剩余 360.4s（旧预算仅 60.4s、距熔断
+    ~15s）；此处用真 TurnDeadline 注入可拨时钟，逐点锁死「预算放宽 → 熔断点后移」。"""
+    from app.agent.guards import TurnDeadline
+
+    now = [0.0]
+    deadline = TurnDeadline(600.0, clock=lambda: now[0])
+
+    now[0] = 239.6  # 批次 6 探针最长 completed 轮：remaining=360.4 > 45
+    update = await guards(_state_with(), _config(deadline=deadline))
+    assert "degraded_reason" not in update
+
+    now[0] = 556.0  # remaining=44 ≤ 30+15：进入裕量带即 trip
+    update2 = await guards(_state_with(), _config(deadline=deadline))
+    assert update2["degraded_reason"] == "timeout"
 
 
 async def test_timeout_priority_over_budget_when_both_tripped() -> None:

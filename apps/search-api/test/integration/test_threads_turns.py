@@ -471,7 +471,7 @@ async def test_get_thread_detail_contract_and_404(async_client, b2_rest, b2_runt
     assert detail["title"] == ("首问标题会截断为五十个字符以内" * 5)[:50]  # REQ-006
     assert detail["mode_summary"] == "fast"
     assert detail["turn_count"] == 1
-    assert detail["has_artifacts"] is False  # 分期口径：0002-M2 起真实值
+    assert detail["has_artifacts"] is False  # 本线程无 artifacts 登记行 → EXISTS 假
     _assert_utc_iso(detail["created_at"])
     _assert_utc_iso(detail["updated_at"])
     assert len(detail["turns"]) == 1

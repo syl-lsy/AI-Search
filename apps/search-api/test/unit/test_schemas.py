@@ -5,8 +5,9 @@
   on_conflict 四策略枚举、incognito 严格布尔（DTO 是 400001「请求参数错误」的第一道
   防线——校验失败经 RequestValidationError → 全局处理器映射 400001）；
 - 分页口径（api.md §0）：limit 默认 50 上限 200、offset 默认 0、列表响应含 total；
-- 分期口径恒值（用户裁决 2026-11-08）：TurnDetail.incognito 恒 false / followups 恒 null、
-  ThreadDetail.has_artifacts 恒 false——真实值分别自 M5（0005）/ 0009-B7 / 0002-M2 起；
+- 分期口径恒值（用户裁决 2026-11-08）：TurnDetail.incognito 恒 false / followups 恒 null
+  ——真实值分别自 M5（0005）/ 0009-B7 起；ThreadDetail.has_artifacts 已转真实投影
+  （service 层 EXISTS artifacts，0002-M2 落地后；DTO 缺省仍 false）；
   memory_hits 不在 TurnDetail（api.md §2.5「M5 及之前无此字段」，评审 P2 勘误移除）；
 - TurnDetail/SourceBrief/StageBrief 与 api.md §2.5 示例形状一致（sources/stages/usage/error）。
 """
@@ -255,7 +256,7 @@ def test_thread_create_result_shape():
     assert result.status == "pending"  # 创建瞬时态；running/queued 由调度层推进（B2 下游）
 
 
-def test_thread_detail_has_artifacts_constant_false():
+def test_thread_detail_has_artifacts_defaults_false():
     detail = ThreadDetail(
         thread_id="7d2f0a1e-0000-4000-8000-000000000002",
         title="t",
@@ -265,7 +266,7 @@ def test_thread_detail_has_artifacts_constant_false():
         updated_at="2026-11-01T09:40:11Z",
         turns=[],
     )
-    # 分期口径：恒 false，0002-M2 起真实值（用户裁决 2026-11-08）
+    # DTO 缺省 false；真实值由 service 层 EXISTS(artifacts) 投影（thread_service）
     assert detail.has_artifacts is False
 
 

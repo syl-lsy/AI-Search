@@ -10,7 +10,7 @@ SourceBrief/StageBrief 对齐 §2.5 sources[]/stages[] 形状。
 - feedback_helpful：**M2 批次 2 起真实值**（0010 turn_feedback + api.md §2.9 REQ-057）；
 - memory_hits：**不在 TurnDetail 返回**（api.md §2.5「M5 及之前无此字段」——评审 P2
   勘误：此前预置恒空命中字段属提前出面；M6（记忆 P1）随迁移与 §7.2 memory 事件一并增）；
-- has_artifacts 属 ThreadDetail（thread.py），同口径 0002-M2 起真实值。
+- has_artifacts 属 ThreadDetail（thread.py）：已转真实投影（service 层 EXISTS artifacts）。
 """
 from datetime import datetime
 from typing import Any, Literal

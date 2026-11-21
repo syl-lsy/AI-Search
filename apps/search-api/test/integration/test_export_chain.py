@@ -161,6 +161,10 @@ async def test_export_deep_completed_200_keys_and_file(
     assert len(files) == 1
     assert files[0].read_text(encoding="utf-8") == _ANSWER
     assert await _count_artifacts(turn_id) == 1
+    # §2.3 has_artifacts 真实投影回归锁（批次 6 探针发现面：此前恒 false）：
+    # 导出登记 artifacts 行后，线程详情的 EXISTS 投影必须为 true
+    detail = (await async_client.get(f"/api/v1/threads/{thread_id}")).json()["data"]
+    assert detail["has_artifacts"] is True
 
 
 async def test_export_degraded_round_200(

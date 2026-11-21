@@ -113,7 +113,9 @@ _CONNECTION_POLICY_KEYS: tuple[str, ...] = (
 #: 分级超时契约缺省（§6.2 容错清单；spec 缺值时的回落口径）
 #: v1.59 增量 A：fast 30 → **60**（裁决①；spec 缺值回落口径的第二道防线——不同步会
 #: 在 L4 回落态复刻窗-包络错配；nacos-config.md §3 v1.32「三处同步」条款）
-_DEFAULT_LLM_TIMEOUT_S: dict[str, float] = {"fast": 60.0, "deep": 60.0}
+#: v1.39：deep 60 → **120**（2026-11-21 用户裁决沉淀，与 Nacos 运行值/内置默认对齐；
+#: 同款「三处同步」纪律——defaults.py / nacos_init.py / 本回落表）
+_DEFAULT_LLM_TIMEOUT_S: dict[str, float] = {"fast": 60.0, "deep": 120.0}
 _DEFAULT_TOOL_TIMEOUT_S: dict[str, float] = {"fast": 10.0, "deep": 30.0}
 
 

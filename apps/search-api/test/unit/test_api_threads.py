@@ -500,7 +500,7 @@ async def test_get_thread_detail_success(overrides: dict) -> None:
     assert body["code"] == "0" and body["message"] == "ok"
     data = body["data"]
     assert data["thread_id"] == _THREAD_ID
-    assert data["has_artifacts"] is False  # 分期口径：0002-M2 起真实值
+    assert data["has_artifacts"] is False  # 假体 DTO 缺省 false（真实投影归 service 层）
     assert data["turns"][0]["has_report"] is True
     assert data["turns"][0]["degraded"] is False
     assert service.detail_calls == [_THREAD_ID]

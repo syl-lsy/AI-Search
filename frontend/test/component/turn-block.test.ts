@@ -51,6 +51,7 @@ function makeTurn(partial: Partial<TurnState>): TurnState {
     degradedReason: null,
     memorySaved: null,
     durationMs: null,
+    exportAvailable: false,
     ...partial,
   }
 }

@@ -41,7 +41,7 @@ LLM 失败（传输/超时/空输出）→ 有可用部分正文走句界 partia
 degraded_reason**（D2：deep 降级单一事实源=guards 的 degraded_reason，api.md §7.2:803
 枚举 timeout|budget 不含节点失败语义）；图内零 error 帧（done 帧归 finalize——兜底
 标记经 errors 传递，finalize 据此发 done extra.sections=0）。
-单调用超时包络 asyncio.timeout(spec.deep.llm_timeout_s，缺省 60——§6.2 分级包络，
+单调用超时包络 asyncio.timeout(spec.deep.llm_timeout_s，缺省 120——§6.2 分级包络，
 无包络则单次挂起吃光轮预算)。
 
 **引用规范化边界**：越界剔除/引用统一编号归 **finalize** 节点（ARCH §4.2:477——
@@ -254,7 +254,7 @@ async def writer(state: Any, config: RunnableConfig | None = None) -> dict[str, 
     spec = spec if isinstance(spec, Mapping) else {}
     outline = _clean_outline(state.get("outline") if isinstance(state, dict) else None)
     top_n = _sources_top_n(spec)
-    timeout_s = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 60（§6.2）
+    timeout_s = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 120（§6.2）
 
     prompt_text = render_prompt(
         resolve_prompt("deep.report_writer"),

@@ -29,6 +29,7 @@ import {
 } from '@/mocks/turnDetails'
 import { threadListFixture } from '@/mocks/threads'
 import { router } from '@/router'
+import type { SnapshotData } from '@/types/api'
 
 import { MockEventSource } from '../helpers/mockEventSource'
 
@@ -676,5 +677,90 @@ describe('regenerate 重新生成接线（v1.26 REQ-063/A47：第 8 钮 → stor
     expect(wrapper.find('[data-testid="turn-answer"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="act-regenerate"]').exists()).toBe(true)
     expect(MockEventSource.instances.filter((i) => i.url.includes(TURN_ID_FAST))).toHaveLength(0)
+  })
+})
+
+describe('快照入口接线（批次 6：SourcePanel 快照胶囊 → SnapshotModal 弹窗预览，api.md §5.1）', () => {
+  const SOURCE_ID_SNAP = turnDetailDeepCompleted.sources[0]!.source_id
+  const SNAPSHOT: SnapshotData = {
+    snapshot_id: 'e5cc1111-1111-4111-8111-111111111111',
+    url: 'https://example.com/original-page',
+    content_type: 'text/html',
+    size_bytes: 20480,
+    fetched_at: '2026-11-01T08:12:03Z',
+    download_url: 'http://127.0.0.1:9000/ai-search-snapshots/e5cc1111?X-Amz-Signature=abc',
+    excerpt: '# 原文标题\n\n第一段正文。',
+  }
+
+  /** 线程 B（deep 完成态，source 1 snapshot_available=true）+ 快照端点分发 */
+  function installWithSnapshot(downloadUrl: string = SNAPSHOT.download_url): void {
+    mockedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/models') return modelsFixture
+      if (url === '/api/v1/threads') return threadListFixture
+      if (url === `/api/v1/threads/${THREAD_ID_B}`) {
+        return {
+          thread_id: THREAD_ID_B,
+          title: THREAD_TITLE_B,
+          mode_summary: 'deep',
+          turn_count: 2,
+          has_artifacts: false,
+          created_at: '2026-10-30T10:00:00Z',
+          updated_at: '2026-10-30T10:03:21Z',
+          turns: [
+            { turn_id: TURN_ID_DEEP, mode: 'deep', status: turnDetailDeepCompleted.status, query: turnDetailDeepCompleted.query, query_lang: 'zh', has_report: true, degraded: false, duration_ms: 62_000, created_at: '2026-10-30T10:00:00Z' },
+            { turn_id: TURN_ID_DIRECT, mode: 'fast', status: turnDetailDirectCompleted.status, query: turnDetailDirectCompleted.query, query_lang: 'zh', has_report: false, degraded: false, duration_ms: 3_200, created_at: '2026-10-30T10:02:00Z' },
+          ],
+        }
+      }
+      if (url === `/api/v1/turns/${TURN_ID_DEEP}`) return turnDetailDeepCompleted
+      if (url === `/api/v1/turns/${TURN_ID_DIRECT}`) return turnDetailDirectCompleted
+      if (url === `/api/v1/sources/${SOURCE_ID_SNAP}/snapshot`) {
+        return { ...SNAPSHOT, download_url: downloadUrl }
+      }
+      throw new Error(`unexpected GET ${url}`)
+    })
+  }
+
+  it('点快照胶囊 → SnapshotModal 打开（Teleport body：excerpt/元数据/打开原文外链）→ Esc 关闭', async () => {
+    installWithSnapshot()
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_B}`)
+    await flushPromises()
+
+    // 深度轮 source 1 快照胶囊在位（snapshot_available=true）
+    const snapIcon = wrapper.find('[data-testid="snapshot-1"]')
+    expect(snapIcon.exists()).toBe(true)
+    await snapIcon.trigger('click')
+    await flushPromises()
+
+    // 弹窗内容（Teleport 到 body——wrapper.find 不可达，走 document 查询）
+    const excerpt = document.querySelector('[data-testid="snapshot-excerpt"]')
+    expect(excerpt).not.toBeNull()
+    expect(excerpt!.textContent).toContain('# 原文标题')
+    expect(excerpt!.textContent).toContain('第一段正文。')
+    const openOriginal = document.querySelector<HTMLAnchorElement>('[data-testid="snapshot-open-original"]')
+    expect(openOriginal?.getAttribute('href')).toBe(SNAPSHOT.download_url)
+    expect(document.querySelector('[data-testid="snapshot-meta"]')).not.toBeNull()
+
+    // Esc 关闭（window.open 直开旧形态 → 弹窗化：关闭通道复用 ThreadModal）
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await flushPromises()
+    expect(document.querySelector('[data-testid="snapshot-excerpt"]')).toBeNull()
+  })
+
+  it('download_url 非 http（协议白名单守卫）：快照地址不可用 toast 保留 + 弹窗仍打开（摘录预览为主面）且无外链钮', async () => {
+    installWithSnapshot('javascript:alert(1)')
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_B}`)
+    await flushPromises()
+
+    await wrapper.find('[data-testid="snapshot-1"]').trigger('click')
+    await flushPromises()
+
+    // 不可用 toast（既有链路保留——answer.snapshotUnavailable）
+    expect(wrapper.find('[data-testid="toast-host"]').text()).toContain('快照地址不可用')
+    // 摘录预览不因外链不可用而缺席；外链钮被 isHttpUrl 守卫隐藏
+    expect(document.querySelector('[data-testid="snapshot-excerpt"]')).not.toBeNull()
+    expect(document.querySelector('[data-testid="snapshot-open-original"]')).toBeNull()
   })
 })

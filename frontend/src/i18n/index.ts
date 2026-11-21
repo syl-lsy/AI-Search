@@ -50,7 +50,8 @@ const zhCN = {
     helpful: '有帮助',
     notHelpful: '没有帮助',
     rerun: '复刻',
-    // 重新生成（v1.26 REQ-063/A47：AnswerActions 第 8 钮——degraded/failed-with-sources fast 轮）
+    // 重新生成（v1.26 REQ-063/A47：AnswerActions 第 8 钮——degraded/failed-with-sources fast/deep 轮，
+    // v1.30 放开 deep：api.md §2.12 前置 3 v1.28 / frontend-api.md §3 生命周期 14 deep 形态注）
     regenerate: '重新生成',
     moreActions: '更多操作',
     linkCopied: '链接已复制',
@@ -81,6 +82,13 @@ const zhCN = {
     sourceKb: '知识库',
     snapshot: '快照',
     snapshotUnavailable: '快照地址不可用',
+    // 快照预览弹窗（批次 6：SnapshotModal 词条族——api.md §5.1 弹窗内预览形态）
+    snapshotTitle: '快照预览',
+    snapshotOpenOriginal: '打开原文',
+    snapshotClose: '关闭',
+    snapshotMetaFetched: '抓取时间',
+    snapshotMetaSize: '大小',
+    snapshotMetaType: '类型',
     stop: '停止',
     followPlaceholder: '提出后续问题…（深度报告后默认快速，携带报告上下文）',
     followDisabledHint: '研究完成后可追问…（当前轮进行中）',
@@ -92,6 +100,10 @@ const zhCN = {
     tabLinks: '链接',
     tabImages: '图片',
     exportMd: '导出 Markdown',
+    // 服务端导出报告（批次 6 REQ-016：AnswerActions 更多菜单 deep 轮项——api.md §2.8/§5.3）
+    exportReport: '导出报告',
+    // download_path 形态守卫失败（批次 6 收口轮 P2-4：非法形态 toast 不跳转——运行时防线）
+    exportPathInvalid: '导出链接形态异常，已停止跳转',
     exportNotReady: '回答还未加载完成，稍后再试',
     share: '分享',
     outlineNav: '对话内容导航',
@@ -268,7 +280,8 @@ const enUS: typeof zhCN = {
     helpful: 'Helpful',
     notHelpful: 'Not helpful',
     rerun: 'Rerun',
-    // Regenerate (v1.26 REQ-063/A47: AnswerActions 8th button — degraded/failed-with-sources fast turns)
+    // Regenerate (v1.26 REQ-063/A47: AnswerActions 8th button — degraded/failed-with-sources fast/deep
+    // turns, deep unlocked in v1.30: api.md §2.12 precondition 3 v1.28 / frontend-api.md §3 L14 deep note)
     regenerate: 'Regenerate',
     moreActions: 'More actions',
     linkCopied: 'Link copied',
@@ -300,6 +313,13 @@ const enUS: typeof zhCN = {
     sourceKb: 'KB',
     snapshot: 'Snapshot',
     snapshotUnavailable: 'Snapshot URL unavailable',
+    // Snapshot preview modal (batch 6: SnapshotModal entries — api.md §5.1 in-modal preview)
+    snapshotTitle: 'Snapshot preview',
+    snapshotOpenOriginal: 'Open original',
+    snapshotClose: 'Close',
+    snapshotMetaFetched: 'Fetched',
+    snapshotMetaSize: 'Size',
+    snapshotMetaType: 'Type',
     stop: 'Stop',
     followPlaceholder: 'Ask a follow-up… (defaults to Fast after a deep report)',
     followDisabledHint: 'You can follow up once the research finishes… (turn in progress)',
@@ -311,6 +331,10 @@ const enUS: typeof zhCN = {
     tabLinks: 'Links',
     tabImages: 'Images',
     exportMd: 'Export Markdown',
+    // Server-side report export (batch 6 REQ-016: AnswerActions more-menu deep-turn item — api.md §2.8/§5.3)
+    exportReport: 'Export report',
+    // download_path shape-guard failure (batch 6 closure P2-4: invalid shape → toast, no navigation)
+    exportPathInvalid: 'Invalid download link shape. Navigation stopped',
     exportNotReady: 'Answer not ready yet. Please try again shortly',
     share: 'Share',
     outlineNav: 'Conversation outline',

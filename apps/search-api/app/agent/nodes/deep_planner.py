@@ -27,7 +27,7 @@ query_type 7 类枚举（无 navigational——判导航型输出 factoid，深�
   llm_call_failed）——stage done.extra 仅契约钉键 subtopics（批次 2 修复轮移除未钉
   fallback/memory_directive 键；契约钉文字归收官环节统一走增量 diff）。
 
-超时包络：TurnDeadline(spec.deep.llm_timeout_s，缺省 60)——主调用 asyncio.timeout
+超时包络：TurnDeadline(spec.deep.llm_timeout_s，缺省 120)——主调用 asyncio.timeout
 包络；修复回喂前查剩余预算（耗尽即跳过回喂直入兜底，deadline-aware）。
 
 取消感知：ensure_not_canceled 入口接线（R14② 跨子图取消感知，同 fast 五节点先例）
@@ -300,7 +300,7 @@ async def planner(state: Any, config: RunnableConfig | None = None) -> dict[str,
     spec = spec if isinstance(spec, Mapping) else {}
     deep_section = spec.get("deep") if isinstance(spec, Mapping) else None
     max_subagents = _max_subagents(deep_section)
-    llm_timeout = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 60（§6.2）
+    llm_timeout = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 120（§6.2）
     budget = TurnDeadline(llm_timeout)  # 规划段包络：主调用 + 修复回喂（deadline-aware）
 
     alias = resolve_chat_alias(state, config)

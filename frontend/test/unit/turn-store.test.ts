@@ -164,6 +164,13 @@ describe('ask()（生命周期 1：POST 建轮 + GET 订阅两段式；§2 注�
     expect(mockedSubscribe.mock.calls[0]![0].holdAfterDone).toBe(false)
   })
 
+  it('种子缺省 exportAvailable=false（ask 新轮不渲染服务端导出报告项——api.md §2.5 判据须待 2.5 对账回写）', async () => {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('测试问题', 'deep')
+    expect(store.turns[TURN_ID]!.exportAvailable).toBe(false)
+  })
+
   it('POST 失败：抛出错误、不种子化、不进生成中集合、不订阅', async () => {
     mockedPost.mockRejectedValueOnce(new Error('409001'))
     const store = useTurnStore()
@@ -334,10 +341,10 @@ describe('applyEvent 派发表（§3 事件 → store 单一状态机）', () =>
     expect(store.turns[TURN_ID]!.answer_md).toBe('')
   })
 
-  it('lastSeq 推进时持久化 sessionStorage ai-search.seq.{turnId}（生命周期 5 形态保留）', async () => {
+  it('lastSeq 推进时持久化 sessionStorage ai-search.seq.{turnId}（OQ-35 v1.30：单键 JSON 双值 {lastSeq,compactSeq}）', async () => {
     const store = await seeded()
     store.applyEvent(TURN_ID, wire(3, 'token', { delta: 'x' }))
-    expect(sessionStorage.getItem(`ai-search.seq.${TURN_ID}`)).toBe('3')
+    expect(JSON.parse(sessionStorage.getItem(`ai-search.seq.${TURN_ID}`)!)).toEqual({ lastSeq: 3, compactSeq: 0 })
   })
 })
 
@@ -403,6 +410,17 @@ describe('reconcile()（生命周期 4/5：REST 为准源对账）', () => {
     mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep' }))
     await store.reconcile(TURN_ID)
     expect(store.turns[TURN_ID]!.compactSeq).toBe(12)
+  })
+
+  it('export_available 对账回写 exportAvailable（批次 6：AnswerActions「导出报告」门控数据源；SSE 无对应事件、仅 2.5 对账双源）', async () => {
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'completed', export_available: true }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    expect(store.turns[TURN_ID]!.exportAvailable).toBe(true)
+
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'completed', export_available: false }))
+    await store.reconcile(TURN_ID)
+    expect(store.turns[TURN_ID]!.exportAvailable).toBe(false)
   })
 
   it('失败轮对账：errorMsg=TurnError.message 文本（镜像勘误——2.5 error 为对象形态 {code,message,stage_key?}，非 string；直写会渲染 [object Object]）', async () => {
@@ -586,21 +604,154 @@ describe('seq 持久化节流（P3：persistSeq 200ms 一次；控制事件/终�
       mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
       await store.ask('测试问题', 'fast')
       const key = `ai-search.seq.${TURN_ID}`
+      const stored = (): { lastSeq: number; compactSeq: number } =>
+        JSON.parse(sessionStorage.getItem(key)!) as { lastSeq: number; compactSeq: number }
       store.applyEvent(TURN_ID, wire(1, 'token', { delta: 'a' }))
-      expect(sessionStorage.getItem(key)).toBe('1') // 首写立即（上次落盘为 0 时刻）
+      expect(stored()).toEqual({ lastSeq: 1, compactSeq: 0 }) // 首写立即（上次落盘为 0 时刻）
       store.applyEvent(TURN_ID, wire(2, 'token', { delta: 'b' }))
       expect(store.turns[TURN_ID]!.lastSeq).toBe(2) // 内存照常推进
-      expect(sessionStorage.getItem(key)).toBe('1') // 200ms 窗口内节流跳过
+      expect(stored()).toEqual({ lastSeq: 1, compactSeq: 0 }) // 200ms 窗口内节流跳过
       await vi.advanceTimersByTimeAsync(200)
       store.applyEvent(TURN_ID, wire(3, 'sources', { batch: [], total: 0 }))
-      expect(sessionStorage.getItem(key)).toBe('3') // 控制事件立即落
+      expect(stored()).toEqual({ lastSeq: 3, compactSeq: 0 }) // 控制事件立即落
       store.applyEvent(TURN_ID, wire(4, 'token', { delta: 'c' }))
-      expect(sessionStorage.getItem(key)).toBe('3') // 刚落过 → 窗口内跳过
+      expect(stored()).toEqual({ lastSeq: 3, compactSeq: 0 }) // 刚落过 → 窗口内跳过
       store.applyEvent(TURN_ID, wire(9, 'done', { finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 1, source_count: 0 }))
-      expect(sessionStorage.getItem(key)).toBe('9') // 终态立即落（崩溃恢复游标不落后于终态）
+      expect(stored()).toEqual({ lastSeq: 9, compactSeq: 0 }) // 终态立即落（崩溃恢复游标不落后于终态）
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('compactSeq 刷新恢复（v1.30 OQ-35：sessionStorage 双值游标 + resolveFromSeq 判定矩阵）', () => {
+  const key = `ai-search.seq.${TURN_ID}`
+
+  /** ask 建轮种子（本 describe 自持——作用域独立） */
+  async function seeded(mode: 'fast' | 'deep' = 'deep'): Promise<ReturnType<typeof useTurnStore>> {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('测试问题', mode)
+    return store
+  }
+
+  it('context_compact 即时落盘双值（节流窗口内也立即写——compactSeq 是重放边界判定依据，不得落后）', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = await seeded('deep')
+      store.applyEvent(TURN_ID, wire(1, 'token', { delta: 'a' })) // 首写立即 {lastSeq:1,compactSeq:0}
+      store.applyEvent(TURN_ID, wire(2, 'token', { delta: 'b' })) // 200ms 窗口内节流跳过（内存 lastSeq=2）
+      expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ lastSeq: 1, compactSeq: 0 })
+      store.applyEvent(TURN_ID, wire(3, 'context_compact', { summarized_messages: 2, released_tokens: 100, retained_tokens: 50, offloaded_files: [] }))
+      // context_compact 即时落盘：节流窗口不拦截 + compactSeq 同帧入值（applyEvent 主 persistSeq
+      // 调用先于 switch 写 compactSeq → case 内二次 immediate 落盘兜住同帧性）
+      expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ lastSeq: 3, compactSeq: 3 })
+      expect(store.turns[TURN_ID]!.compactSeq).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('压缩后普通事件只推 lastSeq、compactSeq 保留（{lastSeq:5, compactSeq:3}）', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = await seeded('deep')
+      store.applyEvent(TURN_ID, wire(3, 'context_compact', { summarized_messages: 1, released_tokens: 1, retained_tokens: 1, offloaded_files: [] }))
+      expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ lastSeq: 3, compactSeq: 3 })
+      await vi.advanceTimersByTimeAsync(200) // 出节流窗
+      store.applyEvent(TURN_ID, wire(5, 'sources', { batch: [], total: 0 }))
+      expect(JSON.parse(sessionStorage.getItem(key)!)).toEqual({ lastSeq: 5, compactSeq: 3 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('判定矩阵①（v1.32 P2-1 收口）：运行中轮 REST answer_md 为空 → REST 承载不了被跳过区间 → 刷新后 fromSeq=0 全量重放（增量续传丢帧修复，等效批次 5 刷新行为；deep 分段报告持久化立项另议前口径不变）', async () => {
+    sessionStorage.setItem(key, JSON.stringify({ lastSeq: 15, compactSeq: 12 }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep', answer_md: '' }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(0)
+  })
+
+  it('判定矩阵①′准入成立：REST answer_md 非空（终态权威已落库、可承载被跳过区间）→ 刷新后 fromSeq=15 增量续传', async () => {
+    sessionStorage.setItem(key, JSON.stringify({ lastSeq: 15, compactSeq: 12 }))
+    mockedGet.mockResolvedValueOnce(
+      makeDetail({ status: 'degraded', mode: 'deep', answer_md: 'REST 权威报告正文' }),
+    )
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(15)
+  })
+
+  it('refresh 后渲染完整性（防回归）：无准入证据 → fromSeq=0 → 服务端首连全量重放重建（重放段含 compact 边界与刷新前正文，无丢帧）', async () => {
+    sessionStorage.setItem(key, JSON.stringify({ lastSeq: 15, compactSeq: 12 }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep', answer_md: '' }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(0)
+    // 服务端首连恒全量重放：按原始轨迹重放 seq 1..15（context_compact@12 为原轮压缩边界）
+    const callbacks = capturedCallbacks()
+    for (let seq = 1; seq <= 11; seq++) callbacks.onEvent(wire(seq, 'token', { delta: `段${seq}` }))
+    callbacks.onEvent(
+      wire(12, 'context_compact', { summarized_messages: 2, released_tokens: 100, retained_tokens: 50, offloaded_files: [] }),
+    )
+    for (let seq = 13; seq <= 15; seq++) callbacks.onEvent(wire(seq, 'token', { delta: `段${seq}` }))
+    // 渲染完整性：刷新前已流式正文（1..11）+ compact 后正文（13..15）全部在位、游标收敛
+    const expected =
+      Array.from({ length: 11 }, (_, i) => `段${i + 1}`).join('') +
+      Array.from({ length: 3 }, (_, i) => `段${i + 13}`).join('')
+    expect(store.turns[TURN_ID]!.answer_md).toBe(expected)
+    expect(store.turns[TURN_ID]!.compactSeq).toBe(12)
+    expect(store.turns[TURN_ID]!.lastSeq).toBe(15)
+  })
+
+  it('判定矩阵②记录缺失放弃：JSON 仅 {lastSeq:9}（compactSeq 键缺席）→ 放弃增量 fromSeq=0（REST 全量对账后重订阅）', async () => {
+    sessionStorage.setItem(key, JSON.stringify({ lastSeq: 9 }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep' }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(0)
+  })
+
+  it('判定矩阵②′compactSeq:0 视同无记录（未发生压缩的轮不携带口径合规证据——fast 轮刷新恒全量重放不回退）', async () => {
+    sessionStorage.setItem(key, JSON.stringify({ lastSeq: 9, compactSeq: 0 }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running' }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(0)
+  })
+
+  it('判定矩阵③compactSeq>基线（落盘防御形态）→ 放弃增量 fromSeq=0', async () => {
+    sessionStorage.setItem(key, JSON.stringify({ lastSeq: 5, compactSeq: 9 }))
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep' }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(0)
+  })
+
+  it('判定矩阵④旧纯数字形态兼容（批次 5 前单值游标）→ 视同 compactSeq 无记录 → 放弃增量 fromSeq=0', async () => {
+    sessionStorage.setItem(key, '15')
+    mockedGet.mockResolvedValueOnce(makeDetail({ status: 'running', mode: 'deep' }))
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID)
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(0)
+  })
+
+  it('同页路径保真：内存 lastSeq 为基线（落盘游标 ≤ 内存时零行为变化——fast 轮路由切回 fromSeq=内存值）', async () => {
+    const store = await seeded('fast')
+    store.applyEvent(TURN_ID, wire(1, 'token', { delta: 'a' }))
+    store.applyEvent(TURN_ID, wire(5, 'sources', { batch: [], total: 0 }))
+    mockedSubscribe.mockClear()
+    store.subscribe(TURN_ID)
+    expect(mockedSubscribe.mock.calls[0]![0].fromSeq).toBe(5)
   })
 })
 
@@ -754,8 +905,8 @@ describe('regenerate()（v1.26 REQ-063/A47：§3 生命周期 14 / api.md §2.12
    * 同页路径种子：ask 建轮后走完一轮流至 degraded 终态（lastSeq=5、渲染态就位、
    * 生成中集合已随 done 移除）——用户在答案页看到降级横幅后点「重新生成」的现场。
    */
-  async function seededDegraded() {
-    const store = await seededFast()
+  async function seededDegraded(mode: 'fast' | 'deep' = 'fast') {
+    const store = await seededFast(mode)
     store.applyEvent(TURN_ID, wire(1, 'stage', { stage_key: 'rewrite', status: 'done' }))
     store.applyEvent(TURN_ID, wire(2, 'sources', { batch: [SOURCE_A], total: 1 }))
     store.applyEvent(TURN_ID, wire(3, 'token', { delta: '旧答案片段' }))
@@ -807,6 +958,42 @@ describe('regenerate()（v1.26 REQ-063/A47：§3 生命周期 14 / api.md §2.12
     expect(mockedSubscribe.mock.calls[1]![0].fromSeq).toBe(7)
     expect(turn.answer_md).toBe('')
     expect(turn.status).toBe('running')
+  })
+
+  it('fresh-page 重放门（JSON 双值游标形态·OQ-35）：sessionStorage {lastSeq:7,compactSeq:5} → fromSeq=7（compact 记录在案不阻塞重放门，readStoredSeq 兼容双形态）', async () => {
+    sessionStorage.setItem(`ai-search.seq.${TURN_ID}`, JSON.stringify({ lastSeq: 7, compactSeq: 5 }))
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('测试问题', 'deep')
+    const turn = store.turns[TURN_ID]!
+    turn.status = 'degraded'
+    turn.answer_md = '旧答案片段'
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+
+    await store.regenerate(TURN_ID)
+
+    expect(turn.lastSeq).toBe(7)
+    expect(mockedSubscribe.mock.calls[1]![0].fromSeq).toBe(7)
+    expect(turn.answer_md).toBe('')
+    expect(turn.status).toBe('running')
+  })
+
+  it('deep 轮同路径（v1.30 放开 mode∈{fast,deep}，frontend-api.md §3 生命周期 14 deep 形态注）：清空渲染态 + 生成中回归 + 重订阅 holdAfterDone=false（deep done 即 close，L13 仅 fast 保活）', async () => {
+    const { store, turn } = await seededDegraded('deep')
+    expect(turn.status).toBe('degraded')
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID, status: 'running' })
+
+    await store.regenerate(TURN_ID)
+
+    expect(turn.status).toBe('running')
+    expect(turn.answer_md).toBe('')
+    expect(turn.thinking_md).toBe('')
+    expect(turn.degradedReason).toBeNull()
+    expect(turn.sources).toHaveLength(1) // 不重检索：sources 保留（api.md §2.12 deep 重放起点=write）
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true)
+    expect(mockedSubscribe).toHaveBeenCalledTimes(2)
+    expect(mockedSubscribe.mock.calls[1]![0].fromSeq).toBe(5)
+    expect(mockedSubscribe.mock.calls[1]![0].holdAfterDone).toBe(false)
   })
 
   it('幂等门保留：regenerate 后旧 done/error（seq ≤ lastSeq）丢弃——状态不被旧终态拉回、生成中不移除、不触发对账', async () => {

@@ -15,7 +15,7 @@
   degraded**（不属 api.md §7.2 degraded_reason 枚举任一语义——fast_rewrite 2026-11-13
   B 裁决同款），留痕面 = errors[]（stage done.extra 仅契约钉键 subtopics——批次 2
   修复轮移除未钉 fallback/memory_directive 键）；
-- TurnDeadline 包络（spec.deep.llm_timeout_s，缺省 60）：主调用 asyncio.timeout 包络，
+- TurnDeadline 包络（spec.deep.llm_timeout_s，缺省 120）：主调用 asyncio.timeout 包络，
   修复回喂前查剩余预算（耗尽即跳过回喂直入兜底）；
 - ensure_not_canceled 入口接线（R14② 跨子图取消感知，同 fast 五节点先例）；
 - 事件：stage(plan, running→done)——running 由 TurnRunner 图前发布（M2 批次 1，
@@ -404,7 +404,7 @@ async def test_repair_skipped_when_budget_exhausted(
 async def test_deadline_default_is_60_when_spec_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """spec.deep.llm_timeout_s 缺失 → TurnDeadline 包络回落契约缺省 60s（§6.2）。"""
+    """spec.deep.llm_timeout_s 缺失 → TurnDeadline 包络回落契约缺省 120s（§6.2 v1.39）。"""
     captured: list[float] = []
     real_deadline = deep_planner.TurnDeadline
 
@@ -418,7 +418,7 @@ async def test_deadline_default_is_60_when_spec_missing(
 
     await planner({**_STATE, "spec": {"deep": {"max_subagents": 3}}}, _config())
 
-    assert captured == [60.0]
+    assert captured == [120.0]
 
 
 # ---- 传输失败：直接机制兜底（planner 单调用面，无传输重试循环）----

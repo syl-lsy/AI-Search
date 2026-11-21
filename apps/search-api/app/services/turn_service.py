@@ -151,9 +151,13 @@ _MCP_DATA_ID = "ai_search.agent.mcp.json"
 
 # spec 缺省兜底（TurnSpec 节缺失时组装层回落 reject 的同款内置口径）
 _DEFAULT_POLICY = "reject"
-# 轮级硬超时内置兜底（nacos-config §3 v1.25）：fast 60→120（2026-11-16 用户裁决②——
-# P50 计时终点改为首个正文内容事件后正文时长释放，给 3000 字慢侧留余量）；快照给值者优先。
-_DEFAULT_TURN_TIMEOUT_S = 120.0
+# 轮级硬超时内置兜底（nacos-config §3 v1.25/v1.40，fast/deep 分档）：fast 60→120
+# （2026-11-16 用户裁决②——P50 计时终点改为首个正文内容事件后正文时长释放，给 3000
+# 字慢侧留余量）/ deep 300→600（2026-11-21 用户裁决——批次 6 探针 completed 轮
+# 239.6s 距 guards 熔断点〔预算−45s≈255s〕仅 ~15s 余量，真深度研究贴顶；token_budget
+# =500k 仍是独立成本硬护栏）；快照给值者优先，mode 未知回落 fast（与 guards
+# _DEFAULT_LLM_TIMEOUT_S 同款回落口径）。
+_DEFAULT_TURN_TIMEOUT_S: dict[str, float] = {"fast": 120.0, "deep": 600.0}
 
 # 历史装配窗口（ARCH §4.1/§6.5：最近 6 轮 {q, a_head≤200 chars}）。nacos spec `history`
 # 节为弃用迁移口径（memory.short_term 于 M5 接管，nacos-config.md §3），B3 以实现常量
@@ -843,9 +847,13 @@ class ThreadScheduler:
         return str(turn.get("default_on_conflict", _DEFAULT_POLICY))
 
     def _turn_timeout_s(self, spec_payload: Mapping[str, Any], mode: str) -> float:
-        """轮级硬超时（入参=已捕获快照，不再实时读；500301 熔断依据）。"""
+        """轮级硬超时（入参=已捕获快照，不再实时读；500301 熔断依据）。
+
+        分档内置兜底：fast 120 / deep 600（nacos-config §3 v1.40）；mode 未知回落 fast。
+        """
         spec = spec_payload.get(mode) or {}
-        return float(spec.get("turn_timeout_s", _DEFAULT_TURN_TIMEOUT_S))
+        default = _DEFAULT_TURN_TIMEOUT_S.get(mode, _DEFAULT_TURN_TIMEOUT_S["fast"])
+        return float(spec.get("turn_timeout_s", default))
 
     # ---- 提交裁决（请求事务内；路由层在建轮后、响应前调用）----
 

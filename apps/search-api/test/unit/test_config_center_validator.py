@@ -1137,13 +1137,18 @@ class TestContractLexiconAlignment:
 
 
 class TestFastLlmTimeout:
-    """§3 v1.32（B14 增量 A 裁决①）：fast.llm_timeout_s 30 → 60（全节点共享键）。"""
+    """§3 v1.32（B14 增量 A 裁决①）：fast.llm_timeout_s 30 → 60（全节点共享键）。
+
+    §3 v1.39（2026-11-21 用户裁决沉淀）：deep.llm_timeout_s 60 → 120（与 Nacos 运行值
+    对齐，消除 FORCE 全量发布把初值冲回 60 的漂移面——溯源批次 5 探针 7/7 撞 60s 包络、
+    批次 6 探针 120s 下活体 completed）。
+    """
 
     def test_fast_llm_timeout_default_is_60(self):
         assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["fast"]["llm_timeout_s"] == 60
 
-    def test_deep_llm_timeout_stays_60(self):
-        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]["llm_timeout_s"] == 60
+    def test_deep_llm_timeout_default_is_120(self):
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]["llm_timeout_s"] == 120
 
 
 # ==== 决策模型接入键组（v1.33 Decision Model 工单批次 2，ADR-016）====

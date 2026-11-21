@@ -7,7 +7,7 @@
   num_retries=0 去重，§6.2 P0）——分类重试判据代码层固化：ValueError/TypeError
   等确定性失败不重试、httpx 仅 5xx 触发重试；
 - 分级超时：LLM 单调用 / 工具两级（spec.<mode>.llm_timeout_s / tool_timeout_s；
-  契约缺省 fast 30/10、deep 60/30，§6.2 容错清单）；
+  契约缺省 fast 60/10（v1.59）、deep 120/30（v1.39），§6.2 容错清单）；
 - 取消感知：与 TurnRunner _cancel_flags 同语义（dict[turn_id, reason]），节点边界
   pop 即感知+清理；无注入面（Studio 直跑）静默 None——节点不依赖 TurnRunner 设施；
 - deadline-aware 预算（§6.2 P0）：轮级 turn_timeout_s 包络计剩余预算，重试尝试前
@@ -90,7 +90,8 @@ def test_default_retry_on_classification() -> None:
 
 
 def test_llm_and_tool_timeouts_from_spec_with_contract_defaults() -> None:
-    """分级超时（§6.2）：读 spec.<mode>，缺省回落契约值——fast 60/10（v1.59）、deep 60/30。"""
+    """分级超时（§6.2）：读 spec.<mode>，缺省回落契约值——fast 60/10（v1.59）、
+    deep 120/30（v1.39：2026-11-21 裁决沉淀，与 Nacos 运行值对齐）。"""
     spec: dict[str, Any] = {
         "fast": {"llm_timeout_s": 15, "tool_timeout_s": 5},
         "deep": {"llm_timeout_s": 90},
@@ -100,6 +101,7 @@ def test_llm_and_tool_timeouts_from_spec_with_contract_defaults() -> None:
     assert llm_timeout_s(spec, "deep") == 90.0
     assert tool_timeout_s(spec, "deep") == 30.0  # deep 未给 tool_timeout_s → 契约缺省
     assert llm_timeout_s({}, "fast") == 60.0  # 整节缺失 → 契约缺省（v1.59：30→60）
+    assert llm_timeout_s({}, "deep") == 120.0  # deep 整节缺失 → 契约缺省（v1.39：60→120）
     assert tool_timeout_s({}, "deep") == 30.0
     assert llm_timeout_s({"fast": {"llm_timeout_s": "oops"}}, "fast") == 60.0  # 非法回落
 

@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { apiGet, apiPost } from '@/api/client'
 import {
   TURN_ID_DIRECT,
+  turnDetailDeepCompleted,
   turnDetailDirectCompleted,
   turnDetailDirectWithFollowups,
   turnDetailFastCompleted,
@@ -111,7 +112,8 @@ describe('fast §7.4 序列（transport 全链路：两段式 → 合帧 → don
     ])
     expect(turn.lastSeq).toBe(9)
     expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
-    expect(sessionStorage.getItem(`ai-search.seq.${TURN_ID_FAST}`)).toBe('9')
+    // OQ-35 v1.30：单键 JSON 双值游标（fast 轮无压缩 → compactSeq 0=视同无记录）
+    expect(JSON.parse(sessionStorage.getItem(`ai-search.seq.${TURN_ID_FAST}`)!)).toEqual({ lastSeq: 9, compactSeq: 0 })
 
     // done 后保活窗口（生命周期 13，fast 轮）：连接未关
     expect(es.closedByClient).toBe(false)
@@ -241,6 +243,96 @@ describe('deep §7.4 序列（applyEvent 单入口联装：§3 派发表投影�
     expect(turn.stages.map((s) => s.stage_key)).toEqual(['plan', 'search', 'read', 'reflect', 'write'])
     expect(turn.lastSeq).toBe(21)
     expect(turn.compactSeq).toBe(12)
+  })
+})
+
+describe('deep regenerate 形态（api.md §7.4 v1.28 / frontend-api.md §3 生命周期 14 deep 形态注：transport 全链路）', () => {
+  /** 一次 regenerate 的续推帧（api.md §7.4 v1.28 deep 重放起点=write：旧轨迹由服务端重放，二次 write 段接力） */
+  function regenerateFrames(turnId: string) {
+    return [
+      { id: 22, type: 'stage', data: JSON.stringify({ seq: 22, turn_id: turnId, ts: '2026-11-01T08:15:00Z', stage_key: 'write', status: 'running', label: '综合中' }) },
+      { id: 23, type: 'token', data: JSON.stringify({ seq: 23, turn_id: turnId, ts: '2026-11-01T08:15:01Z', delta: '重新生成的新报告正文。' }) },
+      { id: 24, type: 'done', data: JSON.stringify({ seq: 24, turn_id: turnId, ts: '2026-11-01T08:15:10Z', finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 9400, source_count: 3, usage: { total_tokens: 9000, cost_usd: 0.009 } }) },
+    ]
+  }
+
+  it('旧序列重放 → 二次 stage(write,running)→token→done：重放门丢弃旧轨迹、sources 保留、write 就地重渲、二次 done 对账 + deep done 即 close（不保活）', async () => {
+    // 回看种子化（运行中 deep）→ 完整旧序列至 done(seq 21) → completed
+    mockedGet.mockResolvedValueOnce({
+      ...turnDetailFastCompleted,
+      turn_id: TURN_ID_DEEP,
+      mode: 'deep',
+      status: 'running',
+      answer_md: '',
+      finished_at: null,
+      sources: [],
+      images: [],
+      stages: [],
+    })
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID_DEEP)
+    store.subscribe(TURN_ID_DEEP) // 回看运行中轮订阅（生命周期 5/11）
+
+    const es1 = MockEventSource.instances[0]!
+    es1.open()
+    mockedGet.mockResolvedValueOnce(turnDetailDeepCompleted) // 第一轮 done 对账（REST 权威——先排队，done 同步触发对账）
+    for (const f of toFrames(deepSequence)) es1.dispatch(f)
+    await vi.waitFor(() => expect(store.turns[TURN_ID_DEEP]!.status).toBe('completed'))
+    expect(store.turns[TURN_ID_DEEP]!.lastSeq).toBe(21)
+    expect(JSON.parse(sessionStorage.getItem(`ai-search.seq.${TURN_ID_DEEP}`)!)).toEqual({ lastSeq: 21, compactSeq: 12 })
+
+    // regenerate：deep 轮走同一路径（v1.30 放开）；重放门抬升 = max(内存 21, 落盘 21) = 21
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID_DEEP, status: 'running' })
+    await store.regenerate(TURN_ID_DEEP)
+    const es2 = MockEventSource.instances[1]!
+    expect(es2).toBeDefined()
+
+    es2.open()
+    // 旧序列全量重放（seq 1..21）：传输层 seq 门（fromSeq=21）整段丢弃——answer_md 不再累积旧 token
+    // （门生效的行为证明：lastSeq 驻留 21、answer_md 空、sources 不被旧重放改写）
+    for (const f of toFrames(deepSequence)) es2.dispatch(f)
+    vi.advanceTimersByTime(2000)
+    const turn = store.turns[TURN_ID_DEEP]!
+    expect(turn.answer_md).toBe('')
+    expect(turn.lastSeq).toBe(21)
+    expect(turn.sources.map((s) => s.ref_no)).toEqual([1, 2]) // 不重检索：sources 保留（REST 对账权威）
+    // 二次 write 段：同 stage_key 就地重渲（write done → running），旧轨迹零残留
+    mockedGet.mockResolvedValueOnce(turnDetailDeepCompleted) // 二次 done 对账（先排队，done 同步触发对账）
+    for (const f of regenerateFrames(TURN_ID_DEEP)) es2.dispatch(f)
+    await vi.waitFor(() => expect(turn.status).toBe('completed'))
+    expect(turn.answer_md).toBe(turnDetailDeepCompleted.answer_md) // 二次 done 对账 REST 权威（answer_md 原地更新）
+    expect(turn.lastSeq).toBe(24)
+    expect(JSON.parse(sessionStorage.getItem(`ai-search.seq.${TURN_ID_DEEP}`)!)).toEqual({ lastSeq: 24, compactSeq: 12 })
+    expect(turn.compactSeq).toBe(12) // 旧轨迹 compact 边界随游标保留（重放丢弃不回写内存）
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(false)
+    // deep 轮 done 即 close（L13 保活仅 fast）——二次终态后连接已收口
+    expect(es2.closedByClient).toBe(true)
+    expect(peekTurnStream(TURN_ID_DEEP)).toBeUndefined()
+  })
+
+  it('regenerate 后新 stage(write,running) 且答案区已有渲染态（新标签页重放门=0 形态）：边界清空重新累积（§3 生命周期 14 清空重渲约定 transport 投影）', async () => {
+    // fresh 页形态：落盘游标为 compact 口径合规的 deep 游标（批次 6 ④）→ 刷新续传 fromSeq=落盘 lastSeq
+    sessionStorage.setItem(`ai-search.seq.${TURN_ID_DEEP}`, JSON.stringify({ lastSeq: 21, compactSeq: 12 }))
+    mockedGet.mockResolvedValueOnce({ ...turnDetailDeepCompleted, status: 'degraded', degraded: true, degraded_reason: 'source_failure' })
+    const store = useTurnStore()
+    await store.reconcile(TURN_ID_DEEP) // 对账重建渲染态（answer_md=REST 终态正文）
+    const turn = store.turns[TURN_ID_DEEP]!
+    expect(turn.answer_md).toBe(turnDetailDeepCompleted.answer_md)
+
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID_DEEP, status: 'running' })
+    await store.regenerate(TURN_ID_DEEP)
+    const es = MockEventSource.instances[0]!
+    es.open()
+    // 全量重放旧 token（新标签页重放门=0：regenerate 抬升为落盘 21——旧 token 仍被门丢弃）
+    for (const f of toFrames(deepSequence.filter((w) => w.event === 'token'))) es.dispatch(f)
+    vi.advanceTimersByTime(2000)
+    expect(turn.answer_md).toBe('') // ≤21 旧 token 整段丢弃（重放幂等门）
+
+    // 二次 write 段 + 新 token：正常累积；二次 done 兜底收束（digest 单块同构路径，此处 completed 形态）
+    mockedGet.mockResolvedValueOnce(turnDetailDeepCompleted) // 二次 done 对账（先排队，done 同步触发对账）
+    for (const f of regenerateFrames(TURN_ID_DEEP)) es.dispatch(f)
+    await vi.waitFor(() => expect(turn.status).toBe('completed'))
+    expect(turn.answer_md).toBe(turnDetailDeepCompleted.answer_md)
   })
 })
 

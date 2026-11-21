@@ -15,7 +15,8 @@ import { flushPromises, mount } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { sendTurnFeedback } from '@/api/turns'
+import { ApiError } from '@/api/client'
+import { exportTurnReport, sendTurnFeedback } from '@/api/turns'
 import AnswerActions from '@/components/answer/AnswerActions.vue'
 import { toast } from '@/composables/toast'
 import { i18n, setLocale } from '@/i18n'
@@ -25,8 +26,10 @@ import type { TurnState } from '@/stores/turn'
 
 vi.mock('@/api/turns', () => ({
   sendTurnFeedback: vi.fn(),
+  exportTurnReport: vi.fn(),
 }))
 const mockedSendFeedback = vi.mocked(sendTurnFeedback)
+const mockedExportReport = vi.mocked(exportTurnReport)
 
 vi.mock('@/composables/toast', () => ({
   toast: vi.fn(),
@@ -62,6 +65,7 @@ function makeTurn(partial: Partial<TurnState> = {}): TurnState {
     degradedReason: null,
     memorySaved: null,
     durationMs: 7420,
+    exportAvailable: false,
     ...partial,
   }
 }
@@ -285,8 +289,30 @@ describe('第 8 钮「重新生成」（v1.26 REQ-063/A47：可见性门控 + �
     expect(w.find('[data-testid="act-regenerate"]').exists()).toBe(false)
   })
 
-  it('不可见：deep 轮（api.md §2.12 前置 3：mode=fast——deep regenerate 挂 M2 深度工单）', () => {
+  it('可见：deep 有源 degraded 轮（v1.30 放开 mode∈{fast,deep}，frontend-api.md §3 生命周期 14 deep 形态注——原「deep 轮不渲染」作废）', () => {
     const w = mountActions(makeTurn({ mode: 'deep', status: 'degraded', degradedReason: 'budget', sources: [SOURCE_A] }))
+    const btn = w.find('[data-testid="act-regenerate"]')
+    expect(btn.exists()).toBe(true)
+    expect(btn.text()).toContain('重新生成')
+  })
+
+  it('可见：deep 有源 failed 轮（deep 崩溃恢复 failed-with-sources 同判据）', () => {
+    const w = mountActions(makeTurn({ mode: 'deep', status: 'failed', errorMsg: '综合失败', sources: [SOURCE_A] }))
+    expect(w.find('[data-testid="act-regenerate"]').exists()).toBe(true)
+  })
+
+  it('不可见：deep completed（终态枚举判据 mode 放开不放宽 status）', () => {
+    const w = mountActions(makeTurn({ mode: 'deep', sources: [SOURCE_A] }))
+    expect(w.find('[data-testid="act-regenerate"]').exists()).toBe(false)
+  })
+
+  it('不可见：deep canceled', () => {
+    const w = mountActions(makeTurn({ mode: 'deep', status: 'canceled', cancelReason: 'user', sources: [SOURCE_A] }))
+    expect(w.find('[data-testid="act-regenerate"]').exists()).toBe(false)
+  })
+
+  it('不可见：deep 零来源 failed（api.md §2.12 前置 2：sources 非空——deep 同判据）', () => {
+    const w = mountActions(makeTurn({ mode: 'deep', status: 'failed', errorMsg: '综合失败', sources: [] }))
     expect(w.find('[data-testid="act-regenerate"]').exists()).toBe(false)
   })
 
@@ -306,6 +332,121 @@ describe('第 8 钮「重新生成」（v1.26 REQ-063/A47：可见性门控 + �
     setLocale('en-US')
     expect(i18n.global.t('answer.regenerate')).toBe('Regenerate')
     setLocale('zh-CN')
+  })
+})
+
+describe('⑦ 更多菜单「导出报告」（批次 6 REQ-016：deep 轮服务端导出，api.md §2.8/§5.3；A40 负向——fast 不调端点）', () => {
+  // §2.8 export 响应八键线形（批次 6 收口轮 P2-3 钉正：drop turn_id、含 thread_id——与 §5.2 artifacts 条目不同构）
+  const EXPORT_ARTIFACT = {
+    artifact_id: 'b0af1234-0000-4000-8000-000000000001',
+    thread_id: THREAD_ID_FAST,
+    artifact_type: 'report' as const,
+    filename: 'report_20261121_1014.md',
+    size_bytes: 18342,
+    content_type: 'text/markdown',
+    created_at: '2026-11-21T02:14:40Z',
+    download_path: `/api/v1/threads/${THREAD_ID_FAST}/artifacts/b0af1234-0000-4000-8000-000000000001/download`,
+  }
+
+  /** 锚点 click 捕获桩（同 export-md 用例形态：记录被点击的 <a>） */
+  function stubAnchorClick(): { current: HTMLAnchorElement | null } {
+    const captured: { current: HTMLAnchorElement | null } = { current: null }
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      captured.current = this
+    })
+    return captured
+  }
+
+  it('deep + exportAvailable=true：更多菜单渲染「导出报告」项（answer.exportReport 词条）', async () => {
+    const w = mountActions(makeTurn({ mode: 'deep', exportAvailable: true }))
+    await w.find('[data-testid="act-more"]').trigger('click')
+    const item = w.find('[data-testid="act-export-report"]')
+    expect(item.exists()).toBe(true)
+    expect(item.text()).toContain('导出报告')
+    expect(i18n.global.t('answer.exportReport')).toBe('导出报告')
+  })
+
+  it('deep + exportAvailable=false：不渲染（api.md §2.5 判据未满足——服务端权威，前端不本地推断）', async () => {
+    const w = mountActions(makeTurn({ mode: 'deep', exportAvailable: false }))
+    await w.find('[data-testid="act-more"]').trigger('click')
+    expect(w.find('[data-testid="act-export-report"]').exists()).toBe(false)
+    expect(w.find('[data-testid="act-export-md"]').exists()).toBe(true) // 本地 Blob 导出不受影响
+  })
+
+  it('fast + exportAvailable=true：不渲染（A40 负向判定——fast 菜单仅本地 Blob 导出，不调 §2.8 端点）', async () => {
+    const w = mountActions(makeTurn({ mode: 'fast', exportAvailable: true }))
+    await w.find('[data-testid="act-more"]').trigger('click')
+    expect(w.find('[data-testid="act-export-report"]').exists()).toBe(false)
+  })
+
+  it('deep 点击导出 → POST §2.8 → 合法形态 download_path（§2.8 工件下载端点线形，P2-4 守卫准入）锚点跳转（§5.3 口径：服务端 FileResponse Content-Disposition 驱动下载）+ 菜单关闭 + 零 blob 本地导出', async () => {
+    mockedExportReport.mockResolvedValueOnce(EXPORT_ARTIFACT)
+    const createObjectURL = vi.fn(() => 'blob:mock-url')
+    Object.defineProperty(URL, 'createObjectURL', { value: createObjectURL, configurable: true, writable: true })
+    const captured = stubAnchorClick()
+    try {
+      const w = mountActions(makeTurn({ mode: 'deep', exportAvailable: true }))
+      await w.find('[data-testid="act-more"]').trigger('click')
+      await w.find('[data-testid="act-export-report"]').trigger('click')
+      await flushPromises()
+
+      expect(mockedExportReport).toHaveBeenCalledWith(TURN_ID_FAST)
+      expect(captured.current).not.toBeNull()
+      expect(captured.current!.getAttribute('href')).toBe(EXPORT_ARTIFACT.download_path)
+      expect(createObjectURL).not.toHaveBeenCalled() // 服务端导出不走本地 Blob（与 export-md 路径区分）
+      expect(w.find('[data-testid="act-more-menu"]').exists()).toBe(false)
+      expect(mockedToast).not.toHaveBeenCalled() // 合法形态零打扰
+    } finally {
+      vi.restoreAllMocks()
+    }
+  })
+
+  it('download_path 形态守卫（批次 6 收口 P2-4）：非法形态（javascript: 伪协议 / 协议相对 //host/ / 非 /api/ 相对怪形态 / 同源但非 /api/ 前缀）一律 toast 不跳转', async () => {
+    const invalidPaths = [
+      'javascript:alert(1)', // 伪协议（脚本注入面）
+      `//evil.example/${TURN_ID_FAST}/report.md`, // 协议相对（他源跳转面）
+      'artifacts/report_20261121_1014.md', // 相对怪形态（不以 /api/ 开头）
+      '/etc/passwd', // 同源相对但非 /api/ 前缀
+    ]
+    const captured = stubAnchorClick()
+    try {
+      for (const path of invalidPaths) {
+        mockedToast.mockClear()
+        mockedExportReport.mockClear()
+        mockedExportReport.mockResolvedValueOnce({ ...EXPORT_ARTIFACT, download_path: path })
+        const w = mountActions(makeTurn({ mode: 'deep', exportAvailable: true }))
+        await w.find('[data-testid="act-more"]').trigger('click')
+        await w.find('[data-testid="act-export-report"]').trigger('click')
+        await flushPromises()
+
+        expect(mockedExportReport).toHaveBeenCalledTimes(1)
+        expect(captured.current).toBeNull() // 非法形态不跳转
+        expect(mockedToast).toHaveBeenCalledTimes(1)
+        expect(mockedToast).toHaveBeenCalledWith(i18n.global.t('answer.exportPathInvalid'))
+      }
+    } finally {
+      vi.restoreAllMocks()
+    }
+  })
+
+  it('409003 同线程同分钟跨轮碰撞：catch → toast 服务端中文 message 直达（normalizeError ApiError 直通）+ 不跳转 + 菜单已收起', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockedExportReport.mockRejectedValueOnce(new ApiError('409003', '同一分钟内已导出其他轮次的报告'))
+    const captured = stubAnchorClick()
+    try {
+      const w = mountActions(makeTurn({ mode: 'deep', exportAvailable: true }))
+      await w.find('[data-testid="act-more"]').trigger('click')
+      await w.find('[data-testid="act-export-report"]').trigger('click')
+      await flushPromises()
+
+      expect(mockedToast).toHaveBeenCalledTimes(1)
+      expect(mockedToast).toHaveBeenCalledWith('同一分钟内已导出其他轮次的报告')
+      expect(captured.current).toBeNull() // 失败不跳转
+      expect(w.find('[data-testid="act-more-menu"]').exists()).toBe(false)
+    } finally {
+      warnSpy.mockRestore()
+      vi.restoreAllMocks()
+    }
   })
 })
 

@@ -19,11 +19,11 @@ import uuid
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import BusinessLog
-from app.db.models import Thread, Turn
+from app.db.models import Artifact, Thread, Turn
 from app.exception import NotFoundException, ThreadBusyException
 from app.schemas.common import PageResponse, SearchMode, TurnStatus
 from app.schemas.thread import (
@@ -268,6 +268,9 @@ class ThreadService(BaseService):
         v1.18 写副作用（§2.3 注 / D-12）：未读线程（read_at IS NULL）打开即置已读，
         同事务 flush；幂等——已读则零写、重复 GET 无观测差异。归档线程/生成中线程
         打开同样置位（用户正在看）。`updated_at` 不因置已读变化。
+
+        `has_artifacts`（§2.3）：artifacts 登记行存在性真实投影——EXISTS(artifacts
+        WHERE thread_id=…)，走 idx_artifacts_thread 的读侧单查询（不逐轮探测）。
         """
         thread = await self._get_owned_thread(thread_id, user_id)
         if thread.read_at is None:
@@ -275,13 +278,14 @@ class ThreadService(BaseService):
             await self.db.flush()
         stmt = select(Turn).where(Turn.thread_id == thread.id).order_by(Turn.created_at.asc())
         turns = (await self.db.scalars(stmt)).all()
+        exists_stmt = select(exists().where(Artifact.thread_id == thread.id))
+        has_artifacts = bool(await self.db.scalar(exists_stmt))
         return ThreadDetail(
             thread_id=str(thread.id),
             title=thread.title,
             mode_summary=cast(SummaryMode, thread.mode_summary),
             turn_count=thread.turn_count,
-            # 分期口径（用户裁决 2026-11-08）：恒 false——0002-M2（artifacts 表+迁移）起真实值
-            has_artifacts=False,
+            has_artifacts=has_artifacts,
             created_at=thread.created_at,
             updated_at=thread.updated_at,
             turns=[_skeleton(t) for t in turns],

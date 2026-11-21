@@ -909,19 +909,23 @@ async def test_rerank_fallback_does_not_mark_degraded() -> None:
     assert getattr(turn, "degraded_reason", None) is None  # 列未被派生赋值
 
 
-def test_turn_timeout_fallback_default_is_120() -> None:
-    """spec 节缺失 turn_timeout_s 时的内置兜底 = 120s（nacos-config §3 v1.25，2026-11-16
-    用户裁决②：P50 计时终点改为正文首字后轮预算放宽，防 3000 字慢侧被截断成 degraded）。"""
+def test_turn_timeout_fallback_defaults_are_per_mode() -> None:
+    """spec 节缺失 turn_timeout_s 时的内置兜底 = fast 120s / deep 600s（nacos-config §3
+    v1.25 fast 裁决② / v1.40 deep 裁决：批次 6 探针 completed 轮 239.6s 距 255s 熔断
+    仅 ~15s 余量，放宽到 600；token_budget=500k 仍是成本硬护栏，与时间解耦）。"""
     runner = ThreadScheduler(
         bus=_bus(),
         session_factory=_FakeSessionFactory(_FakeSession()),
         graph=_FakeGraph([]),
     )
-    assert turn_service._DEFAULT_TURN_TIMEOUT_S == 120.0
+    assert turn_service._DEFAULT_TURN_TIMEOUT_S == {"fast": 120.0, "deep": 600.0}
     assert runner._turn_timeout_s({"fast": {}}, "fast") == 120.0
     assert runner._turn_timeout_s({}, "fast") == 120.0
+    assert runner._turn_timeout_s({"deep": {}}, "deep") == 600.0
+    assert runner._turn_timeout_s({}, "deep") == 600.0
     # 快照给值即按快照（规范路径不受兜底影响）
     assert runner._turn_timeout_s({"fast": {"turn_timeout_s": 300}}, "fast") == 300.0
+    assert runner._turn_timeout_s({"deep": {"turn_timeout_s": 600}}, "deep") == 600.0
 
 
 async def test_execute_turn_timeout_guard_fails_with_500301() -> None:

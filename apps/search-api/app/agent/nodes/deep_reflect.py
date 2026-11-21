@@ -35,7 +35,7 @@ planner 历史块同款形态）。**零占位符 ⇒ 新旧模板渲染同文 �
   （reason=structured_output_invalid / llm_call_failed）——stage done 裸帧（api.md
   §7.4 reflect 帧未钉 extra 键，沿批次 2「extra 仅契约钉键」纪律）。
 
-超时包络：TurnDeadline(spec.deep.llm_timeout_s，缺省 60)——主调用 asyncio.timeout
+超时包络：TurnDeadline(spec.deep.llm_timeout_s，缺省 120)——主调用 asyncio.timeout
 包络；修复回喂前查剩余预算（耗尽即跳过回喂直入兜底，deadline-aware）。
 
 取消感知：ensure_not_canceled 入口接线（R14② 跨子图取消感知，同 planner/research
@@ -124,7 +124,7 @@ def _pre_trip(state: Mapping[str, Any], configurable: Mapping[str, Any]) -> str 
     """回路中途 trip 判定（评审修复 2——发现 2：ARCH §4.3「reflect 出边与 writer 前
     双检查点」的出边承载面）。guards 在回路退出后才执行（拓扑 guards→write→END 零回
     边），route_reflect 的 degraded_reason 判据需要本判定写入才活——否则回路中途耗尽
-    300s/500k 只能靠外层 asyncio.timeout 兜成 error(500301)（与图内熔断「零 error」
+    600s/500k 只能靠外层 asyncio.timeout 兜成 error(500301)（与图内熔断「零 error」
     形态背离，degraded_writer 降级路径结构性不可达）。
 
     读轮级注入面（TurnRunner 注入，deep_guards 同源同值）：remaining ≤ 降级包络+裕量 →
@@ -369,7 +369,7 @@ async def reflect(state: Any, config: RunnableConfig | None = None) -> dict[str,
     spec = state.get("spec")
     spec = spec if isinstance(spec, Mapping) else {}
     rounds = effective_rounds(_section(spec))
-    llm_timeout = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 60（§6.2）
+    llm_timeout = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 120（§6.2）
     budget = TurnDeadline(llm_timeout)  # 评审段包络：主调用 + 修复回喂（deadline-aware）
 
     alias = resolve_chat_alias(state, config)

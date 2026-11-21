@@ -136,7 +136,11 @@ MCP_CONFIG: dict[str, Any] = {
 #    fast.llm_timeout_s 30→60、retry.connection.total_window_s 20→60、thinking 两键
 #    〔fast=off / deep=on〕、safety.enabled true + politics_terms 空初值 /
 #    **v1.37（B15）：safety 节增 url_guard / injection_filter 两子节（内容侧安全
-#    护栏——与 safety.enabled 解耦，缺子节运行时回落本种子=部署即启用）**）
+#    护栏——与 safety.enabled 解耦，缺子节运行时回落本种子=部署即启用）** /
+#    **v1.39：deep.llm_timeout_s 60→120（2026-11-21 用户裁决沉淀，与 Nacos 运行值
+#    对齐；fast 60 不动）** / **v1.40：deep.turn_timeout_s 300→600（2026-11-21 用户
+#    裁决——批次 6 探针 completed 轮 239.6s 距 255s 熔断仅 ~15s 余量；token_budget
+#    500k 不动）**）
 SPEC_CONFIG: dict[str, Any] = {
     "schema_version": 1,
     "updated_at": _UPDATED_AT,
@@ -176,9 +180,18 @@ SPEC_CONFIG: dict[str, Any] = {
         "fuse_top_n": 10,
         "summary_max_tokens": 1200,
         "token_budget": 500000,
-        "llm_timeout_s": 60,
+        # §3 v1.39（2026-11-21 用户裁决沉淀）：60 → 120——GLM thinking 流下单调用
+        # 60s 系统性偏紧（批次 5 探针 7/7 撞包络），120 后活体 completed（批次 6
+        # 探针 write sections=5/4 分钟整轮）；与 Nacos 运行值对齐，消除 FORCE 全量
+        # 发布把初值冲回 60 的漂移面。fast.llm_timeout_s=60 不动（2026-11-18 裁决①）。
+        "llm_timeout_s": 120,
         "tool_timeout_s": 30,
-        "turn_timeout_s": 300,
+        # §3 v1.40（2026-11-21 用户裁决）：300 → 600——批次 6 探针 completed 轮
+        # 239.6s 距 guards 熔断点（轮预算−DEGRADED_WRITER_ENVELOPE_S 30−
+        # TRIP_MARGIN_S 15≈255s）仅 ~15s 余量，真深度研究时长贴顶；放宽后慢侧
+        # 留量充足。token_budget=500000 仍是独立成本硬护栏（时间与成本解耦）；
+        # 回退门=单键热更回 300。
+        "turn_timeout_s": 600,
         # §3 v1.32（B14 增量 C）：deep=on（深度模式开思考）
         "thinking": "on",
         "code_exec_enabled": False,

@@ -201,7 +201,7 @@ class ThreadDetail(BaseModel):
     turn_count: int
     has_artifacts: bool = Field(
         default=False,
-        description="分期口径（用户裁决 2026-11-08）：恒 false——0002-M2（artifacts 表+迁移）起真实值",
+        description="线程是否存在产物登记行（artifacts 表 EXISTS 投影，0002-M2 起真实值）",
     )
     created_at: datetime
     updated_at: datetime

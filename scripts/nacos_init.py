@@ -170,7 +170,10 @@ MCP_CONFIG = {
 #    v1.4 compact / v1.1 memory / v1.24 retry.connection / v1.25 fast.turn_timeout_s=120 /
 #    B13 safety 节置于 followups 与 kb 之间 / **v1.37（B15）：safety 节增 url_guard /
 #    injection_filter 两子节（内容侧安全护栏——与 safety.enabled 解耦，缺子节运行时
-#    回落 defaults.py 种子=部署即启用）**）
+#    回落 defaults.py 种子=部署即启用）** / **v1.39：deep.llm_timeout_s 60→120
+#    （2026-11-21 用户裁决沉淀，与 Nacos 运行值对齐；fast 60 不动）** /
+#    **v1.40：deep.turn_timeout_s 300→600（2026-11-21 用户裁决；token_budget 500k
+#    不动，成本护栏独立于时间）**）
 SPEC_CONFIG = {
     "schema_version": 1,
     "updated_at": _UPDATED_AT,
@@ -208,9 +211,13 @@ SPEC_CONFIG = {
         "fuse_top_n": 10,
         "summary_max_tokens": 1200,
         "token_budget": 500000,
-        "llm_timeout_s": 60,
+        # §3 v1.39（2026-11-21 用户裁决沉淀）：60 → 120（与 Nacos 运行值对齐，
+        # 消除 FORCE 全量发布把初值冲回 60 的漂移面）；fast 60 不动。
+        "llm_timeout_s": 120,
         "tool_timeout_s": 30,
-        "turn_timeout_s": 300,
+        # §3 v1.40（2026-11-21 用户裁决）：300 → 600（批次 6 探针 completed 轮
+        # 239.6s 距 guards 熔断点≈255s 仅 ~15s 余量；token_budget 500k 不动）。
+        "turn_timeout_s": 600,
         # §3 v1.32（B14 增量 C）：deep=on（深度模式开思考）
         "thinking": "on",
         "code_exec_enabled": False,

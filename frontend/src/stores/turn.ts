@@ -15,9 +15,10 @@
  *     turn_service.py:21-22/:753-754，运行中 2.5 answer_md 为空串，替换会清空流式内容）。
  *   - sendFeedback()：轮反馈乐观 UI（v1.17，REQ-057/A41；api.md §2.9——经 api/turns.ts，
  *     失败静默回滚不 toast，reconcile 对 2.5 feedback_helpful 还原）。
- *   - regenerate()：degraded/failed-with-sources fast 轮「仅重新生成」（v1.26，REQ-063/A47；
- *     api.md §2.12——POST → 状态置 running + 清空渲染态 + SSE 重订阅，§3 生命周期 14
- *     清空重渲约定；失败 409006/404001 toast 既有链路）。
+ *   - regenerate()：degraded/failed-with-sources fast/deep 轮「仅重新生成」（v1.26 增、v1.30
+ *     放开 deep——api.md §2.12 前置第 3 条 v1.28，REQ-063/A47；api.md §2.12——POST → 状态置
+ *     running + 清空渲染态 + SSE 重订阅，§3 生命周期 14 清空重渲约定〔deep 形态注 v1.30〕；
+ *     失败 409006/404001 toast 既有链路）。
  *   - generatingThreadIds：侧边栏生成中线程集合（生命周期 12），轮生命周期事件驱动、不轮询。
  *   - closeStream()：路由切走主动断流（生命周期 11，连接注册表保证同 turnId 至多一条连接）。
  */
@@ -28,6 +29,7 @@ import { apiGet, apiPost, normalizeError } from '@/api/client'
 import { regenerateTurn, sendTurnFeedback } from '@/api/turns'
 import { CONTENT_SAFETY_ERROR_CODE } from '@/constants/errors'
 import { toast } from '@/composables/toast'
+import { isRecord } from '@/utils/guards'
 import { closeTurnStream, subscribeTurn } from '@/sse/turnStream'
 import type { TurnStreamState } from '@/sse/turnStream'
 import { usePrefsStore } from '@/stores/prefs'
@@ -50,7 +52,7 @@ import type {
   TurnStatus,
 } from '@/types/api'
 
-/** §3 生命周期 5：本地 last seq 的 sessionStorage 键（标签页隔离语义） */
+/** §3 生命周期 5：本地 seq 游标的 sessionStorage 键（标签页隔离语义；v1.30 OQ-35 起单键 JSON 双值 {lastSeq, compactSeq}） */
 const SEQ_STORAGE_PREFIX = 'ai-search.seq.'
 
 /** P3：seq 持久化节流窗（streaming-buffer 参数表「落库节流」200ms；控制事件/终态豁免） */
@@ -131,6 +133,13 @@ export interface TurnState {
   memorySaved: number | null
   /** 轮耗时（SSE done.duration_ms / 2.5 duration_ms 双源；进行中 null——状态行「已完成 N秒」） */
   durationMs: number | null
+  /**
+   * 服务端报告导出可用（批次 6，api.md §2.5 v1.10 判据：mode=deep ∧ answer_md 非空 ∧
+   * status∈{completed,degraded}）。数据源唯一 = 2.5 对账回写（SSE 无对应事件）；种子缺省
+   * false（ask/followUp 新轮不渲染「导出报告」，api.md §2.5 判据须待 REST 权威）——
+   * 消费面 = AnswerActions 更多菜单「导出报告」门控（§5 ⑦ v1.30）。
+   */
+  exportAvailable: boolean
 }
 
 function seedTurnState(init: {
@@ -166,6 +175,7 @@ function seedTurnState(init: {
     degradedReason: null,
     memorySaved: null,
     durationMs: null,
+    exportAvailable: false,
   }
 }
 
@@ -216,10 +226,13 @@ export const useTurnStore = defineStore('turn', () => {
   const seqPersistedAt = new Map<string, number>()
 
   /**
-   * sessionStorage 游标写入（P3 节流）：delta 事件 200ms 窗口内至多落一次（写放大收敛——
-   * 每帧一次 setItem 换成 ≤5 次/秒）；控制事件与终态（done）豁免立即落（重连续传游标与
-   * 终态恢复不落后）。窗口内跳过的游标仅落后内存 lastSeq ≤200ms——续传按重放幂等门
-   * （seq 去重）兜底，不产生语义偏差。
+   * sessionStorage 游标写入（P3 节流 + v1.30 OQ-35 双值形态）：单键 JSON
+   * `{lastSeq, compactSeq}`（与 lastSeq 同轮同键族——compactSeq 是「lastSeq < compactSeq →
+   * 放弃增量续传」判定依据，刷新后判定不再依赖内存态）。delta 事件 200ms 窗口内至多落一次
+   * （写放大收敛——每帧一次 setItem 换成 ≤5 次/秒）；控制事件与终态（done）豁免立即落。
+   * 注意：context_compact 事件的主调用（applyEvent 持久化点）先于 switch 写 turn.compactSeq
+   * ——此刻读到的 compactSeq 是上一事件值；case 内的二次 immediate 落盘兜住同帧性
+   * （两个 setItem 同步连发，最终值正确）。
    */
   function persistSeq(turnId: string, seq: number, options: { immediate?: boolean } = {}): void {
     if (seq <= 0) return
@@ -232,36 +245,85 @@ export const useTurnStore = defineStore('turn', () => {
       seqPersistedAt.set(turnId, now)
     }
     try {
-      sessionStorage.setItem(SEQ_STORAGE_PREFIX + turnId, String(seq))
+      const compactSeq = turns.value[turnId]?.compactSeq ?? 0
+      sessionStorage.setItem(SEQ_STORAGE_PREFIX + turnId, JSON.stringify({ lastSeq: seq, compactSeq }))
     } catch {
       // 存储不可用（隐私模式等）静默：续传退化为全量重放（幂等）
     }
   }
 
-  function readStoredSeq(turnId: string): number {
-    try {
-      const raw = sessionStorage.getItem(SEQ_STORAGE_PREFIX + turnId)
-      const n = Number(raw)
-      return Number.isFinite(n) && n > 0 ? n : 0
-    } catch {
-      return 0
-    }
+  /** 落盘游标形态（v1.30 OQ-35）：compactSeq=null = 无记录（旧纯数字格式 / compactSeq 键缺席或 ≤0 / 解析失败） */
+  interface StoredSeqCursor {
+    lastSeq: number
+    compactSeq: number | null
   }
 
   /**
-   * 订阅 seq 门基线（生命周期 5/11）。原生 EventSource 新建对象无法携带 Last-Event-ID 头
-   * （浏览器仅在「同一对象」自动重连时原生携带，勿自造 header）——因此：
-   *   - 本页已流式渲染过（lastSeq>0，answer_md/thinking_md 含 ≤lastSeq 增量）→ 门=lastSeq：
-   *     重建连接的全量重放中被门丢弃 ≤lastSeq 部分，仅应用增量（幂等续传）。
-   *   - 本页尚无流式内容（刷新/新页：lastSeq=0）→ 门=0 全量重放重建（运行中轮 REST answer_md
-   *     为空串，重放完整重建；终态轮无需订阅，直接 reconcile）。契约「若刷新丢失则全量重放，
-     幂等」的落地路径。
-   *   - 本地游标早于 compactSeq（v1.4 重放边界）→ 门=0 放弃增量，全量对账重建。
-   * sessionStorage 序列按 §3 L5 形态持久化（readStoredSeq 供游标通道落地后的接入与诊断）。
+   * 读落盘游标（双形态兼容）：JSON `{lastSeq, compactSeq}` 为现行形态；批次 5 前的旧纯数字
+   * 串（"9"）= compactSeq 无记录（宽路径口径：旧游标无 compact 证据 → 视同不可续传）。
+   * 读写 try/catch 同 §2 惯例；任何解析失败回落 lastSeq=0（全量重放幂等）。
+   */
+  function readStoredCursor(turnId: string): StoredSeqCursor {
+    try {
+      const raw = sessionStorage.getItem(SEQ_STORAGE_PREFIX + turnId)
+      if (raw === null) return { lastSeq: 0, compactSeq: null }
+      if (raw.startsWith('{')) {
+        const parsed: unknown = JSON.parse(raw)
+        if (
+          isRecord(parsed) &&
+          typeof parsed.lastSeq === 'number' &&
+          Number.isFinite(parsed.lastSeq) &&
+          parsed.lastSeq > 0
+        ) {
+          const compact = parsed.compactSeq
+          const compactSeq =
+            typeof compact === 'number' && Number.isFinite(compact) && compact > 0 ? compact : null
+          return { lastSeq: parsed.lastSeq, compactSeq }
+        }
+        return { lastSeq: 0, compactSeq: null }
+      }
+      const n = Number(raw)
+      return { lastSeq: Number.isFinite(n) && n > 0 ? n : 0, compactSeq: null }
+    } catch {
+      return { lastSeq: 0, compactSeq: null }
+    }
+  }
+
+  /** 落盘 lastSeq 游标（regenerate 重放门抬升与诊断消费面；readStoredCursor 的数值投影） */
+  function readStoredSeq(turnId: string): number {
+    return readStoredCursor(turnId).lastSeq
+  }
+
+  /**
+   * 订阅 seq 门基线（生命周期 5/11；v1.30 OQ-35 compactSeq 刷新恢复口径 + v1.32 P2-1 准入
+   * 前提注记）。原生 EventSource 新建对象无法携带 Last-Event-ID 头（浏览器仅在「同一对象」
+   * 自动重连时原生携带，勿自造 header）——fromSeq 为纯客户端重放去重门，服务端首连恒全量
+   * 重放。判定序：
+   *   ① 基线 = max(落盘 lastSeq, 内存 lastSeq)（同页路径保真——同页落盘游标恒 ≤ 内存，
+   *     落盘仅兜内存节流窗；刷新后内存归 0、基线即落盘游标）。
+   *   ② compactSeq 边界判定（内存 + 落盘双源证据取大）：> 基线 → 放弃增量返 0（v1.4 重放
+   *     边界——本地游标早于最近一次压缩）。
+   *   ③ 刷新路径（cursor.lastSeq > 内存 lastSeq）增量续传准入证据 = **「REST 可承载被跳过
+   *     区间」**（v1.32 批次 6 收口轮 P2-1 修法，frontend-api.md §3 生命周期 5【v1.32 注记】）：
+   *     落盘游标携带 compactSeq 记录（口径合规证据）∧ REST 对账回写的 answer_md 非空
+   *     （终态权威已落库）两者齐备才允许增量续传；运行中轮 token/thinking 只发布不落库、
+   *     2.5 answer_md 为空串——增量跳过 1..N 的正文无处可重建（刷新恢复丢帧），故一律放弃
+   *     增量返 0 走全量重放（等效恢复批次 5 刷新行为；直到后端为 deep 运行轮持久化分段
+   *     报告前口径不变，后端立项另议）；compactSeq 记录缺失（fast 轮恒无 / 旧纯数字格式 /
+   *     记录丢失）同判放弃。放弃路径 = REST 全量对账后重新订阅（loadThread 既有 reconcile
+   *     先行满足——宽路径灰度安全，宁全量不丢帧）。
+   *   ④ 其余（同页已流式）→ 门 = 基线：重建连接的全量重放中被门丢弃 ≤基线部分，仅应用
+   *     增量（幂等续传）；本页无任何游标（新标签页）→ 门=0 全量重放重建。
    */
   function resolveFromSeq(turn: TurnState): number {
-    if (turn.lastSeq > 0 && turn.compactSeq <= turn.lastSeq) return turn.lastSeq
-    return 0
+    const cursor = readStoredCursor(turn.turnId)
+    const baseline = Math.max(cursor.lastSeq, turn.lastSeq)
+    const compactEvidence = Math.max(turn.compactSeq, cursor.compactSeq ?? 0)
+    if (compactEvidence > baseline) return 0
+    // 刷新路径准入（P2-1）：compactSeq 记录与 REST 持久化证据（answer_md 非空）任一缺席
+    // → 增量跳过的内容无法由 REST 承载 → 全量重放
+    if (cursor.lastSeq > turn.lastSeq && (cursor.compactSeq === null || turn.answer_md === '')) return 0
+    return baseline
   }
 
   /* ---------- 派发表（§3：事件 → store 单一状态机；applyEvent 唯一入口） ---------- */
@@ -345,6 +407,9 @@ export const useTurnStore = defineStore('turn', () => {
       case 'context_compact':
         turn.compactSeq = Math.max(turn.compactSeq, seq)
         turn.compactAt = event.data.ts
+        // OQ-35（v1.30）：compactSeq 是刷新恢复「放弃增量」判定依据，随游标同帧落盘——主
+        // persistSeq 调用（switch 前）读到的还是上一事件 compactSeq，此处二次 immediate 兜底
+        persistSeq(turnId, turn.lastSeq, { immediate: true })
         break
       case 'memory':
         turn.memory_hits = { profile_used: event.data.profile_used, items: event.data.items }
@@ -432,18 +497,22 @@ export const useTurnStore = defineStore('turn', () => {
   }
 
   /**
-   * 重新生成（v1.26 增，REQ-063/A47；api.md §2.12 / frontend-api.md §3 生命周期 14）：
-   * degraded/failed-with-sources fast 轮「仅重新生成」——复用既有 sources 只重跑 synthesis。
+   * 重新生成（v1.26 增，REQ-063/A47；v1.30 放开 deep——api.md §2.12 前置第 3 条 v1.28 /
+   * frontend-api.md §3 生命周期 14 deep 形态注）：degraded/failed-with-sources fast/deep 轮
+   * 「仅重新生成」——复用既有 sources 只重跑 synthesis（deep 重放起点=write，无
+   * plan/search/read/reflect 段重跑；api.md §7.4 v1.28）。
    *   ① POST /api/v1/turns/{turnId}/regenerate（经 api/turns.ts 唯一出口；请求体空）；
    *   ② 成功 → 状态置 running + 清空该轮渲染态：answer_md/thinking_md 缓冲与旧终态展示字段
    *     （errorMsg/degradedReason/durationMs——状态条/DegradedBanner 随 TurnBlock isLive
    *     既有分支接管，零改动）；sources/stages 保留（api.md §2.12：不重检索、时间线按
    *     stage(write,running) 就地重渲，第二次 done 对账时 REST 权威回填）；
    *   ③ 重订阅 SSE（同通道续推，api.md §7.1 通道重开注）：重放门抬升为 max(内存 lastSeq,
-   *     sessionStorage 落盘游标)——同页/同标签页刷新路径旧轨迹（旧 done/error/token/thinking）
-   *     在传输层与派发层双门幂等丢弃；新标签页无落盘游标 → 全量重放由「stage(write,running)
-   *     清空重渲边界」（applyEvent，token/thinking 双缓冲同清——双评审 P2）兜底 delta 泄漏，
-   *     旧 done/error 瞬态由二次 done + 2.5 对账收敛（REST 为准源）；
+   *     sessionStorage 落盘游标——readStoredCursor 双形态兼容)——同页/同标签页刷新路径旧轨迹
+   *     （旧 done/error/token/thinking）在传输层与派发层双门幂等丢弃；新标签页无落盘游标 →
+   *     全量重放由「stage(write,running) 清空重渲边界」（applyEvent，token/thinking 双缓冲
+   *     同清——双评审 P2）兜底 delta 泄漏，旧 done/error 瞬态由二次 done + 2.5 对账收敛
+   *     （REST 为准源）；deep 轮同构零新分支（生命周期判定与 fast 同构，frontend-api.md
+   *     §3 生命周期 14 deep 形态注 v1.30）；
    *   ④ 失败（409006/404001/网络）→ toast（normalizeError 服务端中文 message 直达，
    *     既有链路），状态不清空、不订阅——轮保持原终态可再次点击；进行中重复点击由服务端
    *     条件 UPDATE 以同码 409006 拒绝（§2.12，前端不再加防抖门）。
@@ -658,6 +727,7 @@ export const useTurnStore = defineStore('turn', () => {
     turn.errorCode = detail.error?.code ?? null
     turn.degradedReason = detail.degraded ? detail.degraded_reason : null
     turn.durationMs = detail.duration_ms
+    turn.exportAvailable = detail.export_available
     // lastSeq/compactSeq/thinking_md 为传输层/流式域：REST 无对应字段，一律保留
     markGenerating(turn.threadId, detail.status)
   }

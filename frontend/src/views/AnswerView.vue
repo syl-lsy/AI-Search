@@ -21,8 +21,10 @@
  *     §2.12 POST——同轮原地重渲：状态置 running + 清空渲染态 + SSE 重订阅，§3 生命周期 14；
  *     失败 toast 在 store 内收敛，此处不重复弹）。
  * SSE 连接态横幅：sseState 驱动（handoff §4.4 接线清单 ReconnectBanner）。
+ * 批次 6：快照入口弹窗化（api.md §5.1——SourcePanel 快照胶囊 → SnapshotModal 摘录/元数据/
+ * 打开原文外链；window.open 直开旧形态退役）。
  * M2/M4 范围留位（本批不实现）：IncognitoTurnBanner、SupersededBanner、
- * 深度正文内目录（REQ-013）、导出/分享后端链路。
+ * 深度正文内目录（REQ-013）、分享后端链路。
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -34,6 +36,7 @@ import { fetchThread } from '@/api/threads'
 import OutlineAnchor from '@/components/answer/OutlineAnchor.vue'
 import type { OutlineItem } from '@/components/answer/OutlineAnchor.vue'
 import ScrollToBottomFab from '@/components/answer/ScrollToBottomFab.vue'
+import SnapshotModal from '@/components/answer/SnapshotModal.vue'
 import SourcePanel from '@/components/answer/SourcePanel.vue'
 import type { SourcePanelGroup } from '@/components/answer/SourcePanel.vue'
 import TurnBlock from '@/components/answer/TurnBlock.vue'
@@ -44,7 +47,7 @@ import { useThreadListStore } from '@/stores/threadList'
 import { useTurnStore } from '@/stores/turn'
 import { isHttpUrl, isUuid } from '@/utils/guards'
 import { turnIdFromAnchor } from '@/utils/anchors'
-import type { AskMode } from '@/types/api'
+import type { AskMode, SnapshotData } from '@/types/api'
 
 const route = useRoute()
 const { t } = useI18n()
@@ -279,11 +282,11 @@ async function onRerun(turn: { question: string; mode: AskMode }): Promise<void>
   }
 }
 
-/* ---------- 重新生成（REQ-063/A47，v1.26）：degraded/failed-with-sources fast 轮仅重跑
- * synthesis（api.md §2.12）——同轮原地重渲（状态置 running + 清空渲染态 + SSE 重订阅），
- * 不新增轮（turnIds 不变）；失败 toast 已在 store.regenerate 内收敛（409006/404001/网络），
- * 此处不再重复弹。regenerate 后 liveTurn 扫到 running 轮 → isStreaming/canStop 既有链路
- * 自动接管（流式跟随 + 停止钮），零改动。 */
+/* ---------- 重新生成（REQ-063/A47，v1.26；v1.30 放开 deep）：degraded/failed-with-sources
+ * fast/deep 轮仅重跑 synthesis（api.md §2.12 前置 3 v1.28；deep 重放起点=write）——同轮原地
+ * 重渲（状态置 running + 清空渲染态 + SSE 重订阅），不新增轮（turnIds 不变）；失败 toast 已在
+ * store.regenerate 内收敛（409006/404001/网络），此处不再重复弹。regenerate 后 liveTurn 扫到
+ * running 轮 → isStreaming/canStop 既有链路自动接管（流式跟随 + 停止钮），零改动。 */
 async function onRegenerate(turn: { turnId: string }): Promise<void> {
   await store.regenerate(turn.turnId)
 }
@@ -305,18 +308,22 @@ async function onFollowChip(question: string): Promise<void> {
   }
 }
 
-/* ---------- 快照（api.md §5.1：10 分钟预签名 URL，新开页；出口面 = api/sources.ts） ---------- */
+/* ---------- 快照（api.md §5.1：预签名 URL + 2000 字符摘录；出口面 = api/sources.ts） ----------
+ * 批次 6 弹窗化：window.open 直开旧形态 → SnapshotModal 预览（摘录/元数据/打开原文外链）。
+ * download_url 过 isHttpUrl 守卫——不可用形态 toast answer.snapshotUnavailable 保留（既有
+ * 链路），弹窗仍打开（摘录预览为主面，外链钮由组件内同款守卫隐藏）；fetchSnapshot 失败
+ * toast 链路与 snapshotLoading 防重入不变。 */
 const snapshotLoading = ref(false)
+const snapshotOpen = ref(false)
+const snapshotData = ref<SnapshotData | null>(null)
 async function onSnapshot(sourceId: string): Promise<void> {
   if (snapshotLoading.value) return
   snapshotLoading.value = true
   try {
     const data = await fetchSnapshot(sourceId)
-    if (isHttpUrl(data.download_url)) {
-      window.open(data.download_url, '_blank', 'noopener,noreferrer')
-    } else {
-      toast(t('answer.snapshotUnavailable'))
-    }
+    if (!isHttpUrl(data.download_url)) toast(t('answer.snapshotUnavailable'))
+    snapshotData.value = data
+    snapshotOpen.value = true
   } catch (e) {
     toast(normalizeError(e).message)
   } finally {
@@ -537,6 +544,9 @@ onUnmounted(() => {
         :visible="outlineVisible"
         @select="scrollToAnchor"
       />
+
+      <!-- 快照预览弹窗（批次 6，api.md §5.1）：SourcePanel 快照胶囊 → onSnapshot 取数 → 弹窗 -->
+      <SnapshotModal :open="snapshotOpen" :data="snapshotData" @close="snapshotOpen = false" />
     </template>
   </section>
 </template>

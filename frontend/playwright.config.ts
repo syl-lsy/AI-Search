@@ -2,6 +2,9 @@ import { defineConfig, devices } from '@playwright/test'
 
 export default defineConfig({
   testDir: './test/e2e',
+  // 实现面回归套件专属（批次 6 收口轮 P2-2 收窄）：活体探针三 spec 已迁出至 frontend/probes/
+  // （活体一次性工件、非回归保护面），不经本 config 收集——单独运行见
+  // playwright.probes.config.ts（testDir=./probes）与其文件头落点注记。
   // GUI 黑盒 e2e：不计入 vitest 覆盖率门禁（AGENTS.md：e2e 两端均不计入）
   // timeout 120s：真服务单轮 fast 回答 30~65s（批次 6 实测口径），30s 会掐断流式窗内断言；
   // 深度轮/A13 刷新恢复等长用例在 spec 内单独 test.setTimeout 放大。

@@ -10,7 +10,7 @@
 - list_threads：分页（limit/offset）+ mode 过滤（fast|deep|mixed）+ updated_at DESC，
   SQL 全参数绑定（编译后 params 断言，无字符串拼接）；
 - get_thread_detail：骨架映射（api.md v1.10 §2.3：has_report=mode=deep 且 answer_md 非空、
-  degraded=status==degraded）+ has_artifacts 分期恒 false；
+  degraded=status==degraded）+ has_artifacts 真实投影（artifacts 表 EXISTS，单查询）；
 - 归属校验语句绑定 user_id 参数（越权即 404001，不泄漏存在性）。
 
 DB 走假会话（同 test_main.py _FakeSession 形态：记录语句与写调用、按调用序回放结果）——
@@ -474,7 +474,7 @@ async def test_get_thread_detail_maps_turn_skeletons():
     detail = await service.get_thread_detail(THREAD_ID, user_id=USER_ID)
 
     assert detail.thread_id == THREAD_ID
-    assert detail.has_artifacts is False  # 分期口径：0002-M2 起真实值
+    assert detail.has_artifacts is False  # 无产物登记行（EXISTS 假）→ false
     assert detail.turn_count == 1
     assert [t.turn_id for t in detail.turns] == [
         str(deep_done.id),
@@ -490,6 +490,41 @@ async def test_get_thread_detail_maps_turn_skeletons():
     assert detail.turns[2].has_report is False  # fast 有综合回答但非报告
     assert detail.turns[2].degraded is True  # status==degraded 推导
     assert detail.turns[3].has_report is False  # deep 但无产出
+
+
+async def test_get_thread_detail_has_artifacts_true_when_artifact_rows_exist():
+    """has_artifacts 真实投影（api.md §2.3）：EXISTS(artifacts WHERE thread_id=…) 为真
+    → true；语句走单次标量查询（无 N+1），thread_id 参数绑定。"""
+    fake = _FakeSession()
+    thread = _make_thread()
+    fake.scalars_queue = [[thread], []]
+    fake.scalar_queue = [True]
+    service = ThreadService(fake)
+
+    detail = await service.get_thread_detail(THREAD_ID, user_id=USER_ID)
+
+    assert detail.has_artifacts is True
+    # 三次查询：线程归属 → turns 骨架 → artifacts EXISTS（读侧单查询，无逐轮探测）
+    assert len(fake.statements) == 3
+    exists_stmt = fake.statements[-1]
+    compiled = str(exists_stmt)
+    assert "EXISTS" in compiled.upper()
+    assert "artifacts" in compiled
+    assert uuid.UUID(THREAD_ID) in _uuid_params(exists_stmt)
+    assert fake.commits == 0  # 只 flush 不 commit（读侧零写：线程已读）
+
+
+async def test_get_thread_detail_has_artifacts_false_without_artifact_rows():
+    """无产物登记行（EXISTS 假 + 标量返回 None 的伪体极端形态）→ false。"""
+    fake = _FakeSession()
+    thread = _make_thread()
+    fake.scalars_queue = [[thread], []]
+    fake.scalar_queue = [False]
+    service = ThreadService(fake)
+
+    detail = await service.get_thread_detail(THREAD_ID, user_id=USER_ID)
+
+    assert detail.has_artifacts is False
 
 
 async def test_get_thread_detail_unknown_thread_raises_not_found():

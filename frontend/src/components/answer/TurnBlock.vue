@@ -8,8 +8,8 @@
  *   - 回答底部操作行（REQ-056/A40）：AnswerActions 常驻答案区底部（流式中可见）；
  *   - followups（REQ-046）：FollowupChips 于操作行下方（followups 非空才渲染）。
  * 事件上抛：edit-question（预填追问框）/rerun（原问题原模式重发）/sources（面板定位高亮）/
- * follow（chip 追问）/regenerate（v1.26 REQ-063——degraded/failed-with-sources fast 轮重新生成）
- * → AnswerView 编排层承接。
+ * follow（chip 追问）/regenerate（v1.26 REQ-063——degraded/failed-with-sources fast/deep 轮重新
+ * 生成〔v1.30 放开 deep：api.md §2.12 前置 3 v1.28〕）→ AnswerView 编排层承接。
  */
 import { computed, ref } from 'vue'
 

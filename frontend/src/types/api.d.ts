@@ -2,12 +2,21 @@
  * src/types/api.d.ts — api.md（v1.28）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.28（REST + SSE 协议唯一事实源；本批 M2 批次 5 随批镜像 =
- *     注释级同步（零类型形状变更）——§2.12 regenerate 前置放开 mode∈{fast,deep}（deep 有源
- *     degraded/failed 轮可重生成，api.md §7.4 v1.28 深度 regenerate 形态）：RegenerateTurnData
- *     docstring 与 ErrorCode 409006 触发场景注释同步；§2.4 REQ-017 parented 轮消费面
- *     （TurnDetail.parent_turn_id 既有镜像不变，frontend/src 无新增类型）。B14 批已落镜像：
- *     §2.5/§7.2 stages[].extra 可选键 fallback——frontend-api.md §8.5 登记行）
+ *   - docs/contract/api.md v1.28（REST + SSE 协议唯一事实源；批次 6 收口轮（2026-11-21，
+ *     P2-3 用户裁决「当批收口全修」）随批钉正：**Artifact 镜像改 §2.8 export 八键线形**
+ *     〔drop turn_id、补 thread_id——此前误按「与 §5.2 artifacts 条目同构」落型〕，详见
+ *     Artifact docstring；两处消费面 fixture 同步：api-modules.test.ts / answer-actions.test.ts
+ *     EXPORT_ARTIFACT；download_path 消费面增形态守卫〔AnswerActions P2-4，同源相对路径
+ *     ∧ /api/ 前缀正则，非法 toast 不跳转〕）。M2 批次 6 主批随批镜像 = 注释级同步（零类型
+ *     形状变更）——批次 6 消费面落地注记：第 8 钮可见性公式 mode∈{fast,deep}
+ *     〔api.md §2.12 前置 3 v1.28，frontend-api.md v1.30 §3 生命周期 14 deep 形态注〕/ §2.8
+ *     export 与 §5.1 snapshot 消费面（exportTurnReport→Artifact、fetchSnapshot→SnapshotData
+ *     既有镜像直用，turnStore 增 exportAvailable 投影字段〔§2.5 export_available 对账回写〕））。
+ *     M2 批次 5 批次注：§2.12 regenerate 前置放开
+ *     mode∈{fast,deep}（deep 有源 degraded/failed 轮可重生成，api.md §7.4 v1.28 深度
+ *     regenerate 形态）：RegenerateTurnData docstring 与 ErrorCode 409006 触发场景注释同步；
+ *     §2.4 REQ-017 parented 轮消费面（TurnDetail.parent_turn_id 既有镜像不变）。B14 批已落
+ *     镜像：§2.5/§7.2 stages[].extra 可选键 fallback——frontend-api.md §8.5 登记行）
  *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
  *   - frontend-api.md §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
@@ -455,16 +464,20 @@ export interface RegenerateTurnData {
   status: 'running'
 }
 
-/** §2.8 export 响应 data（与 §5.2 artifacts 条目同构） */
+/**
+ * §2.8 export 响应 data（八键线形，批次 6 收口轮 P2-3 钉正——此前误按「与 §5.2 artifacts
+ * 条目同构」落型：§2.8 响应含 thread_id、不含 turn_id；§5.2 artifacts 列表条目则带 turn_id、
+ * 无 thread_id，两者不同构。如需承载 §5.2 产物列表应另立 ArtifactListItem 类型，不共用本型）。
+ */
 export interface Artifact {
   artifact_id: Uuid
+  thread_id: Uuid
   artifact_type: 'report' | 'code_output'
   filename: string
   size_bytes: number
   content_type: string
-  turn_id: Uuid
   created_at: IsoTimestamp
-  /** 原样请求/跳转（§5.3：前端只用 download_path） */
+  /** 原样请求/跳转（§5.3：前端只用 download_path；消费面过形态守卫——AnswerActions P2-4） */
   download_path: string
 }
 

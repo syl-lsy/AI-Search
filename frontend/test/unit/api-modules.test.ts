@@ -6,11 +6,11 @@ import { ApiError, client } from '@/api/client'
 import { fetchModels } from '@/api/models'
 import { fetchSnapshot } from '@/api/sources'
 import { fetchSuggestionPool } from '@/api/suggestions'
-import { sendTurnFeedback } from '@/api/turns'
+import { exportTurnReport, sendTurnFeedback } from '@/api/turns'
 import { asEnvelope } from '@/mocks/envelope'
 import { modelsFixture } from '@/mocks/models'
 import { suggestionsFixture } from '@/mocks/suggestions'
-import type { FeedbackResponse, SnapshotData } from '@/types/api'
+import type { Artifact, FeedbackResponse, SnapshotData } from '@/types/api'
 
 /**
  * unit 层 LLM/网络全 mock（AGENTS.md 测试门禁）：以自定义 adapter 截获请求，
@@ -81,6 +81,28 @@ describe('api 模块（请求唯一出口 client.ts 之上）', () => {
     await expect(fetchSnapshot('f00d0001-0000-4000-8000-000000000001')).resolves.toEqual(snapshotFixture)
     expect(captured[0]?.method).toBe('get')
     expect(captured[0]?.url).toBe('/api/v1/sources/f00d0001-0000-4000-8000-000000000001/snapshot')
+  })
+
+  it('exportTurnReport：POST /api/v1/turns/{turn_id}/export 无请求体（api.md §2.8，批次 6 REQ-016；错误 404001/409003）', async () => {
+    // §2.8 export 响应八键线形（批次 6 收口轮 P2-3 钉正：drop turn_id、含 thread_id——与 §5.2 artifacts 条目不同构）
+    const artifactFixture: Artifact = {
+      artifact_id: 'b0af1234-0000-4000-8000-000000000001',
+      thread_id: '7d2f0a1e-1c3b-4e5a-9d8f-0a1b2c3d4e5f',
+      artifact_type: 'report',
+      filename: 'report_20261121_1014.md',
+      size_bytes: 18342,
+      content_type: 'text/markdown',
+      created_at: '2026-11-21T02:14:40Z',
+      download_path: '/api/v1/threads/7d2f0a1e-1c3b-4e5a-9d8f-0a1b2c3d4e5f/artifacts/b0af1234-0000-4000-8000-000000000001/download',
+    }
+    client.defaults.adapter = okAdapter(asEnvelope(artifactFixture))
+    await expect(exportTurnReport('c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b')).resolves.toEqual(artifactFixture)
+    expect(captured[0]?.method).toBe('post')
+    expect(captured[0]?.url).toBe('/api/v1/turns/c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b/export')
+    // 请求体空（api.md §2.8 无参数——regenerate 同形态）
+    const raw = captured[0]?.data
+    const body: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw
+    expect(body === undefined || body === null || body === '').toBe(true)
   })
 
   it('业务错误经拦截器归一为 ApiError（code/message 透传）', async () => {
