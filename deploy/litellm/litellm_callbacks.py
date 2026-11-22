@@ -1,7 +1,10 @@
-"""LiteLLM 自定义回调：GLM 腿 thinking 参数剥离（B13 增量批·增量二）+ OTel decisions 兼容垫片。
+"""LiteLLM 自定义回调：GLM 腿 thinking 参数剥离（B13 增量批·增量二）+ OTel decisions 兼容垫片
++ 网关失败告警（post-M2 resilience 工单③）。
 
 溯源：docs/ARCHITECTURE.md v1.57 §7「GLM 腿 thinking 参数剥离」钉注；
-OTel 垫片 = plan-decision-model-20261118 批次 2 接线实测发现（2026-11-19）。
+OTel 垫片 = plan-decision-model-20261118 批次 2 接线实测发现（2026-11-19）；
+失败告警 = plan-post-m2-resilience-20261121 工单③（慢性 500「NoneType.__aiter__」
+失败瞬间真实上游行为不可见，2026-11-22）。
 
 ## 为什么需要这个钩子
 
@@ -37,6 +40,31 @@ config.yaml 的 `drop_params: true` 只覆盖 OpenAI 规范键，不覆盖 `extr
 命中后从请求体剥离 `enable_thinking` 与 `think`（顶层与 `extra_body` 内两处都剥，
 上游不接受任何形态的「关思考」）。GLM 腿允许思考（更慢更贵，ARCH v1.57 §7 已接受）。
 
+## 上游失败告警（本文件第三职责）
+
+慢性 500「'NoneType' object has no attribute '__aiter__'」实证缺口：上游失败在
+流式 + fallbacks 耗尽路径被 litellm 包装成晦涩异常，失败瞬间的真实上游行为
+（哪条腿、什么异常、什么状态码）在网关日志不可见。`GatewayFailureAlerter` 挂
+failure 侧（`async_log_failure_event`）：每次上游调用失败——含 fallback 链
+每一腿的失败与最终耗尽——输出一行 `[gateway-failure-alert]` 前缀的结构化告警
+（grep 友好）。字段全为元数据：请求别名 / 部署模型 / 异常类名 / 失败分类
+（timeout〔含 "timed out" 文本〕/ connection / rate_limit / auth / other，纯文本
+匹配零副作用；数字状态码 429/401/403 按 \\b 词边界匹配防 "1429ms"/"4013" 误命中）/
+状态码 / stream / call_type / 耗时秒 + 异常文本截 200 字符（先脱敏再截断，三道：
+litellm 自带 redact_string〔Bearer 空格分隔 token / 裸 sk- / JWT 等形态，容器
+1.106.4 实测整段替换 REDACTED、完整 URL 不消除〕→ URL 掩码 → 自带 key 片段
+兜底；msg 内双引号替换为单引号——活体实证双引号破坏 key=value 解析）。
+**B15 告警纪律：零 prompt payload、零完整 URL、零密钥**。4xx 状态码记 WARNING
+（客户端/配置侧），其余（5xx / 连接 / 超时 / 无状态码）记 ERROR。请求别名口径：
+部署级（fallback 换腿后 kwargs["model"] 已被 Router 改写、与 litellm_params.model
+同值）取 metadata.model_group，proxy 边界取 kwargs["model"]。钩子自身异常
+fail-open（只记 WARNING 不打断失败处理链——与 glm_thinking_guard 同纪律）。
+签名与 litellm 1.106.4 容器内实读对齐：
+`async_log_failure_event(self, kwargs, response_obj, start_time, end_time)`
+——exception 挂在 kwargs["exception"]（`_failure_handler_helper_fn` 注入）、
+response_obj 恒 None；与新版「独立 exception 形参」签名不同，升级 litellm
+时须复检（R8/R16 同型护栏理念）。
+
 ## OTel decisions 兼容垫片（本文件第二职责）
 
 litellm 1.106.4 上游 bug：`integrations/opentelemetry.py` 的 success/failure 全链路
@@ -54,7 +82,9 @@ defensive 垫片：仅当响应对象**非 dict-like 且可 `model_dump()`** 时
 
 ```yaml
 litellm_settings:
-  callbacks: ["litellm_callbacks.glm_thinking_guard"]
+  callbacks:
+    - "litellm_callbacks.glm_thinking_guard"
+    - "litellm_callbacks.gateway_failure_alerter"
 ```
 
 `get_instance_fn` 会把点分路径解析为 **config.yaml 同目录下的本地模块**（本文件随
@@ -72,12 +102,20 @@ PYTHONPATH；目录挂载的 inode 好处见 docker-compose.yml litellm 服务�
   仅记一条 WARNING。
 """
 
+import re
 from typing import Any
 
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.secret_redaction import redact_string
 
-__all__ = ["GlmThinkingParamGuard", "glm_thinking_guard", "patch_otel_decisions_response_compat"]
+__all__ = [
+    "GlmThinkingParamGuard",
+    "glm_thinking_guard",
+    "GatewayFailureAlerter",
+    "gateway_failure_alerter",
+    "patch_otel_decisions_response_compat",
+]
 
 #: GLM 腿不接受的「关思考」键（DashScope qwen 的 enable_thinking / Ollama 的 think）
 _THINKING_KEYS: tuple[str, ...] = ("enable_thinking", "think")
@@ -300,3 +338,153 @@ def patch_otel_decisions_response_compat() -> None:
 
 
 patch_otel_decisions_response_compat()
+
+
+# ---------------------------------------------------------------------------
+# 网关失败告警（failure 侧 CustomLogger；post-M2 resilience 工单③）
+# ---------------------------------------------------------------------------
+
+#: 异常文本告警截断长度（工单钉点：截 200 字符）
+_EXC_MSG_MAX_LEN = 200
+
+#: 异常对象状态码属性探测序——对齐 litellm 1.106.4 `get_error_information` 自述口径：
+#: ProxyException 用 .code、LiteLLM SDK 异常用 .status_code、httpx 异常只在
+#: .response.status_code 上暴露。
+_STATUS_CODE_ATTRS: tuple[str, ...] = ("code", "status_code")
+
+
+def _extract_failure_status_code(exception: Any) -> str:
+    """从异常对象尽力提取状态码；全部缺失返回空串（不做任何网络/副作用操作）。
+
+    探测序：.code（ProxyException）→ .status_code（LiteLLM SDK 异常）→
+    .response.status_code（httpx.HTTPStatusError）。字符串化后仍可能无值
+    （如 None/空串）则跳过该属性。
+    """
+    for attr in _STATUS_CODE_ATTRS:
+        value = getattr(exception, attr, None)
+        if value is not None and str(value) not in ("", "None"):
+            return str(value)
+    response = getattr(exception, "response", None)
+    value = getattr(response, "status_code", None) if response is not None else None
+    return str(value) if value is not None else ""
+
+
+def _sanitize_exception_text(text: str) -> str:
+    """告警行脱敏（B15 告警纪律：零完整 URL、零密钥）。三道顺序不可换：
+
+    ① redact_string（litellm 自带）先行——覆盖空格分隔 Bearer token / 裸 sk- /
+    JWT 等自有正则够不着的形态；须在 URL 掩码之前跑，否则 URL 整段被掩掉会
+    吞掉 ？api_key= 查询参数形态的匹配上下文。
+    ② URL 掩码——redact_string 不消除完整 URL（容器 1.106.4 实测）。
+    ③ 自带 key 形态兜底（redact_string 已覆盖大部分，此处保底防御）。
+    """
+    text = redact_string(text)
+    text = re.sub(r"https?://\S+", "<url-redacted>", text)
+    text = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*[=:]\s*\S+", r"\1=<redacted>", text)
+    return text
+
+
+def _classify_failure(exception_class: str, message: str) -> str:
+    """失败原因分类（工单钉点：纯文本匹配、零副作用）：timeout > connection > rate_limit > auth > other。
+
+    匹配源 = 异常类名 + 异常文本（casefold；类名如 APITimeoutError 亦可在文本
+    缺失时命中 timeout）。按序命中即返回，供 grep 聚合与告警路由初判。
+    数字状态码（429/401/403）按 \\b 词边界匹配——"after 1429ms"/"attempt 4013"
+    这类时长/计数值含相同子串，裸子串匹配会误判 rate_limit/auth（评审 P1 边界）。
+    """
+    haystack = f"{exception_class} {message}".casefold()
+    if "timeout" in haystack or "timed out" in haystack:
+        return "timeout"
+    if "connect" in haystack:  # connect 是 connection 的子串，单查覆盖两形态
+        return "connection"
+    if "rate" in haystack or re.search(r"\b429\b", haystack):
+        return "rate_limit"
+    if "auth" in haystack or re.search(r"\b401\b|\b403\b", haystack):
+        return "auth"
+    return "other"
+
+
+class GatewayFailureAlerter(CustomLogger):
+    """上游失败告警回调（failure 侧；零 payload 零 URL 零密钥）。
+
+    见模块 docstring「上游失败告警（本文件第三职责）」：把「上游失败 / fallback
+    链耗尽」翻译成一行 grep 友好的结构化告警，钉住失败瞬间的真实上游行为证据。
+    钩子自身异常一律吞掉只记 WARNING——网关横切面故障不得放大失败处理链。
+    """
+
+    async def async_log_failure_event(
+        self,
+        kwargs: dict[str, Any],
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+    ) -> None:
+        """failure 侧钩子（签名 = litellm 1.106.4 容器实读；exception 在 kwargs["exception"]）。
+
+        dispatch（litellm_logging.py）传 response_obj=None，只消费 kwargs 里的
+        元数据；不影响失败语义，只追加一条告警日志。
+        """
+        try:
+            self._emit_alert(kwargs=kwargs, start_time=start_time, end_time=end_time)
+        except Exception as exc:  # noqa: BLE001 —— 网关横切面防御：告警钩子故障不打断失败处理链
+            verbose_proxy_logger.warning(
+                "gateway_failure_alerter: failure hook failed (ignored): %s", exc
+            )
+
+    def _emit_alert(self, kwargs: dict[str, Any], start_time: Any, end_time: Any) -> None:
+        """拼装并落一行 [gateway-failure-alert] 结构化告警（4xx→WARNING，其余→ERROR）。"""
+        exception = kwargs.get("exception")
+        exception_class = type(exception).__name__ if exception is not None else "None"
+        message = str(exception) if exception is not None else ""
+        # 双引号先行替换（活体实证：msg 内双引号破坏 key=value 解析）再截断
+        sanitized_msg = _sanitize_exception_text(message).replace('"', "'")[:_EXC_MSG_MAX_LEN]
+        status_code = _extract_failure_status_code(exception) if exception is not None else ""
+
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        # 部署模型：litellm_params.model（Router 选定部署的 litellm_params.model 形态）
+        deployment = litellm_params.get("model") or kwargs.get("model") or "unknown"
+        # 请求别名：proxy 边界 kwargs["model"] 即别名；部署级（fallback 换腿后）
+        # kwargs["model"] 已被 Router 改写为部署模型（与 litellm_params.model 同值），
+        # 真别名只剩 metadata.model_group 在场——该形态下别名取 model_group，
+        # 否则 alias 与 deployment 两字段重复浪费。
+        model = kwargs.get("model")
+        model_group = metadata.get("model_group")
+        if model_group and (model is None or model == litellm_params.get("model")):
+            alias = model_group
+        else:
+            alias = model or model_group or "unknown"
+
+        try:
+            duration_s = (
+                f"{(end_time - start_time).total_seconds():.3f}"
+                if start_time is not None and end_time is not None
+                else ""
+            )
+        except Exception:  # noqa: BLE001 —— 耗时字段缺失不阻塞告警行
+            duration_s = ""
+
+        stream = bool(kwargs.get("stream") or litellm_params.get("stream") or False)
+        call_type = kwargs.get("call_type") or litellm_params.get("call_type") or "unknown"
+        category = _classify_failure(exception_class, message)
+
+        line = (
+            f"[gateway-failure-alert] alias={alias} deployment={deployment} "
+            f"exception_class={exception_class} category={category} "
+            f"status_code={status_code or '-'} stream={stream} call_type={call_type} "
+            f"duration_s={duration_s or '-'} msg=\"{sanitized_msg}\""
+        )
+        if status_code.isdigit() and int(status_code) < 500:
+            verbose_proxy_logger.warning(line)  # 4xx：客户端/配置侧（401/403/429 等）
+        else:
+            verbose_proxy_logger.error(line)  # 5xx / 连接 / 超时 / 无状态码：基础设施侧
+
+
+#: config.yaml `litellm_settings.callbacks` 消费的模块级实例
+#: （`litellm_callbacks.gateway_failure_alerter` 点分路径 → 本实例）
+gateway_failure_alerter = GatewayFailureAlerter()

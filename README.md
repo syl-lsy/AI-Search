@@ -2,7 +2,7 @@
 
 类 Perplexity 的自建 AI 搜索引擎：快速模式（多源搜索 → ≤3000 字上限内带引用综合回答，篇幅按题型软引导，P50 ≤30s）+ 深度模式（deepagents 子代理并行研究 → 分节带引用报告），全程引用可溯源、成本可观测。
 
-> 当前阶段（2026-11-13）：**M1（快速模式）已退出，M1 后专项（批次 9）已落地**——批次 0~8 全部闭环（工程骨架 → S0 基础设施 → B1 底座 → B2 线程轮次 → B3 主图壳+fast 五节点 → S2 SSE 联调 → 后端综合验证 → 前端 F1 → M1 综合测试与退出），M1 退出判定为**带注记达成**（判定见 `docs/m1-exit-batch8.md`）。批次 9 一次性收口 M1 后专项四条：①synthesis 提速（关 thinking + 事实型篇幅收紧，复测 **P50 15.43s / 慢轮 max 24.27s / 多面题熔断 0/5**，报告 `docs/perf-sampling-m15.md`）+ 后端 e2e 三契约用例摘牌（断言与题面原样，复跑留档待补）；②rerank 兜底 degraded 语义归位（对齐 ARCHITECTURE §6.2 二分口径）；③CSP `img-src` 对齐契约 + 生产 build/preview 冒烟验证 + `make build-frontend` / `make audit` 依赖 CVE 机扫通道（首跑结果见 `docs/security-audit-m1-batch8.md` §五）；④渲染安全专项审计回写收口。下一步 = M2（深度模式）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
+> 当前阶段（2026-11-22）：**M1（快速模式）已退出（带注记达成，判定见 `docs/m1-exit-batch8.md`）；M2（深度模式）已退出（带注记达成，判定见 `docs/m2-exit-batch7-20261121.md`）**——M1 批次 0~8 + 批次 9 后专项全部闭环；M2 七批全部闭环：批次 0 基线收口与版本护栏 → 批次 1 B4 底座（持久化+状态投影+TurnRunner deep 化+工具面+模型工厂+deep 提示词骨架）→ 批次 2 planner+research 逐节点 → 批次 3 reflect+supplement+guards → 批次 4 writer/finalize/degraded_writer+导出链+deep 整图收口 → 批次 5 REQ-017 深度后追问+deep regenerate+deep SSE 联调 → 批次 6 前端 deep 交付（导出报告消费面+SnapshotModal+deep 刷新恢复+报告渲染回归）→ 批次 7 M2 综合测试与退出（e2e deep 契约套件 + 双评审 P0/P1=0 + 性能正式抽样 40 轮双口径 8/8 类达标〔用户钉定 P95 ≤360s + 360s 内完成率 ≥80%，按实测校准，报告 `docs/perf-sampling-m2.md`〕+ 契约零漂移九项终检 + 退出判定留档）；B12 recall 回顾分支+navigational 题型、B13 输入安全检查、B14 历史装配脱敏、B15 内容侧安全护栏四独立工单插队闭环。下一步 = M3（知识库，立项文档 `docs/m3-initiation-20261114.md` 待批）。需求 / 架构 / 契约 / 流程以 `docs/` 冻结文档为准（docs/ 仅本地保留不入库），进度实况见 `docs/PROGRESS.md`，工作区约束见 `AGENTS.md`。
 
 ## 快速开始
 
@@ -76,6 +76,6 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 | `make infra-up` / `infra-down` / `infra-ps` / `infra-logs` | S0 基建栈起停 / 状态 / 日志（停栈保留数据卷） |
 | `make preflight` / `make smoke-infra` / `make nacos-init` | 起栈前置检查 / 七组件 smoke / 五 dataId 初始化 |
 
-## 里程碑路线（M1，状态见 `docs/PROGRESS.md`）
+## 里程碑路线（M1/M2，状态见 `docs/PROGRESS.md`）
 
-批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 ✅ → 批次 7 前端 F1 ✅ → 批次 8 M1 综合测试与退出 ✅ → **M1（快速模式）已退出**（带注记达成，判定见 `docs/m1-exit-batch8.md`）→ 批次 9 M1 后专项（synthesis 提速+e2e 摘牌 / rerank 兜底语义归位 / CSP 对齐+依赖机扫通道）✅；之后 M2 深度模式 / M3 知识库 / M4 沙箱·评测·多模态 / M5·M6 记忆。
+批次 0 工程骨架 ✅ → 批次 1 S0 基建+接入性验证 ✅ → 批次 2 B1 底座 ✅ → 批次 3 B2 线程轮次（桩主图）✅ → 批次 4 B3 主图壳+fast 五节点 ✅ → 批次 5 S2 SSE 联调 ✅ → 批次 6 后端综合验证 ✅ → 批次 7 前端 F1 ✅ → 批次 8 M1 综合测试与退出 ✅ → **M1（快速模式）已退出**（带注记达成，判定见 `docs/m1-exit-batch8.md`）→ 批次 9 M1 后专项（synthesis 提速+e2e 摘牌 / rerank 兜底语义归位 / CSP 对齐+依赖机扫通道）✅；M2 深度模式：批次 0 基线收口与版本护栏 ✅ → 批次 1 B4 底座 ✅ → 批次 2 planner+research ✅ → 批次 3 reflect+supplement+guards ✅ → 批次 4 writer/finalize/degraded_writer+导出链+deep 整图收口 ✅ → 批次 5 REQ-017 深度后追问+deep regenerate+deep SSE 联调 ✅ → 批次 6 前端 deep 交付 ✅（B12 recall 工单 ✅ / B13 输入安全 ✅ / B14 历史装配脱敏 ✅ / B15 安全护栏 ✅ 独立插队）→ **批次 7 M2 综合测试与退出 ✅ → M2（深度模式）已退出**（带注记达成，判定见 `docs/m2-exit-batch7-20261121.md`）；之后 M3 知识库（立项待批）/ M4 沙箱·评测·多模态 / M5·M6 记忆。

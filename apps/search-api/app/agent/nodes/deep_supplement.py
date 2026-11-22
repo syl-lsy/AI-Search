@@ -61,6 +61,13 @@ DeepState.__annotations__（R14①）。外部内容包裹面：本节点零 LLM
 块不读 candidates、批次 4 writer sources_block）由消费侧包裹（research/reflect
 先例同构——包裹发生在「进 prompt」处而非「入 state」处）。
 
+**B15 内容侧护栏（批次 7 评审 P2-3 接线）**：候选入册前逐条过
+`filter_candidates`（guards 经 `load_content_guard_config(spec)` 装载——spec 缺
+safety 节回落 defaults 种子=部署即启用；与 fast web_search / deep research 闭包
+三面同判据）。flag=保留+留痕（`errors[] {stage:"search", reason:"injection_blocked",
+count}`）；drop=丢弃（过滤先于批次装配 → 不占 ref_no、不入册、不发卡，来源卡/[n]
+自然一致）；护栏动作不置 degraded（degraded_reason 枚举封闭）。
+
 失败语义：链/registry 未注入或链空源 → SearchChainUnavailable（research :851-854
 同款，TurnRunner 500201 收轮面）；单源失败 → 其余源候选保留 + errors 增量 + detail
 降级标注（不终止——补搜轮面与 fast 副本同构）。ensure_not_canceled 入口接线
@@ -69,6 +76,7 @@ DeepState.__annotations__（R14①）。外部内容包裹面：本节点零 LLM
 
 import asyncio
 import uuid as uuid_module
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -76,6 +84,8 @@ from langchain_core.runnables import RunnableConfig
 from app.agent.graphs.signals import emit_sources, emit_stage
 from app.agent.guards import ensure_not_canceled
 from app.agent.nodes.deep_research import _merge_candidates, _merge_urls
+from app.agent.safety.config import load_content_guard_config
+from app.agent.safety.content_guard import filter_candidates
 from app.agent.tools.registry import SearchChain, SearchChainUnavailable
 
 __all__ = ["MAX_GAPS_PER_ROUND", "SUPPLEMENT_TOP_K", "supplement"]
@@ -204,6 +214,10 @@ async def supplement(state: Any, config: RunnableConfig | None = None) -> dict[s
     searched_recorded: dict[str, None] = {}  # 本批实际发出 query（未发不登记）
     errors: list[dict[str, Any]] = []  # Annotated[add] 增量（每 query 一条，不聚合）
     new_raw_all: list[dict[str, Any]] = []  # state 入册原始候选累积（附 ref_no 账本键）
+    # B15 内容侧护栏装载（批次 7 评审 P2-3）：spec 缺失/形态漂移回落 defaults 种子
+    # （部署即启用，与 web_search.py:128-129 同口径）——本节点一次装载、逐候选消费
+    guard_spec = state.get("spec") if isinstance(state, Mapping) else None
+    guards = load_content_guard_config(guard_spec if isinstance(guard_spec, Mapping) else None)
     total = len(usable)
     for index, gap in enumerate(usable):
         query = _as_str(gap.get("query"))
@@ -231,8 +245,14 @@ async def supplement(state: Any, config: RunnableConfig | None = None) -> dict[s
                 query_errors.append(source)
                 errors.append({"stage": "search", "reason": "source_failure", "source": source})
             else:
-                candidates.extend(outcome)
-                ok_summary.append(f"{source}×{len(outcome)}")
+                # B15 内容侧护栏（批次 7 评审 P2-3）：补搜面与 fast web_search /
+                # deep research 闭包同判据——逐候选注入扫描后入册（drop 不占 ref_no：
+                # 过滤先于批次装配，来源卡/[n] 自然一致）；flag=保留+留痕；
+                # 护栏动作不置 degraded（degraded_reason 枚举封闭）。
+                filtered, filter_errors = filter_candidates(outcome, guards, stage="search")
+                errors.extend(filter_errors)
+                candidates.extend(filtered)
+                ok_summary.append(f"{source}×{len(filtered)}")
         detail = " / ".join(ok_summary) or "全部源失败"
         if query_errors:
             detail += f"（降级：失败源 {','.join(query_errors)}）"

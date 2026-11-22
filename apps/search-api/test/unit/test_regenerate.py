@@ -795,6 +795,87 @@ async def test_execute_regenerate_deep_writer_partial_fallback_degrades() -> Non
     assert done.data["finish"] == "degraded" and done.data["degraded_reason"] is None
 
 
+class _FakeDeepRegenTwoFrameGraph:
+    """deep regenerate 微图**两帧真实形态**假体（批次 7 评审 P2-1）：
+
+    `_FakeDeepRegenGraph` 把 writer 兜底标记与答案并进**同一条** updates 帧——真图
+    是两条独立帧（writer 节点原始返回 → fallback_done 节点原始返回），errors 的
+    `Annotated[list, add]` reducer 只在图内通道生效，TurnRunner 侧合并语义须与之
+    同构，否则第二帧整帧覆盖第一帧标记（缺陷掩盖面即单帧假体）。
+    """
+
+    def __init__(self, *, partial: str = "研究方法部分已成文[9]。") -> None:
+        self.partial = partial
+        self.payloads: list[Any] = []
+
+    def astream(
+        self, payload: Any, config: Any = None, stream_mode: Any = None, subgraphs: bool = False
+    ) -> Any:
+        self.payloads.append(payload)
+        partial = self.partial
+
+        async def gen():
+            yield ((), "custom", {"type": "stage", "stage_key": "write", "status": "running", "label": "撰写报告"})
+            yield ((), "messages", (_MessageChunk(partial), {"langgraph_node": "writer"}))
+            # 帧 1：writer 节点原始返回（LLM 调用失败兜底标记——
+            # deep_writer.py:320-326）
+            yield ((), "updates", {
+                "writer": {
+                    "answer_md": partial,
+                    "errors": [{"stage": "write", "reason": "llm_call_failed"}],
+                },
+            })
+            # 帧 2：fallback_done 节点原始返回（越界引用剔除留痕——真图
+            # deep_regenerate.fallback_write_done 仅 dropped>0 时带 errors 键）
+            yield ((), "custom", {
+                "type": "stage", "stage_key": "write", "status": "done",
+                "extra": {"fallback": "synthesis_partial"},
+            })
+            yield ((), "updates", {
+                "fallback_done": {
+                    "answer_md": "研究方法部分已成文。",
+                    "report_md": "研究方法部分已成文。",
+                    "errors": [
+                        {"stage": "write", "reason": "citation_out_of_range", "dropped": 1}
+                    ],
+                },
+            })
+
+        return gen()
+
+
+async def test_execute_regenerate_deep_two_frame_errors_accumulate_degrades() -> None:
+    """评审 P2-1：writer 帧的 llm_call_failed 兜底标记不被 fallback 帧的
+    citation_out_of_range 整帧覆盖 —— errors 按键累积合并（DeepState.errors 的
+    `Annotated[list, add]` 图内 reducer 语义在 TurnRunner 侧同构），其余键维持
+    后者覆盖。
+
+    修复前缺陷形态（已实验复现）：第二帧整帧 dict.update 覆盖 errors → writer
+    兜底标记丢失 → has_writer_fallback=False → 误判 completed（正确形态=兜底产出
+    收束 done(finish=degraded, degraded_reason=None)，deep_regenerate 模块
+    docstring 钉死）。
+    """
+    bus = _bus()
+    turn = _turn(status="running", mode="deep")
+    session = _RegenSession(turn=turn, sources=[_source(1, "https://a/1")], events=[])
+    graph = _FakeDeepRegenTwoFrameGraph()
+    scheduler = _scheduler(session, bus=bus, deep_graph=graph)
+
+    await scheduler.execute_regenerate(_TURN_ID)
+
+    assert turn.status == "degraded"  # 误判 completed 即红
+    assert turn.answer_md == "研究方法部分已成文。"  # 归一后正文（后帧覆盖语义保留）
+    assert turn.error is None  # 兜底轮零 error（清旧 error）
+    assert turn.degraded_reason is None  # 枚举零扩容（citation_out_of_range 不派生降级）
+    events = await _drain_all(bus, _TURN_ID)
+    assert "error" not in [e.event_type for e in events]
+    stage_done = [e for e in events if e.event_type == "stage" and e.data["status"] == "done"]
+    assert stage_done[-1].data["extra"] == {"fallback": "synthesis_partial"}
+    done = next(e for e in events if e.event_type == "done")
+    assert done.data["finish"] == "degraded"
+    assert done.data["degraded_reason"] is None
+
+
 async def test_execute_regenerate_deep_timeout_uses_deep_turn_budget() -> None:
     """轮级硬超时读 spec.deep.turn_timeout_s（mode 感知——不落 fast 预算）→
     500301 + degraded_reason=timeout 降级收束。"""

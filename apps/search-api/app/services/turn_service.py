@@ -64,6 +64,7 @@ from app.agent.guards import ContentRejectedError, TurnCanceledSignal, TurnDeadl
 from app.agent.nodes.synthesis import SynthesisError, SynthesisFallback
 from app.agent.safety import SafetyConfig, detect_pii, load_safety_config, sanitize
 from app.agent.tools.registry import SearchChainUnavailable, ToolRegistry, get_tools_registry
+from app.agent.tools.url_reader import _neutralize_content
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
 from app.core.observability import UsageCollector, build_turn_callbacks
@@ -205,6 +206,46 @@ def _strip_citation_anchors(text: str) -> str:
     的 [N+1..] 接续）承担。
     """
     return _CITATION_ANCHOR_RE.sub("", text)
+
+
+#: 父轮 URL 表表行「单行化」控制字符清洗（与 deep_reflect._clean_list_item 同款
+#: 判据：\x00-\x1f 覆盖 \r\n\t 与控制符，\x7f=DEL）——标题含换行会把一行表行拆成
+#: 多行、把任意多行文本抬升为提示词正文（批次 7 评审 P2-2）
+_TABLE_CELL_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_table_cell(text: str) -> str:
+    """父轮 URL 表标题单元格清洗（deep_reflect._clean_list_item 同款双标准收口）：
+
+    外部一手内容（父轮 Source 行 title 源自搜索结果，非我方生成）经 history 块以
+    `Q:/A:` 形态裸进 synthesis 提示词——本函数做三件事：①控制符/换行折叠为空格
+    （防破表行结构 + 防多行文本抬升为提示词正文）；②`_neutralize_content` 包裹标记
+    实体化（防伪造/提前闭合外部内容边界）；③剔除 `[n]`/`［n］` 引用锚点形态（防
+    表行伪造本轮 ref_no 锚点——摘要块的 `_strip_citation_anchors` 不覆盖表行）。
+    """
+    folded = _TABLE_CELL_CTRL_RE.sub(" ", text)
+    return _strip_citation_anchors(_neutralize_content(folded)).strip()
+
+
+def _merge_graph_update(final_state: dict[str, Any], update: Mapping[str, Any]) -> None:
+    """updates 帧合并（regenerate 微图终态面）：`errors` 键累积，其余键覆盖。
+
+    stream_mode="updates" 帧是**节点原始返回**（增量）——图内 `DeepState.errors` 的
+    `Annotated[list, add]` reducer 只在图通道内生效，TurnRunner 侧朴素 dict.update
+    会让后帧整帧覆盖前帧标记（批次 7 评审 P2-1 实证：writer 帧 llm_call_failed 被
+    fallback_done 帧 citation_out_of_range 覆盖 → 兜底轮误判 completed）。故 errors
+    按 reducer 语义累积（非 list 值防御性忽略=零增量，与图内 add 空增量一致），其余
+    键维持后者覆盖（answer_md 归一值等「最后一帧权威」语义不变）。
+    """
+    for key, value in update.items():
+        if key == "errors":
+            prior = final_state.get("errors")
+            final_state["errors"] = [
+                *(prior if isinstance(prior, list) else []),
+                *(value if isinstance(value, list) else []),
+            ]
+        else:
+            final_state[key] = value
 
 
 # 中文判定阈值（PRD OQ-2：CJK 字符占比 ≥30% 判 zh——实现层常量，不进 Nacos）
@@ -708,6 +749,52 @@ class _RunContext:
     # 通用；随 RunnableConfig 继承传播，deepagents 子代理调用同面覆盖），
     # _finish_completed 消费 total() 填 done.usage 与 turns.usage。
     usage_collector: Any = None
+
+
+# ---- sources 限长 varchar 列截断护栏（D2-01，探针实证缺陷修复 2026-11-21）----
+#: 列宽事实源 = data-model.md §1.5 DDL 契约（零 DDL 口径的落库前防线）：
+#: source_type varchar(8)、title varchar(512)；url/snippet 为 Text 无列宽、
+#: score 为 numeric——不在 varchar 截断面。PG varchar(n) 计字符不计量，
+#: 与 Python len(str) 同口径。
+_SOURCE_TYPE_MAX_LEN = 8
+_SOURCE_TITLE_MAX_LEN = 512
+
+
+def _clamp_source_item(item: Mapping[str, Any], *, face: str) -> dict[str, Any]:
+    """sources 行来源卡限长 varchar 列截断护栏（单点收口——TurnRunner 全部
+    sources 行构造面都经此函数）。
+
+    缺陷（探针 D2-01，docs/perf-sampling-m2.md）：英文长标题来源（>512 字符，
+    探针轮 ref_no=34）直落 sources 表 → asyncpg StringDataRightTruncationError
+    → 组装段 INSERT 崩溃 → 轮兜底 degraded(500001)（33 来源已集、thinking/token
+    零产出）。修复口径（2026-11-21 用户裁决：当批即修·截断护栏形态，零迁移零
+    契约升版）：
+    - **截断不丢行**——引用编号稳定性优先（[n]↔ref_no 一一对应与
+      done.source_count 零变化），超宽值按列宽取前缀；
+    - **覆盖全部限长 varchar 列**（source_type+title，非仅 title）；
+    - **返回拷贝**（不改图侧入参 dict，同 source_id 回写「拷贝重写」纪律），
+      SSE batch / turn_events payload / sources 行三面同源截断（可对账）；
+    - 截断留痕走 AgentLog warning（现场既有观测口径）：只记面名/列名/原长/
+      截后长，零内容回显（B15 同款——被截内容可能含外部标题原文，日志面防
+      二次泄漏）。
+    """
+    out = dict(item)
+    for column, max_len in (
+        ("source_type", _SOURCE_TYPE_MAX_LEN),
+        ("title", _SOURCE_TITLE_MAX_LEN),
+    ):
+        value = out.get(column)
+        if not isinstance(value, str) or len(value) <= max_len:
+            continue
+        out[column] = value[:max_len]
+        AgentLog(
+            message=(
+                f"sources 限长列截断落库：face={face} column={column} "
+                f"original_len={len(value)} clamped_len={max_len}"
+            ),
+            graph="turn_runner",
+        ).warning()
+    return out
 
 
 class ThreadScheduler:
@@ -1317,7 +1404,7 @@ class ThreadScheduler:
                 elif stream_mode == "updates" and not namespace:
                     for update in chunk.values():
                         if isinstance(update, Mapping):
-                            final_state.update(update)
+                            _merge_graph_update(final_state, update)
         self._cancel_flags.pop(turn_id, None)  # 防御：清理残留标志
         if cancel_reason is not None:
             await self._finish_canceled(
@@ -1639,6 +1726,7 @@ class ThreadScheduler:
         async with self._session_factory() as session:
             for offset, item in enumerate(pending, start=ctx.sources_count + 1):
                 card = item if isinstance(item, Mapping) else {}
+                card = _clamp_source_item(card, face="supply_append")
                 score = card.get("score")
                 session.add(
                     Source(
@@ -1675,7 +1763,12 @@ class ThreadScheduler:
         """
         source_rows: list[Source] = []
         if sources_batch:
-            for item in sources_batch:
+            # D2-01 截断护栏（限长 varchar 列）先行于行构造——SSE batch 重写与
+            # 落库行共用同一批截断拷贝（三面同源可对账）。
+            clamped_batch = [
+                _clamp_source_item(item, face="sources_event") for item in sources_batch
+            ]
+            for item in clamped_batch:
                 score = item.get("score")
                 source_rows.append(
                     Source(
@@ -1692,7 +1785,7 @@ class ThreadScheduler:
                 )
             business["batch"] = [
                 {**item, "source_id": str(row.id)}
-                for item, row in zip(sources_batch, source_rows)
+                for item, row in zip(clamped_batch, source_rows)
             ]
         stamped = await self._bus.publish(
             ctx.turn_id,
@@ -2206,9 +2299,14 @@ class ThreadScheduler:
                 str(parent.answer_md), max_chars=PARENT_CONTEXT_SUMMARY_CHARS
             )
         ).strip()
-        # URL 表无编号（去引用锚点形态）：仅 URL 供核对，取号面=本轮来源列表
+        # URL 表无编号（去引用锚点形态）：仅 URL 供核对，取号面=本轮来源列表。
+        # **标题与 URL 双单元格**均为外部一手内容（Source 行源自搜索结果）→ 表行按
+        # `_clean_table_cell` 中性化：控制符/换行折叠（防破表 + 防多行文本抬升为
+        # 提示词正文）、包裹标记实体化、引用锚点剔除（评审 P2-2 + 追加工单——URL
+        # 单元格同注入面，history 面 Q:/A: 裸拼无包裹无转义）。仅 display copy：
+        # 返回的 `sources` dict 与 DB 原值不动（匹配/落库零影响）。
         table = [
-            f"- {title}：{url}"
+            f"- {_clean_table_cell(str(title))}：{_clean_table_cell(str(url))}"
             for _ref_no, title, url, _snippet, _source_type, _score in rows
             if url
         ]

@@ -9,6 +9,10 @@
   delta.reasoning_content 增量 → [{reasoning, index 0}] 块；同帧携带 content → 同帧补
   {text, index 1}；index 是 AIMessageChunk 聚合的合并锚点（langchain-core merge_lists
   按 index 匹配、字符串字段拼接）——聚合后 reasoning 增量拼为单块、正文拼为单块；
+- 出站收敛（覆写 `_get_request_payload`，2026-11-22 deep 慢性 400 修复）：assistant 的
+  list content（str item + text 块混合，如聚合终态 `["", {reasoning}, "正文"]`）按序
+  收敛为单一 str，reasoning/其它块丢弃，空收敛维持空串；tool_calls 面与 human 多模态
+  块零触碰；签名哨兵锁上游 `_get_request_payload` 形态；
 - 普通路径零扰动（补丁唯一允许的行为差异边界）：无 reasoning_content 时 invoke 返回
   str content、stream chunk 保持 str content，与上游 ChatOpenAI 行为一致；
 - 注册护栏：import 本模块即注册 openai_reasoning 进 langchain `_BUILTIN_PROVIDERS`
@@ -17,8 +21,9 @@
 - 默认参数不写死 max_tokens（None）——思考模型部署口径 ≥8192（R7：2048 实测思考
   耗尽空输出、GLM-5.3 同病见 ARCH R11 行注），实际值由上游模型映射注入，代码侧不设
   默认值；
-- R8 锁版本护栏本体：两处私有覆写必须在位——langchain-openai==1.7.4 锁定，升级
-  必须先跑本护栏测试再合入（ARCH §10 R8）。
+- R8 锁版本护栏本体：三处私有覆写必须在位（invoke/stream 两处入站 + 出站
+  `_get_request_payload` 收敛）——langchain-openai==1.7.4 锁定，升级必须先跑本护栏
+  测试再合入（ARCH §10 R8）。
 
 桩形态（零网络）：实例化后直接覆盖 model.client / model.async_client 为桩对象（构造
 不触网），让父类真实 _generate/_stream/_agenerate/_astream 代码路径跑完——护栏必须
@@ -27,6 +32,7 @@
 """
 
 import functools
+import inspect
 import operator
 import os
 from types import SimpleNamespace
@@ -320,7 +326,7 @@ class TestStreamReasoningExtraction:
 
 
 # ---------------------------------------------------------------------------
-# 异步双路（与 sync 共用同两处覆写点，护栏一并钉住）
+# 异步双路（与 sync 共用同三处覆写点，护栏一并钉住；出站 payload 构造同源）
 # ---------------------------------------------------------------------------
 
 
@@ -369,13 +375,26 @@ class TestDefaultParams:
 
 class TestR8GuardOverrides:
     def test_overrides_are_in_place(self):
-        # R8 前置哨兵：两处私有覆写必须在位（被移除 → 本文件行为用例随之失效）
+        # R8 前置哨兵：三处私有覆写必须在位（被移除 → 本文件行为用例随之失效）
         assert ReasoningChatModel._create_chat_result is not (
             ChatOpenAI._create_chat_result
         )
         assert ReasoningChatModel._convert_chunk_to_generation_chunk is not (
             ChatOpenAI._convert_chunk_to_generation_chunk
         )
+        assert ReasoningChatModel._get_request_payload is not (
+            ChatOpenAI._get_request_payload
+        )
+
+    def test_request_payload_override_signature_matches_upstream(self):
+        # R8 锁版本护栏：出站 payload 覆写点（langchain_openai==1.7.4
+        # ChatOpenAI._get_request_payload）改名/改签名即红，升级前必须先跑本文件
+        upstream = inspect.signature(ChatOpenAI._get_request_payload)
+        ours = inspect.signature(ReasoningChatModel._get_request_payload)
+        assert list(ours.parameters) == list(upstream.parameters)
+        assert [p.kind for p in ours.parameters.values()] == [
+            p.kind for p in upstream.parameters.values()
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -492,3 +511,106 @@ class TestStructuredOutputInteraction:
         assert len(message.tool_calls) == 1
         assert message.tool_calls[0]["name"] == "RewriteOutput"
         assert message.tool_calls[0]["args"]["query_type"] == "factoid"
+
+
+# ---------------------------------------------------------------------------
+# 出站 payload 收敛（覆写 `_get_request_payload`，2026-11-22 deep 慢性 400 修复）：
+# 流式聚合终态 content 的实测形态是 ["", {reasoning}, "正文"]（chunk 覆写 + langchain
+# merge_content 的 str→list 头插 + 裸串拼接）——多轮回传时上游
+# `_convert_from_v1_to_chat_completions` 只剥 reasoning 块、保留裸串 item，出站成
+# `content: ["", "正文"]`；DashScope 流式路径对 list item 严格要求 dict（400
+# "item must be dict and key[type] should in dict"）。收敛口径：assistant 的 list
+# content 按序合并 str item 与 text 块为单一 str，reasoning/其它块丢弃（上游本就
+# 剥除），空收敛维持空串；tool_calls 面与 human 多模态块零触碰。
+# ---------------------------------------------------------------------------
+
+_MIXED_ASSISTANT_CONTENT = [
+    "",
+    {"type": "reasoning", "reasoning": "思考过程占位", "index": 0},
+    "正文",
+]
+
+# DashScope 实测帧形态：content="" 与 reasoning_content 并存帧（首帧后思考增量帧）
+_DASHSCOPE_MIXED_FRAMES = [
+    _delta_chunk({"role": "assistant", "content": ""}),
+    _delta_chunk({"content": "", "reasoning_content": "先想"}),
+    _delta_chunk({"content": "", "reasoning_content": "一步"}),
+    _delta_chunk({"content": "正"}),
+    _delta_chunk({"content": "文"}),
+    _delta_chunk({}, finish_reason="stop"),
+]
+
+_MULTIMODAL_HUMAN_CONTENT = [
+    {"type": "text", "text": "看图"},
+    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+]
+
+
+def _assistant_payload(payload: dict) -> dict:
+    """取 payload["messages"] 里的 assistant 消息（唯一一条）。"""
+    return next(m for m in payload["messages"] if m["role"] == "assistant")
+
+
+class TestOutboundPayloadCollapse:
+    def test_mixed_content_collapses_to_plain_str(self):
+        # 红→绿：现状出站 ["", "正文"]（裸串 list，DashScope 400）→ 收敛为 "正文"
+        model = _build_model()
+        message = AIMessage(content=list(_MIXED_ASSISTANT_CONTENT))
+        payload = model._get_request_payload(
+            [HumanMessage(content="问"), message]
+        )
+        assert _assistant_payload(payload)["content"] == "正文"
+
+    def test_mixed_content_with_tool_calls_collapses_and_keeps_tool_calls(self):
+        # tool_calls 消息形态：content 同样收敛为 str，tool_calls 原样保留
+        model = _build_model()
+        message = AIMessage(
+            content=list(_MIXED_ASSISTANT_CONTENT),
+            tool_calls=[
+                {"name": "ls", "args": {"path": "/"}, "id": "call_1", "type": "tool_call"}
+            ],
+        )
+        payload = model._get_request_payload([HumanMessage(content="问"), message])
+        assistant = _assistant_payload(payload)
+        assert assistant["content"] == "正文"
+        assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_1"]
+
+    def test_str_items_and_text_blocks_join_in_order(self):
+        model = _build_model()
+        message = AIMessage(
+            content=["你", {"type": "text", "text": "好"}, "呀"]
+        )
+        payload = model._get_request_payload([HumanMessage(content="问"), message])
+        assert _assistant_payload(payload)["content"] == "你好呀"
+
+    def test_empty_list_collapses_to_empty_str(self):
+        model = _build_model()
+        message = AIMessage(content=[])
+        payload = model._get_request_payload([HumanMessage(content="问"), message])
+        assert _assistant_payload(payload)["content"] == ""
+
+    def test_pure_text_blocks_collapse(self):
+        model = _build_model()
+        message = AIMessage(content=[{"type": "text", "text": "好的"}])
+        payload = model._get_request_payload([HumanMessage(content="问"), message])
+        assert _assistant_payload(payload)["content"] == "好的"
+
+    def test_human_multimodal_content_untouched(self):
+        # deepagents 多模态 human 面合法：非 assistant 角色 list content 零触碰
+        model = _build_model()
+        human = HumanMessage(content=[dict(block) for block in _MULTIMODAL_HUMAN_CONTENT])
+        payload = model._get_request_payload([human])
+        assert payload["messages"][0]["content"] == _MULTIMODAL_HUMAN_CONTENT
+
+    def test_aggregated_dashscope_frames_outbound_without_bare_str_items(self):
+        # 聚合→出站串联：实测 DashScope 帧经生产转换链聚合（终态 ["", {reasoning},
+        # "正文"]）→ 出站必须收敛为单一 str，不含裸字符串 list item
+        model = _build_model(chunks=_DASHSCOPE_MIXED_FRAMES)
+        aggregated = functools.reduce(
+            operator.add, model.stream([HumanMessage(content="问")])
+        )
+        assert isinstance(aggregated.content, list)  # 聚合终态确为混合 list（形状锁）
+        payload = model._get_request_payload([HumanMessage(content="问"), aggregated])
+        outbound = _assistant_payload(payload)["content"]
+        assert outbound == "正文"
+        assert not isinstance(outbound, list)

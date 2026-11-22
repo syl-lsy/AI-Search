@@ -165,10 +165,14 @@ litellm_settings:
   # /app/litellm-config/）。对 GLM 腿（*-glm 别名 / openai/GLM-5.3* 上游 id）剥离
   # enable_thinking 与 think：synthesis 的 extra_body={"enable_thinking": false}
   # 随降级链发给 GLM 会上游 400，drop_params 不覆盖该键，故需请求体变换。
+  # post-M2 resilience 工单③（2026-11-22）：gateway_failure_alerter——failure 侧
+  # 钩子，上游失败/fallback 链耗尽时输出一行 [gateway-failure-alert] 结构化告警
+  # （元数据：别名/部署/异常类名/分类/状态码/stream/call_type/耗时 + 异常文本截
+  # 200 字符先脱敏；零 prompt payload、零完整 URL、零密钥——B15 告警纪律）。
   # callbacks 列表启动时解析一次、钩子模块亦在启动时 import 一次——改注册或改实现
   # 均需 `docker compose --project-directory . restart litellm`（目录挂载只保证新文件
   # 可见，不会让 Python 重新加载已导入模块）。
-  callbacks: ["litellm_callbacks.glm_thinking_guard"]
+  callbacks: ["litellm_callbacks.glm_thinking_guard", "litellm_callbacks.gateway_failure_alerter"]
   success_callback: ["otel"]                        # 网关侧 trace → Langfuse OTLP（B 组双 trace 网关侧；langfuse 旧式 callback 事件被 v4 ingestion schema 拒绝已实证，2026-11-06 改走 OTel）
   fallbacks:
     # 每档三节链（nacos-config.md §5：所选主力在前，其余两家按 qwen→glm→deepseek 固定全序接续）

@@ -5,8 +5,9 @@ langchain-openai 的静默丢弃（ARCHITECTURE §6.7 / §10 R8 行 / §3.1 util
 明示 "not extracted or preserved"，langchain_openai/chat_models/base.py 模块头）——
 GLM 与 DeepSeek 经 LiteLLM 出口的思维链被静默丢失（R11 实证：非流式
 message.reasoning_content 独立字段、流式 delta.reasoning_content 增量、无 <think>
-内嵌、网关全透传）。落地 = ChatOpenAI 子类覆写两个私有转换点，产出 v1 content
-blocks（reasoning/text）：
+内嵌、网关全透传）。落地 = ChatOpenAI 子类覆写三个私有转换点，入站产出 v1 content
+blocks（reasoning/text）、出站把混合 blocks 收敛回普通 str（避免 DashScope 流式
+多轮回传 400，见下）：
 
 - invoke 路径：`_create_chat_result`（invoke/ainvoke → _generate/_agenerate 共用）——
   choices[].message.reasoning_content 非空时 content 升 blocks
@@ -17,7 +18,15 @@ blocks（reasoning/text）：
   {type: text, index: 1}。index 是 AIMessageChunk 聚合的合并锚点（langchain-core
   merge_lists 按 index 匹配、字符串字段拼接）——聚合后思考增量拼为单块、正文拼为单块；
 - 普通路径零扰动：无 reasoning_content 时输出与上游逐字节一致（str content）——补丁
-  唯一允许的行为差异边界；qwen 同形字段（handoff 续 10 R11 四路实证）自动并入覆盖。
+  唯一允许的行为差异边界；qwen 同形字段（handoff 续 10 R11 四路实证）自动并入覆盖；
+- 出站收敛：`_get_request_payload`（第三条覆写）把 assistant 的 v1 混合 content 收敛
+  回普通 str——deepagents 协调器多轮回传面（2026-11-22 慢性 400 根因修复）：流式聚合
+  终态 content 实测为 `["", {reasoning}, "正文"]`（chunk 覆写 + langchain
+  `merge_content` 的 str→list 头插 + 裸串拼接），上游 `_convert_from_v1_to_chat_completions`
+  只剥 reasoning 块、保留裸串 item，出站成 `["", "正文"]`；DashScope 流式路径对 list
+  item 严格要求 dict（400 `if content is list. item must be dict and key[type] should
+  in dict`，仅 deepagents 协调器循环命中，fast 轮不传 historical assistant 块故豁免）。
+  收敛只动出站 payload 构造：chunk 流式行为与 SSE §7.1 thinking 事件面零触碰。
 
 注册：import 本模块即把 openai_reasoning 写入 langchain `_BUILTIN_PROVIDERS`
 （init_chat_model 的私有注册表，entry=(module, class, creator)）——模型工厂后续经
@@ -25,7 +34,8 @@ init_chat_model(model_provider="openai_reasoning", ...) 取本类。
 
 R8 锁版本口径（ARCH §10 R8 行）：本模块覆写 langchain-openai 私有 API，锁
 langchain-openai==1.7.4（pyproject），升级前必须先跑护栏测试
-test/unit/test_reasoning_chat_model.py（invoke 与 stream 双路断言 reasoning 块）。
+test/unit/test_reasoning_chat_model.py（invoke 与 stream 双路断言 reasoning 块 +
+出站 payload 收敛 + `_get_request_payload` 签名哨兵）。
 
 默认参数口径（R7）：不写死 max_tokens 等任何采样参数（全部继承上游默认 None，实际值
 由 Nacos 模型映射注入）。部署口径注记：思考模型 max_tokens 必须 ≥8192——思考 token
@@ -38,6 +48,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from langchain.chat_models import base as _lc_chat_models_base
+from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
@@ -49,6 +60,8 @@ _PROVIDER_NAME = "openai_reasoning"
 # 流式块合并锚点：思考块 index 0、正文块 index 1（merge_lists 按 index 匹配后拼接）
 _REASONING_BLOCK_INDEX = 0
 _TEXT_BLOCK_INDEX = 1
+# 出站收敛：chat completions 里唯一可合并进普通 str 的块类型（reasoning 等上游已剥除）
+_TEXT_BLOCK_TYPE = "text"
 
 
 def _extract_reasoning_content(message_obj: Any) -> str | None:
@@ -123,13 +136,30 @@ def _chunk_delta(chunk: Any) -> Any:
     return delta if isinstance(delta, Mapping) else None
 
 
-class ReasoningChatModel(ChatOpenAI):
-    """ChatOpenAI 子类：invoke 与 stream 双路透出 reasoning_content（v1 content blocks）。
+def _collapse_content_list(content: list[Any]) -> str:
+    """把混合 content list 收敛为普通 str：str item 与 text 块按序 join（语义同
+    langchain `merge_content` 的拼接口径），reasoning/其它非 text 块丢弃（上游
+    `_convert_from_v1_to_chat_completions` 本就剥除同类块）。"""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, Mapping) and item.get("type") == _TEXT_BLOCK_TYPE:
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
 
-    仅覆写思维链提取，不引入任何采样默认值——max_tokens 等 kept 上游语义（None，由
-    Nacos 模型映射注入）；部署口径思考模型须 ≥8192（R7，见模块 docstring）。同步与
-    异步入口共用同两处覆写（_generate/_agenerate → _create_chat_result；
-    _stream/_astream → _convert_chunk_to_generation_chunk），无第二套实现。
+
+class ReasoningChatModel(ChatOpenAI):
+    """ChatOpenAI 子类：invoke 与 stream 双路透出 reasoning_content（v1 content blocks），
+    出站时把 assistant 混合 content 收敛回普通 str（DashScope 流式 400 修复）。
+
+    覆写仅限思维链提取与出站内容形态，不引入任何采样默认值——max_tokens 等仍取
+    上游语义（None，由 Nacos 模型映射注入）；部署口径思考模型须 ≥8192（R7，见模块
+    docstring）。同步与异步入口共用同三处覆写（_generate/_agenerate →
+    _create_chat_result；_stream/_astream → _convert_chunk_to_generation_chunk；
+    出站 → _get_request_payload），无第二套实现。
     """
 
     def _create_chat_result(
@@ -186,6 +216,39 @@ class ReasoningChatModel(ChatOpenAI):
             _reasoning_text_blocks(reasoning, message.content, indexed=True),
         )
         return generation_chunk
+
+    def _get_request_payload(
+        self,
+        input_: LanguageModelInput,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        """出站收敛（第三处覆写）：父类组装 payload 后，把 assistant 的 list content
+        合并回普通 str。
+
+        为什么：deepagents 协调器多轮回传历史 assistant 消息时，聚合终态 content 是
+        `["", {reasoning}, "正文"]` 混合 list；父类 `_convert_from_v1_to_chat_completions`
+        只剥 reasoning 块，裸串 item 留在出站 payload（`["", "正文"]`），DashScope 流式
+        路径对 list item 严格要求 dict → 400（2026-11-22 探针复现，仅协调器循环命中）。
+        覆盖面：全部出站调用（invoke/stream/ainvoke/astream 与结构化输出）共用本方法，
+        单点收口。边界：只收敛 role=assistant 的 list content——空收敛维持空串；
+        tool_calls 面与 human 多模态块零触碰（后者是 deepagents 合法面）。
+        R8 复检纪律：同前两处覆写——langchain-openai==1.7.4 锁定，升级前先跑
+        test/unit/test_reasoning_chat_model.py（含本方法签名哨兵）。
+        """
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            # responses API 分支（无 messages 键）不在本补丁覆盖面内，原样返回
+            return payload
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                message["content"] = _collapse_content_list(content)
+        return payload
 
 
 def _create_reasoning_model_instance(

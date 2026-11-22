@@ -1,5 +1,6 @@
 /**
- * src/types/api.d.ts — api.md（v1.28）+ memory-api.md（v1.4）字段/枚举的静态镜像（冻结）
+ * src/types/api.d.ts — api.md（v1.28）+ memory-api.md（v1.4；上游现行 v1.5，M5/M6 域增量
+ * 未镜像——M5 开工前同步）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
  *   - docs/contract/api.md v1.28（REST + SSE 协议唯一事实源；批次 6 收口轮（2026-11-21，
@@ -17,7 +18,9 @@
  *     regenerate 形态）：RegenerateTurnData docstring 与 ErrorCode 409006 触发场景注释同步；
  *     §2.4 REQ-017 parented 轮消费面（TurnDetail.parent_turn_id 既有镜像不变）。B14 批已落
  *     镜像：§2.5/§7.2 stages[].extra 可选键 fallback——frontend-api.md §8.5 登记行）
- *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约）
+ *   - docs/contract/memory-api.md v1.4 §4/§5（记忆域字段级契约——M2 镜像停留 v1.4 形态：
+ *     v1.5 的 M5/M6 域增量〔2026-11-19 去噪/膨胀治理/冲突消解〕M2 零消费面、未镜像，
+ *     M5 开工前同步镜像基准）
  *   - frontend-api.md §8.5（镜像类型清单）+ §8.9（类型盲区纪律）
  *   - .zcode/workflow-drafts/batch7-handoff.md §1（A6 前置小修落型口径：images 条目键可省）
  *
