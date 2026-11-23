@@ -18,7 +18,8 @@ const KB_URLS_URL = '/api/v1/kb/urls'
 /** §1 LibraryView 行：有非终态条目时每 5s 轮询（前端 UI 节奏，实现常量） */
 const POLL_INTERVAL_MS = 5_000
 
-const NON_TERMINAL: readonly KbDocument['status'][] = ['pending', 'parsing', 'embedding']
+/** §4.3 六态状态机（api.md v1.30 REQ-052）：pending/normalizing/chunking/indexing 非终态；ready/failed 终态 */
+const NON_TERMINAL: readonly KbDocument['status'][] = ['pending', 'normalizing', 'chunking', 'indexing']
 
 export const useKbStore = defineStore('kb', () => {
   const documents = ref<KbDocument[]>([])

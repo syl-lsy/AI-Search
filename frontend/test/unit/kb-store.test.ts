@@ -49,7 +49,7 @@ afterEach(() => {
 
 describe('kbStore（§4：文档列表、轮询定时器）', () => {
   it('fetchDocuments：GET /api/v1/kb/documents → items 投影', async () => {
-    mockedGet.mockResolvedValueOnce({ total: 2, items: [doc({ document_id: 'a' }), doc({ document_id: 'b', status: 'parsing' })] })
+    mockedGet.mockResolvedValueOnce({ total: 2, items: [doc({ document_id: 'a' }), doc({ document_id: 'b', status: 'normalizing' })] })
     const store = useKbStore()
     await store.fetchDocuments()
     expect(mockedGet).toHaveBeenCalledWith('/api/v1/kb/documents')
@@ -64,8 +64,8 @@ describe('kbStore（§4：文档列表、轮询定时器）', () => {
   })
 
   it('upload：multipart POST（file+title）→ 成功后重拉列表', async () => {
-    mockedPost.mockResolvedValueOnce(doc({ document_id: 'new', status: 'parsing' }))
-    mockedGet.mockResolvedValue({ total: 1, items: [doc({ document_id: 'new', status: 'parsing' })] })
+    mockedPost.mockResolvedValueOnce(doc({ document_id: 'new', status: 'normalizing' }))
+    mockedGet.mockResolvedValue({ total: 1, items: [doc({ document_id: 'new', status: 'normalizing' })] })
     const store = useKbStore()
     const file = new File(['%PDF-1.4'], 'spec.pdf', { type: 'application/pdf' })
     const result = await store.upload(file, 'spec.pdf')
@@ -100,8 +100,8 @@ describe('kbStore（§4：文档列表、轮询定时器）', () => {
   })
 
   it('pollUntilSettled：有非终态条目 → 5s 后自动重拉，直至全部终态（§1 每 5s 轮询）', async () => {
-    // 第一次拉取：含 parsing 条目 → 排轮询；5s 后第二次拉取：已 ready → 停表
-    mockedGet.mockResolvedValueOnce({ total: 1, items: [doc({ document_id: 'p', status: 'parsing' })] })
+    // 第一次拉取：含 normalizing 条目 → 排轮询；5s 后第二次拉取：已 ready → 停表
+    mockedGet.mockResolvedValueOnce({ total: 1, items: [doc({ document_id: 'p', status: 'normalizing' })] })
     const store = useKbStore()
     await store.pollUntilSettled()
     expect(mockedGet).toHaveBeenCalledTimes(1)
@@ -114,7 +114,7 @@ describe('kbStore（§4：文档列表、轮询定时器）', () => {
   })
 
   it('stopPolling：卸载路径停表（不再发起拉取）', async () => {
-    mockedGet.mockResolvedValue({ total: 1, items: [doc({ document_id: 'p', status: 'embedding' })] })
+    mockedGet.mockResolvedValue({ total: 1, items: [doc({ document_id: 'p', status: 'indexing' })] })
     const store = useKbStore()
     await store.pollUntilSettled()
     store.stopPolling()

@@ -1,9 +1,15 @@
 /**
- * src/types/api.d.ts — api.md（v1.28）+ memory-api.md（v1.4；上游现行 v1.5，M5/M6 域增量
+ * src/types/api.d.ts — api.md（v1.30）+ memory-api.md（v1.4；上游现行 v1.5，M5/M6 域增量
  * 未镜像——M5 开工前同步）字段/枚举的静态镜像（冻结）
  *
  * 镜像基准：
- *   - docs/contract/api.md v1.28（REST + SSE 协议唯一事实源；批次 6 收口轮（2026-11-21，
+ *   - docs/contract/api.md v1.30（M3 知识库契约增量 2026-11-22：KbDocStatus 六态扩容
+ *     〔旧 parsing/embedding 作废 → normalizing/chunking/indexing〕/Source.kb_chunk_id/
+ *     KbChunkDetail 溯源下钻/KbImport* 导入任务面/KbParseMeta/KbDocument 增
+ *     parse_meta·catalog 可选键/ErrorCode 409007——新增契约面已批准（2026-11-22 确认点②），
+ *     实施随 M3 批次 1~6；【v1.31 镜像批注】KbChunkDetail 增可选键 node_token?/node_id?
+ *     （api.md §4.6 A53 GWT#2 飞书原文回跳投影）
+ *   - docs/contract/api.md v1.28（历史基准——REST + SSE 协议唯一事实源；批次 6 收口轮（2026-11-21，
  *     P2-3 用户裁决「当批收口全修」）随批钉正：**Artifact 镜像改 §2.8 export 八键线形**
  *     〔drop turn_id、补 thread_id——此前误按「与 §5.2 artifacts 条目同构」落型〕，详见
  *     Artifact docstring；两处消费面 fixture 同步：api-modules.test.ts / answer-actions.test.ts
@@ -53,6 +59,7 @@ export type ErrorCode =
   | '409004' // 该线程已有进行中的记忆抽取任务
   | '409005' // 线程有进行中轮次，不可删除（api.md §0 v1.18，REQ-059）
   | '409006' // 轮次不支持重新生成（api.md §0 v1.28，REQ-063——非 {degraded,failed} 终态/零来源/regenerate 进行中重复点击单码覆盖；deep 有源 degraded/failed 轮 v1.28 起可重生成，原「deep 轮一律拒收」收窄为 deep 零源/进行中形态）
+  | '409007' // 已有进行中的知识库导入任务（api.md §0 v1.30，REQ-067——已批准（2026-11-22 确认点②）；pending/running 导入任务存在时重复触发 POST /kb/import/jobs；409004 记忆抽取同族语义）
   | '413001' // 文件超过大小上限
   | '415001' // 不支持的文件类型
   | '422001' // URL 非法
@@ -202,6 +209,12 @@ export interface Source {
   score: number
   snapshot_available: boolean
   kb_doc_id: Uuid | null
+  /**
+   * api.md §2.5/§7.2 v1.30（M3——已批准（2026-11-22 确认点②））：KB 来源恒携带——该来源对应知识库 chunk id（溯源下钻 §4.6 解析键）；
+   * web 来源 null。可选键口径（就地修订 2026-11-22 门禁修复轮）：存量轮（M3 前落库）与缓冲重放的旧事件
+   * 无此键——前端按缺省 null 消费，镜像落可选键。
+   */
+  kb_chunk_id?: Uuid | null
 }
 
 /**
@@ -504,12 +517,19 @@ export interface SuggestionPoolData {
  * =========================================================== */
 
 export type KbDocType = 'pdf' | 'md' | 'txt' | 'docx' | 'url'
-export type KbDocStatus = 'pending' | 'parsing' | 'embedding' | 'ready' | 'failed'
+
+/**
+ * §4.3 状态机（api.md v1.30，REQ-052 多阶段——M3 起，已批准（2026-11-22 确认点②））：
+ * pending → normalizing → chunking → indexing → ready；任一阶段失败 failed（fail_reason 阶段化）。
+ * 旧 parsing/embedding 值作废（取代口径——M3 未上线无存量语义负担，迁移随 data-model.md 同批）。
+ */
+export type KbDocStatus = 'pending' | 'normalizing' | 'chunking' | 'indexing' | 'ready' | 'failed'
 
 /**
  * §4.1/4.2/4.3/4.4 KB 文档条目。
- * 字段出现性按端点：上传（4.1）无 source_url/updated_at/ready_at/duplicated；
- * URL 收藏（4.2）多 duplicated；列表（4.3）多 updated_at/ready_at；单条（4.4）同列表项。
+ * 字段出现性按端点：上传（4.1）无 source_url/updated_at/ready_at/duplicated/parse_meta/catalog_ids/catalog_path；
+ * URL 收藏（4.2）多 duplicated；列表（4.3）多 updated_at/ready_at/parse_meta/catalog_ids/catalog_path
+ * 〔api.md §4.3 v1.30——已批准（2026-11-22 确认点②）〕；单条（4.4）同列表项。
  */
 export interface KbDocument {
   document_id: Uuid
@@ -528,6 +548,12 @@ export interface KbDocument {
   ready_at?: IsoTimestamp | null
   /** 4.2 出现（重复收藏返回既有条目时 false） */
   duplicated?: boolean
+  /** api.md §4.3 v1.30（M3——已批准（2026-11-22 确认点②））：归一化产物摘要——normalizing 完成前 null；页式来源 pages 有值、非页式 null */
+  parse_meta?: KbParseMeta | null
+  /** api.md §4.3 v1.30（M3——已批准（2026-11-22 确认点②））：飞书目录链节点 id 数组（root→leaf，连接器外部 token 非 UUID）——本地上传/URL 为 null */
+  catalog_ids?: string[] | null
+  /** api.md §4.3 v1.30（M3——已批准（2026-11-22 确认点②））：目录显示路径（目录层标题串联）——本地上传/URL 为 null */
+  catalog_path?: string | null
 }
 
 /** §4.2 请求体 */
@@ -538,6 +564,103 @@ export interface CollectUrlRequest {
 /** §4.5 响应 data */
 export interface KbDeleteData {
   deleted: boolean
+}
+
+/** §4.3 v1.30（M3——已批准（2026-11-22 确认点②））：归一化产物摘要（页数/表格数/代码块数——页式来源 pages 有值、非页式 null） */
+export interface KbParseMeta {
+  pages: number | null
+  tables: number
+  code_blocks: number
+}
+
+/* -------------------------------------------------------------
+ * 4.6 GET /api/v1/sources/{source_id}/kb-chunk —— KB 来源溯源下钻（api.md v1.30 增，REQ-053——
+ * 已批准（2026-11-22 确认点②）；v1.31 增列 node_token?/node_id? 两可选键）
+ * ----------------------------------------------------------- */
+
+/**
+ * §4.6 响应 data（chunk 原文与位置物化字段；溯源内容仅进 UI 不进 LLM、前端渲染过 DOMPurify——
+ * frontend-api.md §5 v1.33/v1.34 KbChunkDrilldown）。
+ */
+export interface KbChunkDetail {
+  chunk_id: Uuid
+  document_id: Uuid
+  document_title: string
+  /** chunk 原文（纯文本/Markdown 形态随来源格式） */
+  content: string
+  /** 标题链 root→leaf（物化自 chunk.meta.heading_path）；无标题链来源可为空数组 */
+  heading_path: string[]
+  /** 页码/段落定位（键恒出现、值可空——页式来源有页码、结构化来源有段落序） */
+  page: number | null
+  paragraph: number | null
+  /** 飞书来源才有（可选键，缺则省略不置 null，api.md §4.6 v1.31）——「回跳飞书原文」外链 URL = https://www.feishu.cn/wiki/{node_token}（KbChunkDrilldown 消费）；本地/URL 来源无此键 */
+  node_token?: string
+  /** 统一寻址可选键（仅飞书源，缺则省略，api.md §4.6 v1.31）——载荷形态 fs:node:{node_token} / fs:blk:{block_id}，对齐 data-model.md §1.8 meta.node_id */
+  node_id?: string
+}
+
+/* -------------------------------------------------------------
+ * 4.7~4.9 /api/v1/kb/import/jobs —— 飞书导入任务（api.md v1.30 增，REQ-067/A53——已批准（2026-11-22 确认点②））
+ * ----------------------------------------------------------- */
+
+/** §4.7 connector 枚举（M3 仅 feishu——连接器扩展沿此键位） */
+export type KbImportConnector = 'feishu'
+
+/** §4.7 请求体（connector 非法 400001；进行中重复触发 409007） */
+export interface KbImportTriggerRequest {
+  connector: KbImportConnector
+}
+
+/** §4.7 响应 data */
+export interface KbImportTriggerData {
+  job_id: Uuid
+  status: 'pending'
+}
+
+/** §4.8/4.9 任务 status 枚举 */
+export type KbImportJobStatus = 'pending' | 'running' | 'completed' | 'failed'
+
+/** §4.9 触发方式（手动触发/定时全量 diff 同表） */
+export type KbImportTriggerKind = 'manual' | 'scheduled'
+
+/** §4.9 失败清单条目（category 非封闭枚举——state errors[] 先例，宽松 string；document_id=null=文档未建成） */
+export interface KbImportFailure {
+  title: string
+  category: string
+  message: string
+  document_id: Uuid | null
+}
+
+/** §4.9 失败分类计数（category 非封闭枚举，宽松 string） */
+export interface KbImportFailureSummary {
+  category: string
+  count: number
+}
+
+/** §4.8 列表条目 / §4.9 详情条目基形（进度五数 + failure_summary；列表条目不含 failures） */
+export interface KbImportJob {
+  job_id: Uuid
+  connector: KbImportConnector
+  trigger: KbImportTriggerKind
+  status: KbImportJobStatus
+  /** 本批次待处理文档单元总数（触发时快照计数） */
+  total_docs: number
+  /** 已推进数 = imported + failed + skipped */
+  processed_docs: number
+  imported_docs: number
+  failed_docs: number
+  /** mindnote/slides 等无读取 API 能力类型跳过留痕（A53 第 3 GWT 不静默） */
+  skipped_docs: number
+  failure_summary: KbImportFailureSummary[]
+  started_at: IsoTimestamp | null
+  finished_at: IsoTimestamp | null
+  created_at: IsoTimestamp
+  updated_at: IsoTimestamp
+}
+
+/** §4.9 详情 = 列表条目 + failures 失败清单（仅详情端点返回；自用 931+ 量级一次返回不设分页） */
+export interface KbImportJobDetail extends KbImportJob {
+  failures: KbImportFailure[]
 }
 
 /* =============================================================

@@ -262,3 +262,50 @@ def test_deep_report_writer_structure_and_citations() -> None:
         assert "子课题报告" in text
         assert "全量来源" in text
         assert "{{cite_rules}}" in text
+
+
+# ==== 免责校准 + 标题行锚定（2026-11-22 惯性免责热更批，用户批准）====
+#
+# 背景：deep 轮报告 90%（40 轮抽样 36 轮）带「现有来源未覆盖/证据有限」类惯性免责
+# 声明——机理 = report_writer「来源不足如实说明」+ subagent_system 同款两层硬纪律被
+# 模型对冲偏置放大成例行免责。校准句钉语义：正常陈述结论、就地注明，不例行免责、
+# 不单开免责段落。标题语法锚点为回归锁（该行先行批次已入种子，此处防漂移）。
+
+
+def test_deep_report_writer_calibration_and_heading_anchors() -> None:
+    """report_writer 免责校准锚点（写作纪律段）+ 标题语法锚点（回归锁，双源断言）。
+
+    免责校准语义三钉：①覆盖充分部分正常陈述结论、禁止整体性例行免责；
+    ②反例措辞「现有来源未覆盖」「证据有限」点名；③确缺支撑就地注明、不单开免责段落。
+    """
+    for text in (
+        PROMPTS_CONFIG["prompts"]["deep.report_writer"],
+        load_builtin_prompt("deep.report_writer"),
+    ):
+        assert "免责校准：" in text
+        assert "不得在摘要或结论例行添加整体性免责声明" in text
+        assert "「现有来源未覆盖」「证据有限」" in text
+        assert "紧随该句就地注明，不单开免责段落" in text
+        # 标题语法行（回归锁——批次 7 退出档 §7-5 标题行约束，已入种子三源）
+        assert "标题语法：各节标题一律用 markdown 标题行书写（# / ## / ###）" in text
+        assert "不得用加粗或裸文本标签充当标题" in text
+        # 免责校准须落在「写作纪律」段内（段标签先于锚点出现）
+        assert text.index("写作纪律：") < text.index("免责校准：")
+
+
+def test_deep_subagent_system_calibration_anchor() -> None:
+    """subagent_system 免责校准锚点（摘要纪律段，双源断言）。
+
+    语义三钉：①仅关键事实确缺支撑才如实注明；②禁止每节例行免责；③未决问题
+    集中末尾一次列出、不散布全篇。"""
+    for text in (
+        PROMPTS_CONFIG["prompts"]["deep.subagent.system"],
+        load_builtin_prompt("deep.subagent.system"),
+    ):
+        assert "免责校准：" in text
+        assert "仅当关键事实（数字/日期/结论）确缺来源支撑时如实注明" in text
+        assert "不得为每个小节例行添加「来源不足」类免责声明" in text
+        assert "未决问题集中" in text
+        assert "不散布全篇" in text
+        # 免责校准须落在「摘要纪律」段内（段标签先于锚点出现）
+        assert text.index("摘要纪律：") < text.index("免责校准：")

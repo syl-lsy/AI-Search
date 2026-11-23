@@ -26,7 +26,7 @@ test.describe('Library 知识库页主链路（真服务）', () => {
     const url = `https://example.com/e2e-${Date.now()}`
     await page.getByTestId('url-input').fill(url)
     await page.getByTestId('url-collect-btn').click()
-    // 真服务：列表出现该条目（初始 pending/parsing 处理中态）
+    // 真服务：列表出现该条目（初始 pending/normalizing 处理中态）
     await expect(page.locator('[data-testid="kb-doc-row"]').first()).toBeVisible({ timeout: 10_000 })
   })
 

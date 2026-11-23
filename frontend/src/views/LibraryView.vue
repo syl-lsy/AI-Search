@@ -44,10 +44,12 @@ function statusText(status: KbDocStatus): string {
       return t('library.statusFailed')
     case 'pending':
       return t('library.statusPending')
-    case 'parsing':
-      return t('library.statusParsing')
-    case 'embedding':
-      return t('library.statusEmbedding')
+    case 'normalizing':
+      return t('library.statusNormalizing')
+    case 'chunking':
+      return t('library.statusChunking')
+    case 'indexing':
+      return t('library.statusIndexing')
   }
 }
 
@@ -276,7 +278,7 @@ onUnmounted(() => {
               <td>{{ doc.chunk_count > 0 ? doc.chunk_count : '—' }}</td>
               <td>
                 <span class="badge" :class="statusBadgeClass(doc.status)">
-                  <span v-if="doc.status === 'parsing' || doc.status === 'embedding'" class="dot dot-warning" style="width: 6px; height: 6px"></span>
+                  <span v-if="doc.status === 'normalizing' || doc.status === 'chunking' || doc.status === 'indexing'" class="dot dot-warning" style="width: 6px; height: 6px"></span>
                   <UiIcon v-else-if="doc.status === 'ready'" name="i-check" size="sm" />
                   <UiIcon v-else-if="doc.status === 'failed'" name="i-alert" size="sm" />
                   {{ statusText(doc.status) }}

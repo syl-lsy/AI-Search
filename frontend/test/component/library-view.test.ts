@@ -43,7 +43,7 @@ const DOCS: KbDocument[] = [
     doc_type: 'docx',
     title: 'product-spec.docx',
     file_size_bytes: 1_100_000,
-    status: 'parsing',
+    status: 'normalizing',
     fail_reason: null,
     chunk_count: 0,
     created_at: '2026-11-01T08:12:00Z',
@@ -93,7 +93,7 @@ describe('LibraryView（§1：kb 列表/上传/URL 收藏/删除/轮询）', () 
     const rows = w.findAll('[data-testid="kb-doc-row"]')
     expect(rows).toHaveLength(4)
     expect(rows[0]?.text()).toContain('已入库')
-    expect(rows[1]?.text()).toContain('处理中 · 解析')
+    expect(rows[1]?.text()).toContain('归一化中')
     expect(rows[2]?.text()).toContain('失败')
     expect(rows[2]?.text()).toContain('解析超时（扫描件无文本层），请重新上传')
     expect(rows[3]?.text()).toContain('https://example.com/postgres-17-notes')
