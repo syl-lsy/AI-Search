@@ -360,6 +360,83 @@ class TestNacosInitScriptParity:
         script_spec = dict(module.DATA_IDS)[SPEC_DATA_ID]
         assert script_spec["safety"] == BUILTIN_DEFAULTS[SPEC_DATA_ID]["safety"]
 
+    def test_spec_kb_section_parity(self):
+        """§3 v1.43（M3）：SPEC_CONFIG kb 节双投影显式一致（safety 节同款——kb 单侧
+        漂移时给出可读性更好的失败定位）。"""
+        module = self._load_script_module()
+        script_spec = dict(module.DATA_IDS)[SPEC_DATA_ID]
+        assert script_spec["kb"] == BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+
+
+class TestKbSeedDefaults:
+    """§3 kb 节 v1.43 M3 混合检索扩容种子（13 键，nacos-config.md §3 v1.43 / ADR-017）。
+
+    现行两键保留不动（top_k_per_query 弃用迁移沿 type_query_map 先例，批次 4 切
+    per_query_top_k 后可删）；11 新键建议值逐字对齐契约 §3 示例行。两处显式裁决：
+    ① `ocr_engine` 初值钉 "paddleocr"——PRD v1.34 用户裁决（OQ-25 二选一落地）的
+    传导，契约 §3 示例行现写 rapidocr 属确认点②建议值（探针后钉一属实施序、非审批
+    面；RapidOCR 由 validator 枚举保留为合法值=M3+ 重场景复核线）；② `es_enabled=
+    false` 灰度安全（pgvector 单通道=存量轮零行为变化，ES 通道启用前置=批次 3 B18）。
+    `scripts/nacos_init.py` 侧由 TestNacosInitScriptParity.test_spec_kb_section_parity
+    兜住双投影。
+    """
+
+    def test_kb_seed_has_exactly_thirteen_keys(self):
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        assert len(kb) == 13
+        assert set(kb) == {
+            "top_k_per_query", "rerank_timeout_s",
+            "per_query_top_k", "rrf_k", "kb_fuse_top_k", "max_rerank_candidates",
+            "dual_channel_timeout_s", "es_enabled", "chunk_size", "chunk_overlap",
+            "type_weights", "chunking", "normalizer",
+        }
+
+    def test_kb_legacy_two_keys_unchanged(self):
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        assert kb["top_k_per_query"] == 8
+        assert kb["rerank_timeout_s"] == 2
+
+    def test_kb_funnel_and_chunk_seed_values_match_contract(self):
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        assert kb["per_query_top_k"] == 30
+        assert kb["rrf_k"] == 60
+        assert kb["kb_fuse_top_k"] == 20
+        assert kb["max_rerank_candidates"] == 30
+        assert kb["dual_channel_timeout_s"] == 3
+        assert kb["es_enabled"] is False
+        assert kb["chunk_size"] == 800
+        assert kb["chunk_overlap"] == 120
+
+    def test_kb_type_weights_seed_matches_contract(self):
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        assert kb["type_weights"] == {
+            "factoid": [0.7, 0.3],
+            "list": [0.5, 0.5],
+            "comparison": [0.5, 0.5],
+            "multi_facet": [0.3, 0.7],
+            "temporal": [0.5, 0.5],
+            "how_to": [0.4, 0.6],
+            "navigational": [0.8, 0.2],
+            "other": [0.5, 0.5],
+        }
+
+    def test_kb_chunking_seed_matches_contract(self):
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        assert kb["chunking"] == {
+            "page_max_chars": 1200,
+            "para_max_chars": 400,
+            "sentence_max_chars": 200,
+            "table_agg_rows": 10,
+        }
+
+    def test_kb_normalizer_seed_paddleocr_pinned(self):
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        assert kb["normalizer"] == {
+            "pdf_engine": "docling",
+            "ocr_enabled": True,
+            "ocr_engine": "paddleocr",
+        }
+
 
 class TestProductionFloor:
     async def test_production_l4_refuses_start_503001(self, tmp_path):

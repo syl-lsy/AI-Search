@@ -1,0 +1,133 @@
+"""kb 域路由（api.md §4.1~§4.5；M3/B17）。
+
+路由层零业务逻辑：校验（白名单枚举 400001）与依赖注入在本层，上传/收藏/列表/
+详情/删除全下沉 KbService；入库入队经 BackgroundTasks 调 `get_kb_pipeline` 缝。
+入队时序（评审 P1 钉正）：Starlette ≥1.10 事件序为 handler → background →
+get_db teardown——teardown commit 晚于 background，故上传路由在 add_task 前
+对落象行显式 commit（铁律 10 短事务例外口径），保证 worker 新 session 读到
+已提交行。
+
+投影纪律：路由以 `model_dump(mode="json", exclude_unset=True)` 出 JSON——
+source_url 等「可选键缺则省略」契约在序列化口径上落实（response_model 全量
+dump 会补 null 键，故不用）。
+"""
+from typing import Annotated, Any
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, UploadFile
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.dependencies import get_current_user, get_db
+from app.exception import BadRequestException
+from app.schemas.kb import KbDocumentListQuery, KbUrlCollectRequest
+from app.rag.pipeline import KbPipeline, _default_spec_payload, get_kb_pipeline
+from app.rag.service import KbService
+
+router = APIRouter(prefix="/api/v1", tags=["kb"])
+
+#: §4.3 过滤值域（镜像 db/models/kb.KbDocStatus 六态与 doc_type 五值——
+#: 旧 parsing/embedding 作废；api.md §4.3 v1.30）
+_STATUS_VALUES: frozenset[str] = frozenset(
+    {"pending", "normalizing", "chunking", "indexing", "ready", "failed"}
+)
+_DOC_TYPE_VALUES: frozenset[str] = frozenset({"pdf", "md", "txt", "docx", "url"})
+
+
+def get_kb_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> KbService:
+    """KB 服务依赖缝（单测经 dependency_overrides 替换；url_fetcher 一期缺省
+    None——collect_url 对未配置通道显式 422001，不静默）。spec 快照供给接
+    pipeline._default_spec_payload 同源：B15 SSRF 护栏据此读 Nacos spec
+    safety.url_guard（缺省 lambda:{} 会恒落 defaults 种子，单键热更回退门
+    失效——评审 P1 钉正；与 pipeline 自身装配 _default_spec_payload 同形态，
+    与 turn_service._capture_spec_payload 快照消费口径一致）。"""
+    return KbService(db, spec_payload_provider=_default_spec_payload)
+
+
+@router.post("/kb/documents", status_code=201)
+async def upload_document(
+    file: UploadFile,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbService, Depends(get_kb_service)],
+    pipeline: Annotated[KbPipeline, Depends(get_kb_pipeline)],
+    background_tasks: BackgroundTasks,
+    title: Annotated[str, Form()] = "",
+) -> dict[str, Any]:
+    """上传文档（§4.1）：multipart 落象 pending → BackgroundTasks 入库入队。"""
+    data = await file.read()
+    created = await service.upload_document(
+        data, file.filename or "", title or None, user_id=user_id
+    )
+    # 显式提交后才入队（评审 P1 时序钉正）：Starlette ≥1.10 事件序 handler →
+    # background → get_db teardown——teardown commit 晚于 background，行未提交
+    # 则 worker 新 session SELECT 读不到（process_document 判 "gone" 静默放弃，
+    # 文档永停 pending）；此处提交后 get_db teardown 二次 commit 为空操作。
+    await service.db.commit()
+    background_tasks.add_task(pipeline.enqueue, created.document_id)
+    return created.model_dump(mode="json", exclude_unset=True)
+
+
+@router.post("/kb/urls")
+async def collect_url(
+    body: KbUrlCollectRequest,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbService, Depends(get_kb_service)],
+) -> dict[str, Any]:
+    """URL 收藏（§4.2）：护栏 → 去重 → 抓取落象 pending。"""
+    collected = await service.collect_url(body.url, user_id=user_id)
+    return collected.model_dump(mode="json", exclude_unset=True)
+
+
+@router.get("/kb/documents")
+async def list_documents(
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbService, Depends(get_kb_service)],
+    status: str = "",
+    doc_type: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """文档列表（§4.3）：PageResponse 信封（total/items/page/page_size）；空串
+    =不过滤；旧枚举值（如 parsing）→ 400001（400）。"""
+    if status and status not in _STATUS_VALUES:
+        raise BadRequestException(
+            "status 取值非法", detail=f"status={status}（六态值域外）"
+        )
+    if doc_type and doc_type not in _DOC_TYPE_VALUES:
+        raise BadRequestException(
+            "doc_type 取值非法", detail=f"doc_type={doc_type}（五值值域外）"
+        )
+    query = KbDocumentListQuery(
+        limit=limit, offset=offset, status=status or None, doc_type=doc_type or None
+    )
+    page = await service.list_documents(query, user_id=user_id)
+    return {
+        "total": page.total,
+        "items": [
+            item.model_dump(mode="json", exclude_unset=True) for item in page.items
+        ],
+        "page": page.page,
+        "page_size": page.page_size,
+    }
+
+
+@router.get("/kb/documents/{document_id}")
+async def get_document(
+    document_id: str,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbService, Depends(get_kb_service)],
+) -> dict[str, Any]:
+    """文档详情（§4.4）：404001 不存在/越权/非法标识同语义。"""
+    doc = await service.get_document(document_id, user_id=user_id)
+    return doc.model_dump(mode="json", exclude_unset=True)
+
+
+@router.delete("/kb/documents/{document_id}")
+async def delete_document(
+    document_id: str,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbService, Depends(get_kb_service)],
+) -> dict[str, Any]:
+    """删除文档（§4.5）：行删级联 + MinIO 前缀清理 best-effort；200 {"deleted": true}。"""
+    result = await service.delete_document(document_id, user_id=user_id)
+    return result.model_dump(mode="json", exclude_unset=True)

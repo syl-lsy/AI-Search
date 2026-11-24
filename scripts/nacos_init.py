@@ -4,7 +4,8 @@
     向 Nacos 发布五个 dataId 的初值（键位与默认值【逐字】取自 docs/contract/nacos-config.md §1~§5，
     含 spec.routing 节、fast.max_answer_chars=3000、模型映射矩阵三键、anysearch/crawl4ai 备源条目、
     v1.18 搜索备位链（searxng=fallback_search 链首，anysearch 降 fallback_search_secondary 次级）、
-    kb 节 top_k_per_query/rerank_timeout_s）；本脚本不写入任何密钥——密钥绝不入 Nacos（ADR-005）。
+    kb 节 13 键（v1.43 M3 扩容，ocr_engine 初值钉 paddleocr = PRD v1.34 用户裁决））；
+    本脚本不写入任何密钥——密钥绝不入 Nacos（ADR-005）。
 
 用法（docs/contract/nacos-config.md §8 双账号口径——本脚本为【写操作】，用管理员凭据跑一次）：
     NACOS_INIT_USER=<管理员用户名> NACOS_INIT_PASS=<管理员密码> python3 scripts/nacos_init.py
@@ -173,7 +174,9 @@ MCP_CONFIG = {
 #    回落 defaults.py 种子=部署即启用）** / **v1.39：deep.llm_timeout_s 60→120
 #    （2026-11-21 用户裁决沉淀，与 Nacos 运行值对齐；fast 60 不动）** /
 #    **v1.40：deep.turn_timeout_s 300→600（2026-11-21 用户裁决；token_budget 500k
-#    不动，成本护栏独立于时间）**）
+#    不动，成本护栏独立于时间）** / **v1.43（M3）：kb 节 2→13 键扩容（ADR-017——
+#    漏斗四键+题型权重八值+chunk/chunking+normalizer+es 开关；ocr_engine 初值钉
+#    paddleocr = PRD v1.34 用户裁决，RapidOCR 留 validator 枚举 = M3+ 复核线）**）
 SPEC_CONFIG = {
     "schema_version": 1,
     "updated_at": _UPDATED_AT,
@@ -318,7 +321,46 @@ SPEC_CONFIG = {
             "max_scan_chars": 16000,
         },
     },
-    "kb": {"top_k_per_query": 8, "rerank_timeout_s": 2},
+    # §3 kb 节（v1.43 M3 混合检索扩容，ADR-017——13 键：现行两键保留〔top_k_per_query
+    # 弃用迁移沿 type_query_map 先例，批次 4 切 per_query_top_k 后可删〕+ 11 新键建议
+    # 值逐字取契约 §3 示例行，与 config_center/defaults.py 逐字一致（parity 测试锁死）。
+    # **ocr_engine 初值钉 "paddleocr"**——PRD v1.34 用户裁决（OQ-25 二选一落地）的
+    # 传导，契约 §3 示例行现写 rapidocr 属确认点②建议值（探针后钉一属实施序、非审批
+    # 面；RapidOCR 由 validator 枚举保留为合法值 = M3+ 重场景复核线）。es_enabled=false
+    # 灰度安全——pgvector 单通道 = 存量轮零行为变化，ES 通道启用前置 = 批次 3 B18。
+    "kb": {
+        "top_k_per_query": 8,
+        "rerank_timeout_s": 2,
+        "per_query_top_k": 30,
+        "rrf_k": 60,
+        "kb_fuse_top_k": 20,
+        "max_rerank_candidates": 30,
+        "dual_channel_timeout_s": 3,
+        "es_enabled": False,
+        "chunk_size": 800,
+        "chunk_overlap": 120,
+        "type_weights": {
+            "factoid": [0.7, 0.3],
+            "list": [0.5, 0.5],
+            "comparison": [0.5, 0.5],
+            "multi_facet": [0.3, 0.7],
+            "temporal": [0.5, 0.5],
+            "how_to": [0.4, 0.6],
+            "navigational": [0.8, 0.2],
+            "other": [0.5, 0.5],
+        },
+        "chunking": {
+            "page_max_chars": 1200,
+            "para_max_chars": 400,
+            "sentence_max_chars": 200,
+            "table_agg_rows": 10,
+        },
+        "normalizer": {
+            "pdf_engine": "docling",
+            "ocr_enabled": True,
+            "ocr_engine": "paddleocr",
+        },
+    },
     "history": {"window_turns": 6, "answer_head_chars": 200},
     "memory": {
         "inject_top_k": 5,

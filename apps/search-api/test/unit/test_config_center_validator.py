@@ -1580,3 +1580,361 @@ class TestContentGuardSpecRules:
             assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), (
                 field
             )
+
+
+class TestKbSpecRules:
+    """§3 kb 节（v1.43 M3 混合检索扩容，ADR-017）校验面——键缺失合法（extra=allow
+    灰度安全，键在场时范围/形态越界拒收）；漏斗范围按契约「已批准建议范围」条款，
+    rrf_k/dual_channel_timeout_s/max_rerank_candidates/chunking 的上界为实现侧合理
+    范围（契约未钉上界），ocr_engine 枚举保留 rapidocr（PRD v1.34 钉 paddleocr 初值，
+    M3+ 重场景复核线）。"""
+
+    # ---- 缺失与灰度兼容面 ----
+
+    def test_kb_section_missing_allowed(self):
+        """kb 节缺失 = 合法（组装层回落代码内置默认并告警，§3 各节惯例）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p.pop("kb"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_kb_legacy_two_key_form_accepted(self):
+        """存量 Nacos 运行值 = 旧 2 键形态（v1.43 前）——新键缺失合法回落代码缺省，
+        热更兼容零拒收（灰度安全）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p.update(
+                {"kb": {"top_k_per_query": 8, "rerank_timeout_s": 2}}
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_kb_unknown_key_accepted_extra_allow(self):
+        """kb 节内未知键不拒收（extra=allow 热更兼容优先——本文件容错口径）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["kb"].update({"future_key": 1}))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_defaults_seed_kb_section_validates(self):
+        """L4 种子（13 键含 paddleocr 初值）自合法通过整份校验。"""
+        assert BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]["normalizer"]["ocr_engine"] == (
+            "paddleocr"
+        )
+        assert validate_asset(SPEC_DATA_ID, copy.deepcopy(BUILTIN_DEFAULTS[SPEC_DATA_ID])) == (
+            BUILTIN_DEFAULTS[SPEC_DATA_ID]
+        )
+
+    def test_kb_full_form_boundary_values_accepted(self):
+        """11 新键全量在场 + 各范围边界值全部合法。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: p.update(
+                {
+                    "kb": {
+                        "top_k_per_query": 8,
+                        "rerank_timeout_s": 2,
+                        "per_query_top_k": 100,
+                        "rrf_k": 10000,
+                        "kb_fuse_top_k": 50,
+                        "max_rerank_candidates": 1000,
+                        "dual_channel_timeout_s": 60,
+                        "es_enabled": True,
+                        "chunk_size": 100000,
+                        "chunk_overlap": 0,
+                        "type_weights": {
+                            "factoid": [0, 0],
+                            "list": [1, 2],
+                            "comparison": [0.5, 0.5],
+                            "multi_facet": [0.3, 0.7],
+                            "temporal": [0.5, 0.5],
+                            "how_to": [0.4, 0.6],
+                            "navigational": [0.8, 0.2],
+                            "other": [0.5, 0.5],
+                        },
+                        "chunking": {
+                            "page_max_chars": 100000,
+                            "para_max_chars": 50000,
+                            "sentence_max_chars": 20000,
+                            "table_agg_rows": 10000,
+                        },
+                        "normalizer": {
+                            "pdf_engine": "docling",
+                            "ocr_enabled": False,
+                            "ocr_engine": "rapidocr",
+                        },
+                    }
+                }
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    # ---- 漏斗键范围 ----
+
+    @pytest.mark.parametrize(
+        ("key", "value", "legal"),
+        [
+            ("per_query_top_k", 0, False),
+            ("per_query_top_k", 101, False),
+            ("per_query_top_k", 1, True),
+            ("per_query_top_k", 100, True),
+            ("rrf_k", 0, False),
+            ("rrf_k", 10001, False),
+            ("rrf_k", 1, True),
+            ("kb_fuse_top_k", 0, False),
+            ("kb_fuse_top_k", 51, False),
+            ("kb_fuse_top_k", 50, True),
+            ("max_rerank_candidates", 0, False),
+            ("max_rerank_candidates", 1001, False),
+            ("max_rerank_candidates", 1000, True),
+            ("dual_channel_timeout_s", 0, False),
+            ("dual_channel_timeout_s", 61, False),
+            ("dual_channel_timeout_s", 60, True),
+        ],
+    )
+    def test_funnel_key_bounds(self, key, value, legal):
+        # 先垫高 rerank 候选基数，防 kb_fuse_top_k 大值用例误触契约交叉约束
+        # （max_rerank_candidates ≥ kb_fuse_top_k 本身由专用用例单测）；k 重复键
+        # 字面量后者胜出——max_rerank_candidates 自身的边界用例不受垫高影响。
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, k=key, v=value: p["kb"].update({"max_rerank_candidates": 1000, k: v}),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("value", [None, [30], "abc", True, 3.5])
+    def test_funnel_key_non_integer_rejected(self, value):
+        """漏斗键须为整数：显式 null/数组/非数字串/布尔/带小数形态拒收（数字串与
+        整值 float 的 lax 放行与既有 FastSpec int 字段同惯例——值等价无漂移面）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, v=value: p["kb"].update({"per_query_top_k": v})
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("candidates", "fuse", "legal"),
+        [(29, 30, False), (30, 30, True), (31, 30, True)],
+    )
+    def test_max_rerank_candidates_cross_key(self, candidates, fuse, legal):
+        """§3 v1.43：max_rerank_candidates ≥ kb_fuse_top_k（两口径显式区分不混用——
+        rerank 调用基数不得小于 KB 份额上界）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, c=candidates, f=fuse: p["kb"].update(
+                {"max_rerank_candidates": c, "kb_fuse_top_k": f}
+            ),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError, match="max_rerank_candidates"):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    # ---- 严格布尔（kill switch 防形态漂移，safety 子节同款） ----
+
+    @pytest.mark.parametrize("value", ["false", "0", 1, None])
+    def test_es_enabled_non_bool_rejected(self, value):
+        payload = _mutated(SPEC_DATA_ID, lambda p, v=value: p["kb"].update({"es_enabled": v}))
+        with pytest.raises(AssetValidationError, match="布尔"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("value", ["true", 0, None])
+    def test_ocr_enabled_non_bool_rejected(self, value):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, v=value: p["kb"]["normalizer"].update({"ocr_enabled": v})
+        )
+        with pytest.raises(AssetValidationError, match="布尔"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_es_and_ocr_enabled_bool_accepted(self, value):
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, v=value: (
+                p["kb"].update({"es_enabled": v}),
+                p["kb"]["normalizer"].update({"ocr_enabled": v}),
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    # ---- 引擎枚举 ----
+
+    @pytest.mark.parametrize(
+        ("field", "value", "legal"),
+        [
+            ("pdf_engine", "markitdown", True),
+            ("pdf_engine", "docling", True),
+            ("pdf_engine", "paddleocr", False),  # OCR 引擎不是 pdf 引擎（枚举外拒收）
+            ("pdf_engine", "mineru", False),  # AGPL 除名面（OQ-25）枚举外拒收
+            ("pdf_engine", "", False),
+            ("ocr_engine", "paddleocr", True),
+            ("ocr_engine", "rapidocr", True),  # M3+ 重场景复核线保留合法
+            ("ocr_engine", "docling", False),
+            ("ocr_engine", "", False),
+        ],
+    )
+    def test_engine_enums(self, field, value, legal):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, f=field, v=value: p["kb"]["normalizer"].update({f: v})
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    # ---- type_weights（8 值键全覆盖 × 每键恰两数字 ≥0） ----
+
+    def _kb_with_type_weights(self, mutate):
+        def _apply(payload):
+            weights = {
+                "factoid": [0.7, 0.3], "list": [0.5, 0.5], "comparison": [0.5, 0.5],
+                "multi_facet": [0.3, 0.7], "temporal": [0.5, 0.5], "how_to": [0.4, 0.6],
+                "navigational": [0.8, 0.2], "other": [0.5, 0.5],
+            }
+            payload["kb"]["type_weights"] = weights
+            mutate(payload, weights)
+
+        payload = _mutated(SPEC_DATA_ID, _apply)
+        return payload
+
+    def test_type_weights_full_eight_keys_accepted(self):
+        payload = self._kb_with_type_weights(lambda p, w: None)
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    @pytest.mark.parametrize("dropped", ["factoid", "navigational", "other"])
+    def test_type_weights_missing_key_rejected(self, dropped):
+        """8 值键全覆盖：缺任一键拒收（含 deep.planner 7 值子集场景——漏
+        navigational 不落死键是消费面兼容语义，发布面仍须 8 键齐全）。"""
+        def _drop(payload, _w):
+            payload["kb"]["type_weights"].pop(dropped)
+
+        payload = self._kb_with_type_weights(_drop)
+        with pytest.raises(AssetValidationError, match="type_weights"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_type_weights_unknown_key_rejected(self):
+        """键域 = 8 值枚举：未知键拒收。"""
+        def _add(payload, _w):
+            payload["kb"]["type_weights"]["opinion"] = [0.5, 0.5]
+
+        payload = self._kb_with_type_weights(_add)
+        with pytest.raises(AssetValidationError, match="type_weights"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("pair", [[0.5], [0.5, 0.5, 0.5], "0.5", 0.5])
+    def test_type_weights_pair_must_be_exactly_two_numbers(self, pair):
+        def _set(payload, _w):
+            payload["kb"]["type_weights"]["factoid"] = pair
+
+        payload = self._kb_with_type_weights(_set)
+        with pytest.raises(AssetValidationError, match="type_weights"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("weight", ["0.5", None, True, -0.1])
+    def test_type_weights_weight_must_be_non_negative_number(self, weight):
+        """权重须为 number ≥0（字符串/null/布尔/负数形态拒收——布尔是 int 子类须显式排除）。"""
+        def _set(payload, _w):
+            payload["kb"]["type_weights"]["factoid"] = [weight, 0.5]
+
+        payload = self._kb_with_type_weights(_set)
+        with pytest.raises(AssetValidationError, match="type_weights"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_type_weights_non_object_rejected(self):
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["kb"].update({"type_weights": [1, 2]}))
+        with pytest.raises(AssetValidationError, match="type_weights"):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    def test_type_weights_missing_allowed(self):
+        """type_weights 整键缺失合法（消费面按兜底行兼容，灰度安全）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["kb"].pop("type_weights"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    # ---- chunk 参数与 chunking 上限 ----
+
+    @pytest.mark.parametrize(
+        ("size", "overlap", "legal"),
+        [(119, 120, False), (120, 120, True), (121, 120, True), (800, 0, True)],
+    )
+    def test_chunk_size_overlap_cross_key(self, size, overlap, legal):
+        """§3 v1.43：chunk_size ≥ chunk_overlap ≥ 0（等值合法——契约口径；.env 侧
+        KB_ 组「overlap < size」为代码内置默认来源的更严实现面，两平面各自钉定）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, s=size, o=overlap: p["kb"].update({"chunk_size": s, "chunk_overlap": o}),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError, match="chunk"):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("chunk_size", 0), ("chunk_size", 100001), ("chunk_overlap", -1), ("chunk_overlap", 100001)],
+    )
+    def test_chunk_param_bounds_rejected(self, field, value):
+        payload = _mutated(SPEC_DATA_ID, lambda p, f=field, v=value: p["kb"].update({f: v}))
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "legal"),
+        [
+            ("page_max_chars", 0, False),
+            ("page_max_chars", 100001, False),
+            ("page_max_chars", 100000, True),
+            ("para_max_chars", 50001, False),
+            ("para_max_chars", 50000, True),
+            ("sentence_max_chars", 20001, False),
+            ("sentence_max_chars", 20000, True),
+            ("table_agg_rows", 0, False),
+            ("table_agg_rows", 10001, False),
+            ("table_agg_rows", 10000, True),
+        ],
+    )
+    def test_chunking_bounds(self, field, value, legal):
+        """chunking 逐级切分上限：正整数 + 实现侧上界（契约仅钉各值 >0——上界为
+        合理范围授权下的实现侧补齐，挡垃圾热更值）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, f=field, v=value: p["kb"]["chunking"].update({f: v}),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    def test_chunking_partial_keys_accepted(self):
+        """chunking 部分键在场合法（缺键回落代码缺省）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p: p["kb"].update({"chunking": {"page_max_chars": 1200}})
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_chunking_and_normalizer_sections_missing_allowed(self):
+        """chunking / normalizer 子节缺失合法（None；消费面回落代码缺省）。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p: (
+                p["kb"].pop("chunking"),
+                p["kb"].pop("normalizer"),
+            ),
+        )
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_kb_seed_field_names_avoid_secret_sniff(self):
+        """命名纪律（§2 嗅探联动）：kb 节键名零敏感字段名（key/secret/token/password）。"""
+        kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
+        for field in kb:
+            assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), (
+                field
+            )
+        for section in ("type_weights", "chunking", "normalizer"):
+            for field in kb[section]:
+                assert not re.search(
+                    r"key|secret|token|password", field, re.IGNORECASE
+                ), field

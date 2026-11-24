@@ -990,10 +990,213 @@ class SafetySpec(BaseModel):
         return value
 
 
-class KbSpec(BaseModel):
+# ---- §3 kb（v1.43 M3 混合检索扩容，ADR-017；校验规则条款 = nacos-config.md §3「校验
+# ---- 规则（v1.43 增）」）----
+
+#: 漏斗键建议范围（契约「已批准建议范围」条款钉定）：per_query_top_k 1~100 /
+#: kb_fuse_top_k 1~50；rrf_k 契约仅钉 ≥1（上界为实现侧合理范围补齐——挡垃圾热更值）；
+#: max_rerank_candidates 契约钉「≥ kb_fuse_top_k」交叉约束（两口径显式区分不混用——
+#: KB 份额 vs rerank 调用基数），上界为实现侧合理范围；dual_channel_timeout_s 契约
+#: 未钉范围（建议值 3 = PRD 5.1「双通道合计 ≤3s」口径），1~60 为实现侧合理范围。
+KB_RRF_K_MAX = 10000
+KB_MAX_RERANK_CANDIDATES_MAX = 1000
+KB_DUAL_CHANNEL_TIMEOUT_MAX = 60
+
+#: chunk 参数上界（契约钉 chunk_size ≥ chunk_overlap ≥ 0——chunk_overlap=0 合法；
+#: 上界为实现侧合理范围）。.env 侧 KB_ 组（core/config.py KbSettings）「overlap < size」
+#: 为代码内置默认来源的更严实现面，两平面各自钉定互不牵连。
+KB_CHUNK_SIZE_MAX = 100000
+
+#: chunking 逐级切分上限（契约仅钉「各值 >0」——正整数 + 实现侧上界为合理范围授权
+#: 下的补齐）：页面 ≥ 段落 ≥ 句子的量级关系由建议值（1200/400/200）承载，逐级
+#: 不做跨键强制（大文档场景存在非严格递减的合法配置）。
+KB_CHUNKING_MAX: dict[str, int] = {
+    "page_max_chars": 100000,
+    "para_max_chars": 50000,
+    "sentence_max_chars": 20000,
+    "table_agg_rows": 10000,
+}
+
+#: 归一化引擎枚举（合法域以下方 KbNormalizerSpec 的 Literal 内联钉定，与全文件
+#: McpRole/SafetySpec.mode 同惯例；此处仅注释锚点）：pdf_engine ∈ {markitdown,
+#: docling}（契约钉定，枚举外拒收——MinerU/UnstructuredIO 除名理由在案 OQ-25）；
+#: ocr_engine ∈ {paddleocr, rapidocr}：**初值钉 paddleocr = PRD v1.34 用户裁决**
+#: （OQ-25 二选一落地），rapidocr 保留合法 = M3+ 重场景复核线（契约 §3 示例行现写
+#: rapidocr 属确认点②建议值、探针后钉一属实施序——文档侧钉正注由文档巡检线落，
+#: 本文件只管枚举合法域）。
+
+#: KbSpec 整数键清单（形态闸面——显式 null 与布尔形态拒收：「缺省请删键」，防热更
+#: null 语义歧义与 pydantic lax bool→int coerce）
+_KB_INT_KEYS: tuple[str, ...] = (
+    "top_k_per_query",
+    "rerank_timeout_s",
+    "per_query_top_k",
+    "rrf_k",
+    "kb_fuse_top_k",
+    "max_rerank_candidates",
+    "dual_channel_timeout_s",
+    "chunk_size",
+    "chunk_overlap",
+)
+
+
+def _reject_non_int_forms(value: Any, keys: tuple[str, ...], label: str) -> Any:
+    """整数键形态闸（mode="before" 共用）：显式 null 与布尔形态拒收——JSON null 与
+    「键缺失」语义分离（缺失=合法回落代码缺省，在场 null=形态违规拒收）；pydantic
+    v2 lax 会把 True coerce 成 1（实测），布尔须在发布口显式排除（严格布尔纪律的
+    整数侧同款）。"""
+    if isinstance(value, Mapping):
+        for key in keys:
+            if key in value:
+                gate_value = value[key]
+                if gate_value is None:
+                    raise ValueError(
+                        f"{label}{key}：不得为 null（缺省请删键——回落代码内置默认）"
+                    )
+                if isinstance(gate_value, bool):
+                    raise ValueError(f"{label}{key}：须为整数（布尔形态拒收）")
+    return value
+
+
+class KbChunkingSpec(BaseModel):
+    """§3 kb.chunking 逐级切分上限（页面→段落→句子逐级降级 + 表格行聚合阈值）。
+
+    子节缺失=合法（None）；部分键在场合法（缺键回落代码缺省）；各值正整数 + 上界
+    （KB_CHUNKING_MAX，实现侧合理范围）；显式 null 拒收。
+    """
+
     model_config = ConfigDict(extra="allow")
+    page_max_chars: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["page_max_chars"])
+    para_max_chars: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["para_max_chars"])
+    sentence_max_chars: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["sentence_max_chars"])
+    table_agg_rows: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["table_agg_rows"])
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_values(cls, value: Any) -> Any:
+        return _reject_non_int_forms(value, tuple(KB_CHUNKING_MAX), "kb.chunking.")
+
+
+class KbNormalizerSpec(BaseModel):
+    """§3 kb.normalizer 归一化组件路由（格式路由 + OCR 开关）。
+
+    pdf_engine Literal 枚举（KB_PDF_ENGINES）；ocr_enabled 严格布尔（kill switch 防
+    "true"/1 形态漂移，safety 子节同款双防线之一）；ocr_engine Literal 枚举
+    （KB_OCR_ENGINES——paddleocr 初值 / rapidocr 复核线保留合法）。子节缺失=合法。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    pdf_engine: Literal["markitdown", "docling"] | None = None
+    ocr_enabled: bool | None = None
+    ocr_engine: Literal["paddleocr", "rapidocr"] | None = None
+
+    @field_validator("ocr_enabled", mode="before")
+    @classmethod
+    def _check_ocr_enabled_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+
+class KbSpec(BaseModel):
+    """§3 kb 节（v1.43 M3 混合检索扩容，ADR-017）。
+
+    13 键：现行两键保留（top_k_per_query 弃用迁移沿 type_query_map 先例——告警 +
+    批次 4 切 per_query_top_k 后可删）+ 11 新键全部 Optional（**键缺失合法回落代码
+    缺省并告警，extra=allow 灰度安全**——契约校验规则条款；存量 Nacos 运行值 = 旧
+    2 键形态必须继续通过校验）。键在场时范围/形态越界拒收：
+    - 漏斗键正整数 + 范围（契约「已批准建议范围」+ 实现侧上界，见 KB_* 常量注）；
+    - max_rerank_candidates ≥ kb_fuse_top_k（契约交叉约束）；
+    - es_enabled / ocr_enabled 严格布尔（kill switch 防形态漂移）；
+    - pdf_engine / ocr_engine 枚举（枚举外拒收）；
+    - type_weights 8 值键全覆盖（QUERY_TYPES 同源）且各 [bm25_w, vec_w] 恰两数字 ≥0；
+    - chunk_size ≥ chunk_overlap ≥ 0（契约）；chunking 各值正整数 + 上界。
+    键名严禁含 key/secret/token/password（撞 §2 密钥嗅探）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    # 现行两键（M1/M2 口径保留不动）
     top_k_per_query: int = Field(ge=1)
     rerank_timeout_s: int = Field(ge=1)
+    # 检索漏斗键组（§3 v1.43）
+    per_query_top_k: int | None = Field(default=None, ge=1, le=100)
+    rrf_k: int | None = Field(default=None, ge=1, le=KB_RRF_K_MAX)
+    kb_fuse_top_k: int | None = Field(default=None, ge=1, le=50)
+    max_rerank_candidates: int | None = Field(default=None, ge=1, le=KB_MAX_RERANK_CANDIDATES_MAX)
+    dual_channel_timeout_s: int | None = Field(default=None, ge=1, le=KB_DUAL_CHANNEL_TIMEOUT_MAX)
+    #: ES 通道总开关/回退门（false=pgvector 单通道降级，灰度安全缺省）
+    es_enabled: bool | None = None
+    # chunk 参数（热更面收敛本节，.env KB_ 值降为代码内置默认来源）
+    chunk_size: int | None = Field(default=None, ge=1, le=KB_CHUNK_SIZE_MAX)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=KB_CHUNK_SIZE_MAX)
+    # 题型权重映射 / chunking 上限 / 归一化路由
+    type_weights: dict[str, list[float]] | None = None
+    chunking: KbChunkingSpec | None = None
+    normalizer: KbNormalizerSpec | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_non_int_forms_gate(cls, value: Any) -> Any:
+        return _reject_non_int_forms(value, _KB_INT_KEYS, "kb.")
+
+    @field_validator("es_enabled", mode="before")
+    @classmethod
+    def _check_es_enabled_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+    @field_validator("type_weights", mode="before")
+    @classmethod
+    def _check_type_weights(cls, value: Any) -> Any:
+        """题型权重映射（§3 v1.43：8 值键全覆盖 + 各 [bm25_w, vec_w] 恰两数字 ≥0）。
+
+        键域 = QUERY_TYPES 8 值枚举同源（type_query_map 覆盖校验同一常量——单一
+        事实源）；缺任一键/未知键/非两元/含非数字（布尔显式排除——bool 是 int 子类）/
+        负数 → 拒收。整键缺失合法（消费面按兜底行兼容，灰度安全）。
+        """
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError(
+                "kb.type_weights 须为 JSON 对象（query_type → [bm25_w, vec_w]）"
+            )
+        keys = set(value.keys())
+        missing = [t for t in QUERY_TYPES if t not in keys]
+        if missing:
+            raise ValueError(f"kb.type_weights 须覆盖 8 值枚举，缺 {missing}")
+        unknown = sorted(keys - set(QUERY_TYPES))
+        if unknown:
+            raise ValueError(f"kb.type_weights 键域为 8 值枚举，未知键 {unknown}")
+        for weight_key, pair in value.items():
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(
+                    f"kb.type_weights.{weight_key}：须恰为两个数字 [bm25_w, vec_w]"
+                )
+            for weight in pair:
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                    raise ValueError(
+                        f"kb.type_weights.{weight_key}：权重须为数字（字符串/null/布尔形态拒收）"
+                    )
+                if weight < 0:
+                    raise ValueError(f"kb.type_weights.{weight_key}：权重须 ≥ 0")
+        return value
+
+    @model_validator(mode="after")
+    def _check_kb_cross_keys(self) -> "KbSpec":
+        """契约交叉约束（两键均在场才判——缺失侧回落代码缺省，无交叉可言）。"""
+        if (
+            self.max_rerank_candidates is not None
+            and self.kb_fuse_top_k is not None
+            and self.max_rerank_candidates < self.kb_fuse_top_k
+        ):
+            raise ValueError(
+                "kb 要求 max_rerank_candidates ≥ kb_fuse_top_k"
+                "（rerank 调用基数上界不得小于 KB 份额上界）"
+            )
+        if (
+            self.chunk_size is not None
+            and self.chunk_overlap is not None
+            and self.chunk_overlap > self.chunk_size
+        ):
+            raise ValueError("kb 要求 chunk_size ≥ chunk_overlap ≥ 0")
+        return self
 
 
 class HistorySpec(BaseModel):

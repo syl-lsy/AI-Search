@@ -17,6 +17,11 @@ from app.exception.conflict import (
 from app.exception.database import DatabaseException
 from app.exception.export import ExportNotAvailableException
 from app.exception.feedback import FeedbackTurnNotFoundException
+from app.exception.kb import (
+    FileTooLargeException,
+    FileUnsupportedTypeException,
+    KbUrlInvalidException,
+)
 from app.exception.not_found import NotFoundException
 from app.exception.snapshot import SnapshotNotFoundException
 
@@ -44,6 +49,12 @@ ERROR_MAP: dict[type, tuple[str, int, str]] = {
     # 终态 / 零来源 / deep 轮 / 进行中重复点击——沿 409005 独立码先例不拆码）
     TurnNotRegenerableException: ("409006", 409, "轮次不支持重新生成"),
     ConfigCenterException: ("503001", 503, "配置中心不可达且无缓存"),
+    # KB 上传面（api.md §0 v1.30 M3 三码——§4.1 :527 / §4.2 :555）：
+    # 413001 大小上限（KB_MAX_FILE_MB）/ 415001 类型白名单外（音视频同码，message
+    # 提示「暂不支持」由异常方携带）/ 422001 URL 非法（scheme/解析/SSRF 拒收）
+    FileTooLargeException: ("413001", 413, "文件超过大小上限"),
+    FileUnsupportedTypeException: ("415001", 415, "不支持的文件类型"),
+    KbUrlInvalidException: ("422001", 422, "URL 非法"),
     Exception: ("500001", 500, "服务器内部错误"),
 }
 

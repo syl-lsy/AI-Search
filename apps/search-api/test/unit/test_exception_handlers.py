@@ -529,7 +529,12 @@ def test_generate_error_docs_lists_contract_codes_and_hides_fallback():
     assert "| 409001 | 409 | 线程已有进行中轮次 |" in docs
     assert "| 409002 | 409 | 轮次已处于终态，不可取消 |" in docs
     assert "| 500001 | 500 | 内部错误 |" in docs  # DatabaseException 注册 500001 后进文档
-    assert "422001" not in docs  # 422001 让位给「URL 非法」（api.md 46 行，M3 口径，本批不实现）
+    # M3/B17 起 KB 三码进契约表（api.md §0 :45-47；422001 由旧「数据库故障」占用
+    # 正式让位给「URL 非法」——ERROR_MAP 唯一定义处 handler/errors.py 与本断言同源；
+    # DB 侧不再占用 422001 由上方 500001 正向断言 + MRO 精确命中单测共同锁定）
+    assert "| 413001 | 413 | 文件超过大小上限 |" in docs
+    assert "| 415001 | 415 | 不支持的文件类型 |" in docs
+    assert "| 422001 | 422 | URL 非法 |" in docs
     assert "服务器内部错误" not in docs  # Exception 兜底行仍不进文档（客户端无需区分内部成因）
 
 

@@ -5,11 +5,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from starlette.exceptions import HTTPException
 
 from app.agent.tools.registry import get_tools_registry, start_tools_registry
-from app.api.v1 import artifacts, models, sources, threads, turns
+from app.api.v1 import artifacts, kb, models, sources, threads, turns
 from app.api.v1.health import router as health_router
 from app.config_center import start_asset_center
 from app.core.config import common_settings, nacos_settings
@@ -17,10 +17,11 @@ from app.core.logger import CronLog, setup_logging
 from app.core.middleware import register_middleware
 from app.core.openapi import setup_openapi
 from app.crons import CRON_TASKS, CronTask
-from app.db.models import Turn
+from app.db.models import KbDocument, KbImportJob, Turn
 from app.db.session import get_session_factory
 from app.exception import BusinessException
 from app.exception.handler import exception_handler, generate_error_docs
+from app.rag.pipeline import get_kb_pipeline
 from app.services.event_bus import start_event_bus
 from app.services.turn_service import seed_seq_from_db, start_thread_scheduler
 
@@ -86,6 +87,48 @@ async def _cleanup_orphan_turns() -> int:
         return len(orphans)
 
 
+# ---- 启动钩子：KB 队列重入队（data-model.md §4 :608；M3/B16 seam）----
+
+# 重入队状态集（data-model.md §4 :608 逐字）：kb_documents 六态中四个中间态 +
+# pending（ready/failed 终态不入列）；kb_import_jobs 四态中 pending/running
+# （pending=已建未启动的任务行也须恢复——§1.17）。与状态机扩容同批钉死
+# （api.md §4.1 v1.30「pending + normalizing/chunking/indexing」同源，旧 parsing
+# 作废）——漏改本列表则中间态文档重启静默卡死（契约注；常量逐字断言单测锁死，
+# test_main.py::test_kb_requeue_status_constants_match_contract）。
+_KB_REQUEUE_STATUSES: tuple[str, ...] = (
+    "pending",
+    "normalizing",
+    "chunking",
+    "indexing",
+)
+_KB_JOB_REQUEUE_STATUSES: tuple[str, ...] = ("pending", "running")
+
+
+async def _requeue_kb_work() -> tuple[int, int]:
+    """KB 队列重入队启动钩子（M3/B16 seam）：中间态文档与未完任务行计数登记。
+
+    进程内流水线队列（KB 入库）与飞书导入任务队列无持久化、重启即失——启动时
+    按 data-model.md §4 查询应重入队行数。真队列消费：KB 入库 worker 已于本
+    lifespan 下行接线（B17，get_kb_pipeline().start() 内部经 repo.list_requeue_ids
+    消费文档登记行）；飞书导入任务行归 B20。本钩子做「查询计数 + 日志登记」：
+    两个只读计数查询、零状态变更、零 commit（幂等可重入）。
+    独立 AsyncSession 自管（同 _cleanup_orphan_turns 短事务口径）；失败由
+    lifespan 捕获记日志、不阻塞启动（恢复型 best-effort）。
+    """
+    async with get_session_factory()() as session:
+        doc_count = await session.scalar(
+            select(func.count())
+            .select_from(KbDocument)
+            .where(KbDocument.status.in_(_KB_REQUEUE_STATUSES))
+        )
+        job_count = await session.scalar(
+            select(func.count())
+            .select_from(KbImportJob)
+            .where(KbImportJob.status.in_(_KB_JOB_REQUEUE_STATUSES))
+        )
+        return int(doc_count or 0), int(job_count or 0)
+
+
 # ---- 周期任务注册（app/crons/ 注册表 → 进程内 asyncio 周期任务，ADR-001/010）----
 
 
@@ -134,17 +177,23 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
       EventBus 计数器——不种入则新轮 seq 与持久化历史撞 uq(thread_id, seq)；
     - 孤儿轮清理：running/queued 置 failed（error=进程重启），见 _cleanup_orphan_turns；
       失败记日志不阻塞启动（恢复型 best-effort，幂等可重入、下次重启补做）；
+    - KB 队列重入队 + 入库 worker 接线（M3/B16 seam + B17 消费端，data-model.md
+      §4 :608）：kb_documents status IN (pending,normalizing,chunking,indexing) 与
+      kb_import_jobs status IN (pending,running) 只读计数登记（进程内队列无持久化，
+      重启即恢复处理；旧 parsing 值随六态扩容作废，IN 列表与状态机同批钉死、
+      常量逐字断言单测锁死）；随后 get_kb_pipeline().start() 消费登记行
+      （repo.list_requeue_ids → 队列）并 spawn worker 池——api.md §4.1「入队 →
+      ready」主链路的生产消费端。两步均失败记日志不阻塞启动（恢复型 best-effort，
+      登记行下次重启重入队承接）；
     - 默认用户 seed：不在钩子做——迁移 0001 幂等 seed 承担（app/db/seed.py，
-      data-model.md §1.1/§4；钩子不重复承担 seed 职责）；
-    - KB 队列恢复（M3/B5 落地锚点，data-model.md §4）：进程启动时将
-      status IN (pending,parsing,embedding) 的 kb_documents 重新入队（进程内队列
-      无持久化，重启即恢复处理）——随 0003 迁移与 kb_service 队列一并接线。
+      data-model.md §1.1/§4；钩子不重复承担 seed 职责）。
 
     基础设施启动失败（资产中心/EventBus/调度器/seq 种入）不静默吞掉：原样上抛
     令应用启动失败退出（503001 拒启动语义保持；部分启动的组件由嵌套 finally
     逆序收口，不泄漏客户端）。周期任务注册：CRON_TASKS → 进程内 asyncio 周期
     任务（非 LangGraph Agent Server cron，本项目无 Agent Server，ADR-001/010）。
-    停机逆序：cron 逐个 cancel + gather 收口 → EventBus.close → 资产中心.close。
+    停机逆序：cron 逐个 cancel + gather 收口 → KB 入库 worker.stop（队列内残留由
+    下次启动重入队承接）→ EventBus.close → 资产中心.close。
     """
     _silence_uvicorn_loggers()
 
@@ -174,7 +223,36 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                         total=cleaned,
                     ).info()
 
-            # KB 队列恢复（M3/B5 落地，锚点见 docstring）：kb_documents 过期态重新入队。
+            # KB 队列重入队（M3/B16 seam）：中间态文档与未完任务行计数登记，
+            # 文档登记行由下行 KB 入库 worker（B17）start() 消费、任务行归 B20
+            # ——失败不阻塞启动（best-effort 同上口径）
+            try:
+                kb_docs, kb_jobs = await _requeue_kb_work()
+            except Exception as exc:
+                CronLog(
+                    message="启动钩子 KB 队列重入队失败——本次跳过，下次重启补做",
+                    task="startup_hook",
+                ).error(exc)
+            else:
+                CronLog(
+                    message=(
+                        "启动钩子 KB 队列重入队登记："
+                        f"{kb_docs} 条中间态文档 / {kb_jobs} 条未完任务行待 worker 消费"
+                    ),
+                    task="startup_hook",
+                    total=kb_docs + kb_jobs,
+                ).info()
+
+            # KB 入库 worker 接线（M3/B17）：消费上行登记行（start() 内部
+            # list_requeue_ids → 队列）并 spawn worker 池；失败不阻塞启动
+            # （best-effort 同上两钩子口径，登记行下次重启重入队承接）
+            try:
+                await get_kb_pipeline().start()
+            except Exception as exc:
+                CronLog(
+                    message="KB 入库 worker 启动失败——登记行下次重启重入队承接",
+                    task="startup_hook",
+                ).error(exc)
 
             cron_handles = _register_cron_tasks()
             try:
@@ -183,6 +261,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 for handle in cron_handles:
                     handle.cancel()
                 await asyncio.gather(*cron_handles, return_exceptions=True)
+                await get_kb_pipeline().stop()
         finally:
             await bus.close()
     finally:
@@ -231,11 +310,13 @@ app.add_exception_handler(Exception, exception_handler)
 # /health/ready 就绪（四组件并行探活，实现在 app/api/v1/health.py）。
 app.include_router(health_router)
 
-# REST 路由（api.md §2/§3/§5，B2 工单 + M2 批次 4 §5 增量）：threads / turns /
-# models / artifacts / sources——prefix=/api/v1 在各 router 模块内声明（/api/ 前缀
-# 触发成功信封包装，core/middleware/response.py；artifacts 下载自设 is_stream 逃逸）。
+# REST 路由（api.md §2/§3/§4/§5，B2 工单 + M2 批次 4 §5 增量 + M3 B17 §4 增量）：
+# threads / turns / models / artifacts / sources / kb——prefix=/api/v1 在各 router
+# 模块内声明（/api/ 前缀触发成功信封包装，core/middleware/response.py；artifacts
+# 下载自设 is_stream 逃逸）。
 app.include_router(threads.router)
 app.include_router(turns.router)
 app.include_router(models.router)
 app.include_router(artifacts.router)
 app.include_router(sources.router)
+app.include_router(kb.router)

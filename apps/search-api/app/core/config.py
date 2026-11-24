@@ -227,6 +227,10 @@ class KbSettings(BaseSettingsWithEnv):
     chunk_size: int = Field(default=800, ge=1)
     chunk_overlap: int = Field(default=120, ge=0)
     top_k_per_query: int = Field(default=8, ge=1)
+    # pdf 书签大纲层级校正总开关（.env 档：改需重启；非 Nacos 键、零契约变更）。
+    # true=装配前用书签钉正 heading 层级并写 parse_meta.heading_outline；
+    # false=完全等价旧管线（跳过书签校正与序列清洗、不写该 parse_meta 键）——回退门。
+    pdf_outline_correction: bool = True
     model_config = {"env_prefix": "KB_"}
 
     @field_validator("allowed_types", mode="before")

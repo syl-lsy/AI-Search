@@ -1,4 +1,4 @@
-"""unit 层：main.py lifespan 收口（启动钩子孤儿轮清理 + 周期任务注册/优雅取消）。
+"""unit 层：main.py lifespan 收口（启动钩子孤儿轮清理 + KB 队列重入队 + 周期任务注册/优雅取消）。
 
 覆盖点（data-model.md §4 启动钩子 / api.md §7.3 第 4 条 / ARCH §3.1 main.py 注）：
 - 孤儿轮清理（启动钩子一次性）：running/queued → failed（error=进程重启语义），用
@@ -6,6 +6,10 @@
   （lifespan 无请求级 get_db，短事务口径）；DB 路径走 mock session 假体——零网络零真实库；
 - error 载荷契约形态：{code, message, stage_key}（data-model.md §1.3 turns.error），
   code 取错误码表兜底 500001（api.md §0 冻结表无「进程重启」专属码，不私增）；
+- KB 队列重入队（M3/B16，seam——真队列消费归 B17/B20 worker）：两个只读计数查询
+  （kb_documents 中间态 / kb_import_jobs pending+running）→ 返回行数由 lifespan
+  登记；IN 列表常量与 data-model.md §4 逐字一致（漏改则重启静默卡死——契约注），
+  单测锁死；只读零 commit（不造半成品 worker，无状态变更）；
 - 失败语义：清理失败（DB 不可达）异常自钩子外抛、但 lifespan 捕获记日志不阻塞
   启动——恢复型 best-effort（幂等可重入，下次重启补做；就绪探针如实报 503）；
 - 周期任务注册：CRON_TASKS 注册表 → 进程内 asyncio 周期任务，进入 lifespan 即注册
@@ -50,26 +54,37 @@ class _FakeScalars:
 
 
 class _FakeSession:
-    """最小异步会话假体：记录 scalars 语句与 commit/close 调用，可选注入异常。
+    """最小异步会话假体：记录 scalars/scalar 语句与 commit/close 调用，可选注入异常。
 
     scalars() 直接返回实体行序列（实现走 AsyncSession.scalars() 实体级变更，
-    而非 execute().scalars() 两段式）——假体同构，仅暴露实现消费的最小面。
+    而非 execute().scalars() 两段式）——假体同构，仅暴露实现消费的最小面；
+    scalar() 为 KB 重入队只读计数查询（B16）按序弹出 scalar_values。
     """
 
     def __init__(
-        self, turns: list[_FakeTurn] | None = None, exc: Exception | None = None
+        self,
+        turns: list[_FakeTurn] | None = None,
+        exc: Exception | None = None,
+        scalar_values: list[int] | None = None,
     ) -> None:
         self.statements: list[object] = []
         self.commits = 0
         self.closed = False
         self._turns = turns if turns is not None else []
         self._exc = exc
+        self._scalar_values = list(scalar_values) if scalar_values is not None else []
 
     async def scalars(self, statement: object) -> _FakeScalars:
         if self._exc is not None:
             raise self._exc
         self.statements.append(statement)
         return _FakeScalars(list(self._turns))
+
+    async def scalar(self, statement: object) -> int:
+        if self._exc is not None:
+            raise self._exc
+        self.statements.append(statement)
+        return self._scalar_values.pop(0) if self._scalar_values else 0
 
     async def commit(self) -> None:
         self.commits += 1
@@ -160,6 +175,73 @@ async def test_cleanup_orphan_turns_propagates_db_failure(
     assert session.commits == 0
 
 
+# ---- KB 队列重入队启动钩子（M3/B16，data-model.md §4 :608；seam——真队列消费归 B17/B20）----
+
+
+async def _noop_kb_requeue() -> tuple[int, int]:
+    return (0, 0)
+
+
+def test_kb_requeue_status_constants_match_contract():
+    """IN 列表常量与 data-model.md §4 :608 逐字一致（漏改则重启静默卡死——契约注）。
+
+    kb_documents：六态中四个中间态 + pending（ready/failed 终态不入列）；
+    kb_import_jobs：四态中 pending/running（completed/failed 终态不入列；
+    pending=已建未启动的任务行也须恢复——§1.17）。逐字断言 = 与 api.md §4.1
+    v1.30「pending + normalizing/chunking/indexing」同批钉死。
+    """
+    assert main._KB_REQUEUE_STATUSES == (
+        "pending",
+        "normalizing",
+        "chunking",
+        "indexing",
+    )
+    assert main._KB_JOB_REQUEUE_STATUSES == ("pending", "running")
+
+
+async def test_requeue_kb_work_counts_nonterminal_rows(monkeypatch: pytest.MonkeyPatch):
+    """两个只读计数查询（kb_documents 中间态 / kb_import_jobs pending+running）→
+    返回 (docs, jobs)；零 commit（seam 只登记、不造半成品 worker 零状态变更）。"""
+    session = _FakeSession(scalar_values=[3, 1])
+    _patch_session_factory(monkeypatch, session)
+
+    docs, jobs = await main._requeue_kb_work()
+
+    assert (docs, jobs) == (3, 1)
+    assert session.commits == 0  # 只读计数：无状态变更、无 commit
+    assert session.closed is True
+    assert len(session.statements) == 2
+
+    expected_tables = ("kb_documents", "kb_import_jobs")
+    for stmt, table, statuses in (
+        (session.statements[0], expected_tables[0], main._KB_REQUEUE_STATUSES),
+        (session.statements[1], expected_tables[1], main._KB_JOB_REQUEUE_STATUSES),
+    ):
+        assert isinstance(stmt, Select)
+        compiled = stmt.compile()
+        sql = str(compiled).lower()
+        assert f"from {table}" in sql  # 计数查询指向对应表
+        assert "count(" in sql  # 计数形态（seam 只计数不取行）
+        # WHERE 状态集按值断言（IN 列表可能展开多参数，拍平后按值核对）
+        flat_params: list[object] = []
+        for value in compiled.params.values():
+            if isinstance(value, (list, tuple)):
+                flat_params.extend(value)
+            else:
+                flat_params.append(value)
+        assert set(statuses) <= set(flat_params)
+
+
+async def test_requeue_kb_work_propagates_db_failure(monkeypatch: pytest.MonkeyPatch):
+    """DB 失败自钩子外抛（钩子保持纯语义），由 lifespan 统一捕获——只读零 commit。"""
+    session = _FakeSession(exc=RuntimeError("db down"))
+    _patch_session_factory(monkeypatch, session)
+
+    with pytest.raises(RuntimeError, match="db down"):
+        await main._requeue_kb_work()
+    assert session.commits == 0
+
+
 # ---- lifespan 接线：B2 启动序基础设施假体（资产中心 / EventBus / seq 种入）----
 
 
@@ -169,12 +251,15 @@ def _patch_lifespan_infra(
     events: list[str] | None = None,
     asset_exc: Exception | None = None,
     bus_exc: Exception | None = None,
+    pipeline_exc: Exception | None = None,
 ) -> list[str]:
-    """patch main 命名空间的三项 B2 接线并按调用序记录（启动/关停顺序断言的数据面）。
+    """patch main 命名空间的 B2 接线与 KB 入库 worker 缝并按调用序记录（启动/关停
+    顺序断言的数据面）。
 
     返回 events 记录：asset_center:start / event_bus:start / thread_scheduler:start /
-    seed_seq / bus:close / center:close；关停逆序（cron 取消 → bus:close →
-    center:close）由 cron 假体向同一列表追加 "cron:cancelled" 佐证。
+    seed_seq / kb_pipeline:start / bus:close / center:close；关停逆序（cron 取消 →
+    kb_pipeline:stop → bus:close → center:close）由 cron 假体向同一列表追加
+    "cron:cancelled" 佐证。pipeline_exc 模拟 KB worker 启动失败（best-effort 口径）。
     """
     log = events if events is not None else []
 
@@ -185,6 +270,32 @@ def _patch_lifespan_infra(
     class _FakeBus:
         async def close(self) -> None:
             log.append("bus:close")
+
+    class _FakePipeline:
+        """KB 入库 worker 缝假体（start/stop 记录；worker_count 语义由专用测试自建）。"""
+
+        def __init__(self) -> None:
+            self.workers: list[asyncio.Task[None]] = []
+
+        async def start(self) -> None:
+            if pipeline_exc is not None:
+                raise pipeline_exc
+            log.append("kb_pipeline:start")
+
+        async def stop(self) -> None:
+            for worker in self.workers:
+                worker.cancel()
+            if self.workers:
+                await asyncio.gather(*self.workers, return_exceptions=True)
+            self.workers = []
+            log.append("kb_pipeline:stop")
+
+    pipeline_holder: list[_FakePipeline] = []
+
+    def _get_kb_pipeline() -> _FakePipeline:
+        if not pipeline_holder:
+            pipeline_holder.append(_FakePipeline())
+        return pipeline_holder[0]
 
     async def _start_asset_center(**_kwargs: object) -> _FakeCenter:
         if asset_exc is not None:
@@ -209,6 +320,7 @@ def _patch_lifespan_infra(
     monkeypatch.setattr(main, "start_event_bus", _start_event_bus)
     monkeypatch.setattr(main, "start_thread_scheduler", _start_thread_scheduler)
     monkeypatch.setattr(main, "seed_seq_from_db", _seed_seq_from_db)
+    monkeypatch.setattr(main, "get_kb_pipeline", _get_kb_pipeline)
     return log
 
 
@@ -218,22 +330,35 @@ def _patch_lifespan_infra(
 async def test_lifespan_runs_orphan_cleanup_before_yield_and_silences_uvicorn(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """进入 lifespan：孤儿轮清理在 yield 前完成（启动即恢复一致状态）；
-    uvicorn 标准库 logger 保持关闭（dictConfig 重置后的再关闭回归守卫）。"""
+    """进入 lifespan：孤儿轮清理与 KB 队列重入队在 yield 前完成（启动即恢复一致
+    状态）；uvicorn 标准库 logger 保持关闭（dictConfig 重置后的再关闭回归守卫）。"""
     events: list[str] = []
 
     async def _stub() -> int:
         events.append("cleanup")
         return 0
 
+    async def _stub_kb() -> tuple[int, int]:
+        events.append("kb_requeue")
+        return (0, 0)
+
     monkeypatch.setattr(main, "_cleanup_orphan_turns", _stub)
+    monkeypatch.setattr(main, "_requeue_kb_work", _stub_kb)
     monkeypatch.setattr(main, "CRON_TASKS", [])
-    _patch_lifespan_infra(monkeypatch)
+    _patch_lifespan_infra(monkeypatch, events=events)
     logging.getLogger("uvicorn.error").disabled = False  # 模拟被 uvicorn 配置重置
     logging.getLogger("uvicorn.access").disabled = False
 
     async with main.app.router.lifespan_context(main.app):
-        assert events == ["cleanup"]
+        assert events == [
+            "asset_center:start",
+            "event_bus:start",
+            "thread_scheduler:start",
+            "seed_seq",
+            "cleanup",
+            "kb_requeue",
+            "kb_pipeline:start",
+        ]
         assert logging.getLogger("uvicorn.error").disabled is True
         assert logging.getLogger("uvicorn.access").disabled is True
 
@@ -242,12 +367,48 @@ async def test_lifespan_survives_orphan_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """清理失败不阻塞启动：lifespan 捕获记日志，应用照常起跑（best-effort 恢复，
-    幂等可重入、下次重启补做；就绪探针如实反映 db 状态，不在此重复判定）。"""
+    幂等可重入、下次重启补做；就绪探针如实反映 db 状态，不在此重复判定）；
+    KB 队列重入队仍在钩子失败后继续执行（两钩子互相独立、不级联跳过）。"""
+    events: list[str] = []
 
     async def _boom() -> int:
         raise RuntimeError("db down")
 
+    async def _stub_kb() -> tuple[int, int]:
+        events.append("kb_requeue")
+        return (0, 0)
+
     monkeypatch.setattr(main, "_cleanup_orphan_turns", _boom)
+    monkeypatch.setattr(main, "_requeue_kb_work", _stub_kb)
+    monkeypatch.setattr(main, "CRON_TASKS", [])
+    _patch_lifespan_infra(monkeypatch, events=events)
+
+    async with asyncio.timeout(5):
+        async with main.app.router.lifespan_context(main.app):
+            pass  # 能进上下文即启动未被钩子失败阻断
+    assert events == [
+        "asset_center:start",
+        "event_bus:start",
+        "thread_scheduler:start",
+        "seed_seq",
+        "kb_requeue",  # 后续钩子不被前面失败级联跳过
+        "kb_pipeline:start",
+        # 上下文退出后的关停逆序（cron 空 → worker.stop → bus/center close）
+        "kb_pipeline:stop",
+        "bus:close",
+        "center:close",
+    ]
+
+
+async def test_lifespan_survives_kb_requeue_failure(monkeypatch: pytest.MonkeyPatch):
+    """KB 重入队失败不阻塞启动（best-effort 同孤儿清理口径；真队列消费归
+    B17/B20 worker，本钩子只计数登记）。"""
+
+    async def _boom_kb() -> tuple[int, int]:
+        raise RuntimeError("kb db down")
+
+    monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+    monkeypatch.setattr(main, "_requeue_kb_work", _boom_kb)
     monkeypatch.setattr(main, "CRON_TASKS", [])
     _patch_lifespan_infra(monkeypatch)
 
@@ -256,17 +417,99 @@ async def test_lifespan_survives_orphan_cleanup_failure(
             pass  # 能进上下文即启动未被钩子失败阻断
 
 
+async def test_lifespan_starts_kb_pipeline_workers_and_stops_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """KB 入库 worker 生产接线（评审 P1 钉正，api.md §4.1「入队 → ready」消费端）：
+    lifespan 启动段 spawn worker 池（_workers 非空）、停机段 cancel 收口（池清空）。
+    本测试自建带真 asyncio 任务的假体（晚于 _patch_lifespan_infra 的 setattr 覆盖
+    同名缝），佐证 start()/stop() 的 worker 生命周期契约。"""
+    events: list[str] = []
+    _patch_lifespan_infra(monkeypatch, events=events)
+    monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+    monkeypatch.setattr(main, "_requeue_kb_work", _noop_kb_requeue)
+    monkeypatch.setattr(main, "CRON_TASKS", [])
+
+    class _FakePipelineWithWorkers:
+        def __init__(self) -> None:
+            self.workers: list[asyncio.Task[None]] = []
+
+        async def start(self) -> None:
+            async def _worker() -> None:
+                await asyncio.sleep(3600)
+
+            self.workers = [asyncio.create_task(_worker(), name="kb-worker-fake")]
+
+        async def stop(self) -> None:
+            for worker in self.workers:
+                worker.cancel()
+            if self.workers:
+                await asyncio.gather(*self.workers, return_exceptions=True)
+            self.workers = []
+            events.append("kb_pipeline:stopped_with_drained_pool")
+
+    pipeline = _FakePipelineWithWorkers()
+    monkeypatch.setattr(main, "get_kb_pipeline", lambda: pipeline)
+
+    async with asyncio.timeout(5):
+        async with main.app.router.lifespan_context(main.app):
+            assert pipeline.workers  # lifespan 后 worker 已启动（评审建议断言面）
+    assert pipeline.workers == []  # 停机收口：池已清空
+    assert "kb_pipeline:stopped_with_drained_pool" in events
+    # 关停逆序佐证：worker 池收口先于 EventBus/资产中心 close
+    assert events.index("kb_pipeline:stopped_with_drained_pool") < events.index(
+        "bus:close"
+    )
+
+
+async def test_lifespan_survives_kb_pipeline_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """KB worker 启动失败不阻塞启动（best-effort 同孤儿清理/重入队口径）：
+    lifespan 捕获记日志，应用照常起跑；停机段 stop 对半建实例仍安全收口。"""
+    events: list[str] = []
+    _patch_lifespan_infra(
+        monkeypatch,
+        events=events,
+        pipeline_exc=RuntimeError("kb worker spawn failed"),
+    )
+    monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+    monkeypatch.setattr(main, "_requeue_kb_work", _noop_kb_requeue)
+    monkeypatch.setattr(main, "CRON_TASKS", [])
+
+    async with asyncio.timeout(5):
+        async with main.app.router.lifespan_context(main.app):
+            assert "kb_pipeline:start" not in events  # start 失败零记录
+    # 停机段对半建实例安全收口（stop 先于 bus/center close）
+    assert events == [
+        "asset_center:start",
+        "event_bus:start",
+        "thread_scheduler:start",
+        "seed_seq",
+        "kb_pipeline:stop",
+        "bus:close",
+        "center:close",
+    ]
+
+
 # ---- lifespan 接线：B2 启动序（资产中心 → EventBus → 调度器 → seq 种入）与关停逆序 ----
 
 
 async def test_lifespan_wires_infra_in_order_and_teardown_reverses(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """启动序：资产中心 → EventBus → ThreadScheduler → seed_seq → 孤儿轮清理（yield 前）；
-    关停逆序：EventBus.close → 资产中心.close（ThreadScheduler 无常驻任务零收口）。"""
+    """启动序：资产中心 → EventBus → ThreadScheduler → seed_seq → 孤儿轮清理 →
+    KB 重入队 → KB 入库 worker 启动（yield 前）；关停逆序：KB worker.stop →
+    EventBus.close → 资产中心.close（ThreadScheduler 无常驻任务零收口）。"""
     events: list[str] = []
     _patch_lifespan_infra(monkeypatch, events=events)
     monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+
+    async def _stub_kb() -> tuple[int, int]:
+        events.append("kb_requeue")
+        return (0, 0)
+
+    monkeypatch.setattr(main, "_requeue_kb_work", _stub_kb)
     monkeypatch.setattr(main, "CRON_TASKS", [])
 
     async with asyncio.timeout(5):
@@ -276,12 +519,17 @@ async def test_lifespan_wires_infra_in_order_and_teardown_reverses(
                 "event_bus:start",
                 "thread_scheduler:start",
                 "seed_seq",
+                "kb_requeue",
+                "kb_pipeline:start",
             ]
     assert events == [
         "asset_center:start",
         "event_bus:start",
         "thread_scheduler:start",
         "seed_seq",
+        "kb_requeue",
+        "kb_pipeline:start",
+        "kb_pipeline:stop",
         "bus:close",
         "center:close",
     ]
@@ -290,7 +538,8 @@ async def test_lifespan_wires_infra_in_order_and_teardown_reverses(
 async def test_lifespan_shutdown_order_cron_before_bus_before_center(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """关停逆序（ask 口径）：cron 取消 → event_bus.close() → asset_center.close()。
+    """关停逆序（ask 口径）：cron 取消 → KB 入库 worker.stop → event_bus.close()
+    → asset_center.close()。
 
     先等 cron 任务起跑再退出——取消未起跑的任务体不执行（except 不触发），
     无法佐证「取消信号送达任务体」的优雅取消语义。"""
@@ -307,6 +556,7 @@ async def test_lifespan_shutdown_order_cron_before_bus_before_center(
             raise
 
     monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+    monkeypatch.setattr(main, "_requeue_kb_work", _noop_kb_requeue)
     monkeypatch.setattr(
         main,
         "CRON_TASKS",
@@ -316,7 +566,12 @@ async def test_lifespan_shutdown_order_cron_before_bus_before_center(
     async with asyncio.timeout(5):
         async with main.app.router.lifespan_context(main.app):
             await asyncio.wait_for(started.wait(), timeout=2)
-    assert events[-3:] == ["cron:cancelled", "bus:close", "center:close"]
+    assert events[-4:] == [
+        "cron:cancelled",
+        "kb_pipeline:stop",
+        "bus:close",
+        "center:close",
+    ]
 
 
 async def test_lifespan_asset_center_failure_propagates(monkeypatch: pytest.MonkeyPatch):
@@ -354,6 +609,7 @@ def _patch_cron_tasks(
 ) -> None:
     _patch_lifespan_infra(monkeypatch)
     monkeypatch.setattr(main, "_cleanup_orphan_turns", _noop_cleanup)
+    monkeypatch.setattr(main, "_requeue_kb_work", _noop_kb_requeue)
     monkeypatch.setattr(
         main,
         "CRON_TASKS",

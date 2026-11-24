@@ -14,14 +14,31 @@ LiteLLM 网关 typesafe provider 到百炼 Token Plan systemone 端点，R19 探
 结论归 M4 评测线，本用例只做「端到端能不能解析」的活体判定。
 """
 
+from dataclasses import replace
 from typing import Any
 
 import httpx
 import pytest
+from loguru import logger
 
 pytestmark = pytest.mark.requires_llm
 
 _DECISION_ALIAS = "decision-model"
+
+#: 连接类失败桶（decision_client._classify_failure：connection/transient/timeout——
+#: transport 瞬态；解析失败/400 = non_retryable 永不重试）
+_CONNECTION_CLASSES: frozenset[str] = frozenset({"connection", "transient", "timeout"})
+
+
+def _connection_class_failure(records: list[Any]) -> bool:
+    """attempt 1 是否留下连接类失败留痕（decision_client._log_failure 格式：
+    `decision 调用失败（{category}，单次尝试零重试，...）`）。"""
+    for record in records:
+        message = str(record.get("message", ""))
+        for category in _CONNECTION_CLASSES:
+            if f"decision 调用失败（{category}" in message:
+                return True
+    return False
 
 
 def _decision_alias_ready() -> str | None:
@@ -71,13 +88,34 @@ async def test_run_decision_live_gateway_parses_answers() -> None:
     assert params is not None
     assert params.questions  # 内置题面四题键齐备
 
-    outcome = await decision_client.run_decision(
-        query="什么是向量数据库？为什么要用？主流方案有哪些？",
-        history=[],
-        params=params,
-        budget=_Budget(),
-        config=_config(),
-    )
+    # 活体调用：连接类失败单次重试（套件负载下端点瞬态 ReadTimeout 实证——重试次
+    # 放宽单次超时；两次皆败仍判失败，不 skip、解析失败/400 类不重试——回归真信号
+    # 不被藏掉。门禁裁决 2026-11-23：授权测试侧稳健化，与生产 P1a 连接类退避同哲学）
+    records: list[Any] = []
+    sink_id = logger.add(lambda message: records.append(message.record), level=0)
+    try:
+        outcome = await decision_client.run_decision(
+            query="什么是向量数据库？为什么要用？主流方案有哪些？",
+            history=[],
+            params=params,
+            budget=_Budget(),
+            config=_config(),
+        )
+    finally:
+        logger.remove(sink_id)
+    if outcome is None and _connection_class_failure(records):
+        from app.agent.decision_client import _TIMEOUT_MS_MAX
+
+        outcome = await decision_client.run_decision(
+            query="什么是向量数据库？为什么要用？主流方案有哪些？",
+            history=[],
+            params=replace(
+                params,
+                timeout_ms=min(params.timeout_ms * 4, _TIMEOUT_MS_MAX),
+            ),
+            budget=_Budget(),
+            config=_config(),
+        )
     assert outcome is not None, "活体 200 期望 DecisionOutcome（None=调用失败，检查网关日志）"
     # 四约定题键解析正确（判定值随模型/题面版本漂移——只断结构不断文案）
     assert outcome.query_type in (

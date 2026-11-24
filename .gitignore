@@ -47,3 +47,9 @@ tmp/
 .idea/
 .vscode/
 .DS_Store
+
+# 探针/开发产物输出目录（2026-11-24 归拢批）
+out/*
+
+#测试相关的Jupyter Notebook文件
+notebooks/*

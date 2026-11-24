@@ -46,6 +46,20 @@ dependencies = [
     # （官方文档保留）；metadata 收紧 dict[str,str] 且值≤200 字符。== 锁定（R8 同口径：
     # 与 langchain-openai 私有面联动升级前先跑观测护栏，断言见 test_observability.py）
     "langfuse==4.18.0",
+    # M3 批次 1（B16）：kb_chunks.embedding vector(1024) 列类型（pgvector.sqlalchemy
+    # Vector，迁移 0013_m3_kb 与 ORM 两侧同型——alembic check 零漂移依赖同型）。
+    # == 锁定（2026-11-23 PyPI 当日稳定版 0.5.1；0.2.4+ 起支持 vector 类型反射——
+    # alembic check 的 db 反射面所需）。
+    "pgvector==0.5.1",
+    # ── M3 批次 2（B17）归一化组件：== 锁定（版本 = docs/research/
+    # m3-probe-normalization-20261122.md §1 探针实证记录；OCR 引擎钉 PaddleOCR =
+    # PRD v1.34 用户裁决 OQ-25——RapidOCR 留 M3+ 重场景复核线，docling 依赖树原生带
+    # rapidocr 3.10.0 作对照线）。首跑模型下载属部署动作非运行时：Docling/Paddle 模型
+    # 目录预置 + HF_HUB_OFFLINE=1（探针已验证离线复跑可用，.env.example 同批注）。
+    "markitdown[docx,html]==0.1.9",  # Office/HTML/飞书导出 docx 主线转换（docx 代码块缺口由 Docling docx 对照线兜——探针 §2.1）
+    "docling==2.151.1",              # pdf 主线（版面/表格/页码级溯源 loc.page；探针 §2.2——core 2.108.0 / ibm-models 4.0.4 随装）
+    "paddleocr==3.7.0",              # OCR 通道（paddlex 3.7.2 随装；init 首跑下载 PP-OCRv6 medium 检测+识别模型——探针 §2.3）
+    "paddlepaddle==3.3.1",           # PaddleOCR 推理后端（CPU；OQ-32 本地 CPU 进程内）
 ]
 
 [build-system]
@@ -77,6 +91,16 @@ dev = [
     "pyright==1.1.414",
     "ruff==0.17.4",
     "python-dotenv==1.2.4",
+    # M3 飞书接入（ARCH B20 行既有钉定）：探查工具面首次落地——notebooks/
+    #   feishu_kb_tree_probe.ipynb 的 wiki/docx/drive 通道走官方 lark-oapi SDK。
+    #   仅 dev 组（notebook 开发辅助面）；生产面随 B20 实施再进 [project]，
+    #   届时沿用同一 == 锁定版本。
+    "lark-oapi==1.8.0",
+    # notebook 交付物的执行验证最小面（nbformat 结构校验 + nbclient 真执行）：
+    #   开发辅助，不进生产。与同组其余项一致用 == 精确锁（值 = 2026-11-24 uv.lock 定版）
+    "nbformat==5.11.1",
+    "nbclient==0.11.0",
+    "ipykernel==7.4.0",
     # R4 依赖 CVE 清零（2026-11-15 专项，原「互锁接受」解除）：langgraph-cli 的 inmem
     #   extra 此前钉 langgraph-api<0.6.0，而 0.5.x 全档反钉 cryptography<45.0，使两条
     #   修复线（langgraph-api ≥0.15.0 / cryptography ≥50.0.0）互锁不可达。0.4.43 起该
