@@ -1893,11 +1893,16 @@ class TestKbSpecRules:
             ("table_agg_rows", 0, False),
             ("table_agg_rows", 10001, False),
             ("table_agg_rows", 10000, True),
+            ("table_group_max_chars", 0, False),
+            ("table_group_max_chars", 100001, False),
+            ("table_group_max_chars", 100000, True),
         ],
     )
     def test_chunking_bounds(self, field, value, legal):
         """chunking 逐级切分上限：正整数 + 实现侧上界（契约仅钉各值 >0——上界为
-        合理范围授权下的实现侧补齐，挡垃圾热更值）。"""
+        合理范围授权下的实现侧补齐，挡垃圾热更值；table_group_max_chars=v1.45 增键
+        〔2026-11-25 表格双工单契约批〕，同「各值 >0」规则、上界对齐 page_max_chars
+        实现侧口径）。"""
         payload = _mutated(
             SPEC_DATA_ID,
             lambda p, f=field, v=value: p["kb"]["chunking"].update({f: v}),

@@ -261,3 +261,158 @@ def test_bold_judged_by_font_weight_threshold(monkeypatch: pytest.MonkeyPatch) -
         assert sampler._is_bold(tp, 0) is True
     finally:
         sampler.close()
+
+
+def test_stats_in_bbox_bold_takes_median_char_weight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """④ 负例：bbox 加粗判定取**中位字符**权重——首字符加粗不代表整行加粗。
+
+    「B」首字符 800、其余 435 → bbox 加粗=False（取中位字符）；反向（仅中位字符
+    800）→ True。取首字符的变异形态会被本用例打红。
+    """
+    data = _build_pdf([[(12, "Bold headline text here")]])
+    sampler = CharFontSampler(open_pdf_bytes(data))
+    try:
+        chars = [c for c in sampler.page_chars(0) if not c[5].isspace()]
+        first = chars[0]
+        box = (
+            min(c[0] for c in chars) - 2,
+            min(c[1] for c in chars) - 2,
+            max(c[2] for c in chars) + 2,
+            max(c[3] for c in chars) + 2,
+        )
+        mid_index = len(chars) // 2
+
+        def _weight_for(bold_indexes: set[int]):
+            def _impl(tp: Any, index: int) -> int:
+                return 800 if index in bold_indexes else 435
+
+            return _impl
+
+        # 首字符加粗、其余常规 → 整行不加粗（中位字符权重决定）
+        monkeypatch.setattr(pdf_textlayer_raw(), "FPDFText_GetFontWeight", _weight_for({first[6]}))
+        stat = sampler.stats_in_bbox(0, box)
+        assert stat is not None and stat[1] is False
+        # 仅中位字符加粗 → 整行加粗
+        monkeypatch.setattr(
+            pdf_textlayer_raw(), "FPDFText_GetFontWeight", _weight_for({chars[mid_index][6]})
+        )
+        stat = sampler.stats_in_bbox(0, box)
+        assert stat is not None and stat[1] is True
+    finally:
+        sampler.close()
+
+
+# ---------------------------------------------------------------------------
+# 工单 B：多信号复核层数据源（盒高采样 / 字体名 / 字号存活检测 / 盒高众数）
+# ---------------------------------------------------------------------------
+
+
+def test_heights_in_bbox_returns_median_charbox_height() -> None:
+    """盒高采样：bbox 内非空白字符的字符盒高中位数（字号死亡信号的可移植回落面）。"""
+    data = _build_pdf([[(24, "BIGHEADING"), (12, "small body line")]])
+    sampler = CharFontSampler(open_pdf_bytes(data))
+    try:
+        chars = sampler.page_chars(0)
+        big = next(c for c in chars if c[4] == 24.0 and not c[5].isspace())
+        small = next(c for c in chars if c[4] == 12.0 and not c[5].isspace())
+
+        def _box(char: tuple[float, float, float, float, float, str, int]) -> tuple[float, float, float, float]:
+            return (char[0] - 2, char[1] - 2, char[2] + 2, char[3] + 2)
+
+        big_h = sampler.heights_in_bbox(0, _box(big))
+        small_h = sampler.heights_in_bbox(0, _box(small))
+        assert big_h is not None and big_h > small_h  # 24pt 行盒高 > 12pt 行盒高
+        assert sampler.heights_in_bbox(0, (5000, 5000, 5100, 5100)) is None
+        # 真字符盒高与字符自身盒高一致（非空白字符）
+        assert big_h == pytest.approx(big[3] - big[1], abs=0.01)
+    finally:
+        sampler.close()
+
+
+def test_heights_in_bbox_excludes_whitespace_chars() -> None:
+    """盒高采样剔空白：空白字符的盒高不得进入中位数（与 stats_in_bbox 同口径）。"""
+    import statistics
+
+    data = _build_pdf([[(12, "a b")]])
+    sampler = CharFontSampler(open_pdf_bytes(data))
+    try:
+        chars = sampler.page_chars(0)
+        target = next(c for c in chars if c[5] == "a")
+        box = (target[0] - 5, target[1] - 5, target[2] + 30, target[3] + 5)
+        heights = [
+            c[3] - c[1]
+            for c in chars
+            if not c[5].isspace()
+            and box[0] - 1.5 <= (c[0] + c[2]) / 2 <= box[2] + 1.5
+            and box[1] - 1.5 <= (c[1] + c[3]) / 2 <= box[3] + 1.5
+        ]
+        expected = statistics.median(heights)
+        assert sampler.heights_in_bbox(0, box) == pytest.approx(expected, abs=0.01)
+        # 剔空白自证：含空白的全字符中位数不同（空白盒高参与会稀释）
+        all_heights = [
+            c[3] - c[1]
+            for c in chars
+            if box[0] - 1.5 <= (c[0] + c[2]) / 2 <= box[2] + 1.5
+            and box[1] - 1.5 <= (c[1] + c[3]) / 2 <= box[3] + 1.5
+        ]
+        assert all_heights != heights  # 面上确有空白字符被剔除
+    finally:
+        sampler.close()
+
+
+def test_font_names_in_bbox_reads_font_info_with_c_int_flags() -> None:
+    """字体名面：FPDFText_GetFontInfo 第 5 参须传 ctypes.c_int（裸 int 会 TypeError——
+    旧实现死信号根因）；真构造 PDF 返回 Helvetica。"""
+    import ctypes
+
+    data = _build_pdf([[(12, "body text line")]])
+    sampler = CharFontSampler(open_pdf_bytes(data))
+    try:
+        chars = sampler.page_chars(0)
+        target = next(c for c in chars if not c[5].isspace())
+        box = (target[0] - 2, target[1] - 2, target[2] + 2, target[3] + 2)
+        names = sampler.font_names_in_bbox(0, box)
+        assert names is not None and names
+        assert any("helvetica" in name.casefold() for name in names)
+        assert sampler.font_names_in_bbox(0, (5000, 5000, 5100, 5100)) is None
+        # 绑定形态自证：裸 int 传参复现旧死亡形态（TypeError——第 5 参须 LP_c_int）
+        buf = ctypes.create_string_buffer(128)
+        with pytest.raises(ctypes.ArgumentError):
+            pdf_textlayer._pdfium_raw().FPDFText_GetFontInfo(
+                sampler._textpage(0), target[6], buf, 128, 0
+            )
+    finally:
+        sampler.close()
+
+
+def test_font_size_alive_detects_uniform_dead_signal() -> None:
+    """字号存活检测：全文档字号恒定（渲染器死亡形态）→ False；多字号 → True。"""
+    sampler = CharFontSampler(open_pdf_bytes(TWO_PAGE_PDF))
+    try:
+        assert sampler.font_size_alive is True  # 24/12 两档
+    finally:
+        sampler.close()
+    uniform = _build_pdf([[(12, "only one size here"), (12, "second line")]])
+    sampler2 = CharFontSampler(open_pdf_bytes(uniform))
+    try:
+        assert sampler2.font_size_alive is False
+    finally:
+        sampler2.close()
+
+
+def test_heights_mode_is_non_space_charbox_mode() -> None:
+    """全文盒高众数：非空白字符盒高（取整）众数（复核层正文基线）。"""
+    sampler = CharFontSampler(open_pdf_bytes(TWO_PAGE_PDF))
+    try:
+        from collections import Counter
+
+        histogram: Counter[int] = Counter()
+        for i in range(2):
+            for char in sampler.page_chars(i):
+                if char[4] > 0 and not char[5].isspace():
+                    histogram[round(char[3] - char[1])] += 1
+        expected = float(histogram.most_common(1)[0][0])
+        assert sampler.heights_mode == expected
+        assert sampler.heights_mode > 0
+    finally:
+        sampler.close()

@@ -18,8 +18,10 @@ from app.exception.database import DatabaseException
 from app.exception.export import ExportNotAvailableException
 from app.exception.feedback import FeedbackTurnNotFoundException
 from app.exception.kb import (
+    FeishuNotConfiguredException,
     FileTooLargeException,
     FileUnsupportedTypeException,
+    KbImportJobActiveException,
     KbUrlInvalidException,
 )
 from app.exception.not_found import NotFoundException
@@ -55,6 +57,11 @@ ERROR_MAP: dict[type, tuple[str, int, str]] = {
     FileTooLargeException: ("413001", 413, "文件超过大小上限"),
     FileUnsupportedTypeException: ("415001", 415, "不支持的文件类型"),
     KbUrlInvalidException: ("422001", 422, "URL 非法"),
+    # KB 导入面（api.md §0 v1.30 增 / §4.7）：409007 已有进行中的知识库导入任务
+    # （沿 409005 独立码先例）；500001 兜底含 FEISHU 凭据缺失（凭据只进 .env，
+    # 裁决 #8——业务异常出口防裸 Exception traceback 噪音，铁律 8）
+    KbImportJobActiveException: ("409007", 409, "已有进行中的知识库导入任务"),
+    FeishuNotConfiguredException: ("500001", 500, "内部错误"),
     Exception: ("500001", 500, "服务器内部错误"),
 }
 

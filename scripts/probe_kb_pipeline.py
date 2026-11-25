@@ -13,6 +13,14 @@
      后、锚点间、非锚点）、被压深条数、章级挂错数、锚点树深偏差。指标由「树 + PDF
      书签」独立重算（不采信管线自报），**只读不改树**；docx/md 等非 PDF 通道显示
      「不适用（非 PDF 通道）」。
+  ③.b **小节级伤情单（工单 C v2，只读观察）**：PDF 通道且书签校正启用时在自检节后
+     追加五类检测——①书签召回缺失逐条列出（零命中条目标题/层级/目标页）；②标题
+     密度分布（heading/千字、heading/页）与超阈值嫌疑清单（单页密集 + 连续簇）；
+     ③Fix 2 提升行形态矩阵（已提升 + 未提升候选，句末标点/行数/字数/字号比值，
+     句末正则缺口「脱漏」量化；管线留痕 promoted 对照 + 指纹缺口自诊断）；
+     ④formula 空 text 候选计数与标题占比（Fix 1 通道活跃度）；⑤无书签显著警示
+     （版面推断主导时伤情单第一行）。**非 PDF 通道与关闭态（KB_PDF_OUTLINE_CORRECTION
+     =false）零输出变化**（伤情单整节不出现）。
 
 零外部依赖面：不碰 DB / MinIO / Nacos / 上传流水线编排——直接调 normalizers registry
 与 chunker；配置取 `config_center.defaults.SPEC_CONFIG` 的 kb 节缺省（等价「键缺失
@@ -36,6 +44,10 @@
     # 5) 飞书文档（obj_token）→ export task 通道取 docx → 同一管线
     uv run --package search-api python scripts/probe_kb_pipeline.py --feishu-token <obj_token>
 
+    # 5.b) 飞书 docx（obj_token）→ SDK blocks 直读通道（生产导入同映射形态：
+    #      list_document_blocks → map_blocks → 树 IR → 同一 chunker）
+    uv run --package search-api python scripts/probe_kb_pipeline.py --feishu-sdk <obj_token>
+
     # 6) 演示完整目录链轨迹（可选附加旗标，可与上面任一输入方式共存）
     uv run --package search-api python scripts/probe_kb_pipeline.py out/x.docx \\
         --catalog-path "RAG核心面（精选） > 一、基础认知与对比"
@@ -48,11 +60,19 @@
 
 飞书通道参考形态：2026-11-23 第二阶段 V5 探针实证（`docs/research/m3-probe-feishu-v5v6-20261122.md`
 §2/【复测注】）——创建 export task → 轮询 job_status=0 → 下载产物（即 docx 本体，OOXML zip 容器）。
+
+两条飞书通道并存：`--feishu-token`（export docx → markitdown 归一化，M3 前接线形态）与
+`--feishu-sdk`（SDK blocks 直读 → `feishu_mapper` 映射 → sheet(30) 装配后回填段
+（`backfill_sheet_placeholders`），**生产导入现行形态**，B20 A 线）。后者与
+`app/rag/import_worker.py` `_ingest_docx` 逐字同组合（**含回填段**——2026-11-25 活体
+验收钉正：缺回填段时 sheet 占位不翻转、回填失败分类不落 parse_meta，探针无法演示生产
+形态），用于对同一文档比对两条通道的树/切片视图差异。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import html
 import io
 import re
@@ -67,6 +87,18 @@ from typing import Any
 from app.config_center.defaults import SPEC_CONFIG
 from app.exception.base import BusinessException
 from app.rag.chunker import Chunk, ChunkingConfig, ChunkingResult, chunk_forest
+from app.rag.feishu_client import (
+    FeishuClientError,
+    SheetValuesData,
+    get_default_feishu_client,
+)
+from app.rag.feishu_mapper import (
+    PARSER_FEISHU_BLOCKS,
+    build_document_node,
+    build_feishu_parse_meta,
+    map_blocks,
+)
+from app.rag.import_worker import SheetBackfillReport, backfill_sheet_placeholders
 from app.rag.ir_schema import (
     DOCUMENT_REF_TEMPLATE,
     IrNode,
@@ -74,6 +106,8 @@ from app.rag.ir_schema import (
     find_document_refs,
 )
 from app.rag.normalizers.heading_outline import (
+    CORRECTION_RAW,
+    CORRECTION_SEQUENCE_CLEAN,
     Anchor,
     HeadingItem,
     OutlineEntry,
@@ -82,7 +116,9 @@ from app.rag.normalizers.heading_outline import (
     read_pdf_outline,
     resolve_anchors,
 )
+from app.rag.normalizers.pdf_textlayer import CharFontSampler, open_pdf_bytes
 from app.rag.normalizers.registry import normalize_document, read_normalizer_settings
+from app.rag.tree_assembler import attach_block_tree
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = REPO_ROOT / ".env"
@@ -107,6 +143,14 @@ FEISHU_EXPORT_POLL_TERMINAL_ERR = {
     111: "文档已删除",
     6000: "图片过多",
 }
+
+#: SDK blocks 直读通道：源标签前缀（summary 行「按块计数」注记的判定依据）
+SDK_LABEL_PREFIX = "feishu-sdk:"
+#: SDK 通道缺省空间 / 标题（探针无同步目录，取示意值；语义同生产 build_document_node 入参）
+SDK_DEFAULT_SPACE = "probe"
+SDK_DEFAULT_TITLE = "feishu-sdk"
+#: SDK 通道文档类型（build_document_node 要求 ∈ DOC_KINDS；B20 只走 docx 直读）
+SDK_OBJ_TYPE = "docx"
 
 #: 内置样本：两个标题层级 + 一段带图片占位符的正文 + 代码块 + 3 行表格。
 SAMPLE_MARKDOWN = """# 管线验证样本
@@ -168,6 +212,12 @@ class PipelineOutput:
     config: ChunkingConfig
     #: PDF 通道的书签大纲（自检节用；非 PDF / 读取失败 → None）
     outline: list[OutlineEntry] | None = None
+    #: 原始输入字节（伤情单 ③ 字号比值重采样用；渲染层只读，None=不重采样）
+    data: bytes | None = None
+    #: 取数通道标识（`file` / `feishu-sdk`；summary 按通道注记，不做标签前缀匹配）
+    channel: str = "file"
+    #: SDK blocks 翻页防御截断（True=尾块缺失，树/切片视图不完整）
+    truncated: bool = False
 
 
 def run_pipeline(
@@ -207,6 +257,7 @@ def run_pipeline(
         chunking=results[0],
         config=config,
         outline=_read_outline(data, ext),
+        data=data,
     )
 
 
@@ -606,15 +657,572 @@ def render_structure_check_html(check: StructureSelfCheck) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 5b) 小节级伤情单（工单 C v2；只读观察——五类检测机器先于用户抓异常）
+# ---------------------------------------------------------------------------
+
+#: ② 单页密集阈值：同页 heading 数 ≥ 此值 → 嫌疑页（heading/页 轴）。
+#: Nacos 式可调常量——探针零运行时资产中心依赖，按三分法收敛模块常量；
+#: `build_injury_report` 的同名 kwarg 供会话级/测试覆写。
+INJURY_DENSITY_PAGE_SUSPECT = 3
+#: ② 连续簇阈值：文档序连续 heading 条数 ≥ 此值 → 检查簇内正文间隔合计
+#: （heading/千字 轴的局部形态；治「修改为：」×5 类假阳性的主要抓手）。
+INJURY_DENSITY_CLUSTER_MIN = 4
+#: ② 连续簇阈值：相邻 heading 之间正文量合计 ≤ 此值（字）→ 判「标题扎堆」。
+INJURY_DENSITY_CLUSTER_MAX_CHARS = 300
+
+#: ③ Fix 2 提升通道的树内指纹：提升块在装配时保留 docling 原始 label 进
+#: meta.raw_type（`font_promoted` 来源会被后续分级/校正覆写，raw_type 不会）——
+#: 原生标题是 section_header/title、OCR 行是 ocr_line，互不重叠。
+_PROMOTED_RAW_TYPES = frozenset({"text", "formula"})
+#: ③ 句末标点正则面（与 docling_adapter._PROMOTE_SENT_END `[。：:，,；;.]$` 逐字符
+#: 对齐——parity 由 test_probe_kb_injury_report 锁死，防两处漂移；工单 B ④ 补
+#: 英文句点「.」——句末「.」结尾大字行不得提升，两处同批）。
+_PROMOTE_SENT_END_CHARS = "。：:，,；;."
+#: ③ 句末标点超集 = 正则面 ∪ 中英文缺口字符（！?…等）——落在超集而正则面不含
+#: 即「脱漏」，把 P3-1 句末正则缺口量化暴露成伤情单行。
+_SENTENCE_ENDING_ALL = "。．.！!？?；;，,：:…"
+#: ④ Fix 1 通道树内指纹：docling formula 条目 text 恒空、原文只在 orig
+#: （_item_text 回落补写）——树内 raw_type=formula 的节点即该通道的全部活动面。
+_FORMULA_RAW_TYPE = "formula"
+#: ③ 未提升候选的形态筛选（与 docling_adapter 提升候选形状对齐：单行、≤40 字；
+#: 句末标点**不筛**——「因句末标点被拒」正是要暴露的形态信息）。
+_INJURY_CANDIDATE_MAX_CHARS = 40
+#: ③ 形态矩阵行数展示上限（超过截断计数；防病态树撑爆伤情单）。
+_INJURY_MATRIX_ROW_LIMIT = 50
+#: 伤情单清单/样例展示截断（①缺失逐条不截、②③④的标题预览与样例截前 N 条）
+_INJURY_SAMPLE_LIMIT = 5
+
+#: ⑤ 无书签显著警示触发路径：校正启用但书签未主导（序列清洗/裸路径）——
+#: 版面推断主导、层级可信度降级。关闭态（键整缺）不触发（零变化门禁）。
+_INJURY_LAYOUT_ONLY_PATHS = (CORRECTION_SEQUENCE_CLEAN, CORRECTION_RAW)
+
+
+@dataclass(slots=True)
+class MissingBookmark:
+    """① 书签召回缺失条目：零命中的书签原文 + 原始层级 + 目标页（0 基）。"""
+
+    title: str
+    level: int
+    page: int | None
+
+
+@dataclass(slots=True)
+class DensitySuspect:
+    """② 密度嫌疑：kind=page（单页密集）| cluster（连续簇）。"""
+
+    kind: str
+    page: int | None
+    count: int
+    span_chars: int | None
+    pages: tuple[int, int] | None
+    titles: list[str]
+
+
+@dataclass(slots=True)
+class PromotedRow:
+    """③ 提升行形态：句末标点/行数/字数/字号比值（比值不可采样 → None）。
+
+    `promoted=False` 为未提升候选（text/formula 短行段——Fix 2 候选形状但未被
+    提升；其形态列同样输出，用于归因「为何未提升」：句末标点拦截 / 字号未命中）。
+    """
+
+    title: str
+    chars: int
+    lines: int
+    ending: str | None
+    gap: bool
+    ratio: float | None
+    promoted: bool = True
+
+
+@dataclass(slots=True)
+class InjuryReport:
+    """小节级伤情单指标块（五类检测；渲染与指标分离）。"""
+
+    correction_path: str
+    no_bookmark_warning: str | None
+    missing_available: bool
+    missing: list[MissingBookmark]
+    headings: int
+    body_chars: int
+    per_1k: float | None
+    pages: int | None
+    per_page: float | None
+    density_suspects: list[DensitySuspect]
+    promoted: list[PromotedRow]
+    #: 管线自报的提升条数（parse_meta.heading_heuristic.promoted；缺失 → None）
+    promoted_pipeline: int | None
+    #: 指纹缺口警示：管线留痕 promoted > 树内指纹已提升行数时非空（留痕与树面矛盾，
+    ##  提升行形态在树内不可归因——观测面自诊断，工单 B 复核面）
+    promotion_gap_warning: str | None
+    formula_total: int
+    formula_headings: int
+    formula_empty: int
+    formula_samples: list[str]
+
+
+def _iter_nodes(document: IrNode) -> Any:
+    """文档序 pre-order 迭代（含根下全部后代）。"""
+    stack = list(reversed(document.children))
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.children))
+
+
+def _node_body_volume(node: IrNode) -> int:
+    """非 heading 节点的正文量（字）：text + 表格逐格字符（簇间隔体积的近似）。"""
+    volume = len(node.text or "")
+    rows = node.meta.get("rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, list):
+                volume += sum(len(str(cell)) for cell in row)
+    return volume
+
+
+def _walk_headings(document: IrNode) -> tuple[list[IrNode], list[int]]:
+    """文档序 heading 节点 + 各 heading 之前的正文量（gaps[i]=heading i 前的间隔；
+    相邻 heading 间隔 = sum(gaps[i+1:j])）。"""
+    headings: list[IrNode] = []
+    gaps: list[int] = []
+    acc = 0
+    for node in _iter_nodes(document):
+        if node.type is IrNodeType.HEADING:
+            headings.append(node)
+            gaps.append(acc)
+            acc = 0
+        else:
+            acc += _node_body_volume(node)
+    return headings, gaps
+
+
+def _missing_bookmark_entries(
+    outline: Sequence[OutlineEntry], unmatched: Sequence[str]
+) -> list[MissingBookmark]:
+    """未命中书签标题 → 逐条缺失条目（标题 + 原始层级 + 目标页 0 基）。"""
+    remaining = list(unmatched)
+    entries: list[MissingBookmark] = []
+    for entry in outline:
+        if entry.title in remaining:
+            entries.append(
+                MissingBookmark(title=entry.title, level=entry.level, page=entry.page)
+            )
+            remaining.remove(entry.title)
+            if not remaining:
+                break
+    return entries
+
+
+def _density_suspects(
+    headings: Sequence[IrNode],
+    gaps: Sequence[int],
+    *,
+    page_suspect: int,
+    cluster_min: int,
+    cluster_max_chars: int,
+) -> list[DensitySuspect]:
+    """② 密度嫌疑清单：单页密集（heading/页 轴）+ 连续簇（char 轴局部密度）。"""
+    suspects: list[DensitySuspect] = []
+    by_page: dict[int, list[IrNode]] = {}
+    for node in headings:
+        page = _node_page(node)
+        if page is not None:
+            by_page.setdefault(page, []).append(node)
+    for page in sorted(by_page):
+        nodes = by_page[page]
+        if len(nodes) >= page_suspect:
+            suspects.append(
+                DensitySuspect(
+                    kind="page",
+                    page=page,
+                    count=len(nodes),
+                    span_chars=None,
+                    pages=(page, page),
+                    titles=[node.title or "" for node in nodes[:_INJURY_SAMPLE_LIMIT]],
+                )
+            )
+    total = len(headings)
+    if total >= cluster_min:
+        start = 0
+        while start + cluster_min <= total:
+            span = sum(gaps[start + 1 : start + cluster_min])
+            if span > cluster_max_chars:
+                start += 1
+                continue
+            end = start + cluster_min
+            while (
+                end < total
+                and span + gaps[end] <= cluster_max_chars
+            ):
+                span += gaps[end]
+                end += 1
+            first_page = _node_page(headings[start])
+            last_page = _node_page(headings[end - 1])
+            pages = (
+                (first_page, last_page)
+                if first_page is not None and last_page is not None
+                else None
+            )
+            suspects.append(
+                DensitySuspect(
+                    kind="cluster",
+                    page=None,
+                    count=end - start,
+                    span_chars=span,
+                    pages=pages,
+                    titles=[
+                        node.title or ""
+                        for node in headings[start:end][: _INJURY_SAMPLE_LIMIT]
+                    ],
+                )
+            )
+            start = end
+    return suspects
+
+
+def _promotion_channel(document: IrNode) -> list[tuple[IrNode, bool]]:
+    """③ 提升通道全集（文档序）：`(节点, 是否已提升)`。
+
+    已提升 = heading 且 raw_type∈{text,formula}（提升块装配时保留 docling 原始
+    label——`font_promoted` 来源会被分级/校正覆写，raw_type 不会，故为唯一树内指纹）；
+    未提升候选 = 同指纹的 paragraph 且单行 ≤ `_INJURY_CANDIDATE_MAX_CHARS` 字
+    （Fix 2 候选形状，与 docling_adapter 对齐；句末标点不筛——「因句末标点被拒」
+    正是要暴露的形态）。
+    """
+    channel: list[tuple[IrNode, bool]] = []
+    for node in _iter_nodes(document):
+        if node.meta.get("raw_type") not in _PROMOTED_RAW_TYPES:
+            continue
+        if node.type is IrNodeType.HEADING:
+            channel.append((node, True))
+            continue
+        payload = (node.text or "") or (node.title or "")
+        if payload and "\n" not in payload and len(payload) <= _INJURY_CANDIDATE_MAX_CHARS:
+            channel.append((node, False))
+    return channel
+
+
+def _promoted_rows(
+    channel: Sequence[tuple[IrNode, bool]],
+    *,
+    sampler: Any,
+    body_font_size: float | None,
+) -> list[PromotedRow]:
+    """③ 提升行形态矩阵：字数/行数/句末标点/脱漏标记/字号比值（重采样）。
+
+    已提升行采样标题原文；未提升候选采样段内文本（比值 < 提升锚比值即「字号
+    未命中」的直接成因可见）。
+    """
+    rows: list[PromotedRow] = []
+    for node, promoted in channel:
+        payload = (node.title or "") if promoted else ((node.text or "") or (node.title or ""))
+        ending = payload[-1] if payload and payload[-1] in _SENTENCE_ENDING_ALL else None
+        gap = ending is not None and ending not in _PROMOTE_SENT_END_CHARS
+        ratio: float | None = None
+        page = _node_page(node)
+        if sampler is not None and payload and page and body_font_size:
+            try:
+                stat = sampler.text_font_stats(page - 1, payload)
+            except Exception:  # noqa: BLE001 —— 重采样失败按数据不可得（比值 —）
+                stat = None
+            if stat is not None:
+                ratio = float(stat[0]) / float(body_font_size)
+        rows.append(
+            PromotedRow(
+                title=payload,
+                chars=len(payload),
+                lines=len(payload.splitlines()),
+                ending=ending,
+                gap=gap,
+                ratio=ratio,
+                promoted=promoted,
+            )
+        )
+    return rows
+
+
+def _formula_stats(document: IrNode) -> tuple[int, int, int, list[str]]:
+    """④ formula 通道活跃度：→ (总数, 其中 heading 数, 空载荷数, 样例)。
+
+    树内 raw_type=formula 的节点 = 「text 空且有 orig」的 docling 条目全量（Fix 1
+    回落写回 orig 后 text/title 二者必有其一；皆空 = 空载荷残留，切分时被跳过）。
+    样例标题类优先（误判嫌疑面），无标题类时回落正文样例。
+    """
+    total = heading_count = empty = 0
+    heading_samples: list[str] = []
+    text_samples: list[str] = []
+    for node in _iter_nodes(document):
+        if node.meta.get("raw_type") != _FORMULA_RAW_TYPE:
+            continue
+        total += 1
+        payload = (node.title or "") or (node.text or "")
+        if node.type is IrNodeType.HEADING:
+            heading_count += 1
+            if payload and len(heading_samples) < _INJURY_SAMPLE_LIMIT:
+                heading_samples.append(payload)
+        elif payload and len(text_samples) < _INJURY_SAMPLE_LIMIT:
+            text_samples.append(payload)
+        if not payload:
+            empty += 1
+    return total, heading_count, empty, (heading_samples + text_samples)
+
+
+def build_injury_report(
+    output: PipelineOutput,
+    *,
+    font_sampler: Any | None = None,
+    page_suspect: int = INJURY_DENSITY_PAGE_SUSPECT,
+    cluster_min: int = INJURY_DENSITY_CLUSTER_MIN,
+    cluster_max_chars: int = INJURY_DENSITY_CLUSTER_MAX_CHARS,
+) -> InjuryReport | None:
+    """小节级伤情单（工单 C v2；只读观察，不碰树、不碰管线、不写 parse_meta）。
+
+    **门禁（零变化硬约束）**：仅 PDF 通道且 parse_meta 带 heading_outline 键
+    （= 书签校正启用）时产出；非 PDF 与关闭态（KB_PDF_OUTLINE_CORRECTION=false）
+    恒 None——text/html 渲染与 v1 逐字节一致。
+    """
+    meta = output.parse_meta.get("heading_outline")
+    path = meta.get("correction_path") if isinstance(meta, dict) else None
+    if output.ext.lstrip(".").lower() != "pdf" or not isinstance(path, str):
+        return None
+
+    headings, gaps = _walk_headings(output.document)
+    heading_count = len(headings)
+    body_chars = len(output.chunking.document_text)
+    per_1k = heading_count / body_chars * 1000 if body_chars else None
+    pages_raw = output.parse_meta.get("pages")
+    pages = pages_raw if isinstance(pages_raw, int) and pages_raw > 0 else None
+    per_page = heading_count / pages if pages else None
+
+    # ⑤ 无书签显著警示（校正启用但书签未主导）
+    warning = None
+    if path in _INJURY_LAYOUT_ONLY_PATHS:
+        warning = f"⚠️ 无书签锚定：版面推断主导，层级可信度降级（correction_path={path}）"
+
+    # ① 书签召回缺失（需要可读书签面；零命中逐条列出）
+    outline = output.outline
+    missing_available = bool(outline)
+    missing: list[MissingBookmark] = []
+    if outline:
+        items = [
+            HeadingItem(
+                title=node.title or "",
+                level=node.level or 1,
+                page=_node_page(node),
+            )
+            for node in headings
+        ]
+        _anchors, unmatched = resolve_anchors(items, outline)
+        missing = _missing_bookmark_entries(outline, unmatched)
+
+    # ② 密度嫌疑（阈值相对量：页/簇/间隔均为分布形态，不写绝对 pt/绝对密度上限）
+    suspects = _density_suspects(
+        headings,
+        gaps,
+        page_suspect=page_suspect,
+        cluster_min=cluster_min,
+        cluster_max_chars=cluster_max_chars,
+    )
+
+    # ③ 提升行形态矩阵（字号比值需重采样；sampler 缺失 → 比值 —）
+    sampler = font_sampler
+    owned_pdf: Any | None = None
+    if sampler is None and output.data:
+        try:
+            owned_pdf = open_pdf_bytes(output.data)
+            sampler = CharFontSampler(owned_pdf)
+        except Exception:  # noqa: BLE001 —— 字体数据不可得 → 比值列 —（不阻塞伤情单）
+            if owned_pdf is not None:
+                owned_pdf.close()
+                owned_pdf = None
+            sampler = None
+    heuristic = output.parse_meta.get("heading_heuristic")
+    base_raw = heuristic.get("body_font_size") if isinstance(heuristic, dict) else None
+    if not isinstance(base_raw, (int, float)) or not base_raw:
+        base_raw = getattr(sampler, "body_font_size", None)
+    try:
+        channel = _promotion_channel(output.document)
+        promoted = _promoted_rows(
+            channel,
+            sampler=sampler,
+            body_font_size=float(base_raw) if base_raw else None,
+        )
+    finally:
+        if sampler is not None and sampler is not font_sampler:
+            sampler.close()
+        if owned_pdf is not None:
+            owned_pdf.close()
+    # ③ 自诊断：管线留痕 promoted（parse_meta.heading_heuristic.promoted）与树内
+    # 指纹（已提升行数）矛盾 = 提升行形态在树内不可归因——缺口警示显式输出
+    fingerprint_promoted = sum(1 for _node, flag in channel if flag)
+    pipeline_promoted_raw = (
+        heuristic.get("promoted") if isinstance(heuristic, dict) else None
+    )
+    pipeline_promoted = (
+        pipeline_promoted_raw if isinstance(pipeline_promoted_raw, int) else None
+    )
+    promotion_gap_warning: str | None = None
+    if pipeline_promoted is not None and pipeline_promoted > fingerprint_promoted:
+        promotion_gap_warning = (
+            f"  · ⚠️ 指纹缺口：管线留痕 promoted={pipeline_promoted} 条，"
+            f"树内 raw_type=text/formula 的 heading 仅 {fingerprint_promoted} 条"
+            "——提升行形态指纹不可归因（工单 B 复核面）"
+        )
+
+    # ④ formula 通道活跃度
+    f_total, f_headings, f_empty, f_samples = _formula_stats(output.document)
+
+    return InjuryReport(
+        correction_path=path,
+        no_bookmark_warning=warning,
+        missing_available=missing_available,
+        missing=missing,
+        headings=heading_count,
+        body_chars=body_chars,
+        per_1k=per_1k,
+        pages=pages,
+        per_page=per_page,
+        density_suspects=suspects,
+        promoted=promoted,
+        promoted_pipeline=pipeline_promoted,
+        promotion_gap_warning=promotion_gap_warning,
+        formula_total=f_total,
+        formula_headings=f_headings,
+        formula_empty=f_empty,
+        formula_samples=f_samples,
+    )
+
+
+def _render_density_suspect(suspect: DensitySuspect) -> str:
+    titles = "、".join(suspect.titles[:_INJURY_SAMPLE_LIMIT]) or "—"
+    if suspect.kind == "page":
+        return f"  · [单页密集] p{suspect.page} 共 {suspect.count} 个 heading：{titles}"
+    pages = (
+        "—"
+        if suspect.pages is None
+        else f"p{suspect.pages[0]}~p{suspect.pages[1]}"
+    )
+    span = "—" if suspect.span_chars is None else str(suspect.span_chars)
+    return (
+        f"  · [连续簇] {suspect.count} 条 heading · 正文间隔 {span} 字"
+        f"（{pages}）：{titles}"
+    )
+
+
+def _render_promoted_row(row: PromotedRow) -> str:
+    ratio = "—" if row.ratio is None else f"{row.ratio:.2f}"
+    if row.ending is None:
+        ending = "无"
+    elif row.gap:
+        ending = f"「{row.ending}」（脱漏：提升正则不含）"
+    else:
+        ending = f"「{row.ending}」"
+    status = "" if row.promoted else " · 未提升（字号未命中标题簇或句末标点拦截）"
+    return (
+        f"  · 「{row.title}」 {row.chars} 字 · {row.lines} 行"
+        f" · 句末：{ending} · 字号比值 {ratio}{status}"
+    )
+
+
+def render_injury_report_text(report: InjuryReport) -> list[str]:
+    """text 视图伤情单块（③.b 节；⑤ 警告恒为第一行）。"""
+    lines = ["--- ③.b 小节级伤情单（工单 C v2 · 只读观察）---"]
+    if report.no_bookmark_warning:
+        lines.append(report.no_bookmark_warning)
+    lines.append("")
+    # ① 书签召回缺失（零命中逐条）
+    if report.missing_available:
+        if report.missing:
+            lines.append(f"书签召回缺失    : {len(report.missing)} 条——")
+            for entry in report.missing:
+                page = "—" if entry.page is None else str(entry.page + 1)
+                lines.append(
+                    f"  · 「{entry.title}」 书签层级 L{entry.level + 1}"
+                    f" · 目标页 {page} · 树内零命中"
+                )
+        else:
+            lines.append("书签召回缺失    : 0 条（全部命中）")
+    else:
+        lines.append("书签召回缺失    : 书签不可读，无法核对")
+    # ② 标题密度（分布 + 嫌疑清单）
+    volume = (
+        f"{report.body_chars / 1000:.1f} 千字"
+        if report.body_chars >= 1000
+        else f"{report.body_chars} 字"
+    )
+    density = f"标题密度        : {report.headings} heading / {volume}"
+    if report.per_1k is not None:
+        density += f" = {report.per_1k:.2f} 条/千字"
+    if report.pages is not None:
+        density += f" · {report.pages} 页"
+        if report.per_page is not None:
+            density += f" = {report.per_page:.2f} 条/页"
+    if report.density_suspects:
+        density += f"；嫌疑 {len(report.density_suspects)} 处——"
+        lines.append(density)
+        lines.extend(_render_density_suspect(s) for s in report.density_suspects)
+    else:
+        lines.append(f"{density}；嫌疑 0 处")
+    # ③ 提升行形态矩阵（已提升 + 未提升候选；留痕对照与缺口自诊断）
+    promoted_count = sum(1 for row in report.promoted if row.promoted)
+    candidate_count = len(report.promoted) - promoted_count
+    pipeline_mark = (
+        str(report.promoted_pipeline)
+        if report.promoted_pipeline is not None
+        else "—"
+    )
+    lines.append(
+        f"提升行形态      : Fix 2 提升通道已提升 {promoted_count} 条"
+        f" · 未提升候选 {candidate_count} 条"
+        f"（管线留痕 promoted={pipeline_mark}）"
+        + ("——" if report.promoted else "")
+    )
+    if report.promotion_gap_warning:
+        lines.append(report.promotion_gap_warning)
+    shown = report.promoted[:_INJURY_MATRIX_ROW_LIMIT]
+    lines.extend(_render_promoted_row(row) for row in shown)
+    if len(report.promoted) > _INJURY_MATRIX_ROW_LIMIT:
+        hidden = len(report.promoted) - _INJURY_MATRIX_ROW_LIMIT
+        lines.append(f"  · …其余 {hidden} 条略（上限 {_INJURY_MATRIX_ROW_LIMIT} 条）")
+    # ④ 空 text 候选（formula 活跃度）
+    share = (
+        round(report.formula_headings / report.formula_total * 100)
+        if report.formula_total
+        else 0
+    )
+    body_count = (
+        report.formula_total - report.formula_headings - report.formula_empty
+    )
+    samples = "、".join(report.formula_samples) if report.formula_samples else "—"
+    lines.append(
+        f"空 text 候选    : formula {report.formula_total} 条"
+        f"（标题 {report.formula_headings} · 正文 {body_count}"
+        f" · 空载荷 {report.formula_empty}）；标题占比 {share}%；样例: {samples}"
+    )
+    return lines
+
+
+def render_injury_report_html(report: InjuryReport) -> str:
+    """html 视图伤情单块（与 text 同源同文案；复用 selfcheck 类，零新增 CSS）。"""
+    body = "\n".join(
+        html.escape(line) for line in render_injury_report_text(report)
+    )
+    return f'<section class="selfcheck"><pre>{body}</pre></section>'
+
+
+# ---------------------------------------------------------------------------
 # 6) 整体渲染
 # ---------------------------------------------------------------------------
 
 
 def _summary_lines(output: PipelineOutput) -> list[str]:
     meta = output.parse_meta
-    return [
+    # SDK blocks 通道无原始字节面：byte_size 记块数，行尾注记口径（见 run_feishu_sdk_pipeline）
+    size_note = "（SDK 通道按块计数）" if output.channel == "feishu-sdk" else ""
+    lines = [
         f"源              : {output.source_label}",
-        f"字节 / 扩展名   : {output.byte_size} B / .{output.ext}",
+        f"字节 / 扩展名   : {output.byte_size} B / .{output.ext}{size_note}",
         f"归一化通道      : {meta.get('parser', '?')}"
         f"（pages={meta.get('pages')} tables={meta.get('tables')}"
         f" code_blocks={meta.get('code_blocks')}）",
@@ -630,6 +1238,12 @@ def _summary_lines(output: PipelineOutput) -> list[str]:
         f"{output.config.para_max_chars}/{output.config.sentence_max_chars}"
         f" table_agg_rows={output.config.table_agg_rows}",
     ]
+    if output.truncated:
+        # 翻页防御截断：summary 与落盘文件里也必须显眼可见（不只 stdout 即时 print）
+        lines.append(
+            "[!] SDK blocks 翻页截断（truncated=True）：视图不完整，尾块缺失"
+        )
+    return lines
 
 
 def render_text(output: PipelineOutput) -> str:
@@ -647,6 +1261,11 @@ def render_text(output: PipelineOutput) -> str:
     lines.extend(render_chunks_text(output))
     lines.extend([""])
     lines.extend(render_structure_check_text(build_structure_check(output)))
+    # ③.b 小节级伤情单（工单 C v2）：仅 PDF + 校正启用时产出（非 PDF / 关闭态零变化）
+    injury = build_injury_report(output)
+    if injury is not None:
+        lines.extend([""])
+        lines.extend(render_injury_report_text(injury))
     return "\n".join(lines)
 
 
@@ -687,6 +1306,10 @@ footer { margin-top: 1.5rem; font-size: 12px; color: #777; }
 
 def render_html(output: PipelineOutput) -> str:
     meta = "\n".join(html.escape(line) for line in _summary_lines(output))
+    injury = build_injury_report(output)
+    injury_html = (
+        render_injury_report_html(injury) if injury is not None else ""
+    )
     return f"""<!doctype html>
 <html lang="zh">
 <head>
@@ -698,7 +1321,7 @@ def render_html(output: PipelineOutput) -> str:
 <body>
 <h1>KB 管线验证探针 · {html.escape(output.source_label)}</h1>
 <div class="meta">{meta}</div>
-{render_structure_check_html(build_structure_check(output))}
+{render_structure_check_html(build_structure_check(output))}{injury_html}
 <div class="wrap">
   <div class="col tree">
     <h2>① 树 IR（◆ = document-ref 占位符）</h2>
@@ -919,6 +1542,134 @@ def _validate_docx(payload: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# 6.b) 飞书 SDK blocks 直读通道（生产导入同映射形态；凭据走 feishu_settings 单例）
+# ---------------------------------------------------------------------------
+
+
+def _fetch_sdk_blocks(obj_token: str) -> tuple[list[Any], bool]:
+    """同步桥接：异步 client 分页翻全 → (items, truncated)。
+
+    凭据缺失时 `get_default_feishu_client()` 在**构造即抛** FeishuClientError（消息经
+    redact 脱敏、零回显凭据值）——此处归一 ProbeError（飞书失败面 → 退出码 1 + 降级
+    提示）；取回后全程同步，不再进事件循环。
+    """
+    async def _run() -> Any:
+        return await get_default_feishu_client().list_document_blocks(obj_token)
+
+    try:
+        page = asyncio.run(_run())
+    except FeishuClientError as exc:
+        raise ProbeError(
+            f"飞书 SDK blocks 直读失败：{exc}", exit_code=1, feishu=True
+        ) from exc
+    except ImportError as exc:  # lark-oapi 未安装（环境面）
+        raise ProbeError(
+            f"飞书 SDK 不可用（lark-oapi 未安装）：{exc}", exit_code=2, feishu=True
+        ) from exc
+    return list(page.items), bool(page.truncated)
+
+
+def run_feishu_sdk_pipeline(
+    obj_token: str,
+    *,
+    node_token: str | None = None,
+    space_id: str = SDK_DEFAULT_SPACE,
+    title: str = SDK_DEFAULT_TITLE,
+    obj_edit_time: int | None = None,
+    catalog_path: Sequence[str] = (),
+) -> PipelineOutput:
+    """SDK blocks 直读 → 树 IR → sheet(30) 回填 → 逐级切分（与生产 `_ingest_docx` 逐字同组合）。
+
+    生产组合（`apps/search-api/app/rag/import_worker.py` `_ingest_docx`）：
+    `map_blocks`（探针无同步目录 → `known_node_tokens`/`node_token_by_obj_token` 空）
+    → `build_document_node` → catalog_path → `attach_block_tree` → **sheet(30) 装配后
+    回填段**（`backfill_sheet_placeholders`：placeholder 翻 false + meta.rows/col_count
+    物化；失败保留占位不算文档失败，FeishuSheetValuesError.category 进
+    failed_categories 留痕；探针零 DB 语义不变，client 即取即用）→ parse_meta →
+    `chunk_forest`。产出面（`PipelineOutput`）与本地文件通道同构，后续渲染/落盘
+    全部复用既有 main 流程。
+
+    `catalog_path` 与 `run_pipeline` 同口径：从根到本文档、含本文档标题；空白段
+    （纯空白）在此滤除（不是标题，落进链会污染 heading_path 轨迹）。
+    """
+    items, truncated = _fetch_sdk_blocks(obj_token)
+    if truncated:
+        # 翻页防御上限截断：尾块缺失 → 树与切片视图都不完整，判定不可全信
+        print(
+            "[!] SDK blocks 翻页防御截断（truncated=True）：尾块缺失，树/切片视图不完整"
+        )
+
+    node = node_token or obj_token
+    mapping = map_blocks(
+        items,
+        space_id=space_id,
+        node_token=node,
+        known_node_tokens=frozenset(),  # 探针场景无同步目录（生产由同步 diff 供给）
+        node_token_by_obj_token={},  # 同上：无 obj_token → node_token 反查表
+    )
+    doc_node = build_document_node(
+        node_token=node,
+        title=title,
+        obj_type=SDK_OBJ_TYPE,
+        obj_edit_time=obj_edit_time,
+        space_id=space_id,
+    )
+    # 空白段滤除（与 run_pipeline 注释同语义：只丢空白段，不重写真实标题内容）
+    doc_node.catalog_path = [segment for segment in catalog_path if segment.strip()]
+    attach_block_tree(doc_node, mapping.refs, root_order=mapping.root_order)
+
+    # sheet(30) 装配后回填段（生产 `_ingest_docx` 同组合——同位：装配后、切分前）：
+    # 占位翻 false + meta.rows/col_count 物化；失败保留占位不算文档失败（27 行 image
+    # 先例同款）；超限截断计数留痕 parse_meta.feishu.sheet_backfill。同步→异步单桥：
+    # backfill 整体一个 asyncio.run，fetch 闭包保持生产同款 async 形态（嵌套 run 非法）。
+    async def _backfill() -> SheetBackfillReport:
+        async def _fetch_sheet_values(sheet_token: str) -> SheetValuesData:
+            return await get_default_feishu_client().fetch_sheet_values(sheet_token)
+
+        return await backfill_sheet_placeholders(doc_node, _fetch_sheet_values)
+
+    backfill = asyncio.run(_backfill())
+    degraded = dict(mapping.degraded_blocks)
+    for key, count in backfill.degraded_delta().items():
+        degraded[key] = degraded.get(key, 0) + count
+    parse_meta = {
+        "pages": None,
+        "tables": sum(1 for ref in mapping.refs if ref.node.type.value == "table"),
+        "code_blocks": sum(1 for ref in mapping.refs if ref.node.type.value == "code"),
+        "parser": PARSER_FEISHU_BLOCKS,  # 通道标识（api.md §4.7；常量取自 feishu_mapper）
+        "feishu": build_feishu_parse_meta(
+            space_id=space_id,
+            node_token=node,
+            obj_type=SDK_OBJ_TYPE,
+            obj_edit_time=obj_edit_time,
+            degraded_blocks=degraded,
+        ),
+    }
+    sheet_backfill_block = backfill.parse_meta_block()
+    if sheet_backfill_block:
+        parse_meta["feishu"]["sheet_backfill"] = sheet_backfill_block
+    config = ChunkingConfig.from_spec(SPEC_CONFIG)
+    results = chunk_forest(doc_node, config=config)
+    if len(results) != 1:
+        raise ProbeError(
+            f"单文档管线期望 1 个切分结果，实得 {len(results)}（SDK blocks 产物形态异常）"
+        )
+    return PipelineOutput(
+        source_label=f"{SDK_LABEL_PREFIX}obj_token={obj_token[:6]}***",
+        ext=SDK_OBJ_TYPE,
+        byte_size=len(items),  # 无字节面：按块计数（summary 行注记口径）
+        document=doc_node,
+        parse_meta=parse_meta,
+        chunking=results[0],
+        config=config,
+        outline=None,  # 非 PDF 通道（自检节「不适用」）
+        data=b"",  # 无原始字节（伤情单等 PDF 专属面不触达）
+        channel="feishu-sdk",  # summary 按通道注记（不靠标签前缀判定）
+        truncated=truncated,  # 截断留痕进 summary（text/html 落盘可见）
+    )
+
+
+# ---------------------------------------------------------------------------
 # 7) 入口
 # ---------------------------------------------------------------------------
 
@@ -933,6 +1684,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python scripts/probe_kb_pipeline.py README.md --format html --out out/kb_probe.html\n"
             "  python scripts/probe_kb_pipeline.py --sample\n"
             "  python scripts/probe_kb_pipeline.py --feishu-token <obj_token>\n"
+            "  python scripts/probe_kb_pipeline.py --feishu-sdk <obj_token> --feishu-sdk-space <space_id>\n"
             "  python scripts/probe_kb_pipeline.py out/x.docx --catalog-path \"A > B\"\n"
         ),
     )
@@ -944,6 +1696,35 @@ def _build_parser() -> argparse.ArgumentParser:
         "--feishu-token",
         metavar="OBJ_TOKEN",
         help="飞书文档 obj_token：走 export task 通道取 docx 后喂同一管线",
+    )
+    parser.add_argument(
+        "--feishu-sdk",
+        metavar="OBJ_TOKEN",
+        help="飞书 docx obj_token：走 SDK blocks 直读通道（生产导入同映射形态）",
+    )
+    parser.add_argument(
+        "--feishu-sdk-node",
+        metavar="NODE_TOKEN",
+        help="SDK 通道的 wiki 节点 token（缺省=obj_token；无同步目录时任意值）",
+    )
+    parser.add_argument(
+        "--feishu-sdk-space",
+        metavar="SPACE_ID",
+        default=SDK_DEFAULT_SPACE,
+        help=f"SDK 通道的知识空间 ID（缺省 {SDK_DEFAULT_SPACE}；只进 parse_meta.feishu）",
+    )
+    parser.add_argument(
+        "--feishu-sdk-title",
+        metavar="TITLE",
+        default=SDK_DEFAULT_TITLE,
+        help=f"SDK 通道的文档标题（缺省 {SDK_DEFAULT_TITLE}）",
+    )
+    parser.add_argument(
+        "--feishu-sdk-edit-time",
+        metavar="INT",
+        type=int,
+        default=None,
+        help="SDK 通道的 obj_edit_time（秒级整数，缺省 None）",
     )
     parser.add_argument(
         "--catalog-path",
@@ -964,17 +1745,34 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: 输入方式四选一（path / --sample / --feishu-token / --feishu-sdk）——互斥校验与文案单一来源
+_INPUT_MODES: tuple[tuple[str, str], ...] = (
+    ("<文件路径>", "path"),
+    ("--sample", "sample"),
+    ("--feishu-token", "feishu_token"),
+    ("--feishu-sdk", "feishu_sdk"),
+)
+
+
+def _check_single_input(args: argparse.Namespace) -> None:
+    """输入须且只须一种（四选一互斥；`--catalog-path` 等附加旗标不参与选择）。"""
+    picked = [name for name, attr in _INPUT_MODES if getattr(args, attr, None)]
+    if len(picked) != 1:
+        raise ProbeError("输入须且只须一种：" + " / ".join(name for name, _ in _INPUT_MODES))
+
+
 def _resolve_input(args: argparse.Namespace) -> tuple[bytes, str, str]:
-    """参数 → (bytes, ext, 源标签)；三选一互斥校验。"""
-    chosen = [bool(args.path), args.sample, bool(args.feishu_token)]
-    if sum(chosen) != 1:
-        raise ProbeError("输入须且只须一种：<文件路径> / --sample / --feishu-token")
+    """参数 → (bytes, ext, 源标签)；四选一互斥校验（SDK blocks 通道由 main 先分流）。"""
+    _check_single_input(args)
     if args.sample:
         return SAMPLE_MARKDOWN.encode("utf-8"), SAMPLE_EXT, "内置样本 --sample"
     if args.feishu_token:
         token = args.feishu_token
         label = f"飞书文档 obj_token={token[:6]}***（export task）"
         return fetch_feishu_docx(token), "docx", label
+    if args.feishu_sdk:
+        # 防御：main 对 --feishu-sdk 先分流（无字节面），走到这里说明调用方绕过了 main
+        raise ProbeError("--feishu-sdk 走 SDK blocks 直读通道，不经本地字节管线")
     assert args.path is not None  # 互斥校验已保证
     path = Path(args.path)
     if not path.is_file():
@@ -999,10 +1797,22 @@ def _emit(payload: str, out: str | None, *, default_out: Path | None) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        data, ext, label = _resolve_input(args)
-        output = run_pipeline(
-            data, ext, label, catalog_path=_parse_catalog_path(args.catalog_path)
-        )
+        _check_single_input(args)  # 四选一互斥先于任何取数动作（含 SDK 通道）
+        if args.feishu_sdk:
+            # SDK blocks 直读通道：产出面与本地文件通道同构，渲染/落盘全复用下方流程
+            output = run_feishu_sdk_pipeline(
+                args.feishu_sdk,
+                node_token=args.feishu_sdk_node,
+                space_id=args.feishu_sdk_space,
+                title=args.feishu_sdk_title,
+                obj_edit_time=args.feishu_sdk_edit_time,
+                catalog_path=_parse_catalog_path(args.catalog_path),
+            )
+        else:
+            data, ext, label = _resolve_input(args)
+            output = run_pipeline(
+                data, ext, label, catalog_path=_parse_catalog_path(args.catalog_path)
+            )
         if args.format == "html":
             _emit(render_html(output), args.out, default_out=DEFAULT_HTML_OUT)
         else:

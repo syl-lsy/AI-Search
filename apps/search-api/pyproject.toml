@@ -60,6 +60,13 @@ dependencies = [
     "docling==2.151.1",              # pdf 主线（版面/表格/页码级溯源 loc.page；探针 §2.2——core 2.108.0 / ibm-models 4.0.4 随装）
     "paddleocr==3.7.0",              # OCR 通道（paddlex 3.7.2 随装；init 首跑下载 PP-OCRv6 medium 检测+识别模型——探针 §2.3）
     "paddlepaddle==3.3.1",           # PaddleOCR 推理后端（CPU；OQ-32 本地 CPU 进程内）
+    # ── M3 批次 3（B20）飞书导入 SDK 通道：lark-oapi 自 dev 组移入生产 dependencies
+    #    （原 dev 组注「生产面随 B20 实施再进 [project]，届时沿用同一 == 锁定版本」兑现；
+    #    ARCH S16 既有钉定）。== 锁定 + 护栏单测（import 断言：版本锁 +
+    #    wiki.v2/docx.v1/drive.v1 三域调用路径在位——上游 API 面漂移先在护栏红，
+    #    R8/R16 同口径；test_kb_feishu_client.py）。传递依赖 websockets<16,>=11
+    #    由 uv.lock 既有解析 15.0.1 满足（依赖组迁移零重解析漂移——lock 后已核对）。
+    "lark-oapi==1.8.0",
 ]
 
 [build-system]
@@ -91,13 +98,10 @@ dev = [
     "pyright==1.1.414",
     "ruff==0.17.4",
     "python-dotenv==1.2.4",
-    # M3 飞书接入（ARCH B20 行既有钉定）：探查工具面首次落地——notebooks/
-    #   feishu_kb_tree_probe.ipynb 的 wiki/docx/drive 通道走官方 lark-oapi SDK。
-    #   仅 dev 组（notebook 开发辅助面）；生产面随 B20 实施再进 [project]，
-    #   届时沿用同一 == 锁定版本。
-    "lark-oapi==1.8.0",
     # notebook 交付物的执行验证最小面（nbformat 结构校验 + nbclient 真执行）：
     #   开发辅助，不进生产。与同组其余项一致用 == 精确锁（值 = 2026-11-24 uv.lock 定版）
+    #   （lark-oapi 原在本组作 notebook 探查工具面——2026-11-25 B20 实施移入 [project]
+    #   生产 dependencies，==1.8.0 锁版不变；notebook 走生产依赖继续可用）
     "nbformat==5.11.1",
     "nbclient==0.11.0",
     "ipykernel==7.4.0",

@@ -29,8 +29,15 @@
 3. **代码整块**：kind=code 原子——永不内切、不与邻接合并；超长整块保留不腰斩
    （ADR-018④/调研 §13.4），`Chunk.oversized` 留痕 + `ChunkingResult.oversized_units`
    计数（日志形态由流水线层承担：只记组件名/字符数，零内容）。
-4. **表格聚合**：≤table_agg_rows 数据行聚为单 chunk；超限按组切分且**每组重携表头**
-   （缓解 markitdown 表头语义瑕疵）；行为组原子切（单元格/占位符永不跨块）。
+4. **表格聚合**：≤table_agg_rows 数据行聚为单 chunk；行组字符预算
+   `table_group_max_chars`（1600，nacos-config §3 v1.45）与行数上限**并行生效、
+   先到者断组**，表头行不计入预算；超限按组切分且**每组重携表头**（缓解 markitdown
+   表头语义瑕疵）；行为组原子切（单元格/占位符永不跨块）。渲染侧：单元格净化
+   （内嵌换行→单空格、裸管道符→转义，物理行=逻辑行）+ `meta.cell_spans` 合并区
+   前向填充（锚点文本填覆盖格、跨组每组重复——`meta.rows` 锚点单写形态不变）；
+   负例（无合并/无多行格/无管道符）输出字节级不变（fixture + 变异自证锁死）。
+   占位表（无 rows，30/18 行升格形态）渲染占位字面进语料（回填失败不静默蒸发）。
+   ★挂账：markitdown 上游列移位缺陷不修、`_render_table` 内留痕（见其 docstring）。
 5. **PUA 占位符保护**（§1.18 / ir_schema 协议）：切分前 `protect_document_refs`
    完整性校验（残片 ValueError）+ PUA U+F0000 单字符替换 → 在保护空间选切点
    （占位符=单字符，结构性永不跨块）→ 逐片还原 → `find_document_refs` 按切片筛选
@@ -89,14 +96,16 @@ from app.rag.ir_schema import (
 # 配置（消费面：Nacos Agent Spec `kb` 节快照——配置三分法，AI 行为类热更）
 # ---------------------------------------------------------------------------
 
-#: 契约默认值（nacos-config.md §3 kb 节 v1.43；config_center/defaults.py SPEC_CONFIG
-#: `kb` 节同源——键缺失回落此处，灰度安全）
+#: 契约默认值（nacos-config.md §3 kb 节 v1.45——2026-11-25 表格双工单契约批增
+#: `table_group_max_chars`；config_center/defaults.py SPEC_CONFIG `kb` 节同源——
+#: 键缺失回落此处，灰度安全）
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 120
 DEFAULT_PAGE_MAX_CHARS = 1200
 DEFAULT_PARA_MAX_CHARS = 400
 DEFAULT_SENTENCE_MAX_CHARS = 200
 DEFAULT_TABLE_AGG_ROWS = 10
+DEFAULT_TABLE_GROUP_MAX_CHARS = 1600
 
 
 @dataclass(frozen=True)
@@ -109,6 +118,7 @@ class ChunkingConfig:
     para_max_chars: int = DEFAULT_PARA_MAX_CHARS
     sentence_max_chars: int = DEFAULT_SENTENCE_MAX_CHARS
     table_agg_rows: int = DEFAULT_TABLE_AGG_ROWS
+    table_group_max_chars: int = DEFAULT_TABLE_GROUP_MAX_CHARS
 
     def __post_init__(self) -> None:
         for name in (
@@ -117,6 +127,7 @@ class ChunkingConfig:
             "para_max_chars",
             "sentence_max_chars",
             "table_agg_rows",
+            "table_group_max_chars",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -157,6 +168,9 @@ class ChunkingConfig:
                 chunking, "sentence_max_chars", DEFAULT_SENTENCE_MAX_CHARS
             ),
             table_agg_rows=_int(chunking, "table_agg_rows", DEFAULT_TABLE_AGG_ROWS),
+            table_group_max_chars=_int(
+                chunking, "table_group_max_chars", DEFAULT_TABLE_GROUP_MAX_CHARS
+            ),
         )
 
 
@@ -479,11 +493,94 @@ def _snap_tail(text: str, overlap: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_cell(cell: str) -> str:
+    """单元格净化（2026-11-25 表格双工单实现批——切分渲染契约）：
+
+    - 内嵌换行 → 单空格：净化后**物理行=逻辑行**（多行格行对齐）——`_table_pieces`
+      的表头定位/行偏移换算/分组计数不再被裸续行片破坏（飞书 `_cell_text` 以换行
+      拼接格内多段、docling `cell.text` 均可含换行）；
+    - 裸管道符 → 反斜杠转义：markdown 列边界消歧（格内 `a|b`/`cmd | grep` 旧渲染
+      下列结构歧义；chunk 正文为 KB 语料终态内容，转义后列边界唯一）。
+
+    无换行无管道符的格逐字节不变（负例锁：`_render_table` 对无合并/无多行格/
+    无管道符的表输出与旧算法字节级一致——变异测试锁死）。
+    """
+    if "\n" in cell or "\r" in cell:
+        cell = cell.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    if "|" in cell:
+        cell = cell.replace("|", "\\|")
+    return cell
+
+
+def _forward_fill(display: list[list[str]], cell_spans: Any) -> list[list[str]]:
+    """合并单元格前向填充（data-model §1.18 映射表 31 行消费面钉注——切分链侧）：
+
+    `meta.cell_spans` 稠密同构矩阵（每格 [row_span, col_span]）就位时，锚点文本
+    填充到跨度覆盖格（`meta.rows` 锚点单写形态不变、填充只发生在渲染视图）；
+    rowspan 跨组时因填充作用于全表行矩阵、每组渲染自身行 → **每组重复锚点文本**。
+
+    spans 形态不合规（行/列数与 rows 不同构、非整数跨度、非正跨度、出界）→
+    防御忽略整体填充（视为无合并——mapper 侧 `_build_cell_spans` 已自检，此处为
+    消费端兜底，坏 spans 不改变渲染行为）。display 本体不被修改（返回填充副本）。
+    """
+    row_count = len(display)
+    col_count = len(display[0]) if display else 0
+    if not isinstance(cell_spans, list) or row_count == 0 or len(cell_spans) != row_count:
+        return display
+    for span_row in cell_spans:
+        if not isinstance(span_row, list) or len(span_row) != col_count:
+            return display
+    filled = [list(row) for row in display]
+    for r, span_row in enumerate(cell_spans):
+        for c, span in enumerate(span_row):
+            if not (isinstance(span, list) and len(span) == 2):
+                return display
+            row_span, col_span = span
+            if (
+                isinstance(row_span, bool)
+                or isinstance(col_span, bool)
+                or not isinstance(row_span, int)
+                or not isinstance(col_span, int)
+                or (row_span <= 1 and col_span <= 1)
+            ):
+                continue
+            if row_span <= 0 or col_span <= 0 or r + row_span > row_count or c + col_span > col_count:
+                return display  # 出界/非正：整体形态不合规 → 防御忽略
+            anchor = display[r][c]
+            for dr in range(row_span):
+                for dc in range(col_span):
+                    if dr or dc:
+                        filled[r + dr][c + dc] = anchor
+    return filled
+
+
 def _render_table(node: IrNode) -> tuple[str, list[list[Any]] | None]:
-    """table 节点 → markdown 管道表全文 + rows（缺 rows 视为空单元）。"""
+    """table 节点 → markdown 管道表全文 + rows（缺 rows/占位表 → `node.text` 兜底
+    渲染——占位字面进语料，评审 P2；node.text 亦空则维持零贡献旧口径）。
+
+    渲染管线（2026-11-25 表格双工单实现批）：列定形（补空/截断）→ 合并前向填充
+    （`_forward_fill`，仅 `meta.cell_spans` 在场时激活）→ 单元格净化（`_sanitize_cell`）
+    → 拼行。负例不变式：无合并/无多行格/无管道符的表输出字节级不变（对照旧算法
+    复刻参照物的 fixture 测试 + 变异自证锁死）。
+    防御性归一（仅畸形输入与旧实现不同、三路 mapper 均不产此形态）：非 list 数据行
+    旧实现按字符迭代产乱码行，本实现跳过该行；全部行非 list 时返回空文本（单元
+    计入 skipped）。良构输入两条路径逐字节一致。
+
+    ★挂账（本批不修，上游缺陷留痕）：markitdown→markdownify 1.2.4 对 colspan 输出
+    等量空格（`' |' * colspan`）、对 rowspan 零处理 → 后续行缺格；本函数在**行尾**
+    补空（下方 `cells += [""] * ...` 处），被纵向合并的列非末列时其后各列整体左移
+    一格（html 上传件通道静默列错位风险）。溯源与三路来源对照见
+    docs/research/chunking-table-code-practices-20261125.md §2.2②〔S18〕；修复归
+    上游升级或归一化侧补格，不在切分链擅动。
+    """
     rows = node.meta.get("rows")
     if not isinstance(rows, list) or not rows:
-        return "", None
+        # 占位/缺 rows 表不静默蒸发（评审 P2）：占位字面（node.text=`[sheet]`/
+        # `[bitable]`，30/18 行升格形态）或表格原文兜底进 document_text——契约
+        # 「占位字面恒保留（纯文本消费面兜底）」在切分链的兑现（回填失败的占位表
+        # 此前对检索语料零贡献）。node.text 亦空（真实表格缺 rows 防御面）→ 维持
+        # 零贡献旧口径。有 rows 表渲染路径零变化（负例不变式不触达本分支）。
+        return (node.text or ""), None
     col_raw = node.meta.get("col_count")
     col = (
         col_raw
@@ -491,19 +588,40 @@ def _render_table(node: IrNode) -> tuple[str, list[list[Any]] | None]:
         else max((len(r) for r in rows if isinstance(r, list)), default=0) or 1
     )
 
-    def _fmt(row: list[Any]) -> str:
-        cells = ["" if c is None else str(c) for c in row]
+    display: list[list[str]] = []
+    for r in rows:
+        if not isinstance(r, list):
+            continue
+        cells = ["" if c is None else str(c) for c in r]
         if len(cells) < col:
+            # ★markitdown 上游列移位挂账点：行尾补空（见函数 docstring ★挂账段）
             cells += [""] * (col - len(cells))
-        return "| " + " | ".join(cells[:col]) + " |"
+        display.append(cells[:col])
+    if not display:
+        return "", rows
+    display = _forward_fill(display, node.meta.get("cell_spans"))
 
-    lines = [_fmt(rows[0]), "| " + " | ".join(["---"] * col) + " |"]
-    lines.extend(_fmt(r) for r in rows[1:] if isinstance(r, list))
+    def _fmt(row: list[str]) -> str:
+        return "| " + " | ".join(_sanitize_cell(cell) for cell in row) + " |"
+
+    lines = [_fmt(display[0]), "| " + " | ".join(["---"] * col) + " |"]
+    lines.extend(_fmt(r) for r in display[1:])
     return "\n".join(lines), rows
 
 
 def _table_pieces(unit: _Unit, cfg: ChunkingConfig) -> list[_Piece]:
-    """表格聚合（行为组原子：单元格/占位符永不跨块；每组重携表头）。"""
+    """表格聚合（行为组原子：单元格/占位符永不跨块；每组重携表头）。
+
+    断组双上限**并行生效、先到者封组**（nacos-config.md §3 kb.chunking v1.45——
+    2026-11-25 表格双工单契约批）：
+    - 行数：`table_agg_rows`（数据行计数，既有上限）；
+    - 字符预算：`table_group_max_chars`（组内数据行**渲染行长度**累计——渲染行即
+      chunk 实际字节成本；表头行不计入预算，表头=每组重携的合成上下文，与「后续
+      组表头不计区间」同口径）。
+    预算判定在行入组前做（组内累计 + 当前行 > 预算 → 先封组再开新组）：单行自身
+    超预算时仍独立成组（行原子——单元格永不跨块，组超预算仅此一态）。
+    净化后物理行=逻辑行（`_sanitize_cell`），行偏移换算保持精确。
+    """
     assert unit.rows is not None
     lines = unit.text.split("\n")
     header_lines = lines[:2]
@@ -515,24 +633,40 @@ def _table_pieces(unit: _Unit, cfg: ChunkingConfig) -> list[_Piece]:
         offsets.append(pos)
         pos += len(line) + 1
     data_offsets = offsets[2:]
-    groups = [
-        data_lines[i : i + cfg.table_agg_rows]
-        for i in range(0, len(data_lines), cfg.table_agg_rows)
-    ] or [[]]
+
+    groups: list[list[int]] = []  # 数据行下标分组
+    current: list[int] = []
+    current_chars = 0
+    for idx, line in enumerate(data_lines):
+        line_len = len(line)
+        if current and (
+            len(current) >= cfg.table_agg_rows
+            or current_chars + line_len > cfg.table_group_max_chars
+        ):
+            groups.append(current)
+            current = []
+            current_chars = 0
+        current.append(idx)
+        current_chars += line_len
+    if current:
+        groups.append(current)
+    if not groups:
+        groups = [[]]
+
     pieces: list[_Piece] = []
     for gi, group in enumerate(groups):
         if not group and gi == 0 and not data_lines:
             group_text = "\n".join(header_lines)
             g_start, g_end = 0, len(unit.text)
         else:
-            first = data_offsets[gi * cfg.table_agg_rows]
-            last_line_idx = gi * cfg.table_agg_rows + len(group) - 1
-            g_end = data_offsets[last_line_idx] + len(data_lines[last_line_idx])
-            group_text = "\n".join(header_lines + group)
+            first_idx = group[0]
+            last_idx = group[-1]
+            g_end = data_offsets[last_idx] + len(data_lines[last_idx])
+            group_text = "\n".join(header_lines + [data_lines[i] for i in group])
             if gi == 0:
                 g_start = 0  # 首组内容=表头+数据，区间覆盖整段真实文本
             else:
-                g_start = first  # 后续组重携表头为合成上下文，不计区间
+                g_start = data_offsets[first_idx]  # 后续组重携表头为合成上下文，不计区间
         pieces.append(
             _Piece(
                 unit=unit,
@@ -564,6 +698,21 @@ def _unit_pieces(unit: _Unit, cfg: ChunkingConfig) -> list[_Piece]:
             )
         ]
     if unit.kind == IrNodeType.TABLE.value:
+        if unit.rows is None:
+            # 占位/缺 rows 表：无表体可分组——占位字面整块单片（tail_exempt 同 code；
+            # _table_pieces 的 rows 非 None 前置守卫由本分支保证）
+            return [
+                _Piece(
+                    unit=unit,
+                    text=unit.text,
+                    abs_start=unit.start,
+                    abs_end=unit.end,
+                    level=None,
+                    standalone=True,
+                    oversized=len(unit.text) > cfg.chunk_size,
+                    tail_exempt=True,
+                )
+            ]
         return _table_pieces(unit, cfg)
     # 文本类（paragraph/list/quote/image）：逐级降级
     if len(unit.text) <= cfg.page_max_chars and not unit.spans:
@@ -850,7 +999,11 @@ def chunk_document(
     # 链**两种形态均兼容**（链含本文档节点标题 / 链仅祖先 + doc.title 补接缝均可，
     # 拼接 + 接缝去重对两口径都无断层不重复）；为空时维持 B17 现状口径
     # （base_path = catalog + [doc.title] 不参与轨迹物化——轨迹 = [doc.title] + 文内标题链）。
-    catalog = list(doc.catalog_path or [])
+    # 空串段滤除（评审 P3）：无标题文档/祖先以 "" 占位物化进 catalog_path
+    # （tree_assembler `title or ""`），空串入链制造轨迹空元素 + has_catalog 误开
+    # （[""] 亦触发目录链语义）。滤除后链语义=非空标题序列；titled 全非空目录
+    # 零变化（负例不变式）。IR catalog_path 本体不动（展示链只动轨迹）。
+    catalog = [seg for seg in (doc.catalog_path or []) if seg]
     has_catalog = bool(catalog)
     base_path = [*catalog, *([doc.title] if doc.title else [])]
     chain = _build_chain(catalog, doc.title)

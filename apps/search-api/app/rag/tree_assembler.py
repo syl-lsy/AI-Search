@@ -103,8 +103,9 @@ def assemble_catalog_tree(flat_nodes: Sequence[IrNode]) -> tuple[IrNode, Assembl
 
     - parent 空（None/空串）或已指向虚拟根哨兵 = 根；
     - BFS 建完全树；孤儿挂虚拟根留痕；环边切断留痕；shortcut 子树整支切断留痕；
-    - 装配期末物化 `catalog_ids`/`catalog_path`（祖先链/标题链，document 节点专属，
-      §13.7「构造即一致」——入参既有值按树重算覆写）；
+    - 装配期末物化 `catalog_ids`/`catalog_path`（祖先 ID 链 / 祖先标题+自身标题链，
+      document 节点专属，§13.7「构造即一致」——入参既有值按树重算覆写；catalog_path
+      含自身标题〔§1.18 C9=(a)，顶层=[自身标题]、不存在空链〕）；
     - 返回 `(虚拟根 IrNode, AssembleReport)`；虚拟根 children = 真根 + 孤儿 + 环切根
       （全部 parent_id 重接 VIRTUAL_ROOT_ID，输入序）。
     """
@@ -182,6 +183,11 @@ def assemble_catalog_tree(flat_nodes: Sequence[IrNode]) -> tuple[IrNode, Assembl
     virtual_root.children = top_nodes
 
     # catalog_ids / catalog_path 物化（BFS 沿树；document 节点专属；visited 保险防病态输入）
+    # §1.18「catalog_path 含自身标题」（C9=(a)，B20 契约批）：catalog_path=[祖先标题…,
+    # 自身标题]，顶层（含孤儿兜底/环切成根）=[自身标题]，不存在空链；catalog_ids 口径
+    # 不变（祖先 ID 链，顶层 []）——恒有 len(catalog_path)=len(catalog_ids)+1。链元素
+    # 空串占位（无标题文档）保恒等式；chunker 末位同名吸收（§1.18 物化细则），切片
+    # 轨迹语义零变化；上传/URL 来源不走本装配器（catalog 列恒 null 零变化）。
     queue: deque[tuple[IrNode, IrNode | None]] = deque((child, None) for child in top_nodes)
     materialized: set[str] = set()
     while queue:
@@ -192,13 +198,10 @@ def assemble_catalog_tree(flat_nodes: Sequence[IrNode]) -> tuple[IrNode, Assembl
         if node.type is IrNodeType.DOCUMENT:
             if parent is None:
                 node.catalog_ids = []
-                node.catalog_path = []
+                node.catalog_path = [node.title or ""]
             else:
                 node.catalog_ids = [*parent.catalog_ids, parent.id]
-                titles = [*parent.catalog_path]
-                if parent.title is not None:
-                    titles.append(parent.title)
-                node.catalog_path = titles
+                node.catalog_path = [*parent.catalog_path, node.title or ""]
         for child in node.children:
             queue.append((child, node))
 

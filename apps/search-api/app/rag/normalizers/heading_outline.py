@@ -32,6 +32,26 @@
    （相对最近更浅祖先压到 +1；`[1,4,3,2]` → `[1,2,2,2]`，不做紧邻式推断——紧邻式
    会把回退的浅标题误当上一标题的父级，产生父子反转）；重复标题**只报数不删节点**
    （内容零丢失）。字号/版面聚类留后续工单。
+5. **骨架重建（工单 A，2026-11-24 立项；推翻 T1-b「校正不造节点」旧裁决——用户
+   立项批准即授权，修订注落 docs/m3-b2-delivery-20261123.md）**：护栏通过的 PDF
+   以书签大纲为骨架重建标题结构——`plan_skeleton_slots` 对「书签有而版面识别无」
+   的条目出**造节点计划**（纯函数：标题/层级/目标页/插入位），docling_adapter
+   装配序执行（pending 序列插块后再走既有锚点钉正，造节点与自身书签条目精确
+   匹配成锚点，内容归属由 heading 栈自然完成）。设计判据：
+   - **造节点只收顶级条目**（level == 大纲最小层级的章级书签）——书签对「章」的
+     确定性最强；未命中的非顶级条目绝大多数是图表/附件书签（双层护栏第二支的
+     豁免对象本身），给它们造节点等于把豁免面反转成污染源（图表页内容被划进
+     伪章）。小节粒度版面已有候选，缺小节多属版式变体，归 Fix 2/复核门通道。
+   - **空标题节点语义**：造节点是「只有标题、自身零正文载荷」的结构壳——正文
+     按页码区间直接归属其子树（`正文直接归属`）；书签条目**标题残缺**（归一化
+     空串，read_pdf_outline 已降级置空）不造节点、保持 unmatched 上报可见
+     （无从匹配、无从归属，造出来只会污染 heading_path）。
+   - **内容归属边界 = 相邻书签页码区间的页首**：插入位取 pending 序列中首个
+     页码 ≥ 目标页（dest 0-based +1）的块之前——目标页之前的文本留在前一书签
+     区间；书签只给标题+页码，页内不再细分（文本边界=页首，如实钉定）。
+   - **残损书签不造**：缺 dest 页码（无处归属）、目标页超出正文末块（给文档尾
+     伪造空节会把末节内容错划进它）一律跳过、保持 unmatched。
+   护栏不通过/无书签/总开关关闭 → 计划恒空，回落现行路径逐字节等价。
 
 **介入时机**：校正产物是「标题序列 → 校正 level」的纯映射，调用方在**装配前**应用
 （docling_adapter 在 `BlockTreeBuilder.add` 之前写回 pending.level）——层级是在
@@ -60,10 +80,12 @@ __all__ = [
     "HeadingItem",
     "OutlineCorrection",
     "OutlineEntry",
+    "SkeletonSlot",
     "correct_heading_levels",
     "count_level_jumps",
     "duplicate_title_report",
     "normalize_title",
+    "plan_skeleton_slots",
     "read_pdf_outline",
     "resolve_anchors",
     "sequence_clean_levels",
@@ -208,6 +230,18 @@ def resolve_anchors(
     给层级、顶层恒为 0（生产路径不会出现 1-based），此处归一为兜底形态（其它生成器
     若给 1-based 也不至于让全文档锚点统一抬高一级）。
     """
+    anchors, _matched, unmatched = _resolve_anchor_state(headings, outline)
+    return anchors, unmatched
+
+
+def _resolve_anchor_state(
+    headings: Sequence[HeadingItem], outline: Sequence[OutlineEntry]
+) -> tuple[list[Anchor], set[int], list[str]]:
+    """锚点解析带命中书签下标集（骨架重建计划需要知道**哪些条目**未命中）。
+
+    公开口径（resolve_anchors）只回标题清单；同一条目同名重复时「哪一个未命中」
+    由占位次序决定，此处按下标精确记录，供 plan_skeleton_slots 逐条出造节点计划。
+    """
     level_offset = min((entry.level for entry in outline), default=0)
     index_by_title: dict[str, list[int]] = {}
     for index, item in enumerate(headings):
@@ -216,9 +250,10 @@ def resolve_anchors(
             index_by_title.setdefault(key, []).append(index)
 
     claimed: set[int] = set()
+    matched_outline: set[int] = set()
     anchors: list[Anchor] = []
     unmatched: list[str] = []
-    for entry in outline:
+    for entry_index, entry in enumerate(outline):
         key = normalize_title(entry.title)
         candidates = (
             [i for i in index_by_title.get(key, []) if i not in claimed] if key else []
@@ -228,6 +263,7 @@ def resolve_anchors(
             unmatched.append(entry.title)
             continue
         claimed.add(picked)
+        matched_outline.add(entry_index)
         normalized_level = entry.level - level_offset
         anchors.append(
             Anchor(
@@ -238,7 +274,7 @@ def resolve_anchors(
             )
         )
     anchors.sort(key=lambda anchor: anchor.index)
-    return anchors, unmatched
+    return anchors, matched_outline, unmatched
 
 
 def _pick_candidate(
@@ -278,6 +314,82 @@ def _outline_usable(
     top_entries = sum(1 for entry in outline if entry.level == top_level)
     top_hits = sum(1 for anchor in anchors if anchor.outline_level == 0)
     return top_hits >= OUTLINE_MIN_ENTRIES and top_hits / top_entries >= OUTLINE_MIN_HIT_RATE
+
+
+@dataclass(frozen=True, slots=True)
+class SkeletonSlot:
+    """骨架重建造节点规格（工单 A）：未命中的顶级书签条目 → 新 heading 块。
+
+    `page` 为 1-based 目标页（书签 dest 0-based +1）；`insert_index` 是调用方
+    pending 块序列的插入下标（首个页码 ≥ 目标页的块之前——页首即文本边界）。
+    """
+
+    title: str
+    level: int
+    page: int
+    insert_index: int
+
+
+def plan_skeleton_slots(
+    headings: Sequence[HeadingItem],
+    outline: Sequence[OutlineEntry],
+    block_pages: Sequence[int | None],
+) -> list[SkeletonSlot]:
+    """骨架重建计划（纯函数，工单 A）：护栏过门 → 未命中顶级书签条目的造节点规格。
+
+    决策链（全部在此处，调用方零推断）：
+    1. 双层护栏按**原始匹配**判定（造节点只发生在护栏通过之后——造出来的节点
+       必然与自身书签条目命中，先造后判会把护栏变成自我实现）；
+    2. 未命中条目只收**顶级**（level == 大纲最小层级的章级书签；图表/小节书签
+       不造，见模块 docstring 第 5 条）；
+    3. 残损条目不造：标题归一化空串 / 缺 dest 页码 / 目标页超出正文末块
+       （保持 unmatched 上报可见，不给文档尾伪造空节）；
+    4. 插入位 = `block_pages` 中首个页码 ≥ 目标页的块下标（页码区间归界的页首；
+       无可比页码的块不构成边界，直接越过）。
+
+    输出按 `(insert_index, 大纲序)` 升序——调用方**逆序**执行 `insert` 即可保持
+    前位下标有效且同位插入保持大纲序。
+    """
+    if not outline:
+        return []
+    anchors, matched_outline, _unmatched = _resolve_anchor_state(headings, outline)
+    if not _outline_usable(outline, anchors):
+        return []
+
+    top_level = min(entry.level for entry in outline)
+    level_offset = top_level
+    slots: list[SkeletonSlot] = []
+    for entry_index, entry in enumerate(outline):
+        if entry_index in matched_outline:
+            continue  # 版面已识别（锚点匹配），不重复造
+        if entry.level != top_level:
+            continue  # 造节点只收顶级条目（图表/小节书签不造，见 docstring 第 5 条）
+        key = normalize_title(entry.title)
+        if not key:
+            continue  # 标题残缺（归一化空串）不造——保持 unmatched 上报
+        if entry.page is None:
+            continue  # 缺 dest 页码无处归属
+        target_page = entry.page + 1  # 书签 dest 0-based → docling prov 1-based
+        insert_index = next(
+            (
+                index
+                for index, page in enumerate(block_pages)
+                if page is not None and page >= target_page
+            ),
+            None,
+        )
+        if insert_index is None:
+            continue  # 目标页超出正文末块：不给文档尾伪造空节
+        slots.append(
+            SkeletonSlot(
+                title=entry.title,
+                level=_clamp(entry.level - level_offset + 1),
+                page=target_page,
+                insert_index=insert_index,
+            )
+        )
+    slots.sort(key=lambda slot: slot.insert_index)
+    return slots
 
 
 # ---------------------------------------------------------------------------

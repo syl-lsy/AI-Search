@@ -17,6 +17,7 @@ IO 面失败归一（SnapshotError → 本模块 IrStorageError，原异常 rais
 import asyncio
 import importlib
 import io
+import re
 import uuid
 from typing import Any
 
@@ -98,6 +99,11 @@ def _ensure_bucket_and_put(client: Any, object_key: str, payload: str) -> None:
     并发首写同桶竞态兜底（评审 P3，B17 并行入库流水线前置）：桶已存在类错误
     视为建桶成功继续写，其余异常原样上抛（调用方归一 IrStorageError）。
     """
+    _ensure_bucket_and_put_bytes(client, object_key, payload.encode("utf-8"), IR_JSON_CONTENT_TYPE)
+
+
+def _ensure_bucket_and_put_bytes(client: Any, object_key: str, data: bytes, content_type: str) -> None:
+    """建桶 + 字节载荷写入（put_kb_object 与 ir.json 共用的底层通道）。"""
     bucket = minio_settings.bucket_kb
     if not client.bucket_exists(bucket):
         try:
@@ -105,13 +111,12 @@ def _ensure_bucket_and_put(client: Any, object_key: str, payload: str) -> None:
         except Exception as exc:
             if not _is_bucket_already_exists(exc):
                 raise
-    data = payload.encode("utf-8")
     client.put_object(
         bucket,
         object_key,
         io.BytesIO(data),
         length=len(data),
-        content_type=IR_JSON_CONTENT_TYPE,
+        content_type=content_type,
     )
 
 
@@ -162,3 +167,34 @@ async def get_ir_json(user_id: str, doc_id: str, *, client: Any | None = None) -
         raise IrStorageError(f"ir.json 读取失败：{type(exc).__name__}（key={object_key}）") from exc
     node = deserialize_ir(raw)
     return rebuild_siblings(node)
+
+
+#: kb 桶通用键卫生（B20 附件/图片素材通道）：`kb/{uuid}/{uuid}/<尾段非空>`——前两段
+#: 必须为合法 UUID（与 ir_object_key/original_object_key 同口径；尾段由调用方保证无
+#: 穿越形态，feishu_client.image_material_object_key 另有 block_id 白名单校验）
+_KB_KEY_PREFIX_RE = re.compile(r"^kb/([^/]+)/([^/]+)/.+")
+
+
+async def put_kb_object(
+    object_key: str,
+    data: bytes,
+    *,
+    content_type: str = "application/octet-stream",
+    client: Any | None = None,
+) -> str:
+    """kb 桶通用字节写入口（B20 附件/图片素材落 MinIO 通道——键由调用方按既有
+    约定构造：附件 `original_object_key`、图片素材 `kb/{u}/{d}/img/{block_id}.{ext}`）。
+
+    键前两段须为合法 UUID（键卫生，先于任何 IO 归一 ValueError）；
+    IO 失败 → IrStorageError（原异常链入）。client 注入面供测试假体/复用既有连接。
+    """
+    m = _KB_KEY_PREFIX_RE.match(object_key)
+    if m is None:
+        raise ValueError(f"kb 桶键须为 kb/{{user_id}}/{{doc_id}}/<尾段> 形态：{object_key!r}")
+    _validate_ids(m.group(1), m.group(2))
+    minio_client = client if client is not None else get_kb_minio_client()
+    try:
+        await asyncio.to_thread(_ensure_bucket_and_put_bytes, minio_client, object_key, data, content_type)
+    except Exception as exc:
+        raise IrStorageError(f"kb 对象写入失败：{type(exc).__name__}（key={object_key}）") from exc
+    return object_key

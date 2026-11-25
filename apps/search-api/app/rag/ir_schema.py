@@ -63,13 +63,18 @@ DocKind = Literal["docx", "file", "sheet", "bitable", "upload", "url"]
 
 
 class FeishuLoc(BaseModel):
-    """飞书源定位（§13.5）：node_token/block_id 天然跨导入稳定（增量 delta 寻址）。"""
+    """飞书源定位（§13.5）：node_token/block_id 天然跨导入稳定（增量 delta 寻址）。
+
+    变更判据键名 2026-11-25 B20 契约批统一为 `obj_edit_time`（data-model §1.18
+    通用规则「meta.obj_edit_time 沿既有键」契约字面胜出——wiki 节点编辑时间原批次 1
+    草案名 `edit_time` 收窄作废，防双键并存漂移）。
+    """
 
     origin: Literal["feishu"]
     space_id: str
     node_token: str
     block_id: str | None = None
-    edit_time: int | None = None
+    obj_edit_time: int | None = None
 
 
 class LocalLoc(BaseModel):

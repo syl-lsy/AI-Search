@@ -21,6 +21,7 @@ from app.db.models import KbDocument, KbImportJob, Turn
 from app.db.session import get_session_factory
 from app.exception import BusinessException
 from app.exception.handler import exception_handler, generate_error_docs
+from app.rag.import_worker import get_import_worker
 from app.rag.pipeline import get_kb_pipeline
 from app.services.event_bus import start_event_bus
 from app.services.turn_service import seed_seq_from_db, start_thread_scheduler
@@ -108,9 +109,10 @@ async def _requeue_kb_work() -> tuple[int, int]:
     """KB 队列重入队启动钩子（M3/B16 seam）：中间态文档与未完任务行计数登记。
 
     进程内流水线队列（KB 入库）与飞书导入任务队列无持久化、重启即失——启动时
-    按 data-model.md §4 查询应重入队行数。真队列消费：KB 入库 worker 已于本
+    按 data-model.md §4 查询应重入队行数。真队列消费：KB 入库 worker 于本
     lifespan 下行接线（B17，get_kb_pipeline().start() 内部经 repo.list_requeue_ids
-    消费文档登记行）；飞书导入任务行归 B20。本钩子做「查询计数 + 日志登记」：
+    消费文档登记行）；飞书导入任务行由 get_import_worker().start() 同缝消费
+    （B20 B 线 G5——断点游标续跑，§1.17 :534）。本钩子做「查询计数 + 日志登记」：
     两个只读计数查询、零状态变更、零 commit（幂等可重入）。
     独立 AsyncSession 自管（同 _cleanup_orphan_turns 短事务口径）；失败由
     lifespan 捕获记日志、不阻塞启动（恢复型 best-effort）。
@@ -181,10 +183,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
       §4 :608）：kb_documents status IN (pending,normalizing,chunking,indexing) 与
       kb_import_jobs status IN (pending,running) 只读计数登记（进程内队列无持久化，
       重启即恢复处理；旧 parsing 值随六态扩容作废，IN 列表与状态机同批钉死、
-      常量逐字断言单测锁死）；随后 get_kb_pipeline().start() 消费登记行
+      常量逐字断言单测锁死）；随后 get_kb_pipeline().start() 消费文档登记行
       （repo.list_requeue_ids → 队列）并 spawn worker 池——api.md §4.1「入队 →
-      ready」主链路的生产消费端。两步均失败记日志不阻塞启动（恢复型 best-effort，
-      登记行下次重启重入队承接）；
+      ready」主链路的生产消费端；get_import_worker().start() 消费导入任务登记行
+      （B20 B 线 G5——断点游标续跑，§1.17 :534）。两步均失败记日志不阻塞启动
+      （恢复型 best-effort，登记行下次重启重入队承接）；
     - 默认用户 seed：不在钩子做——迁移 0001 幂等 seed 承担（app/db/seed.py，
       data-model.md §1.1/§4；钩子不重复承担 seed 职责）。
 
@@ -254,6 +257,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                     task="startup_hook",
                 ).error(exc)
 
+            # KB 导入 worker 接线（M3/B20 B 线 G5，data-model.md §1.17 :534 / §4 :608）：
+            # pending/running 导入任务行被 worker 实际重入队续跑（start() 内部
+            # list_requeue_ids → 队列，断点游标续跑）——B20 验收断言的消费端；
+            # 失败不阻塞启动（best-effort 同上口径，登记行下次重启重入队承接）
+            try:
+                await get_import_worker().start()
+            except Exception as exc:
+                CronLog(
+                    message="KB 导入 worker 启动失败——任务行下次重启重入队承接",
+                    task="startup_hook",
+                ).error(exc)
+
             cron_handles = _register_cron_tasks()
             try:
                 yield
@@ -262,6 +277,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                     handle.cancel()
                 await asyncio.gather(*cron_handles, return_exceptions=True)
                 await get_kb_pipeline().stop()
+                await get_import_worker().stop()
         finally:
             await bus.close()
     finally:

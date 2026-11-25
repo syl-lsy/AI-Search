@@ -85,3 +85,57 @@ class KbDocumentListQuery(BaseModel):
     offset: int = Field(default=0, ge=0)
     status: str | None = None
     doc_type: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 飞书导入任务（api.md §4.7~4.9；B20 B 线④——键位镜像 data-model §1.17）
+# ---------------------------------------------------------------------------
+
+
+class KbImportJobCreateRequest(BaseModel):
+    """§4.7 请求体（connector：M3 仅 feishu 合法——其他值路由层 400001）。"""
+
+    connector: str
+
+
+class KbImportJobCreated(BaseModel):
+    """§4.7 响应 data（触发成功：{job_id, status:"pending"}）。"""
+
+    job_id: str
+    status: str
+
+
+class KbImportFailure(BaseModel):
+    """失败清单条目（四键；document_id=null=文档未建成——api.md §4.9）。"""
+
+    title: str
+    category: str
+    message: str
+    document_id: str | None
+
+
+class KbImportJobEntry(BaseModel):
+    """§4.8 列表条目 = §4.9 详情条目不含 failures（失败清单随详情返回）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    connector: str
+    trigger: str
+    status: str
+    total_docs: int
+    processed_docs: int
+    imported_docs: int
+    failed_docs: int
+    skipped_docs: int
+    failure_summary: list[dict[str, object]]
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class KbImportJobDetail(KbImportJobEntry):
+    """§4.9 详情（failures 按处理序排列；仅本端点返回、不设分页——自用 931+ 量级）。"""
+
+    failures: list[KbImportFailure]

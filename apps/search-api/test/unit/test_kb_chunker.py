@@ -83,11 +83,17 @@ def _code(nid: str, text: str) -> IrNode:
     )
 
 
-def _table(nid: str, rows: list[list[Any]]) -> IrNode:
+def _table(nid: str, rows: list[list[Any]], **extra_meta: Any) -> IrNode:
+    meta: dict[str, Any] = {
+        "raw_type": 31,
+        "rows": rows,
+        "col_count": len(rows[0]) if rows else 0,
+    }
+    meta.update(extra_meta)
     return IrNode(
         id=f"loc:blk:{nid}",
         type=IrNodeType.TABLE,
-        meta={"raw_type": 31, "rows": rows, "col_count": len(rows[0]) if rows else 0},
+        meta=meta,
     )
 
 
@@ -211,6 +217,41 @@ class TestHeadingPathCatalogChain:
         )
         result = chunk_document(doc, document_id="d-10", config=CFG)
         assert result.chunks[0].heading_path == [
+            "RAG核心面（精选）",
+            "一、基础认知与对比",
+            "Q1：什么是 RAG？",
+        ]
+
+    def test_catalog_chain_with_own_title_equals_ancestors_only_form(self) -> None:
+        """C9=(a) 接缝吸收：catalog_path 含自身标题（B20 物化新口径）与仅祖先链
+        （doc.title 补接缝）两形态产出的 heading_path **逐字相同**——切片轨迹语义
+        零变化（data-model §1.18「catalog_path 含自身标题」条：本条只改列与投影
+        取值，不改切片轨迹）。"""
+        inner = [_heading("h1", 1, "Q1：什么是 RAG？"), _para("p1", "RAG 是检索增强生成。")]
+        with_own = chunk_document(
+            _doc_at(
+                "d10a",
+                inner,
+                title="一、基础认知与对比",
+                catalog=["RAG核心面（精选）", "一、基础认知与对比"],  # 新口径：含自身
+            ),
+            document_id="d-10a",
+            config=CFG,
+        )
+        ancestors_only = chunk_document(
+            _doc_at(
+                "d10b",
+                [_heading("h1", 1, "Q1：什么是 RAG？"), _para("p1", "RAG 是检索增强生成。")],
+                title="一、基础认知与对比",
+                catalog=["RAG核心面（精选）"],  # 旧口径：仅祖先，接缝补 doc.title
+            ),
+            document_id="d-10b",
+            config=CFG,
+        )
+        assert [c.heading_path for c in with_own.chunks] == [
+            c.heading_path for c in ancestors_only.chunks
+        ]
+        assert with_own.chunks[0].heading_path == [
             "RAG核心面（精选）",
             "一、基础认知与对比",
             "Q1：什么是 RAG？",
@@ -800,3 +841,411 @@ class TestBoundaries:
         result = chunk_document(doc, document_id="d", config=CFG)
         assert result.document_text == "正文段落。"
         assert "章节" not in result.document_text
+
+
+# ---------------------------------------------------------------------------
+# 表格切分链扩围（2026-11-25 表格双工单实现批——B20 工单 2）
+# 契约锚点：data-model.md §1.18 映射表 31 行 meta 扩容（v1.20）+ nacos-config.md
+# §3 kb.chunking `table_group_max_chars`（v1.45）；五组先红后绿 + 负例变异自证。
+# ---------------------------------------------------------------------------
+
+
+#: 真实标本形态（9 行×2 列含内嵌换行格——飞书 `_cell_text` 以换行拼接格内多段
+#: 落地的多行格；旧渲染把内嵌换行变成物理行 → 表头定位/分组偏移被裸续行片破坏）
+_SPECIMEN_9X2: list[list[Any]] = [
+    ["字段", "说明"],
+    ["名称", "多行说明第一行\n第二行内容"],
+    ["别名", "no_newline_cell"],
+    ["来源", "第一段\n第二段\n第三段"],
+    ["状态", "启用"],
+    ["备注", "含\n连续\n三段换行"],
+    ["创建者", "admin"],
+    ["更新者", "root\nsudo"],
+    ["删除者", "nobody"],
+]
+
+
+def _legacy_render(rows: list[list[Any]]) -> str:
+    """旧渲染算法逐字复刻（负例字节级锁的参照物——重构前 chunker.py `_render_table`
+    的输出公式；仅对良构输入（rows[0] 为 list）有定义）。"""
+    col = len(rows[0])
+
+    def fmt(row: list[Any]) -> str:
+        cells = ["" if c is None else str(c) for c in row]
+        if len(cells) < col:
+            cells += [""] * (col - len(cells))
+        return "| " + " | ".join(cells[:col]) + " |"
+
+    lines = [fmt(rows[0]), "| " + " | ".join(["---"] * col) + " |"]
+    lines.extend(fmt(r) for r in rows[1:])
+    return "\n".join(lines)
+
+
+def _legacy_group_contents(rows: list[list[Any]], agg: int) -> list[str]:
+    """旧分组算法逐字复刻（行数单维断组 + 每组重携表头）——负例字节级锁的参照物。"""
+    text = _legacy_render(rows)
+    lines = text.split("\n")
+    header, data = lines[:2], lines[2:]
+    groups = [data[i : i + agg] for i in range(0, len(data), agg)] or [[]]
+    return ["\n".join(header + g) if g else "\n".join(header) for g in groups]
+
+
+def _spans(
+    rows: list[list[Any]], anchors: dict[tuple[int, int], tuple[int, int]]
+) -> list[list[list[int]]]:
+    """构造与 rows 同构的稠密 cell_spans 矩阵（缺省 [1,1]；anchors 按 (r,c)→(rs,cs)）。"""
+    col = len(rows[0])
+    return [
+        [list(anchors.get((r, c), (1, 1))) for c in range(col)] for r in range(len(rows))
+    ]
+
+
+class TestTableCellSanitize:
+    """组 1：多行格行对齐——净化后物理行=逻辑行（9×2 标本 fixture）。"""
+
+    CFG_PLAIN = ChunkingConfig(
+        chunk_size=400,
+        chunk_overlap=20,
+        page_max_chars=60,
+        para_max_chars=25,
+        sentence_max_chars=12,
+        table_agg_rows=10,
+    )
+
+    def test_multiline_cells_align_to_logical_rows(self) -> None:
+        result = chunk_document(
+            _doc([_table("t1", _SPECIMEN_9X2)]), document_id="d", config=self.CFG_PLAIN
+        )
+        assert len(result.chunks) == 1
+        chunk = result.chunks[0]
+        lines = chunk.content.split("\n")
+        # 物理行数 = 逻辑行数（9 行）+ 分隔行（1）——无裸续行片
+        assert len(lines) == 10
+        for line in lines:
+            assert line.startswith("| ") and line.endswith(" |")
+        # 表头仍在首行（旧渲染下内嵌换行会把分隔行挤成"第一条数据行"）
+        assert lines[0] == "| 字段 | 说明 |"
+        assert lines[1] == "| --- | --- |"
+        # 多行格净化为单行（内嵌换行 → 单空格）
+        assert lines[2] == "| 名称 | 多行说明第一行 第二行内容 |"
+        assert lines[4] == "| 来源 | 第一段 第二段 第三段 |"
+        assert lines[6] == "| 备注 | 含 连续 三段换行 |"
+        assert lines[8] == "| 更新者 | root sudo |"
+        # document_text 层面同样无内嵌换行泄漏（物理行=逻辑行的全局不变式）
+        assert result.document_text.count("\n") == 9
+
+    def test_bare_pipe_escaped(self) -> None:
+        rows = [["命令", "输出"], ["a|b", "x||y"], ["cmd | grep", "r"]]
+        result = chunk_document(
+            _doc([_table("t1", rows)]), document_id="d", config=self.CFG_PLAIN
+        )
+        lines = result.chunks[0].content.split("\n")
+        assert lines[2] == "| a\\|b | x\\|\\|y |"
+        assert lines[3] == "| cmd \\| grep | r |"
+
+
+class TestTableCellForwardFill:
+    """组 2：合并单元格前向填充——rowspan 锚点文本填组内被覆盖格，跨组每组重复锚点。"""
+
+    def test_rowspan_anchor_fills_covered_cells_across_groups(self) -> None:
+        # CFG.table_agg_rows=3：6 数据行 → 组1=[r0,r1,r2]、组2=[r3,r4,r5]
+        rows = [
+            ["组", "值"],
+            ["锚点A", "v0"],
+            ["", "v1"],
+            ["", "v2"],
+            ["", "v3"],
+            ["r5", "v4"],
+            ["r6", "v5"],
+        ]
+        spans = _spans(rows, {(1, 0): (4, 1)})  # 数据行 r0 起纵向跨 4 行（矩阵行 1~4）
+        result = chunk_document(
+            _doc([_table("t1", rows, cell_spans=spans)]), document_id="d", config=CFG
+        )
+        assert len(result.chunks) == 2
+        assert result.chunks[0].content.split("\n") == [
+            "| 组 | 值 |",
+            "| --- | --- |",
+            "| 锚点A | v0 |",
+            "| 锚点A | v1 |",  # 组内被覆盖格：锚点文本填充
+            "| 锚点A | v2 |",
+        ]
+        assert result.chunks[1].content.split("\n") == [
+            "| 组 | 值 |",
+            "| --- | --- |",
+            "| 锚点A | v3 |",  # 跨组：锚点在每组重复（组内被覆盖格同判据）
+            "| r5 | v4 |",
+            "| r6 | v5 |",
+        ]
+
+    def test_colspan_anchor_fills_covered_cells(self) -> None:
+        rows = [["类别", "子项", "值"], ["硬件", "", "1"], ["软件", "os", "2"]]
+        spans = _spans(rows, {(1, 0): (1, 2)})  # 数据行 r0 横向跨 2 列
+        result = chunk_document(
+            _doc([_table("t1", rows, cell_spans=spans)]),
+            document_id="d",
+            config=ChunkingConfig(chunk_size=400, chunk_overlap=20, table_agg_rows=10),
+        )
+        assert result.chunks[0].content.split("\n")[2] == "| 硬件 | 硬件 | 1 |"
+
+    def test_malformed_spans_defensively_ignored(self) -> None:
+        rows = [["h", "v"], ["a", "b"]]
+        for bad in (
+            [[1, 1]],  # 行数不同构
+            [["x", "y"], ["z", "w"]],  # 非跨度形态
+            [[[2, 1], [1, 1]], [[1, 1], [1, 1], [1, 1]]],  # 列数不同构
+            [[[0, 1], [1, 1]], [[1, 1], [1, 1]]],  # 非正跨度
+            [[[5, 1], [1, 1]], [[1, 1], [1, 1]]],  # 出界
+        ):
+            result = chunk_document(
+                _doc([_table("t1", rows, cell_spans=bad)]),
+                document_id="d",
+                config=ChunkingConfig(chunk_size=400, chunk_overlap=20, table_agg_rows=10),
+            )
+            assert result.chunks[0].content.split("\n")[2] == "| a | b |"
+
+
+class TestTableGroupBudget:
+    """组 3：行组字符预算——与行数上限并行生效、先到者断组；表头不计入预算。"""
+
+    CFG_BUDGET = ChunkingConfig(
+        chunk_size=400,
+        chunk_overlap=20,
+        page_max_chars=60,
+        para_max_chars=25,
+        sentence_max_chars=12,
+        table_agg_rows=10,
+        table_group_max_chars=25,
+    )
+
+    def test_budget_breaks_group_before_row_cap(self) -> None:
+        # 4 数据行各渲染 10 字符："| r1 | x |"……预算 25 → 2 行/组（2 行累计 20 ≤ 25、
+        # 加第 3 行 30 > 25 先封组；行上限 10 未触达——预算先到者断组）
+        rows = [["列A", "列B"]] + [[f"r{i}", "x"] for i in range(1, 5)]
+        result = chunk_document(
+            _doc([_table("t1", rows)]), document_id="d", config=self.CFG_BUDGET
+        )
+        assert len(result.chunks) == 2
+        assert result.chunks[0].content.split("\n") == [
+            "| 列A | 列B |",
+            "| --- | --- |",
+            "| r1 | x |",
+            "| r2 | x |",
+        ]
+        assert result.chunks[1].content.split("\n") == [
+            "| 列A | 列B |",
+            "| --- | --- |",
+            "| r3 | x |",
+            "| r4 | x |",
+        ]
+        # 组内数据行累计 ≤ 预算（每组重携表头不计入预算）
+        for chunk in result.chunks:
+            data_chars = sum(len(line) for line in chunk.content.split("\n")[2:])
+            assert data_chars <= 25
+
+    def test_header_line_not_counted_in_budget(self) -> None:
+        # 表头渲染行远超预算 → 不触发表头侧断组；分组仍由数据行预算决定
+        rows = [
+            ["很长的表头单元格内容用来证明表头不计入行组字符预算", "列B"],
+            ["r1", "x"],
+            ["r2", "x"],
+            ["r3", "x"],
+            ["r4", "x"],
+        ]
+        result = chunk_document(
+            _doc([_table("t1", rows)]), document_id="d", config=self.CFG_BUDGET
+        )
+        assert len(result.chunks) == 2  # 若表头计入预算 → 每组只剩 1 行
+
+    def test_oversized_single_row_still_own_group(self) -> None:
+        # 单数据行自身超预算：行原子永不内切——独立成组（组可超预算仅此一态）
+        rows = [["列A", "列B"], ["r" * 40, "x"], ["r2", "x"]]
+        result = chunk_document(
+            _doc([_table("t1", rows)]), document_id="d", config=self.CFG_BUDGET
+        )
+        assert len(result.chunks) == 2
+        assert "| " + "r" * 40 + " | x |" in result.chunks[0].content
+        assert result.chunks[1].content.split("\n")[2] == "| r2 | x |"
+
+    def test_row_cap_still_applies_in_parallel(self) -> None:
+        # 行数上限先到：短行表格在行上限处断组（预算未触达）
+        cfg = ChunkingConfig(
+            chunk_size=400,
+            chunk_overlap=20,
+            table_agg_rows=2,
+            table_group_max_chars=10_000,
+        )
+        rows = [["h1", "h2"]] + [[f"m{i}", f"{i}B"] for i in range(5)]
+        result = chunk_document(_doc([_table("t1", rows)]), document_id="d", config=cfg)
+        assert len(result.chunks) == 3  # 5 数据行 / agg=2 → 3 组
+        assert [len(c.content.split("\n")) - 2 for c in result.chunks] == [2, 2, 1]
+
+    def test_from_spec_reads_table_group_max_chars(self) -> None:
+        spec = {
+            "kb": {
+                "chunking": {
+                    "page_max_chars": 1100,
+                    "para_max_chars": 350,
+                    "sentence_max_chars": 180,
+                    "table_agg_rows": 8,
+                    "table_group_max_chars": 2000,
+                }
+            }
+        }
+        cfg = ChunkingConfig.from_spec(spec)
+        assert cfg.table_group_max_chars == 2000
+
+    def test_from_spec_defaults_table_group_max_chars_1600(self) -> None:
+        assert ChunkingConfig.from_spec({}).table_group_max_chars == 1600
+
+    def test_invalid_table_group_max_chars_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            ChunkingConfig(table_group_max_chars=0)
+        with pytest.raises(ValueError):
+            ChunkingConfig(table_group_max_chars=True)
+
+
+class TestTableNegativeByteLock:
+    """组 4：负例锁——无合并/无多行格/无管道符的表输出字节级不变（对照旧算法
+    逐字复刻参照物；变异自证见交付说明）。"""
+
+    CFG_PLAIN = ChunkingConfig(
+        chunk_size=400,
+        chunk_overlap=20,
+        page_max_chars=60,
+        para_max_chars=25,
+        sentence_max_chars=12,
+        table_agg_rows=10,
+    )
+
+    def test_plain_small_table_bytes_identical(self) -> None:
+        rows = [["模型", "参数量"], ["A", "7B"], [None, "13B"], ["C", ""]]
+        result = chunk_document(
+            _doc([_table("t1", rows)]), document_id="d", config=self.CFG_PLAIN
+        )
+        assert result.chunks[0].content == _legacy_render(rows)
+
+    def test_plain_grouped_table_bytes_identical(self) -> None:
+        rows = [["模型", "参数量"]] + [[f"m{i}", f"{i}B"] for i in range(7)]
+        result = chunk_document(_doc([_table("t1", rows)]), document_id="d", config=CFG)
+        assert [c.content for c in result.chunks] == _legacy_group_contents(rows, 3)
+        # char 区间同口径：后续组起点为其首数据行偏移（合成表头不计入区间）
+        assert result.chunks[1].char_start > result.chunks[0].char_start
+
+    def test_plain_wide_table_with_none_and_unicode_bytes_identical(self) -> None:
+        rows = [
+            ["名前", "説明", "備考"],
+            [" α ", 1, None],
+            ["β", "日本語 テキスト", "√"],
+        ]
+        result = chunk_document(
+            _doc([_table("t1", rows)]), document_id="d", config=self.CFG_PLAIN
+        )
+        assert result.chunks[0].content == _legacy_render(rows)
+
+
+class TestTableCellEscapedPipeRoundShape:
+    """组 5：净化与填充的组合序——先填充后净化（锚点文本含管道符同样转义）。"""
+
+    def test_anchor_text_with_pipe_is_escaped_after_fill(self) -> None:
+        rows = [["组", "值"], ["a|b", "v0"], ["", "v1"]]
+        spans = _spans(rows, {(1, 0): (2, 1)})
+        result = chunk_document(
+            _doc([_table("t1", rows, cell_spans=spans)]),
+            document_id="d",
+            config=ChunkingConfig(chunk_size=400, chunk_overlap=20, table_agg_rows=10),
+        )
+        lines = result.chunks[0].content.split("\n")
+        assert lines[2] == "| a\\|b | v0 |"
+        assert lines[3] == "| a\\|b | v1 |"  # 填充后的锚点文本同样经净化转义
+
+
+# ---------------------------------------------------------------------------
+# 占位表占位字面进语料（评审 P2：回填失败占位表此前零语料贡献——契约「占位字面
+# 恒保留（纯文本消费面兜底）」在切分链的兑现）
+# ---------------------------------------------------------------------------
+
+
+def test_placeholder_table_without_rows_renders_literal_into_corpus() -> None:
+    """占位表（placeholder=true、零 rows）：[sheet] 占位字面进 document_text 与
+    chunks——回填失败后检索语料不再静默蒸发；document_content_hash 同步含字面。
+    真实表格（有 rows）渲染路径零变化（负例不变式不触达本分支）。"""
+    doc = _doc(
+        [
+            _heading("h1", 1, "第一章"),
+            IrNode(
+                id="loc:blk:sh1",
+                type=IrNodeType.TABLE,
+                text="[sheet]",
+                meta={"raw_type": "feishu.sheet", "placeholder": True, "sheet_token": "tok"},
+            ),
+        ]
+    )
+    result = chunk_document(doc, config=ChunkingConfig())
+
+    assert result.document_text.count("[sheet]") == 1
+    assert any("[sheet]" in c.content for c in result.chunks)
+    assert result.document_content_hash == content_hash(result.document_text)
+    assert result.skipped_units == 0  # 不再判空跳过
+
+
+def test_real_table_without_rows_still_renders_node_text_fallback() -> None:
+    """真实表格缺 rows（三路归一化不产、防御面）：node.text 兜底渲染非空不蒸发
+    （node.text 空则维持跳过旧口径——零 rows 零文本零贡献）。"""
+    doc = _doc(
+        [
+            _heading("h1", 1, "第一章"),
+            IrNode(
+                id="loc:blk:tb1",
+                type=IrNodeType.TABLE,
+                text="[表格原文]",
+                meta={"raw_type": 31, "rows": "not-a-list", "col_count": 0},
+            ),
+        ]
+    )
+    result = chunk_document(doc, config=ChunkingConfig())
+    assert any("[表格原文]" in c.content for c in result.chunks)
+
+
+# ---------------------------------------------------------------------------
+# 目录链空串过滤（评审 P3：无标题文档「title or ''」空串占位进 heading_path——
+# C9 轨迹语义「不改切片轨迹语义」的字面兑现）
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_path_blank_segments_filtered_from_chain() -> None:
+    """空串段不入轨迹：①顶层无标题文档 catalog=[""]（tree_assembler title or ''
+    物化形态）→ 目录链语义关断（has_catalog=False、B17 旧口径轨迹、零空串元素）；
+    ②链中空段（无标题祖先）滤除、其余元素保序；③titled 文档零变化（接缝去重吸收）。"""
+    # ① 顶层无标题：旧实现 chain=[""] → has_catalog=True、轨迹含空串根元素
+    doc1 = _doc_at(
+        "d1", [_heading("h1", 1, "第一章"), _para("p1", "正文甲")], None, [""]
+    )
+    r1 = chunk_document(doc1, config=ChunkingConfig())
+    assert r1.chunks
+    for chunk in r1.chunks:
+        assert "" not in chunk.heading_path
+    assert r1.chunks[0].heading_path == ["第一章"]
+
+    # ② 链中空段（无标题祖先）：滤除保序
+    doc2 = _doc_at(
+        "d2",
+        [_heading("h2", 1, "甲节"), _para("p2", "正文乙")],
+        "文档乙",
+        ["空间甲", "", "文档乙"],
+    )
+    r2 = chunk_document(doc2, config=ChunkingConfig())
+    assert r2.chunks
+    for chunk in r2.chunks:
+        assert "" not in chunk.heading_path
+    assert r2.chunks[0].heading_path == ["空间甲", "文档乙", "甲节"]
+
+    # ③ titled 文档零变化（负例锁）
+    doc3 = _doc_at(
+        "d3",
+        [_heading("h3", 1, "乙节"), _para("p3", "正文丙")],
+        "文档丙",
+        ["空间乙", "文档丙"],
+    )
+    r3 = chunk_document(doc3, config=ChunkingConfig())
+    assert r3.chunks[0].heading_path == ["空间乙", "文档丙", "乙节"]

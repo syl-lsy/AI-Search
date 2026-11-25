@@ -37,6 +37,14 @@ def test_trace_cleanup_registered_daily():
     assert task.interval_seconds == 86400
 
 
+def test_feishu_sync_registered_daily():
+    """feishu_sync 已注册且每日执行一次（86400 秒——api.md §4.7「间隔 24h 代码
+    常量，不入 Nacos」；B20 B 线③ 定时全量 diff）。"""
+    task = _task_by_name("feishu_sync")
+    assert task.interval_seconds == 86400
+    assert asyncio.iscoroutinefunction(task.coroutine_factory)
+
+
 def test_coroutine_factory_returns_fresh_awaitable():
     """协程工厂每次调用取得一个新协程对象（不能是同一个可复用协程）。"""
     task = _task_by_name("trace_cleanup")

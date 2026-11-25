@@ -14,6 +14,7 @@ import 惰性化，保模块 import 轻量）；本模块保持库形态（异�
 NormalizationError 由 docling 适配器统一收口。
 """
 
+import ctypes
 import importlib
 import io
 from collections import Counter
@@ -128,6 +129,22 @@ def render_page(pdf: Any, page_index: int, *, scale: float = OCR_RENDER_SCALE) -
         page.close()
 
 
+def _font_info_name(tp: Any, char_index: int) -> str | None:
+    """单字符字体名（FPDFText_GetFontInfo）；不可得 → None（调用方按无证据处理）。
+
+    第 5 参 flags 必须传 `ctypes.c_int(0)`：绑定层签名为 LP_c_int，裸 int 抛
+    TypeError（2026-11-24 实测复现）——旧实现「FontInfo 死信号」的根因即此形态。
+    """
+    try:
+        buf = ctypes.create_string_buffer(128)
+        length = _pdfium_raw().FPDFText_GetFontInfo(tp.raw, char_index, buf, 128, ctypes.c_int(0))
+    except Exception:  # noqa: BLE001 —— 字体名面异常一律按不可得处理（零降级方向）
+        return None
+    if not length or length <= 0:
+        return None
+    return buf.value.decode("utf-8", "replace")
+
+
 class CharFontSampler:
     """页字符级字号/加粗采样（heading 启发式数据源；textpage 惰性缓存按页）。
 
@@ -155,6 +172,8 @@ class CharFontSampler:
             int, list[tuple[float, float, float, float, float, str, int]]
         ] = {}
         self._body_cache: float | None = None
+        self._heights_mode_cache: float | None = None
+        self._alive_cache: bool | None = None
 
     def close(self) -> None:
         for tp in self._textpages.values():
@@ -236,6 +255,48 @@ class CharFontSampler:
             self._body_cache = float(histogram.most_common(1)[0][0])
         return self._body_cache
 
+    @property
+    def heights_mode(self) -> float | None:
+        """全文非空白字符**字符盒高众数**（复核层的正文盒高基线；无数据 → None）。
+
+        字号（GetFontSize）死亡标本上的正文基线：盒高取整后取最高频——CJK 正文
+        盒高聚集（ECMA 实测正文 ≈9.5~11.1 → 众数 10~11），与标题盒高（≥13.8）
+        分离度 ≥1.25×。
+        """
+        if self._heights_mode_cache is None:
+            histogram: Counter[int] = Counter()
+            for i in range(len(self._pdf)):
+                for char in self.page_chars(i):
+                    if char[4] > 0 and not char[5].isspace():
+                        height = char[3] - char[1]
+                        if height > 0:
+                            histogram[round(height)] += 1
+            if not histogram:
+                return None
+            self._heights_mode_cache = float(histogram.most_common(1)[0][0])
+        return self._heights_mode_cache
+
+    @property
+    def font_size_alive(self) -> bool:
+        """字号信号存活判定：**非空白字符**非零字号取整后 ≥2 档 → True。
+
+        剔空白口径与 body_font_size/heights_mode 一致——空白字符的字号在健康
+        PDF 上也可能报退化值（构造 PDF 实测空白=1.0），不剔会把健康文档误判为
+        死亡。渲染器死亡形态（2026-11-24 ECMA 新渲染版实测：全字符恒 1.0）→
+        False，提升通道/复核门回落字符盒高口径（heading_review.size_stat_for）。
+        """
+        if self._alive_cache is None:
+            distinct: set[int] = set()
+            for i in range(len(self._pdf)):
+                for char in self.page_chars(i):
+                    if char[4] > 0 and not char[5].isspace():
+                        distinct.add(round(char[4]))
+                        if len(distinct) >= 2:
+                            self._alive_cache = True
+                            return True
+            self._alive_cache = False
+        return self._alive_cache
+
     def stats_in_bbox(
         self, page_index: int, bbox: tuple[float, float, float, float]
     ) -> tuple[float, bool] | None:
@@ -244,8 +305,24 @@ class CharFontSampler:
         生产 heading 分级/提升的采样面（取代「文本首现搜索」——同页同文多处时首现
         会采错，ECMA 实测 30/373 条偏样）。
         """
+        candidates = self._chars_in_bbox(page_index, bbox)
+        if not candidates:
+            return None
+        sizes = [char[4] for char in candidates]
+        # 加粗面取候选序列中位字符（页内字符下标随 tuple 携带，免二次定位）
+        mid_index = candidates[len(candidates) // 2][6]
+        return float(median(sizes)), self._is_bold(self._textpage(page_index), mid_index)
+
+    def _chars_in_bbox(
+        self, page_index: int, bbox: tuple[float, float, float, float]
+    ) -> list[tuple[float, float, float, float, float, str, int]]:
+        """bbox 内候选字符（剔空白 + 字符盒中心外扩容差过滤；无候选 → 空列表）。
+
+        stats_in_bbox / heights_in_bbox / font_names_in_bbox 共用的过滤面——空白
+        字符盒会稀释中位数（负例锁死面，工单 B ④「bbox 采样剔空白」）。
+        """
         left, top, right, bottom = bbox
-        candidates = [
+        return [
             char
             for char in self.page_chars(page_index)
             if char[4] > 0
@@ -253,12 +330,42 @@ class CharFontSampler:
             and left - _BBOX_CENTER_TOLERANCE <= (char[0] + char[2]) / 2 <= right + _BBOX_CENTER_TOLERANCE
             and top - _BBOX_CENTER_TOLERANCE <= (char[1] + char[3]) / 2 <= bottom + _BBOX_CENTER_TOLERANCE
         ]
+
+    def heights_in_bbox(
+        self, page_index: int, bbox: tuple[float, float, float, float]
+    ) -> float | None:
+        """bbox 内非空白字符的**字符盒高中位数**；无候选 → None。
+
+        工单 B 复核层的「字号」主信号：2026-11-24 渲染版本更换后的标本上
+        FPDFText_GetFontSize 恒 1.0（死亡信号，全文档实测），字符盒高与字号线性
+        同构、跨渲染器存活；相对比值阈值（≥正文众数×1.25）两口径通用。
+        """
+        candidates = self._chars_in_bbox(page_index, bbox)
         if not candidates:
             return None
-        sizes = [char[4] for char in candidates]
-        # 加粗面取候选序列中位字符（页内字符下标随 tuple 携带，免二次定位）
-        mid_index = candidates[len(candidates) // 2][6]
-        return float(median(sizes)), self._is_bold(self._textpage(page_index), mid_index)
+        return float(median(char[3] - char[1] for char in candidates))
+
+    def font_names_in_bbox(
+        self, page_index: int, bbox: tuple[float, float, float, float]
+    ) -> list[str] | None:
+        """bbox 内非空白字符的字体名（去重保序）；无候选或全部不可得 → None。
+
+        `FPDFText_GetFontInfo` 第 5 参必须传 `ctypes.c_int`（裸 int 在绑定层
+        TypeError——旧实现死信号根因）；名称是 pdfium 侧原始串（子集前缀/混淆名
+        原样返回，等宽判定由调用方做）。
+        """
+        candidates = self._chars_in_bbox(page_index, bbox)
+        if not candidates:
+            return None
+        tp = self._textpage(page_index)
+        names: list[str] = []
+        seen: set[str] = set()
+        for char in candidates:
+            name = _font_info_name(tp, char[6])
+            if name is not None and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names or None
 
     def text_font_stats(self, page_index: int, text: str) -> tuple[float, bool] | None:
         """按文本首现位置定位字符区间 → (字号中位数, 是否加粗)；定位失败 → None。"""

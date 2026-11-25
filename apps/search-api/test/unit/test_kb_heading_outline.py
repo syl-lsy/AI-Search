@@ -20,10 +20,12 @@ from app.rag.normalizers.heading_outline import (
     CORRECTION_SEQUENCE_CLEAN,
     HeadingItem,
     OutlineEntry,
+    SkeletonSlot,
     correct_heading_levels,
     count_level_jumps,
     duplicate_title_report,
     normalize_title,
+    plan_skeleton_slots,
     read_pdf_outline,
     resolve_anchors,
 )
@@ -324,13 +326,189 @@ def test_offset_recalibration_clamped_to_nine() -> None:
 
 
 def test_outline_title_unmatched_reported() -> None:
-    """书签有、树内无（识别召回缺口）→ 计入 unmatched 清单，不造节点。"""
+    """书签有、树内无（识别召回缺口）→ 计入 unmatched 清单。
+
+    工单 A 修订（2026-11-24，推翻 T1-b「校正不造节点」）：造节点改由
+    `plan_skeleton_slots` 出计划、docling_adapter 装配序执行——本函数仍是纯层级
+    映射器，对输入 items 只定级不增删（造节点语义见 plan_skeleton_slots 用例）。
+    """
     headings = [_h("关于", 1, 3), _h("引言", 1, 5), _h("附录A", 1, 300)]
     outline = [_o("关于", 0, 2), _o("引言", 0, 4), _o("附录A", 0, 299), _o("修改记录", 0, 321)]
     result = correct_heading_levels(headings, outline)
 
     assert result.unmatched == ["修改记录"]
     assert len(result.levels) == 3
+
+
+# ---------------------------------------------------------------------------
+# 骨架重建计划（工单 A）：未命中顶级书签条目 → 造节点规格（纯函数）
+# ---------------------------------------------------------------------------
+
+
+def test_plan_skeleton_slots_creates_nodes_for_unmatched_bookmarks() -> None:
+    """ECMA「修改记录」形态：护栏过门 → 未命中顶级书签条目各得一个造节点规格。
+
+    插入位 = pending 块序列中首个页码 ≥ 目标页（dest 0-based +1）的块之前
+    （内容按相邻书签页码区间归属，页首即文本边界）；规格按插入位升序输出。
+    """
+    headings = [
+        _h("关于", 1, 3),
+        _h("第一章 块级绑定", 2, 10),
+        _h("第三章 结果", 2, 20),
+    ]
+    outline = [
+        _o("关于", 0, 2),
+        _o("第一章 块级绑定", 0, 9),
+        _o("第三章 结果", 0, 19),
+        _o("引言", 0, 0),
+        _o("修改记录", 0, 321),
+    ]
+    block_pages = [1, 1, 2, 3, 3, 10, 322, 322, 323]
+    slots = plan_skeleton_slots(headings, outline, block_pages)
+
+    assert slots == [
+        SkeletonSlot(title="引言", level=1, page=1, insert_index=0),
+        SkeletonSlot(title="修改记录", level=1, page=322, insert_index=6),
+    ]
+
+
+def test_plan_skeleton_slots_guardrail_fail_blocks_creation() -> None:
+    """双层护栏不过（3 条书签 1 命中）→ 零造节点，骨架重建整体不启用。
+
+    缺书签的目标页刻意落在 block_pages 范围内（可插入）——若护栏被去掉，
+    缺一/缺二会拿到造节点规格（变异敏感；页不可达的形态由残损书签用例单独锁）。
+    """
+    headings = [_h("甲", 1, 3)]
+    outline = [_o("甲", 0, 2), _o("缺一", 0, 3), _o("缺二", 0, 4)]
+    assert plan_skeleton_slots(headings, outline, [1, 2, 3, 4, 5]) == []
+
+
+def test_plan_skeleton_slots_dual_gate_pass_chart_bookmarks_not_fabricated() -> None:
+    """双层护栏顶级支通过（图表书签豁免形态）→ 造节点不反转豁免面。
+
+    顶级书签 3/3 全命中启用重建；未命中的**非顶级**图表书签（图 1-1…）不得被
+    造节点——护栏豁免它们正是为了不连坐整本，造出来会把图表页内容划进伪章。
+    """
+    headings = [
+        _h("章一", 2, 10),
+        _h("节1", 3, 11),
+        _h("章二", 2, 20),
+        _h("节2", 3, 21),
+        _h("章三", 2, 30),
+        _h("节3", 3, 31),
+        _h("节4", 3, 32),
+    ]
+    outline = [
+        _o("章一", 0, 9),
+        _o("节1", 1, 10),
+        _o("章二", 0, 19),
+        _o("节2", 1, 20),
+        _o("章三", 0, 29),
+        _o("节3", 1, 30),
+        _o("节4", 1, 31),
+    ] + [_o(f"图 {i}-1 示意图", 1, 100 + i) for i in range(5)]
+    block_pages = [10, 11, 20, 21, 30, 31, 32]
+    assert plan_skeleton_slots(headings, outline, block_pages) == []
+
+
+def test_plan_skeleton_slots_creates_only_top_level_entries() -> None:
+    """整体命中率达标时，未命中的非顶级条目（小节/图表书签）同样不造节点。
+
+    造节点只收顶级（章级）条目——书签大纲对「章」的确定性最强；小节粒度版面
+    已有候选，缺小节多属版式变体，造节点风险大于收益。
+    """
+    headings = [
+        _h("章一", 2, 10),
+        _h("节1", 3, 11),
+        _h("章二", 2, 20),
+        _h("节2", 3, 21),
+        _h("章三", 2, 30),
+        _h("节3", 3, 31),
+        _h("节4", 3, 32),
+    ]
+    outline = [
+        _o("章一", 0, 9),
+        _o("节1", 1, 10),
+        _o("章二", 0, 19),
+        _o("节2", 1, 20),
+        _o("章三", 0, 29),
+        _o("节3", 1, 30),
+        _o("节4", 1, 31),
+        _o("节5", 1, 32),
+        _o("图 2-1", 1, 40),
+    ]
+    block_pages = [10, 11, 20, 21, 30, 31, 32, 33, 41]
+    assert plan_skeleton_slots(headings, outline, block_pages) == []
+
+
+def test_plan_skeleton_slots_skips_damaged_bookmark_entries() -> None:
+    """残损书签三形态不造节点：标题空（归一化零串）/缺 dest 页码/目标页超出正文。
+
+    超界条目保持 unmatched 上报（伤情单可见），不给文档尾伪造空节（否则末节
+    内容会被错划进它——`test_pressed_heading_keeps_its_children_in_tree` 的
+    「参考文献」形态即依赖此防御）。
+    """
+    headings = [
+        _h("关于", 1, 3),
+        _h("章二", 2, 10),
+        _h("章三", 2, 20),
+        _h("章四", 2, 30),
+        _h("章五", 2, 40),
+    ]
+    outline = [
+        _o("关于", 0, 2),
+        _o("章二", 0, 9),
+        _o("章三", 0, 19),
+        _o("章四", 0, 29),
+        _o("章五", 0, 39),
+        _o("", 0, 50),
+        _o("无 dest 条目", 0, None),
+        _o("超界条目", 0, 999),
+    ]
+    block_pages = [1, 3, 10, 20, 30, 40]
+    assert plan_skeleton_slots(headings, outline, block_pages) == []
+
+
+def test_plan_skeleton_slots_insert_index_is_page_boundary() -> None:
+    """插入位是页码区间边界：目标页之前的块全部留在前一书签区间（不被吞入）。"""
+    headings = [_h("关于", 1, 3), _h("章二", 2, 10)]
+    outline = [_o("关于", 0, 2), _o("章二", 0, 9), _o("附录", 0, 5)]
+    block_pages = [1, 2, 3, 3, 10, 10]
+    slots = plan_skeleton_slots(headings, outline, block_pages)
+
+    assert slots == [SkeletonSlot(title="附录", level=1, page=6, insert_index=4)]
+    assert all(page < 6 for page in block_pages[:4])  # 前区间内容不被吞
+
+
+def test_plan_skeleton_slots_multi_level_outline_top_level_mapping() -> None:
+    """多级书签形态：未命中顶级条目 level = 书签层级按最小层级归一 + 1。"""
+    headings = [
+        _h("章一", 2, 10),
+        _h("节1", 3, 11),
+        _h("章二", 2, 20),
+        _h("节2", 3, 21),
+        _h("章三", 2, 30),
+        _h("节3", 3, 31),
+    ]
+    outline = [
+        _o("章一", 0, 9),
+        _o("节1", 1, 10),
+        _o("章二", 0, 19),
+        _o("节2", 1, 20),
+        _o("章三", 0, 29),
+        _o("节3", 1, 30),
+        _o("附录A", 0, 39),
+    ]
+    block_pages = [10, 11, 20, 21, 30, 31, 40]
+    slots = plan_skeleton_slots(headings, outline, block_pages)
+
+    assert slots == [SkeletonSlot(title="附录A", level=1, page=40, insert_index=6)]
+
+
+def test_plan_skeleton_slots_empty_outline_no_slots() -> None:
+    """无书签（sample_structured 形态）→ 零造节点（现行路径逐字节等价的前提）。"""
+    headings = [_h("甲", 1, 3), _h("乙", 2, 5)]
+    assert plan_skeleton_slots(headings, [], [1, 3, 5]) == []
 
 
 # ---------------------------------------------------------------------------

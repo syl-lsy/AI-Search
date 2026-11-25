@@ -160,7 +160,12 @@ class KbDocumentRepository:
     """
 
     async def load(self, doc_id: uuid.UUID | str) -> dict[str, Any] | None:
-        """行投影（流水线只消费这七键；行不存在 → None）。"""
+        """行投影（流水线消费八键；行不存在 → None）。
+
+        parse_meta：飞书附件行建行时预置 feishu 四键（同步 diff 寻址——B20 B 线），
+        normalizing 段合并保留该子对象（漏保留则 node_token 丢失、同步 diff 恒判
+        「新增」重复建行）。
+        """
         async with get_session_factory()() as session:
             row = await session.get(KbDocument, _as_uuid(doc_id))
             if row is None:
@@ -173,6 +178,7 @@ class KbDocumentRepository:
                 "title": row.title,
                 "source_url": row.source_url,
                 "file_object_key": row.file_object_key,
+                "parse_meta": row.parse_meta,
             }
 
     async def transition(
@@ -467,7 +473,14 @@ class KbPipeline:
         root: IrNode = result.document
         root.title = row["title"]  # 标题富化（§1.18 heading_path 构成公式 doc.title 段）
         await put_ir_json(user_id, doc_id, root, client=client)
-        return dict(result.parse_meta)
+        parse_meta = dict(result.parse_meta)
+        # 飞书附件行 feishu 四键合并保留（B20 B 线——同步 diff 寻址）：建行时预置的
+        # parse_meta.feishu 不被归一化产物覆写丢失，否则 node_token 断链、同步 diff
+        # 恒判「新增」重复建行（api.md §4.7 判定序①的本地行寻址依赖此键）
+        existing = row.get("parse_meta") or {}
+        if isinstance(existing, dict) and isinstance(existing.get("feishu"), dict):
+            parse_meta["feishu"] = existing["feishu"]
+        return parse_meta
 
     async def _run_chunking(self, row: dict[str, Any]) -> tuple[int, str]:
         """ir.json 装载（rebuild_siblings 内置）→ 逐级切分 → kb_chunks 全量替换。

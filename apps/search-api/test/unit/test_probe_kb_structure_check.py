@@ -332,3 +332,28 @@ def test_render_text_includes_self_check_section() -> None:
     payload = probe.render_text(_output(outline=_OUTLINE))
     assert "--- ③ 标题结构自检" in payload
     assert "correction_path=bookmark" in payload
+
+
+def test_render_text_appends_no_injury_section_for_non_pdf() -> None:
+    """伤情单 v2 零变化门禁（非 PDF 面）：docx 渲染恰止于 v1 自检块、零新增行。"""
+    output = _output(ext="docx", outline=None)
+    text = probe.render_text(output)
+    v1_block = "\n".join(probe.render_structure_check_text(probe.build_structure_check(output)))
+    assert text.endswith(v1_block)
+    for marker in ("伤情单", "书签召回缺失", "标题密度", "提升行形态", "空 text 候选"):
+        assert marker not in text
+
+
+def test_render_text_appends_no_injury_section_when_correction_disabled() -> None:
+    """伤情单 v2 零变化门禁（关闭态面）：heading_outline 键整缺时渲染零新增行。"""
+    output = _output(outline=_OUTLINE)
+    output.parse_meta = {
+        key: value
+        for key, value in output.parse_meta.items()
+        if key != "heading_outline"
+    }
+    text = probe.render_text(output)
+    v1_block = "\n".join(probe.render_structure_check_text(probe.build_structure_check(output)))
+    assert text.endswith(v1_block)
+    for marker in ("伤情单", "书签召回缺失", "标题密度", "提升行形态", "空 text 候选"):
+        assert marker not in text

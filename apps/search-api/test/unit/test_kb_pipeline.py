@@ -533,6 +533,39 @@ def test_project_parse_meta_mapping() -> None:
     }  # 非页式 pages=null（缺省键补 null/0）
 
 
+def test_project_parse_meta_feishu_sub_object_not_projected() -> None:
+    """data-model §1.7 parse_meta.feishu（B20 存储侧附加键，2026-11-25 确认点 C7=(a)）：
+    四键子对象与 parser 同为存储侧——§4.3 投影恒三键，feishu/parser 键零泄漏。"""
+    storage_meta = {
+        "pages": None,
+        "tables": 2,
+        "code_blocks": 1,
+        "parser": "feishu_blocks",
+        "feishu": {
+            "space_id": "7708408008821771292",
+            "node_token": "WTp2dAqBposqlFxMmmhcnLsCnmf",
+            "obj_type": "docx",
+            "obj_edit_time": 1737100000,
+            "degraded_blocks": {"bitable": 1, "block_16": 2},
+        },
+    }
+    projected = kb_pipeline.project_parse_meta(storage_meta)
+    assert projected == {"pages": None, "tables": 2, "code_blocks": 1}
+    assert "feishu" not in projected and "parser" not in projected
+
+
+async def test_upload_source_parse_meta_has_no_feishu_key(stub_pipeline_seams, fake_minio) -> None:
+    """非飞书来源省略整个 feishu 键（§1.7 feishu 子对象「非飞书来源省略」半边）：
+    上传通道 parse_meta 仅常规四键，无 feishu 子对象——storage 落列与投影两侧一致。"""
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"))
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"es_enabled": False}})
+    await pipeline.process_document(_DOC_ID)
+    stored = repo.transitions[1]["fields"]["parse_meta"]
+    assert "feishu" not in stored  # 上传来源整个 feishu 键省略
+    assert set(stored) == {"pages", "tables", "code_blocks", "parser"}
+
+
 def test_chunk_row_meta_seven_keys() -> None:
     chunk = Chunk(
         document_id=_DOC_ID,
@@ -580,6 +613,35 @@ def test_zero_vector_placeholder_shape() -> None:
     vec = kb_pipeline.embedding_placeholder()
     assert len(vec) == 1024  # KB_EMBEDDING_DIM（一期定死）
     assert all(v == 0 for v in vec)  # 零向量占位——B18 向量通道落地前 NOT NULL 列写入缝
+
+
+async def test_normalizing_preserves_feishu_parse_meta_for_attachment_rows(
+    stub_pipeline_seams, fake_minio
+) -> None:
+    """飞书附件行 parse_meta.feishu 键保留（B20 B 线——附件同步 diff 寻址面）：
+    normalizing 产物覆写 parse_meta 时合并保留既有 feishu 四键子对象——漏保留则
+    附件行 node_token 丢失、同步 diff 恒判「新增」重复建行。"""
+    feishu_meta = {
+        "space_id": "sp1",
+        "node_token": "tok-att",
+        "obj_type": "file",
+        "obj_edit_time": 1732166400,
+    }
+    row = _row("pending")
+    row["parse_meta"] = {"feishu": feishu_meta}  # worker 建行时预置（附件 pending 行）
+    repo = _FakeRepo(row)
+    _seed_original(fake_minio)
+    pipeline = _make_pipeline(repo, fake_minio)
+
+    outcome = await pipeline.process_document(str(row["id"]))
+
+    assert outcome == "ready"
+    chunking_transition = next(
+        t for t in repo.transitions if t["to"] == "chunking"
+    )
+    parse_meta = chunking_transition["fields"]["parse_meta"]
+    assert parse_meta["feishu"] == feishu_meta  # 四键原样保留
+    assert "parser" in parse_meta  # 归一化产物键照常合入
 
 
 def test_serialize_import_health() -> None:

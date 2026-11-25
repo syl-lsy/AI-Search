@@ -327,6 +327,9 @@ SPEC_CONFIG: dict[str, Any] = {
             "para_max_chars": 400,
             "sentence_max_chars": 200,
             "table_agg_rows": 10,
+            # 行组字符预算（nacos-config §3 v1.45——2026-11-25 表格双工单契约批）：
+            # 与 table_agg_rows=10 并行生效、先到者断组；表头行不计入预算
+            "table_group_max_chars": 1600,
         },
         "normalizer": {
             "pdf_engine": "docling",

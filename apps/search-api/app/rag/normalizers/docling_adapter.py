@@ -30,15 +30,34 @@ paragraph（meta.raw_type="ocr_line" + loc.page）；
 OCR 运行时 parse_meta.parser 记末段实际执行组件（data-model §1.7「多组件流水记
 末段」）；`ocr_enabled=false` 或文本层充足 → OCR 通道零触发（回退门语义）。
 
-**书签大纲校正（确定性层级钉正，heading_outline 模块）**：版面/字号推断的层级在
+**书签大纲校正 + 骨架重建（确定性层级钉正，heading_outline 模块）**：版面/字号推断的层级在
 「章」的语义上系统性不可靠（标本 17/17 可命中书签章标题判错）。装配**前**拿 PDF
 书签（pypdfium2 get_toc）与 pending heading 序列做归一化标题 + 页码消歧匹配，锚点
 level = 书签层级+1、未命中项按最近锚点相对偏移重校准；书签不可用（条目 <3 或
 双层命中判据不过：整体命中率 <0.6 且非「顶级命中率 ≥0.6 且顶级命中 ≥3」）回落序列
-一致性清洗。**介入点必须在装配前**：层级是在 `BlockTreeBuilder.add`
+一致性清洗。**骨架重建（工单 A，推翻 T1-b「校正不造节点」，用户 2026-11-24 立项
+批准）**：护栏通过的 PDF，未命中的**顶级**书签条目（章级）按「页码区间归界」在
+pending 序列造 heading 节点（raw_type=outline_bookmark、level_source=outline_created，
+插入位=首个页码 ≥ dest+1 的块之前），再走既有锚点钉正——造节点与自身条目精确
+匹配成锚点（进复核门豁免面），正文按相邻书签页码区间归属其子树；残损书签
+（空标题/缺页码/超界）不造、保持 unmatched 上报。护栏不过/无书签/开关关闭 →
+零造节点，回落现行路径逐字节等价。**介入点必须在装配前**：层级在 `BlockTreeBuilder.add`
 的 heading 栈里即时物化 children 的，装配后改 level 得重挂父子（重复实现嵌套语义）。
 书签读取失败（坏字节/pdfium 不可用）不阻塞解析，按「无书签」处理并留痕错误类型名；
-parse_meta.heading_outline 记 correction_path 与锚点/未命中/跳级诊断。
+parse_meta.heading_outline 记 correction_path 与锚点/未命中/跳级/造节点诊断。
+
+**多信号复核层（工单 B，heading_review 模块；KB_PDF_HEADING_REVIEW 总开关）**：
+docling 类型标签进 IR 前过排版事实门（校正后、装配前、只降级不升级）——①非书签
+锚点 heading **降级当且仅当**：盒高 <正文众数×1.05 且 非加粗 且 句末标点矛盾
+（标题以句末标点结尾=正文句式，含同名家族继承——ECMA p325「修改为」无冒号变体
+随「修改为：」×5 族降）；无矛盾证据时尊重版面模型标签保留（真标题零误降实证：
+38 假全带标点 / 18 真全无标点，几何留白信号与假阳性分布重叠已废弃）。
+②formula 候选盒高=正文众数且行宽近满行降为 text（走 orig/提升通道）；③code
+候选盒高=正文众数且字体名无等宽证据降级。「字号」口径：信号存活 → GetFontSize
+（回归等价）；死亡（2026-11-24 新渲染版 ECMA 实测恒 1.0/权重恒 0/GetFontName
+缺失）→ 字符盒高回落（线性同构、跨渲染器存活），Fix 2 提升通道同批恢复（旧
+基线「关于本书 = heading raw_type=formula」形态）。关闭态 = 完全等价旧管线
+（零降级、零回落、parse_meta 无 heading_review 键）。
 
 异常归一：组件失败 → NormalizationError（original_exception 链入，零内容回显）。
 单例 DocumentConverter（模型权重进程内一份；do_ocr=False——OCR 通道钉 PaddleOCR，
@@ -46,7 +65,6 @@ parse_meta.heading_outline 记 correction_path 与锚点/未命中/跳级诊断�
 """
 
 import importlib
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from io import BytesIO
@@ -63,8 +81,16 @@ from app.rag.normalizers.heading_outline import (
     HeadingItem,
     OutlineCorrection,
     OutlineEntry,
+    SkeletonSlot,
     correct_heading_levels,
+    plan_skeleton_slots,
     read_pdf_outline,
+)
+from app.rag.normalizers.heading_review import (
+    SENTENCE_END_PATTERN,
+    body_baseline_for,
+    review_blocks,
+    size_stat_for,
 )
 from app.rag.normalizers.markdown_mapper import (
     BlockTreeBuilder,
@@ -308,8 +334,10 @@ _PROMOTE_ANCHOR_TOLERANCE = 0.05
 _PROMOTE_MAX_CHARS = 40
 #: 单行判定：bbox 高 < 该比值 × 字号（两行以上行距会把 bbox 撑高）
 _PROMOTE_LINE_RATIO = 1.75
-#: 句末/列表式标点结尾 → 正文句式，不提升（debugger 原型零误报约束的一部分）
-_PROMOTE_SENT_END = re.compile(r"[。：:，,；;]$")
+#: 句末/列表式标点结尾 → 正文句式，不提升（debugger 原型零误报约束的一部分）。
+#: 工单 B ④ P3-1 补英文句点「.」（句末「.」结尾大字行不得提升）；与复核门 (c)
+#: 同源（heading_review.SENTENCE_END_PATTERN），探针伤情单「脱漏」判据 parity 锁死。
+_PROMOTE_SENT_END = SENTENCE_END_PATTERN
 
 
 def _bbox_font_stat(
@@ -325,25 +353,42 @@ def _bbox_font_stat(
 
 
 def _promote_font_headings(
-    pending: list[_PendingBlock], font_sampler: Any, body_font_size: float | None
+    pending: list[_PendingBlock],
+    font_sampler: Any,
+    body_font_size: float | None,
+    *,
+    allow_height_fallback: bool = False,
 ) -> int:
     """非标题短行（text/formula）按字号命中已有标题字号簇 → 提升为 heading。
 
     返回提升条数。条件（全满足，debugger 原型 ECMA 8 条零误报的约束）：
-    单行（bbox 高 < 1.75×字号）、≤40 字、不以句末/列表式标点结尾、bbox 采样的
-    字号落在**已有标题字号簇**（≥1.25×正文众数者）±5% 内。
+    单行（bbox 高 < 1.75×字号）、≤40 字、不以句末/列表式标点结尾（工单 B ④ 补
+    英文句点「.」）、bbox 采样的字号落在**已有标题字号簇**（≥1.25×正文众数者）
+    ±5% 内。
     提升在 pending 阶段完成 → 参与后续字号分级与书签大纲校正（与 T1-b 的交互面）。
+
+    **字号口径**（工单 B ④ 高度回落）：字号信号存活（`font_size_alive`）→ GetFontSize
+    口径（回归等价）；死亡（2026-11-24 新渲染版 ECMA 实测恒 1.0）且
+    `allow_height_fallback`（随 KB_PDF_HEADING_REVIEW 开关）→ 字符盒高回落
+    （`heading_review.size_stat_for`，正文基线同步回落 `heights_mode`）——恢复旧
+    基线「关于本书 = heading raw_type=formula」的既有已验收行为。回落关闭时死亡
+    字号通道保持旧行为（零提升，等价旧管线）。
     """
     if font_sampler is None or body_font_size is None:
         return 0
     if not hasattr(font_sampler, "stats_in_bbox"):
         return 0  # 注入假体无 bbox 采样面 → 旧行为（不提升）
+    baseline = body_font_size
+    if allow_height_fallback and not getattr(font_sampler, "font_size_alive", True):
+        baseline = body_baseline_for(font_sampler)
+        if baseline is None:
+            return 0
     anchors: list[float] = []
     for block in pending:
         if block.kind != "heading":
             continue
-        stat = _bbox_font_stat(font_sampler, block.page, block.bbox)
-        if stat is not None and stat[0] >= _PROMOTE_HEAD_RATIO * body_font_size:
+        stat = size_stat_for(font_sampler, block.page, block.bbox, height_fallback=allow_height_fallback)
+        if stat is not None and stat[0] >= _PROMOTE_HEAD_RATIO * baseline:
             anchors.append(stat[0])
     if not anchors:
         return 0
@@ -356,7 +401,7 @@ def _promote_font_headings(
             continue
         if _PROMOTE_SENT_END.search(text):
             continue
-        stat = _bbox_font_stat(font_sampler, block.page, block.bbox)
+        stat = size_stat_for(font_sampler, block.page, block.bbox, height_fallback=allow_height_fallback)
         if stat is None:
             continue
         size = stat[0]
@@ -374,8 +419,13 @@ def _promote_font_headings(
 
 
 # ---------------------------------------------------------------------------
-# 书签大纲校正（确定性层级钉正；装配前写回 pending.level）
+# 书签大纲校正 + 骨架重建（确定性层级钉正；装配前写回 pending.level）
 # ---------------------------------------------------------------------------
+
+#: 造节点 raw_type（工单 A：docling 版面未识别、由书签大纲确定性重建的 heading）
+_OUTLINE_BOOKMARK_LABEL = "outline_bookmark"
+#: 造节点 level_source（来源如实：与命中锚点的 bookmark_outline 区分）
+_OUTLINE_CREATED_SOURCE = "outline_created"
 
 
 def _correct_outline_levels(
@@ -383,12 +433,23 @@ def _correct_outline_levels(
     heading_indexes: Sequence[int],
     data: bytes,
     outline_reader: Callable[[bytes], Sequence[OutlineEntry]] | None,
-) -> tuple[OutlineCorrection, str | None]:
-    """pending heading 序列 → 书签校正并写回 level/level_source（返回 (结果, 读取错误名)）。
+) -> tuple[OutlineCorrection, str | None, set[int], int, list[str]]:
+    """pending heading 序列 → 书签校正并写回 level/level_source（含骨架重建造节点）。
+
+    返回 `(结果, 读取错误名, 锚点 pending 下标集合, 造节点数, 造节点标题样例)`——
+    锚点下标供工单 B 复核门豁免面使用（书签锚点=确定性层级源，不让位于启发式门；
+    骨架重建造节点与自身书签条目匹配成锚点，天然进豁免面）。
+
+    **骨架重建（工单 A，推翻 T1-b「校正不造节点」，用户 2026-11-24 立项批准）**：
+    书签可读且护栏（plan_skeleton_slots 内按原始匹配）通过 → 未命中顶级书签条目
+    按「页码区间归界」插入新 pending heading 块，再走既有锚点钉正——造出来的节点
+    标题=书签标题、页=dest+1，与自身条目精确匹配成锚点，后续内容由 heading 栈
+    自然归属。护栏不过/无书签 → 计划恒空，本函数与旧路径逐字节等价。
 
     书签读取失败按「无书签」处理（不阻塞解析）——错误只留类型名，零内容回显。
-    level_source 如实标注：锚点 `bookmark_outline`、非锚点重校准 `outline_offset`、
-    序列清洗改动项 `sequence_clean`；未改动项保留原有启发式来源（不伪造来源）。
+    level_source 如实标注：锚点 `bookmark_outline`、造节点 `outline_created`、
+    非锚点重校准 `outline_offset`、序列清洗改动项 `sequence_clean`；未改动项保留
+    原有启发式来源（不伪造来源）。
     """
     items = [
         HeadingItem(
@@ -406,6 +467,41 @@ def _correct_outline_levels(
             outline = list(reader(data))
         except Exception as exc:  # noqa: BLE001 —— 书签不可读不废解析（回退序列清洗）
             error = type(exc).__name__
+
+    # 骨架重建（工单 A）：护栏过门才造节点；造块预置 level=书签归一层
+    # （= 锚点 target_level，写回零漂移），插入后重取 heading 序列参与钉正
+    created_count = 0
+    created_sample: list[str] = []
+    created_blocks: list[_PendingBlock] = []
+    if outline:
+        slots: list[SkeletonSlot] = plan_skeleton_slots(
+            items, outline, [block.page for block in pending]
+        )
+        # 逆序插入：前位下标不漂移；同位插入按逆大纲序执行 → 序内保持大纲序
+        for slot in reversed(slots):
+            block = _PendingBlock(
+                kind="heading",
+                title=slot.title,
+                label=_OUTLINE_BOOKMARK_LABEL,
+                page=slot.page,
+                level=slot.level,
+                level_source=_OUTLINE_CREATED_SOURCE,
+            )
+            pending.insert(slot.insert_index, block)
+            created_blocks.append(block)
+        if created_blocks:
+            heading_indexes = [i for i, block in enumerate(pending) if block.kind == "heading"]
+            items = [
+                HeadingItem(
+                    title=pending[index].title or "",
+                    level=pending[index].level or 1,
+                    page=pending[index].page,
+                )
+                for index in heading_indexes
+            ]
+            created_count = len(created_blocks)
+            created_sample = [slot.title for slot in slots[:5]]
+
     correction = correct_heading_levels(items, outline)
     anchor_slots = {anchor.index for anchor in correction.anchors}
     for slot, index in enumerate(heading_indexes):
@@ -421,7 +517,14 @@ def _correct_outline_levels(
                 node.level_source = "sequence_clean"
         elif slot in anchor_slots:
             node.level_source = "bookmark_outline"
-    return correction, error
+    # 造节点来源如实回写（上方锚点分支会盖成 bookmark_outline；此处改判）
+    if created_blocks:
+        created_ids = {id(block) for block in created_blocks}
+        for index, block in enumerate(pending):
+            if id(block) in created_ids:
+                block.level_source = _OUTLINE_CREATED_SOURCE
+    anchor_indexes = {heading_indexes[slot] for slot in anchor_slots}
+    return correction, error, anchor_indexes, created_count, created_sample
 
 
 def _outline_correction_enabled(explicit: bool | None) -> bool:
@@ -431,12 +534,29 @@ def _outline_correction_enabled(explicit: bool | None) -> bool:
     return kb_settings.pdf_outline_correction
 
 
-def _outline_meta(correction: OutlineCorrection, error: str | None) -> dict[str, Any]:
+def _heading_review_enabled(explicit: bool | None) -> bool:
+    """复核层总开关（工单 B）：显式注入优先（测试缝），否则读 `.env` 档 kb_settings。
+
+    false = 复核层整体旁路（零降级、Fix 2 高度回落不生效、不写 parse_meta 键）——
+    完全等价旧管线的回退门。getattr 兜底：测试面 SimpleNamespace 假体可能缺属性。
+    """
+    if explicit is not None:
+        return explicit
+    return bool(getattr(kb_settings, "pdf_heading_review", True))
+
+
+def _outline_meta(
+    correction: OutlineCorrection,
+    error: str | None,
+    created_count: int = 0,
+    created_sample: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """parse_meta.heading_outline（探针自检节读 correction_path / pressed 等留痕）。
 
     `unmatched` 截前 10 条、全量计数另给 `unmatched_count`（脏书签不撑爆 parse_meta）；
-    `unmatched`/`duplicates`/`pressed_sample` 里是书签与标题原文（不是敏感面），
-    其余诊断字段零正文回显。
+    `created`/`created_sample` = 工单 A 骨架重建造节点数与前 5 标题样例；
+    `unmatched`/`duplicates`/`pressed_sample`/`created_sample` 里是书签与标题原文
+    （不是敏感面），其余诊断字段零正文回显。
     """
     return {
         "correction_path": correction.path,
@@ -449,6 +569,8 @@ def _outline_meta(correction: OutlineCorrection, error: str | None) -> dict[str,
         "pressed_sample": list(correction.pressed_titles[:5]),
         "level_jumps_before": correction.level_jumps_before,
         "level_jumps_after": correction.level_jumps_after,
+        "created": created_count,
+        "created_sample": list(created_sample or []),
         "error": error,
     }
 
@@ -713,6 +835,7 @@ def normalize_with_docling(
     page_count: int | None = None,
     outline_reader: Callable[[bytes], Sequence[OutlineEntry]] | None = None,
     outline_correction: bool | None = None,
+    heading_review: bool | None = None,
 ) -> NormalizationResult:
     """docling pdf 归一化：bytes → document 树 + parse_meta（启发式/OCR/大纲留痕）。
 
@@ -721,9 +844,12 @@ def normalize_with_docling(
     pypdfium2）、page_texts（OCR 去重的页文本层原文——免 pdfium 抽页；缺省按
     `data` 逐页抽取、抽取失败去重降级）、ocr_recognizer（识别假体——真模型绝不
     加载）、outline_reader（书签读取假体——免真实 PDF）、outline_correction（校正
-    总开关：None=读 .env 档 `KB_PDF_OUTLINE_CORRECTION`，false=完全等价旧管线）。
+    总开关：None=读 .env 档 `KB_PDF_OUTLINE_CORRECTION`，false=完全等价旧管线）、
+    heading_review（复核层总开关，工单 B：None=读 .env 档
+    `KB_PDF_HEADING_REVIEW`；false=复核门/降级/高度回落全部旁路，等价旧管线）。
     """
     settings = settings or NormalizerSettings()
+    review_enabled = _heading_review_enabled(heading_review)
     conv = converter if converter is not None else _get_converter()
     try:
         from docling_core.types.io import DocumentStream
@@ -771,7 +897,9 @@ def normalize_with_docling(
                 font_sampler = None
         if font_sampler is not None:
             body_font_size = getattr(font_sampler, "body_font_size", None)
-            promoted = _promote_font_headings(pending, font_sampler, body_font_size)
+            promoted = _promote_font_headings(
+                pending, font_sampler, body_font_size, allow_height_fallback=review_enabled
+            )
             if promoted:
                 heading_indexes = [i for i, p in enumerate(pending) if p.kind == "heading"]
         entries: list[tuple[str, tuple[float, bool] | None]] = []
@@ -797,23 +925,33 @@ def normalize_with_docling(
                 if (pending[i].title or "") == title:
                     pending[i].level = level
                     pending[i].level_source = source
-        # 采样完成即释放（pdfium 句柄零滞留——每次归一化泄漏的旧缺陷）
-        if font_sampler_owned and font_sampler is not None:
-            try:
-                font_sampler.close()
-            finally:
-                if font_pdf is not None:
-                    font_pdf.close()
 
     # 书签大纲校正（确定性层级钉正；**装配前介入**——层级在 BlockTreeBuilder.add
     # 的 heading 栈里即时物化 children，装配后改 level 须重挂父子）。总开关关闭时
     # 完全跳过（等价旧管线：原始启发式 level、不写 parse_meta.heading_outline）
     correction: OutlineCorrection | None = None
     outline_error: str | None = None
+    anchor_indexes: set[int] = set()
+    created_count = 0
+    created_sample: list[str] = []
     if _outline_correction_enabled(outline_correction):
-        correction, outline_error = _correct_outline_levels(
-            pending, heading_indexes, data, outline_reader
+        correction, outline_error, anchor_indexes, created_count, created_sample = (
+            _correct_outline_levels(pending, heading_indexes, data, outline_reader)
         )
+
+    # 多信号复核层（工单 B；**校正后**——锚点豁免面依赖校正产出；**装配前**——
+    # 降级即时改变 kind/label，装配段零特判）。关闭态整体旁路（等价旧管线）
+    review_counts: dict[str, int] | None = None
+    if review_enabled and font_sampler is not None:
+        review_counts = review_blocks(pending, sampler=font_sampler, anchors=anchor_indexes)
+
+    # 采样完成即释放（pdfium 句柄零滞留——每次归一化泄漏的旧缺陷；复核门之后）
+    if font_sampler_owned and font_sampler is not None:
+        try:
+            font_sampler.close()
+        finally:
+            if font_pdf is not None:
+                font_pdf.close()
 
     # 统一装配（文档序；列表连续项聚合单节点；heading 栈嵌套经 builder）
     i = 0
@@ -912,7 +1050,11 @@ def normalize_with_docling(
         },
     }
     if correction is not None:
-        parse_meta["heading_outline"] = _outline_meta(correction, outline_error)
+        parse_meta["heading_outline"] = _outline_meta(
+            correction, outline_error, created_count, created_sample
+        )
+    if review_counts is not None:
+        parse_meta["heading_review"] = review_counts
     parse_meta["ocr"] = {
         "engine": settings.ocr_engine if settings.ocr_enabled else None,
         "pages": ocr_pages,

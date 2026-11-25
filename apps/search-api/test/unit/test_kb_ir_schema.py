@@ -12,7 +12,8 @@ TDD 红绿，纯函数零网络零 DB，合成数据）。
 - **双层 type**（§13.4/§13.8#4）：统一枚举九值；未知类型兜底 paragraph 且原始类型
   进 `meta.raw_type`（全量留痕——不只未知类型）；`meta.raw_type` 必带；
 - **loc 三源 discriminated union**（§13.5）：feishu{space_id,node_token,block_id,
-  edit_time} / local{page,char_range,file_object_key} / url{source_url,char_range}，
+  obj_edit_time〔2026-11-25 B20 契约批命名统一，原 edit_time 收窄〕} /
+  local{page,char_range,file_object_key} / url{source_url,char_range}，
   以 `origin` 判别；
 - **类型专属字段**：heading `level` 1~9；text 载荷节点 `text`；
 - **序列化无 prev/next 兄弟指针**（data-model :544 钉注 / 调研 §13.8#2）：兄弟关系
@@ -244,6 +245,64 @@ def test_loc_missing_required_field_rejected() -> None:
         _block_node(loc={"origin": "feishu", "space_id": "7708"})  # 缺 node_token
     with pytest.raises(ValidationError):
         _block_node(loc={"origin": "url"})  # 缺 source_url
+
+
+def test_feishu_loc_obj_edit_time_key_name() -> None:
+    """命名统一（2026-11-25 B20 契约批待核项处置）：loc 源定位的变更判据键以契约
+    字面 `obj_edit_time` 为准统一（data-model §1.18 通用规则「meta.obj_edit_time 沿
+    既有键」；原批次 1 草案名 `edit_time` 收窄作废——wiki 节点编辑时间语义对齐）。"""
+    from app.rag.ir_schema import FeishuLoc
+
+    loc = FeishuLoc(origin="feishu", space_id="7708", node_token="tok1", obj_edit_time=1737100000)
+    assert loc.obj_edit_time == 1737100000
+    assert "edit_time" not in loc.model_fields  # 旧名不复存在（防双键并存漂移）
+
+
+# ---------------------------------------------------------------------------
+# SDK blocks 字面表锚点（2026-11-25 B20 契约批——data-model §1.18「受影响方」指定落点：
+# notebook feishu_kb_tree_probe.ipynb 一手材料字面表；原锚 29/31/27/19 + 本批补 33/34
+# ——33=view / 34=quote_container 之前无锚点断言（R-b））
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("btype", "name"),
+    [
+        (1, "page"),
+        (2, "text"),
+        (12, "bullet"),
+        (13, "ordered"),
+        (14, "code"),
+        (17, "todo"),
+        (18, "bitable"),
+        (19, "callout"),
+        (22, "divider"),
+        (23, "file"),
+        (27, "image"),
+        (29, "mindnote"),
+        (30, "sheet"),
+        (31, "table"),
+        (32, "table_cell"),
+        (33, "view"),
+        (34, "quote_container"),
+        (35, "task"),
+        (42, "wiki_catalog"),
+    ],
+)
+def test_feishu_block_field_anchors(btype: int, name: str) -> None:
+    """BLOCK_FIELD 锚点：错标回归门（轻审 P2-1 实证 SDK _types 字段序不可推导——
+    必须钉字面表；31/table 与 19/callout 曾被凭记忆错标为 30/18）。"""
+    from app.rag.feishu_mapper import BLOCK_FIELD
+
+    assert BLOCK_FIELD[btype] == name
+
+
+def test_feishu_block_field_no_16_and_bounded() -> None:
+    """16 未文档化不作块类型（notebook 注）；枚举界 1~42（>42 枚举外降级策略面）。"""
+    from app.rag.feishu_mapper import BLOCK_FIELD
+
+    assert 16 not in BLOCK_FIELD
+    assert set(BLOCK_FIELD) == set(range(1, 43)) - {16}
 
 
 def test_loc_char_range_must_be_pair() -> None:

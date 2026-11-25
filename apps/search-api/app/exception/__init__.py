@@ -17,8 +17,10 @@ from app.exception.database import DatabaseException
 from app.exception.export import ExportNotAvailableException
 from app.exception.feedback import FeedbackTurnNotFoundException
 from app.exception.kb import (
+    FeishuNotConfiguredException,
     FileTooLargeException,
     FileUnsupportedTypeException,
+    KbImportJobActiveException,
     KbUrlInvalidException,
 )
 from app.exception.not_found import NotFoundException
@@ -31,9 +33,11 @@ __all__ = [
     "ConflictException",
     "DatabaseException",
     "ExportNotAvailableException",
+    "FeishuNotConfiguredException",
     "FeedbackTurnNotFoundException",
     "FileTooLargeException",
     "FileUnsupportedTypeException",
+    "KbImportJobActiveException",
     "KbUrlInvalidException",
     "NotFoundException",
     "SnapshotNotFoundException",

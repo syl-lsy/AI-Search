@@ -13,12 +13,19 @@ dump 会补 null 键，故不用）。
 """
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_current_user, get_db
 from app.exception import BadRequestException
-from app.schemas.kb import KbDocumentListQuery, KbUrlCollectRequest
+from app.exception.kb import FeishuNotConfiguredException
+from app.schemas.kb import (
+    KbDocumentListQuery,
+    KbImportJobCreateRequest,
+    KbUrlCollectRequest,
+)
+from app.rag.import_service import KbImportJobService
+from app.rag.import_worker import get_import_worker
 from app.rag.pipeline import KbPipeline, _default_spec_payload, get_kb_pipeline
 from app.rag.service import KbService
 
@@ -31,6 +38,9 @@ _STATUS_VALUES: frozenset[str] = frozenset(
 )
 _DOC_TYPE_VALUES: frozenset[str] = frozenset({"pdf", "md", "txt", "docx", "url"})
 
+#: §4.7 connector 值域（M3 仅 feishu 合法——连接器扩展沿此键位）
+_CONNECTOR_VALUES: frozenset[str] = frozenset({"feishu"})
+
 
 def get_kb_service(
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -42,6 +52,34 @@ def get_kb_service(
     失效——评审 P1 钉正；与 pipeline 自身装配 _default_spec_payload 同形态，
     与 turn_service._capture_spec_payload 快照消费口径一致）。"""
     return KbService(db, spec_payload_provider=_default_spec_payload)
+
+
+def get_kb_import_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> KbImportJobService:
+    """导入任务服务依赖缝（单测经 dependency_overrides 替换）。"""
+    return KbImportJobService(db)
+
+
+def _require_feishu_credentials_with(app_id: str, app_secret: str) -> None:
+    """凭据前置校验（纯函数面）：app_id/secret 任一为空 → 500001 兜底面
+    （api.md §4.7——凭据只进 .env 禁入 Nacos，裁决 #8；业务异常出口防裸
+    Exception 的 ERROR traceback 噪音，铁律 8；零凭据值回显）。"""
+    if not app_id or not app_secret:
+        raise FeishuNotConfiguredException(
+            "飞书凭据未配置，无法触发知识库导入",
+            detail="FEISHU_APP_ID / FEISHU_APP_SECRET 未配置（凭据只进 .env）",
+        )
+
+
+def _require_feishu_credentials() -> None:
+    """凭据前置（settings 单例读取——密钥只经 settings 消费，零 str 化零打印）。"""
+    from app.core.config import feishu_settings
+
+    _require_feishu_credentials_with(
+        feishu_settings.app_id.get_secret_value(),
+        feishu_settings.app_secret.get_secret_value(),
+    )
 
 
 @router.post("/kb/documents", status_code=201)
@@ -131,3 +169,68 @@ async def delete_document(
     """删除文档（§4.5）：行删级联 + MinIO 前缀清理 best-effort；200 {"deleted": true}。"""
     result = await service.delete_document(document_id, user_id=user_id)
     return result.model_dump(mode="json", exclude_unset=True)
+
+
+# ---- 飞书导入任务（api.md §4.7~4.9；M3/B20 B 线④）----
+
+
+@router.post("/kb/import/jobs")
+async def create_import_job(
+    body: KbImportJobCreateRequest,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbImportJobService, Depends(get_kb_import_service)],
+    worker: Annotated[Any, Depends(get_import_worker)],
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    """手动触发飞书导入批次（§4.7）：建行 pending → BackgroundTasks 入队 worker。
+
+    图外导入 worker（ADR-011）：可中断可恢复（断点游标）、5 QPS 令牌桶、失败分类
+    清单重试；不进图拓扑、零 SSE 事件。错误：400001（connector 非法）/ 409007
+    （已有 pending/running 任务）/ 500001（FEISHU 凭据未配置兜底面）。
+    """
+    if body.connector not in _CONNECTOR_VALUES:
+        raise BadRequestException(
+            "connector 取值非法", detail=f"connector={body.connector}（M3 仅 feishu）"
+        )
+    _require_feishu_credentials()
+    created = await service.create_job(body.connector, user_id=user_id)
+    # 显式提交后才入队（评审 P1 时序钉正同款）：handler → background → get_db
+    # teardown——worker 新 session 须读到已提交行
+    await service.db.commit()
+    background_tasks.add_task(worker.enqueue, created.job_id)
+    return created.model_dump(mode="json", exclude_unset=True)
+
+
+@router.get("/kb/import/jobs")
+async def list_import_jobs(
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbImportJobService, Depends(get_kb_import_service)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    """导入任务列表（§4.8）：?limit=50&offset=0（§0 分页约定）+ created_at DESC；
+    items 同详情条目不含 failures（失败清单随详情返回）。
+
+    评审 P3：limit/offset 走 FastAPI Query 校验通道（越界 → RequestValidationError
+    → 400001）——handler 体内手动实例化 KbDocumentListQuery 会触发未注册 ERROR_MAP
+    的 pydantic ValidationError → 兜底 500001，语义错位。"""
+    page = await service.list_jobs(limit, offset, user_id=user_id)
+    return {
+        "total": page.total,
+        "items": [
+            item.model_dump(mode="json", exclude_unset=True) for item in page.items
+        ],
+        "page": page.page,
+        "page_size": page.page_size,
+    }
+
+
+@router.get("/kb/import/jobs/{job_id}")
+async def get_import_job(
+    job_id: str,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbImportJobService, Depends(get_kb_import_service)],
+) -> dict[str, Any]:
+    """导入任务详情（§4.9）：进度五数/失败分类/failures 清单；404001 不存在或越权。"""
+    detail = await service.get_job(job_id, user_id=user_id)
+    return detail.model_dump(mode="json", exclude_unset=True)

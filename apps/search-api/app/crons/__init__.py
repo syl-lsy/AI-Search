@@ -19,6 +19,8 @@ CronTask = (name, interval_seconds, coroutine_factory)：
 
 现有任务：
 - trace_cleanup（每日）：Langfuse 过期 trace 清理，见 trace_cleanup.py；
+- feishu_sync（每日）：飞书导入定时全量 diff（M3/B20 B 线——api.md §4.7 同步 MVP
+  定时形态，24h 代码常量；撞进行中任务/零变更不建行），见 feishu_sync.py；
 - memory_ttl_sweeper（M5 规划）：记忆 TTL 衰减清扫，参数归 Agent Spec memory 节
   （nacos-config.md §3），落地时进本注册表。
 """
@@ -41,6 +43,11 @@ class CronTask:
     coroutine_factory: Callable[[], Awaitable[None]]
 
 
+# feishu_sync 在 CronTask 定义之后导入（其模块级 CronTask 构造回引本命名空间——
+# 顺序颠倒会撞部分初始化的循环导入）
+from app.crons.feishu_sync import FEISHU_SYNC_TASK, run_feishu_sync as run_feishu_sync  # noqa: E402
+
+
 async def _run_trace_cleanup() -> None:
     """注册表契约适配：批次结果已由 cleanup_expired_traces 内部落 CronLog，此处只消费返回值。"""
     await cleanup_expired_traces()
@@ -53,4 +60,5 @@ CRON_TASKS: list[CronTask] = [
         interval_seconds=TRACE_CLEANUP_INTERVAL_SECONDS,
         coroutine_factory=_run_trace_cleanup,
     ),
+    FEISHU_SYNC_TASK,
 ]

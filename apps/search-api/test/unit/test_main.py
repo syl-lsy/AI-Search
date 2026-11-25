@@ -297,6 +297,18 @@ def _patch_lifespan_infra(
             pipeline_holder.append(_FakePipeline())
         return pipeline_holder[0]
 
+    class _FakeImportWorker:
+        """飞书导入 worker 缝假体（G5：lifespan start/stop 生命周期记录）。"""
+
+        async def start(self) -> None:
+            log.append("import_worker:start")
+
+        async def stop(self) -> None:
+            log.append("import_worker:stop")
+
+    def _get_import_worker() -> _FakeImportWorker:
+        return _FakeImportWorker()
+
     async def _start_asset_center(**_kwargs: object) -> _FakeCenter:
         if asset_exc is not None:
             raise asset_exc
@@ -321,6 +333,7 @@ def _patch_lifespan_infra(
     monkeypatch.setattr(main, "start_thread_scheduler", _start_thread_scheduler)
     monkeypatch.setattr(main, "seed_seq_from_db", _seed_seq_from_db)
     monkeypatch.setattr(main, "get_kb_pipeline", _get_kb_pipeline)
+    monkeypatch.setattr(main, "get_import_worker", _get_import_worker)
     return log
 
 
@@ -358,6 +371,7 @@ async def test_lifespan_runs_orphan_cleanup_before_yield_and_silences_uvicorn(
             "cleanup",
             "kb_requeue",
             "kb_pipeline:start",
+            "import_worker:start",
         ]
         assert logging.getLogger("uvicorn.error").disabled is True
         assert logging.getLogger("uvicorn.access").disabled is True
@@ -393,8 +407,10 @@ async def test_lifespan_survives_orphan_cleanup_failure(
         "seed_seq",
         "kb_requeue",  # 后续钩子不被前面失败级联跳过
         "kb_pipeline:start",
-        # 上下文退出后的关停逆序（cron 空 → worker.stop → bus/center close）
+        "import_worker:start",
+        # 上下文退出后的关停逆序（cron 空 → 双 worker.stop → bus/center close）
         "kb_pipeline:stop",
+        "import_worker:stop",
         "bus:close",
         "center:close",
     ]
@@ -480,13 +496,16 @@ async def test_lifespan_survives_kb_pipeline_start_failure(
     async with asyncio.timeout(5):
         async with main.app.router.lifespan_context(main.app):
             assert "kb_pipeline:start" not in events  # start 失败零记录
-    # 停机段对半建实例安全收口（stop 先于 bus/center close）
+    # 停机段对半建实例安全收口（stop 先于 bus/center close）——导入 worker 独立
+    # try 块，不受 KB 入库 worker 失败级联（各自 best-effort）
     assert events == [
         "asset_center:start",
         "event_bus:start",
         "thread_scheduler:start",
         "seed_seq",
+        "import_worker:start",
         "kb_pipeline:stop",
+        "import_worker:stop",
         "bus:close",
         "center:close",
     ]
@@ -521,6 +540,7 @@ async def test_lifespan_wires_infra_in_order_and_teardown_reverses(
                 "seed_seq",
                 "kb_requeue",
                 "kb_pipeline:start",
+                "import_worker:start",
             ]
     assert events == [
         "asset_center:start",
@@ -529,7 +549,9 @@ async def test_lifespan_wires_infra_in_order_and_teardown_reverses(
         "seed_seq",
         "kb_requeue",
         "kb_pipeline:start",
+        "import_worker:start",
         "kb_pipeline:stop",
+        "import_worker:stop",
         "bus:close",
         "center:close",
     ]
@@ -566,9 +588,10 @@ async def test_lifespan_shutdown_order_cron_before_bus_before_center(
     async with asyncio.timeout(5):
         async with main.app.router.lifespan_context(main.app):
             await asyncio.wait_for(started.wait(), timeout=2)
-    assert events[-4:] == [
+    assert events[-5:] == [
         "cron:cancelled",
         "kb_pipeline:stop",
+        "import_worker:stop",
         "bus:close",
         "center:close",
     ]

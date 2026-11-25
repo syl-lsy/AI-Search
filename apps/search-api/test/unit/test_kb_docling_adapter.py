@@ -1082,6 +1082,231 @@ def test_outline_meta_truncates_unmatched_and_counts_total() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 工单 A：书签骨架重建（护栏过门 → 未命中顶级书签条目造节点；内容按页区间归属；
+# 无锚点 heading 存废判据 = 工单 B 复核门）
+# ---------------------------------------------------------------------------
+
+
+def _make_skeleton_document() -> DoclingDocument:
+    """「修改记录」形态：p1/p2 两章版面有标题，p3 只有正文（书签在版面零命中）。"""
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="skeleton")
+    for page_no in (1, 2, 3):
+        doc.add_page(page_no=page_no, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "关于", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "关于章的正文段落", 1, height=14.0)
+    _add_bbox_item(doc, "第一章 块级绑定", 2, header=True, height=28.0)
+    _add_bbox_item(doc, "第一章的正文段落", 2, height=14.0)
+    _add_bbox_item(doc, "修改记录区的正文段落", 3, height=14.0)
+    return doc
+
+
+_SKELETON_OUTLINE = [
+    OutlineEntry("关于", 0, 0),
+    OutlineEntry("第一章 块级绑定", 0, 1),
+    OutlineEntry("修改记录", 0, 2),
+]
+
+
+def _run_skeleton(doc: DoclingDocument, outline: Any, **kwargs: Any) -> Any:
+    return normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=_BboxFontSampler({28.0: (23.0, True), 14.0: (9.5, False)}, body=16.0),
+        text_layer_pages=[True, True, True],
+        ocr_recognizer=None,
+        outline_reader=lambda _data: outline,
+        outline_correction=True,
+        heading_review=False,
+        settings=_settings(ocr_enabled=False),
+        **kwargs,
+    )
+
+
+def test_skeleton_rebuild_creates_node_and_attributes_content() -> None:
+    """书签有而版面识别无 → 造节点（L1、页=书签目标页），页区间正文归属其下，零丢字。"""
+    result = _run_skeleton(_make_skeleton_document(), _SKELETON_OUTLINE)
+
+    headings = _all_headings(result.document)
+    assert [(node.title, node.level, depth) for node, depth in headings] == [
+        ("关于", 1, 1),
+        ("第一章 块级绑定", 1, 1),
+        ("修改记录", 1, 1),
+    ]
+    created = headings[2][0]
+    assert created.meta["raw_type"] == "outline_bookmark"  # 版面未识别、书签确定性重建
+    assert created.meta["level_source"] == "outline_created"
+    assert created.loc is not None and created.loc.page == 3
+    # 内容归属：目标页（p3）正文直接挂造节点之下
+    assert [c.text for c in created.children] == ["修改记录区的正文段落"]
+    # 零丢字：三段正文全部在树内（各出现一次）
+    texts = [
+        n.text for n, _p in _preorder(result.document) if n.type is IrNodeType.PARAGRAPH
+    ]
+    assert texts == ["关于章的正文段落", "第一章的正文段落", "修改记录区的正文段落"]
+
+    meta = result.parse_meta["heading_outline"]
+    assert meta["correction_path"] == "bookmark"
+    assert meta["anchors"] == 3  # 造节点与自身书签条目匹配成锚点
+    assert meta["unmatched"] == []
+    assert meta["created"] == 1
+    assert meta["created_sample"] == ["修改记录"]
+
+
+def test_skeleton_created_node_exempt_from_review_gate() -> None:
+    """造节点是确定性书签源 → 与锚点同豁免面，不被工单 B 复核门降级。
+
+    「修正为：」带句末标点 + 造节点无 bbox（零正向证据）——若无豁免会被句末
+    标点判据降级；锚点豁免使该形态可观察。
+    """
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="skeleton-review")
+    for page_no in (1, 2, 3):
+        doc.add_page(page_no=page_no, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "章一", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "章二", 2, header=True, height=28.0)
+    _add_bbox_item(doc, "末节正文段落", 3, height=14.0)
+    sampler = _ReviewE2ESampler({28.0: 20.0, 14.0: 9.5}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True, True, True],
+        page_count=3,
+        ocr_recognizer=None,
+        outline_reader=lambda _data: [
+            OutlineEntry("章一", 0, 0),
+            OutlineEntry("章二", 0, 1),
+            OutlineEntry("修正为：", 0, 2),
+        ],
+        outline_correction=True,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    headings = [node.title for node, _p in _preorder(result.document) if node.type is IrNodeType.HEADING]
+    assert headings == ["章一", "章二", "修正为："]  # 造节点带句末标点仍存活（豁免）
+    assert result.parse_meta["heading_review"]["demoted_header"] == 0
+    assert result.parse_meta["heading_review"]["checked"] == 0  # 全部锚点豁免
+
+
+def test_skeleton_unanchored_heading_fate_by_review_gate() -> None:
+    """② 存废判据 = 工单 B 复核门：不过门降级回正文；过门保留挂最近锚点（造节点）下。
+
+    - 「修改为：」未入书签 + 正文字号 + 句末标点 → 降级回正文段（废）；
+    - 「真小节」未入书签 + 标题字号（正向证据过门）→ 保留且挂最近前置锚点之下（存）。
+    """
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="skeleton-fate")
+    for page_no in (1, 2, 3, 4):
+        doc.add_page(page_no=page_no, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "章一", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "修改为：", 2, header=True, height=14.0)  # 假阳性：正文字号+标点
+    _add_bbox_item(doc, "第二章的正文段落", 2, height=14.0)
+    _add_bbox_item(doc, "真小节", 2, header=True, height=28.0)  # 真标题版面漏挂书签
+    _add_bbox_item(doc, "小节正文段落", 2, height=14.0)
+    _add_bbox_item(doc, "章二", 3, header=True, height=28.0)
+    _add_bbox_item(doc, "修改记录区的正文段落", 4, height=14.0)
+    sampler = _ReviewE2ESampler({28.0: 20.0, 14.0: 9.5}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True, True, True, True],
+        page_count=4,
+        ocr_recognizer=None,
+        outline_reader=lambda _data: [
+            OutlineEntry("章一", 0, 0),
+            OutlineEntry("章二", 0, 2),
+            OutlineEntry("修改记录", 0, 3),
+        ],
+        outline_correction=True,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+
+    by_title = {node.title: node for node, _p in _preorder(result.document)}
+    # 废：假阳性降级回正文段（降级后 title 置 None、文本带回 text——按 text 找）
+    demoted = next(n for n, _p in _preorder(result.document) if (n.text or "") == "修改为：")
+    assert demoted.type is IrNodeType.PARAGRAPH
+    assert result.parse_meta["heading_review"]["demoted_header"] == 1
+    # 存：真小节过门保留，挂最近前置锚点「章一」之下（不冒充章级）
+    kept = next(n for n, _p in _preorder(result.document) if n.title == "真小节")
+    assert kept.type is IrNodeType.HEADING
+    assert kept.level == 2
+    zhang1 = by_title["章一"]
+    assert kept.parent_id == zhang1.id and kept in zhang1.children
+    # 造节点照常产出，正文归属不变
+    created = by_title["修改记录"]
+    assert created.meta["raw_type"] == "outline_bookmark"
+    assert [c.text for c in created.children] == ["修改记录区的正文段落"]
+
+
+def test_skeleton_guardrail_fail_falls_back_and_creates_nothing() -> None:
+    """护栏不过（3 条书签 1 命中）→ 零造节点，结构树与无书签现行路径逐条等价。
+
+    （meta 级 level_source 溯源差异——锚点槽在 sequence-clean 路径也标
+    bookmark_outline——系 T1-b 既有语义，非本单改动面，不纳入对照。）
+    """
+    doc = _make_skeleton_document()
+    junk = [
+        OutlineEntry("关于", 0, 0),
+        OutlineEntry("缺甲", 0, 1),
+        OutlineEntry("缺乙", 0, 2),
+    ]
+    with_junk = _run_skeleton(doc, junk)
+    without_outline = _run_skeleton(_make_skeleton_document(), [])
+
+    def _shape(node: IrNode) -> list[tuple[str, str | None, int | None, int | None, str | None]]:
+        rows: list[tuple[str, str | None, int | None, int | None, str | None]] = []
+        stack: list[tuple[IrNode, int]] = [(child, 1) for child in reversed(node.children)]
+        while stack:
+            current, depth = stack.pop()
+            loc_page = getattr(current.loc, "page", None) if current.loc else None
+            rows.append(
+                (current.type.value, current.title, current.level, loc_page, current.text)
+            )
+            for child in reversed(current.children):
+                stack.append((child, depth + 1))
+        return rows
+
+    assert _shape(with_junk.document) == _shape(without_outline.document)
+    created_nodes = [
+        n
+        for n, _p in _preorder(with_junk.document)
+        if n.meta.get("raw_type") == "outline_bookmark"
+    ]
+    assert created_nodes == []
+    meta = with_junk.parse_meta["heading_outline"]
+    assert meta["correction_path"] == "sequence-clean"
+    assert meta["created"] == 0
+    assert meta["unmatched"] == ["缺甲", "缺乙"]
+
+
+def test_skeleton_respects_correction_switch() -> None:
+    """总开关关闭（KB_PDF_OUTLINE_CORRECTION=false）→ 骨架重建一并旁路（等价旧管线）。"""
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(_make_skeleton_document()),
+        font_sampler=_BboxFontSampler({28.0: (23.0, True), 14.0: (9.5, False)}, body=16.0),
+        text_layer_pages=[True, True, True],
+        ocr_recognizer=None,
+        outline_reader=lambda _data: _SKELETON_OUTLINE,
+        outline_correction=False,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert "heading_outline" not in result.parse_meta
+    created_nodes = [
+        n
+        for n, _p in _preorder(result.document)
+        if n.meta.get("raw_type") == "outline_bookmark"
+    ]
+    assert created_nodes == []
+
+
+# ---------------------------------------------------------------------------
 # 生产接线缝（P0 回归）：render_page 的 PIL 必须经归一层才到达 engine.predict
 # ---------------------------------------------------------------------------
 
@@ -1407,6 +1632,7 @@ def test_heading_levels_sampled_from_bbox_not_text_search() -> None:
         font_sampler=sampler,
         text_layer_pages=[True],
         page_count=1,
+        heading_review=False,  # 本测面=分级聚类（小字标题为正文字号样式）；复核门另一测面
         settings=_settings(ocr_enabled=False),
     )
 
@@ -1451,3 +1677,405 @@ def test_promoted_heading_participates_in_outline_correction() -> None:
     )
     assert promoted.level == 1
     assert promoted.meta["level_source"] == "bookmark_outline"
+
+
+# ---------------------------------------------------------------------------
+# 工单 B：多信号复核层（section_header 门 / formula 复核 / code 复核 / Fix 2 高度回落）
+# ---------------------------------------------------------------------------
+
+
+class _ReviewE2ESampler:
+    """复核层 e2e 假体：死亡字号口径（恒 1.0）+ 盒高回落表面（ECMA 新渲染形态）。
+
+    page_chars 提供单条全宽行带（x 62→532，宽 470）——PageGeometry 的行宽基准面；
+    盒高/字号/加粗按 bbox 高度键控（同 _BboxFontSampler 风格）。
+    """
+
+    def __init__(
+        self,
+        heights_by_height: dict[float, float],
+        *,
+        body_height: float = 10.0,
+        bold_by_height: dict[float, bool] | None = None,
+    ) -> None:
+        self._heights = heights_by_height
+        self._bold = bold_by_height or {}
+        self.body_font_size = 1.0  # GetFontSize 死亡口径（ECMA 2026-11-24 新渲染版实测恒 1.0）
+        self.heights_mode = body_height
+        self.font_size_alive = False
+
+    def page_chars(self, page_index: int) -> list[tuple[float, float, float, float, float, str, int]]:
+        chars: list[tuple[float, float, float, float, float, str, int]] = []
+        step = (532.0 - 62.0) / 20
+        for i in range(20):
+            chars.append((62.0 + i * step, 60.0, 62.0 + (i + 1) * step, 70.0, 1.0, "字", i))
+        return chars
+
+    def stats_in_bbox(
+        self, page_index: int, bbox: tuple[float, float, float, float]
+    ) -> tuple[float, bool] | None:
+        height = round(bbox[3] - bbox[1], 1)
+        if height not in self._heights:
+            return None
+        return (1.0, self._bold.get(height, False))
+
+    def heights_in_bbox(
+        self, page_index: int, bbox: tuple[float, float, float, float]
+    ) -> float | None:
+        return self._heights.get(round(bbox[3] - bbox[1], 1))
+
+
+def _make_review_document() -> DoclingDocument:
+    """复核层 e2e 形态：真标题（大字号）+ 假阳性标题（正文字号短行）+ 正文。"""
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="review-gate")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 块级绑定", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "修改为：", 1, header=True, height=14.0)
+    _add_bbox_item(doc, "这是正文段落内容", 1, height=14.0)
+    return doc
+
+
+def test_review_gate_demotes_false_header_end_to_end() -> None:
+    """① e2e：正文字号假阳性 heading 降级回正文段，真标题（字号门）保留。"""
+    sampler = _ReviewE2ESampler({28.0: 20.0, 14.0: 9.5}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(_make_review_document()),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        outline_correction=False,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    headings = [n.title for n, _p in _preorder(result.document) if n.type is IrNodeType.HEADING]
+    assert headings == ["第一章 块级绑定"]
+    false_header = next(n for n, _p in _preorder(result.document) if (n.text or "") == "修改为：")
+    assert false_header.type is IrNodeType.PARAGRAPH
+    assert false_header.meta["raw_type"] == "section_header"  # 留痕：docling 原始标签不篡改
+    assert result.parse_meta["heading_review"]["demoted_header"] == 1
+    assert result.parse_meta["heading_review"]["checked"] == 2
+
+
+def test_review_gate_spares_bookmark_anchor_end_to_end() -> None:
+    """① e2e：书签锚点 heading 零信号也豁免（校正开启时锚点不被门误伤）。
+
+    锚题带句末标点使豁免可观察（非标点锚题在句末标点判据下本就保留）。
+    """
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="review-anchor")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    doc.add_page(page_no=2, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "引言：", 1, header=True, height=14.0)  # 正文字号 + 句末标点形态
+    _add_bbox_item(doc, "正文内容", 2, height=14.0)
+    sampler = _ReviewE2ESampler({14.0: 9.5}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True, True],
+        page_count=2,
+        outline_reader=lambda _data: [OutlineEntry("引言：", 0, 0)],
+        outline_correction=True,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    headings = [n.title for n, _p in _preorder(result.document) if n.type is IrNodeType.HEADING]
+    assert headings == ["引言："]  # 锚点豁免（无锚点时该形态会被句末标点判据降级）
+    assert result.parse_meta["heading_review"]["demoted_header"] == 0
+
+
+def test_review_disabled_switch_is_noop() -> None:
+    """关闭态回退门：heading_review=False → 零降级、不写 parse_meta 键（等价旧管线）。"""
+    sampler = _ReviewE2ESampler({28.0: 20.0, 14.0: 9.5}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(_make_review_document()),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        outline_correction=False,
+        heading_review=False,
+        settings=_settings(ocr_enabled=False),
+    )
+    headings = [n.title for n, _p in _preorder(result.document) if n.type is IrNodeType.HEADING]
+    assert headings == ["第一章 块级绑定", "修改为："]  # 假阳性保留（旧管线形态）
+    assert "heading_review" not in result.parse_meta
+
+
+def test_review_flag_reads_env_settings_on_production_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产路径（不传显式参数）读 `.env` 档 kb_settings.pdf_heading_review。"""
+    from types import SimpleNamespace
+
+    sampler = _ReviewE2ESampler({28.0: 20.0, 14.0: 9.5}, body_height=10.0)
+
+    def _run() -> Any:
+        return normalize_with_docling(
+            b"%PDF-1.4 fake",
+            converter=_fake_converter(_make_review_document()),
+            font_sampler=sampler,
+            text_layer_pages=[True],
+            page_count=1,
+            outline_correction=False,
+            settings=_settings(ocr_enabled=False),
+        )
+
+    monkeypatch.setattr(
+        docling_adapter,
+        "kb_settings",
+        SimpleNamespace(pdf_outline_correction=False, pdf_heading_review=False),
+    )
+    assert "heading_review" not in _run().parse_meta
+
+    monkeypatch.setattr(
+        docling_adapter,
+        "kb_settings",
+        SimpleNamespace(pdf_outline_correction=False, pdf_heading_review=True),
+    )
+    enabled = _run().parse_meta["heading_review"]
+    assert enabled["demoted_header"] == 1
+
+
+def test_formula_review_demotes_to_text_end_to_end() -> None:
+    """② e2e：盒高=正文众数且近满行的 formula 候选 → raw_type 降为 text（文本段）。"""
+    from docling_core.types.doc.base import BoundingBox, Size
+    from docling_core.types.doc.document import ProvenanceItem
+
+    doc = DoclingDocument(name="review-formula")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 块级绑定", 1, header=True, height=28.0)
+    item = doc.add_text(label=DocItemLabel.FORMULA, text="")
+    item.orig = "这一行其实是被误判成公式的正文内容"
+    item.prov.append(
+        ProvenanceItem(
+            page_no=1,
+            bbox=BoundingBox(l=62, t=100, r=532, b=111, page_size=Size(width=612, height=792)),
+            charspan=(0, 4),
+        )
+    )
+    sampler = _ReviewE2ESampler({28.0: 20.0, 11.0: 10.1}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        outline_correction=False,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    formula_node = next(
+        n for n, _p in _preorder(result.document) if (n.text or "").startswith("这一行其实")
+    )
+    assert formula_node.meta["raw_type"] == "text"
+    assert result.parse_meta["heading_review"]["demoted_formula"] == 1
+
+
+def test_code_review_demotes_to_text_end_to_end() -> None:
+    """③ e2e：盒高=正文众数 + 字体名可得且非等宽 → code 降级为文本段。"""
+    from docling_core.types.doc.base import BoundingBox, Size
+    from docling_core.types.doc.document import ProvenanceItem
+
+    doc = DoclingDocument(name="review-code")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 块级绑定", 1, header=True, height=28.0)
+    code = doc.add_code(text="x = 1  # 这其实不是代码")
+    code.prov.append(
+        ProvenanceItem(
+            page_no=1,
+            bbox=BoundingBox(l=62, t=100, r=532, b=111, page_size=Size(width=612, height=792)),
+            charspan=(0, 5),
+        )
+    )
+    sampler = _ReviewE2ESampler({28.0: 20.0, 11.0: 9.9}, body_height=10.0)
+    names_by_height = {11.0: ["AAAAAD+ArialMT"]}
+
+    def _names(page_index: int, bbox: tuple[float, float, float, float]) -> list[str] | None:
+        return names_by_height.get(round(bbox[3] - bbox[1], 1))
+
+    sampler.font_names_in_bbox = _names  # type: ignore[method-assign]
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        outline_correction=False,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    code_node = next(n for n, _p in _preorder(result.document) if (n.text or "").startswith("x = 1"))
+    assert code_node.type is IrNodeType.PARAGRAPH
+    assert result.parse_meta["heading_review"]["demoted_code"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 工单 B ④：Fix 2 提升通道——句末正则补英文句点 + 约束负例 + 高度回落复活
+# ---------------------------------------------------------------------------
+
+
+def test_does_not_promote_line_ending_with_english_period() -> None:
+    """④ P3-1：句末英文句点「.」结尾的大字行不得提升（脱漏缺口修复，工单 B 随单清偿）。"""
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="promote-period")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 总纲", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "Set the flag.", 1, height=28.0)
+    _add_bbox_item(doc, "参见附录 A.", 1, height=28.0)
+    sampler = _BboxFontSampler({28.0: (23.0, False), 14.0: (16.0, False)}, body=16.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert result.parse_meta["heading_heuristic"]["promoted"] == 0
+    headings = [n.title for n, _p in _preorder(result.document) if n.type is IrNodeType.HEADING]
+    assert headings == ["第一章 总纲"]
+
+
+def test_does_not_promote_line_ending_with_comma_or_semicolon() -> None:
+    """④ 负例：逗号/分号结尾不提升（正则面已有，负例锁死防回退——变异敏感性见交付说明）。"""
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="promote-comma")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 总纲", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "第一部分，", 1, height=28.0)
+    _add_bbox_item(doc, "流程如下;", 1, height=28.0)
+    sampler = _BboxFontSampler({28.0: (23.0, False), 14.0: (16.0, False)}, body=16.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert result.parse_meta["heading_heuristic"]["promoted"] == 0
+
+
+def test_does_not_promote_tall_bbox_single_line() -> None:
+    """④ 负例：单行高度比约束——bbox 高 ≥1.75×字号（多行行距撑高形态）不提升。"""
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="promote-tall")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 总纲", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "占位两行的标题样式行", 1, height=50.0)  # 50 ≥ 1.75×23
+    sampler = _BboxFontSampler({28.0: (23.0, False), 50.0: (23.0, False)}, body=16.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True],
+        page_count=1,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert result.parse_meta["heading_heuristic"]["promoted"] == 0
+    headings = [n.title for n, _p in _preorder(result.document) if n.type is IrNodeType.HEADING]
+    assert headings == ["第一章 总纲"]
+
+
+def _make_height_fallback_document() -> DoclingDocument:
+    """高度回落形态：死亡字号 + 标题样式 formula 候选（旧基线「关于本书」指纹形态）。"""
+    from docling_core.types.doc.base import BoundingBox, Size
+    from docling_core.types.doc.document import ProvenanceItem
+
+    doc = DoclingDocument(name="height-fallback")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    doc.add_page(page_no=2, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "浏览器与 Node.js 的兼容性", 1, header=True, height=28.0)
+    item = doc.add_text(label=DocItemLabel.FORMULA, text="")
+    item.orig = "关于本书"
+    item.prov.append(
+        ProvenanceItem(
+            page_no=2,
+            bbox=BoundingBox(l=62, t=100, r=128, b=124, page_size=Size(width=612, height=792)),
+            charspan=(0, 4),
+        )
+    )
+    return doc
+
+
+def test_promote_falls_back_to_heights_when_font_size_dead() -> None:
+    """④ Fix 2 高度回落：字号死亡（恒 1.0）标本上按盒高命中标题簇 → formula 候选提升。
+
+    旧基线（旧标本）验收形态：关于本书 = heading raw_type=formula（Fix 2 提升指纹，
+    out/kb_probe_ecma_final.txt:50）——新渲染版 GetFontSize 死亡后通道失效，本面=
+    恢复既有已验收行为，使「关于本书」类在关闭书签校正场景也能归位。
+    """
+    sampler = _ReviewE2ESampler({28.0: 14.2, 24.0: 14.2}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(_make_height_fallback_document()),
+        font_sampler=sampler,
+        text_layer_pages=[True, True],
+        page_count=2,
+        outline_correction=False,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert result.parse_meta["heading_heuristic"]["promoted"] == 1
+    promoted = next(
+        n for n, _p in _preorder(result.document)
+        if n.type is IrNodeType.HEADING and n.title == "关于本书"
+    )
+    assert promoted.meta["raw_type"] == "formula"  # 旧基线同款提升指纹
+    # 死亡字号标本上分级本就扁平（GetFontSize 口径，级别归一非本单范围）→
+    # 提升标题与锚点标题同为 level=1 兄弟节点，父=文档根
+    anchor = next(
+        n for n, _p in _preorder(result.document) if n.title == "浏览器与 Node.js 的兼容性"
+    )
+    assert anchor.type is IrNodeType.HEADING
+    assert promoted.level == 1 and anchor.level == 1
+    assert promoted.parent_id == "loc:doc:0"
+
+
+def test_promote_height_fallback_gated_by_review_switch() -> None:
+    """④ 回落门控：review 关闭 → 回落不生效（关闭态等价旧管线=死亡通道零提升）。"""
+    sampler = _ReviewE2ESampler({28.0: 14.2}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(_make_height_fallback_document()),
+        font_sampler=sampler,
+        text_layer_pages=[True, True],
+        page_count=2,
+        outline_correction=False,
+        heading_review=False,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert result.parse_meta["heading_heuristic"]["promoted"] == 0
+
+
+def test_height_fallback_does_not_promote_body_height_line() -> None:
+    """④ 回落负例：正文件高的 text 行（修正记录句形态）不提升（零误报约束保持）。"""
+    from docling_core.types.doc.base import Size
+
+    doc = DoclingDocument(name="height-fallback-neg")
+    doc.add_page(page_no=1, size=Size(width=612, height=792))
+    doc.add_page(page_no=2, size=Size(width=612, height=792))
+    _add_bbox_item(doc, "第一章 总纲", 1, header=True, height=28.0)
+    _add_bbox_item(doc, "相应的，本书也存在一些问题。", 2, height=14.0)
+    sampler = _ReviewE2ESampler({28.0: 20.0, 14.0: 9.5}, body_height=10.0)
+    result = normalize_with_docling(
+        b"%PDF-1.4 fake",
+        converter=_fake_converter(doc),
+        font_sampler=sampler,
+        text_layer_pages=[True, True],
+        page_count=2,
+        outline_correction=False,
+        heading_review=True,
+        settings=_settings(ocr_enabled=False),
+    )
+    assert result.parse_meta["heading_heuristic"]["promoted"] == 0
+    headings = [n.title for n, _p in _preorder(result.document) if n.type is IrNodeType.HEADING]
+    assert headings == ["第一章 总纲"]

@@ -1010,11 +1010,14 @@ KB_CHUNK_SIZE_MAX = 100000
 #: chunking 逐级切分上限（契约仅钉「各值 >0」——正整数 + 实现侧上界为合理范围授权
 #: 下的补齐）：页面 ≥ 段落 ≥ 句子的量级关系由建议值（1200/400/200）承载，逐级
 #: 不做跨键强制（大文档场景存在非严格递减的合法配置）。
+#: table_group_max_chars（v1.45——2026-11-25 表格双工单契约批增键）：行组字符预算，
+#: 同「各值 >0」规则；上界对齐 page_max_chars 实现侧口径（组预算超页面上限无意义）。
 KB_CHUNKING_MAX: dict[str, int] = {
     "page_max_chars": 100000,
     "para_max_chars": 50000,
     "sentence_max_chars": 20000,
     "table_agg_rows": 10000,
+    "table_group_max_chars": 100000,
 }
 
 #: 归一化引擎枚举（合法域以下方 KbNormalizerSpec 的 Literal 内联钉定，与全文件
@@ -1059,7 +1062,8 @@ def _reject_non_int_forms(value: Any, keys: tuple[str, ...], label: str) -> Any:
 
 
 class KbChunkingSpec(BaseModel):
-    """§3 kb.chunking 逐级切分上限（页面→段落→句子逐级降级 + 表格行聚合阈值）。
+    """§3 kb.chunking 逐级切分上限（页面→段落→句子逐级降级 + 表格行聚合阈值 +
+    行组字符预算）。
 
     子节缺失=合法（None）；部分键在场合法（缺键回落代码缺省）；各值正整数 + 上界
     （KB_CHUNKING_MAX，实现侧合理范围）；显式 null 拒收。
@@ -1070,6 +1074,7 @@ class KbChunkingSpec(BaseModel):
     para_max_chars: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["para_max_chars"])
     sentence_max_chars: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["sentence_max_chars"])
     table_agg_rows: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["table_agg_rows"])
+    table_group_max_chars: int | None = Field(default=None, gt=0, le=KB_CHUNKING_MAX["table_group_max_chars"])
 
     @model_validator(mode="before")
     @classmethod

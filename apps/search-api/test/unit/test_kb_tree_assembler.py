@@ -129,15 +129,82 @@ def test_orphans_attached_to_virtual_root_with_trace() -> None:
 
 
 def test_catalog_ids_and_path_materialized_down_tree() -> None:
+    """catalog 物化（data-model §1.18「catalog_path 含自身标题」条，C9=(a)）：
+    catalog_ids=祖先 ID 链（顶层 [] 口径不变）；catalog_path=[祖先标题…, 自身标题]
+    （顶层=[自身标题]，不存在空链）——恒有 len(catalog_path)=len(catalog_ids)+1。"""
     r = _doc("r", title="根文档")
     m1 = _doc("m1", "fs:node:r", title="中间层")
     m2 = _doc("m2", "fs:node:m1", title="叶文档")
     root, _ = assemble_catalog_tree([r, m1, m2])
-    assert r.catalog_ids == [] and r.catalog_path == []  # 顶层无祖先
+    assert r.catalog_ids == []
+    assert r.catalog_path == ["根文档"]  # 顶层=自身标题（C9=(a)——漏物化则顶层无路径可显）
     assert m1.catalog_ids == ["fs:node:r"]
-    assert m1.catalog_path == ["根文档"]
+    assert m1.catalog_path == ["根文档", "中间层"]
     assert m2.catalog_ids == ["fs:node:r", "fs:node:m1"]
-    assert m2.catalog_path == ["根文档", "中间层"]
+    assert m2.catalog_path == ["根文档", "中间层", "叶文档"]
+
+
+# ---------------------------------------------------------------------------
+# 顶层物化 C9=(a)：孤儿兜底 / 环切成根 / 不变式 / 子树传播 / 非飞书零触碰
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_orphan_and_cycle_root_get_own_title_path() -> None:
+    """顶层文档含孤儿兜底与环切后成根者 = [自身标题]，不存在空链（§1.18 C9=(a) 原文）。"""
+    a = _doc("a", title="普通根")
+    orphan = _doc("x", "fs:node:missing-parent", title="孤儿文档")
+    z = _doc("z", "fs:node:z", title="自环文档")  # 自环切边成根
+    root, report = assemble_catalog_tree([a, orphan, z])
+    by_id = {n.id: n for n in _walk(root)}
+    assert report.orphan_ids == ["fs:node:x"]
+    assert report.cycle_ids == ["fs:node:z"]
+    assert by_id["fs:node:a"].catalog_path == ["普通根"]
+    assert by_id["fs:node:x"].catalog_path == ["孤儿文档"]
+    assert by_id["fs:node:z"].catalog_path == ["自环文档"]
+    for node in by_id.values():
+        if node.id == VIRTUAL_ROOT_ID:
+            continue
+        assert node.catalog_path, "不存在空链"
+
+
+def test_catalog_path_invariant_holds_forest_wide() -> None:
+    """不变式 len(catalog_path) == len(catalog_ids) + 1 全树恒成立（§1.18 C9=(a)）。"""
+    flat, _ = _build_probe_shaped_forest()
+    root, _ = assemble_catalog_tree(flat)
+    for node in _walk(root):
+        if node.id == VIRTUAL_ROOT_ID:
+            continue
+        assert len(node.catalog_path) == len(node.catalog_ids) + 1
+        assert node.catalog_path[-1] == node.title  # 链末=自身标题
+
+
+def test_catalog_path_propagates_parent_chain_incl_parent_title() -> None:
+    """子树传播：子节点 catalog_path = 父全链（含父自身标题）+ 自身标题——中间层
+    改名会改写子树全链（同步 diff 判定序②「重导」的比对基准语义）。"""
+    r = _doc("r", title="根文档")
+    m1 = _doc("m1", "fs:node:r", title="中间层")
+    m2 = _doc("m2", "fs:node:m1", title="叶文档")
+    root, _ = assemble_catalog_tree([r, m1, m2])
+    assert m2.catalog_path == ["根文档", "中间层", "叶文档"]
+
+
+def test_node_without_title_keeps_invariant_with_empty_marker() -> None:
+    """无标题文档（探针单文件形态）：链元素以空串占位保持不变式——不回退旧行为
+    （漏元素则 len(catalog_path)=len(catalog_ids)，§1.18 恒等式被破坏）。"""
+    r = IrNode(
+        id="fs:node:r",
+        parent_id=None,
+        type="document",
+        title=None,
+        doc_kind="docx",
+        meta={"raw_type": "docx"},
+    )
+    child = _doc("c", "fs:node:r", title="子文档")
+    root, _ = assemble_catalog_tree([r, child])
+    assert r.catalog_ids == [] and r.catalog_path == [""]
+    assert child.catalog_ids == ["fs:node:r"]
+    assert child.catalog_path == ["", "子文档"]
+    assert len(child.catalog_path) == len(child.catalog_ids) + 1
 
 
 def test_assembly_wires_prev_next_siblings() -> None:
@@ -362,7 +429,7 @@ def _build_probe_shaped_forest() -> tuple[list[IrNode], dict[str, list[BlockRef]
                 "space_id": _SPACE,
                 "node_token": f"tok{counter:05d}",
                 "block_id": None,
-                "edit_time": 1732166400 + counter,
+                "obj_edit_time": 1732166400 + counter,
             }
             layer.append(node)
             flat.append(node)
@@ -421,10 +488,14 @@ def test_probe_scale_forest_assembles_correctly() -> None:
     depth5_samples = [n for n in walked if len(n.catalog_ids) == 4]
     assert len(depth5_samples) == 121  # 第 5 层节点：祖先链长 = 4（catalog_ids 物化）
     deepest = depth5_samples[0]
-    # catalog_ids=祖先 ID 链物化（边真相）；catalog_path=其标题解析派生（§13.7）——沿 parent 链回溯逐级核对
+    # catalog_ids=祖先 ID 链物化（边真相）；catalog_path=祖先标题 + 自身标题（C9=(a)
+    # 含自身——沿 parent 链回溯逐级核对）
     by_id = {n.id: n for n in flat}
     assert deepest.catalog_ids == _ancestor_ids(by_id, deepest)
-    assert deepest.catalog_path == [by_id[i].title for i in _ancestor_ids(by_id, deepest)]
+    assert deepest.catalog_path == [
+        *[by_id[i].title for i in _ancestor_ids(by_id, deepest)],
+        deepest.title,
+    ]
 
 
 def _ancestor_ids(by_id: dict[str, IrNode], node: IrNode) -> list[str]:

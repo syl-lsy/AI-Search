@@ -421,12 +421,15 @@ class TestKbSeedDefaults:
         }
 
     def test_kb_chunking_seed_matches_contract(self):
+        """§3 kb.chunking v1.45（2026-11-25 表格双工单契约批）：+table_group_max_chars
+        行组字符预算（1600，与 table_agg_rows=10 并行生效、先到者断组；表头不计入预算）。"""
         kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
         assert kb["chunking"] == {
             "page_max_chars": 1200,
             "para_max_chars": 400,
             "sentence_max_chars": 200,
             "table_agg_rows": 10,
+            "table_group_max_chars": 1600,
         }
 
     def test_kb_normalizer_seed_paddleocr_pinned(self):

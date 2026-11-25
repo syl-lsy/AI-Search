@@ -231,6 +231,14 @@ class KbSettings(BaseSettingsWithEnv):
     # true=装配前用书签钉正 heading 层级并写 parse_meta.heading_outline；
     # false=完全等价旧管线（跳过书签校正与序列清洗、不写该 parse_meta 键）——回退门。
     pdf_outline_correction: bool = True
+    # pdf docling 输出多信号复核层总开关（工单 B，.env 档：改需重启；非 Nacos 键）。
+    # true=docling 类型标签进 IR 前过排版事实复核门：非书签锚点 heading 降级当且
+    # 仅当（盒高 <正文众数×1.05 且 非加粗 且 句末标点矛盾——含同名家族继承）；
+    # 无矛盾证据尊重版面模型标签（真标题零误降方向）。formula/code 候选按盒高+
+    # 字体名复核降级；含 Fix 2 提升通道的高度回落（字号死亡标本恢复提升能力）。
+    # 写 parse_meta.heading_review。false=完全等价旧管线（零降级、零回落、不写
+    # 该 parse_meta 键）——回退门。
+    pdf_heading_review: bool = True
     model_config = {"env_prefix": "KB_"}
 
     @field_validator("allowed_types", mode="before")
@@ -243,6 +251,19 @@ class KbSettings(BaseSettingsWithEnv):
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("KB_CHUNK_OVERLAP 必须 < KB_CHUNK_SIZE（否则切片窗口不前进）")
         return self
+
+
+# 飞书开放平台（FEISHU_，M3 批次 3 / B20；凭据只进 .env 禁入 Nacos——裁决 #8，
+# Nacos 拒收疑似密钥字段）。app_id/app_secret 为 SecretStr：业务侧一律 get_secret_value
+# 消费、零 str 化零打印（异常文本经 feishu_client.redact 脱敏）。space_id 为目标 wiki
+# 知识空间（自用部署绑定，空=未绑定态由调用方决定降级）；api_base 沿 notebook
+# FEISHU_API_BASE 形态（默认官方域名；出站 URL scheme 在配置层收紧——HttpUrlStr）。
+class FeishuSettings(BaseSettingsWithEnv):
+    app_id: SecretStr = SecretStr("")
+    app_secret: SecretStr = SecretStr("")
+    space_id: str = ""  # 目标 wiki space id；空=未绑定（触发导入时按空间列表裁决）
+    api_base: HttpUrlStr = "https://open.feishu.cn"
+    model_config = {"env_prefix": "FEISHU_"}
 
 
 # ---- 模块级单例：业务代码 import 即用（与分组一一对应）----
@@ -258,3 +279,4 @@ langfuse_settings = LangfuseSettings()
 sandbox_settings = SandboxSettings()
 sse_settings = SseSettings()
 kb_settings = KbSettings()
+feishu_settings = FeishuSettings()
