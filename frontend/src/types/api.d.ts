@@ -579,6 +579,20 @@ export interface KbParseMeta {
   code_blocks: number
 }
 
+/** §4.3 响应 data：items 字段同 4.1 响应对象（另含 updated_at/ready_at/parse_meta/catalog_ids/catalog_path）+ total（limit/offset 分页约定同 §0） */
+export type KbDocumentListData = Paginated<KbDocument>
+
+/**
+ * §4.3 文档列表查询参数（`?limit=50&offset=0&status=&doc_type=`——api.md §4.3；
+ * P1-A 分页消费面：触底加载 limit/offset + ready 已入库计数条件请求 status）
+ */
+export interface KbDocumentListQuery {
+  limit?: number
+  offset?: number
+  status?: KbDocStatus
+  doc_type?: KbDocType
+}
+
 /* -------------------------------------------------------------
  * 4.6 GET /api/v1/sources/{source_id}/kb-chunk —— KB 来源溯源下钻（api.md v1.30 增，REQ-053——
  * 已批准（2026-11-22 确认点②）；v1.31 增列 node_token?/node_id? 两可选键）
@@ -663,6 +677,9 @@ export interface KbImportJob {
   created_at: IsoTimestamp
   updated_at: IsoTimestamp
 }
+
+/** §4.8 响应 data：items 为任务条目（同 4.9 详情基形、不含 failures，created_at DESC 新任务在前）+ total */
+export type KbImportJobListData = Paginated<KbImportJob>
 
 /** §4.9 详情 = 列表条目 + failures 失败清单（仅详情端点返回；自用 931+ 量级一次返回不设分页） */
 export interface KbImportJobDetail extends KbImportJob {

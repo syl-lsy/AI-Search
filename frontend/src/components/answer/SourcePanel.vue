@@ -57,6 +57,8 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   snapshot: [sourceId: string]
+  /** KB 来源卡溯源钮（v1.33 增，REQ-053——payload = (source_id, kb_chunk_id)，§4.6 解析键） */
+  kbChunk: [sourceId: string, kbChunkId: string]
 }>()
 
 const open = ref(true)
@@ -247,6 +249,20 @@ function initialOf(src: Source): string {
                 <UiIcon :name="src.source_type === 'kb' ? 'i-book' : 'i-globe'" size="sm" />
               </span>
               <span class="src-spring"></span>
+              <!-- KB 来源溯源钮（v1.33 增，REQ-053）：落位=快照胶囊位（KB 来源 snapshot_available 恒 false
+                   无胶囊，api.md §5.1 语义）→ 同位放溯源钮；web 卡无此钮（400001 防御面——前端仅对
+                   source_type=kb 且 kb_chunk_id 存在渲染；kb_chunk_id 缺省 null〔存量轮〕不渲染） -->
+              <button
+                v-if="src.source_type === 'kb' && src.kb_chunk_id"
+                type="button"
+                class="snapshot-icon"
+                :data-testid="`source-kb-drill`"
+                :title="$t('answer.kbDrill')"
+                :aria-label="$t('answer.kbDrill')"
+                @click="emit('kbChunk', src.source_id, src.kb_chunk_id)"
+              >
+                <UiIcon name="i-search" size="sm" />
+              </button>
               <button
                 v-if="src.snapshot_available"
                 type="button"

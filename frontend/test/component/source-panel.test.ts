@@ -439,6 +439,58 @@ describe('折叠态联动与焦点返还（评审 P1/P2-1/P2-2/P3-3：折叠胶�
   })
 })
 
+describe('SourcePanel KB 来源卡溯源钮（v1.33 增，REQ-053；frontend-api §5 SourcePanel/plan §1.1）', () => {
+  function kbSource(partial: Partial<Source> & { source_id: string; ref_no: number }): Source {
+    return makeSource({ source_type: 'kb', url: null, kb_doc_id: '9a770003-0000-4000-8000-000000000003', ...partial })
+  }
+
+  it('KB 卡（source_type=kb 且 kb_chunk_id 存在）渲染溯源钮；点击 emit kbChunk(source_id, kb_chunk_id) 载荷', async () => {
+    const w = mountPanel([
+      group({
+        turnId: TURN_1,
+        sources: [kbSource({ source_id: 'kb-1', ref_no: 2, kb_chunk_id: '5c2e0001-0000-4000-8000-000000000001' })],
+      }),
+    ])
+    const btn = w.find('[data-testid="source-kb-drill"]')
+    expect(btn.exists()).toBe(true)
+    await btn.trigger('click')
+    expect(w.emitted('kbChunk')).toEqual([['kb-1', '5c2e0001-0000-4000-8000-000000000001']])
+  })
+
+  it('web 卡无溯源钮（400001 防御面——前端仅对 KB 卡渲染入口）', () => {
+    const w = mountPanel([group({ turnId: TURN_1, sources: [makeSource({ source_id: 'w1', ref_no: 1 })] })])
+    expect(w.find('[data-testid="source-kb-drill"]').exists()).toBe(false)
+  })
+
+  it('kb_chunk_id 缺省 null（存量轮形态）→ 不渲染溯源钮', () => {
+    const w = mountPanel([group({ turnId: TURN_1, sources: [kbSource({ source_id: 'kb-legacy', ref_no: 1, kb_chunk_id: null })] })])
+    expect(w.find('[data-testid="source-kb-drill"]').exists()).toBe(false)
+  })
+
+  it('KB 卡快照胶囊位共存：snapshot_available=false 无胶囊、溯源钮与快照位同位不重叠', () => {
+    const w = mountPanel([
+      group({
+        turnId: TURN_1,
+        sources: [
+          makeSource({ source_id: 'w-snap', ref_no: 1, snapshot_available: true }),
+          kbSource({ source_id: 'kb-1', ref_no: 2, kb_chunk_id: '5c2e0001-0000-4000-8000-000000000001', snapshot_available: false }),
+        ],
+      }),
+    ])
+    const cards = w.findAll('.src-card')
+    expect(cards[0]!.find('[data-testid="snapshot-1"]').exists()).toBe(true)
+    expect(cards[1]!.find('[data-testid="snapshot-2"]').exists()).toBe(false) // KB 来源无快照胶囊（api.md §5.1 语义）
+    expect(cards[1]!.find('[data-testid="source-kb-drill"]').exists()).toBe(true)
+  })
+
+  it('溯源钮 a11y：icon-only 按钮带 aria-label（溯源）', () => {
+    const w = mountPanel([
+      group({ turnId: TURN_1, sources: [kbSource({ source_id: 'kb-1', ref_no: 1, kb_chunk_id: '5c2e0001-0000-4000-8000-000000000001' })] }),
+    ])
+    expect(w.find('[data-testid="source-kb-drill"]').attributes('aria-label')).toBe('溯源')
+  })
+})
+
 describe('SourcePanel 分支收尾（覆盖率恢复批：domainOf 兜底/initialOf 空回落/highlightSeq 早退）', () => {
   it('url 非法（URL 解析抛错）→ 域名位回落展示原始串（domainOf catch 分支）', () => {
     const w = mountPanel([

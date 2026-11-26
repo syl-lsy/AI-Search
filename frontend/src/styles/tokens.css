@@ -61,8 +61,11 @@
   --color-warning-bg: rgba(224, 163, 62, 0.12);
   --color-danger: #e5484d;           /* 失败 / 熔断 */
   --color-danger-bg: rgba(229, 72, 77, 0.12);
+  --color-danger-hover: #ef5a5f;     /* 危险按钮 hover 提亮——2026-11-26 随 OQ-2 清偿收编；dark 组继承此值（暗色 hover 提亮同手法） */
   --color-kb: #8f7ff0;               /* 【知识库】来源徽标专用紫 */
   --color-kb-bg: rgba(143, 127, 240, 0.14);
+  --color-feishu: #3370ff;           /* 飞书品牌蓝——2026-11-26 用户裁决合入（OQ-2 清偿）；品牌色两主题恒定不随主题覆写 */
+  --color-feishu-bg: rgba(51, 112, 255, 0.14);
 
   /* v1.4（v1.23 UiTooltip）：tooltip 深色气泡主题不变量——对标 Perplexity tooltip 恒暗
      （两主题都近黑底浅字；浅色组无需覆写，--color-text-inverse 在浅色主题是白色不适用） */
@@ -365,6 +368,9 @@ img, svg { display: block; }
 .btn-ghost:hover { color: var(--color-text-primary); background: var(--color-surface-ghost); }
 .btn-accent { background: var(--color-accent); color: #06282e; }
 .btn-accent:hover { background: var(--color-accent-hover); }
+/* 危险确认钮（设计稿 05-library-m3 组件类——2026-11-26 OQ-2 清偿：scoped 字面量收编为 token 变体） */
+.btn-danger { background: var(--color-danger); color: #fff; }
+.btn-danger:hover { background: var(--color-danger-hover); }
 .btn-sm { min-height: 32px; padding: 0 var(--space-3); font-size: var(--text-sm); }
 
 .icon-btn {

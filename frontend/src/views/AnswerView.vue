@@ -30,9 +30,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 
-import { normalizeError } from '@/api/client'
+import { normalizeError, ApiError } from '@/api/client'
+import { fetchDocument, fetchKbChunk } from '@/api/kb'
 import { fetchSnapshot } from '@/api/sources'
 import { fetchThread } from '@/api/threads'
+import KbChunkDrilldown from '@/components/answer/KbChunkDrilldown.vue'
 import OutlineAnchor from '@/components/answer/OutlineAnchor.vue'
 import type { OutlineItem } from '@/components/answer/OutlineAnchor.vue'
 import ScrollToBottomFab from '@/components/answer/ScrollToBottomFab.vue'
@@ -47,7 +49,7 @@ import { useThreadListStore } from '@/stores/threadList'
 import { useTurnStore } from '@/stores/turn'
 import { isHttpUrl, isUuid } from '@/utils/guards'
 import { turnIdFromAnchor } from '@/utils/anchors'
-import type { AskMode, SnapshotData } from '@/types/api'
+import type { AskMode, KbChunkDetail, KbDocument, SnapshotData } from '@/types/api'
 
 const route = useRoute()
 const { t } = useI18n()
@@ -331,6 +333,67 @@ async function onSnapshot(sourceId: string): Promise<void> {
   }
 }
 
+/* ---------- KB 来源溯源下钻（api.md §4.6；frontend-api §5 KbChunkDrilldown 行 v1.33/34；
+ * plan-m3-b6-f6 §2.3/§2.4）----------
+ * 数据面归本视图承载：SourcePanel KB 卡溯源钮 → onKbChunk(sourceId) → fetchKbChunk
+ * （api/kb.ts 唯一出口；kbChunkLoading 防重入）。成功后并发 fetchDocument(chunk.document_id)
+ * （文档面失败不遮蔽切片面——parse_meta/catalog_path 区降级隐藏，doc 置 null 不 toast）。
+ * 缓存（OQ-3 建议值）：成功态会话内存缓存 Map<source_id, {detail, doc}>（弹窗关闭不弃缓存，
+ * 同 source_id 重复点击零请求）；404001 不缓存（每次重查——文档删除后重开及时降级，避免
+ * 陈旧成功态盖过 §4.5 级联删除事实）。404001 → unavailable 占位卡（不报错红、不 toast）；
+ * 其余错误 toast 既有链路、不弹窗。 */
+const kbChunkLoading = ref(false)
+const kbChunkOpen = ref(false)
+const kbChunkData = ref<KbChunkDetail | null>(null)
+const kbChunkDoc = ref<KbDocument | null>(null)
+const kbChunkUnavailable = ref(false)
+const kbChunkCache = new Map<string, { detail: KbChunkDetail; doc: KbDocument | null }>()
+
+async function onKbChunk(sourceId: string): Promise<void> {
+  // CR-6/SA-2 选型说明：sourceId 是 §4.6 URL 路径参数（GET /api/v1/sources/{source_id}/kb-chunk），
+  // 进请求前过 isUuid——与 frontend-api.md §8.3「路由参数经校验后才进 API 调用」（threadId 先例）
+  // 同纪律，在视图层收口而非 api/kb.ts 内 encodeURIComponent（编码只防解析歧义，不校验语义合法性，
+  // 与既有路由参数纪律不一致）。原 kbChunkId 前置校验删除：§4.6 请求仅由 source_id 键定，
+  // kb_chunk_id 按 §5 SourcePanel emit 契约形态携带但无消费面（不进任何请求），不应成为前置门。
+  if (kbChunkLoading.value || !isUuid(sourceId)) return
+  const cached = kbChunkCache.get(sourceId)
+  if (cached) {
+    kbChunkData.value = cached.detail
+    kbChunkDoc.value = cached.doc
+    kbChunkUnavailable.value = false
+    kbChunkOpen.value = true
+    return
+  }
+  kbChunkLoading.value = true
+  kbChunkUnavailable.value = false
+  try {
+    const detail = await fetchKbChunk(sourceId)
+    // 文档面合流（§4.4）：失败置 null 降级隐藏、不遮蔽切片面
+    let doc: KbDocument | null = null
+    try {
+      doc = await fetchDocument(detail.document_id)
+    } catch {
+      doc = null
+    }
+    kbChunkCache.set(sourceId, { detail, doc })
+    kbChunkData.value = detail
+    kbChunkDoc.value = doc
+    kbChunkOpen.value = true
+  } catch (e) {
+    if (e instanceof ApiError && e.code === '404001') {
+      // 已删除/不存在/越权单码 → 占位卡优雅降级（不缓存——每次重查）
+      kbChunkData.value = null
+      kbChunkDoc.value = null
+      kbChunkUnavailable.value = true
+      kbChunkOpen.value = true
+      return
+    }
+    toast(normalizeError(e).message)
+  } finally {
+    kbChunkLoading.value = false
+  }
+}
+
 /* ---------- 追问（2.4；§1 AnswerView 行） ---------- */
 const followingUp = ref(false)
 async function onFollowSubmit(): Promise<void> {
@@ -504,6 +567,7 @@ onUnmounted(() => {
                 :active-turn-id="activeTurnId"
                 :expand-seq="panelExpandSeq"
                 @snapshot="onSnapshot"
+                @kb-chunk="onKbChunk"
               />
             </div>
           </div>
@@ -547,6 +611,15 @@ onUnmounted(() => {
 
       <!-- 快照预览弹窗（批次 6，api.md §5.1）：SourcePanel 快照胶囊 → onSnapshot 取数 → 弹窗 -->
       <SnapshotModal :open="snapshotOpen" :data="snapshotData" @close="snapshotOpen = false" />
+
+      <!-- KB 来源溯源下钻弹窗（M3 批次 6，api.md §4.6）：SourcePanel KB 卡溯源钮 → onKbChunk 取数 → 弹窗 -->
+      <KbChunkDrilldown
+        :open="kbChunkOpen"
+        :chunk="kbChunkData"
+        :doc="kbChunkDoc"
+        :unavailable="kbChunkUnavailable"
+        @close="kbChunkOpen = false"
+      />
     </template>
   </section>
 </template>

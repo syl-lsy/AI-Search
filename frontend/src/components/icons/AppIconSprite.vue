@@ -53,6 +53,11 @@
       <symbol id="i-thumb-down" viewBox="0 0 24 24"><path class="stroke" d="M17 14V3" /><path class="stroke" d="M9 18.12L10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H17v12l-4.55 7.94A3.13 3.13 0 0 1 9 18.12z" /></symbol>
       <symbol id="i-replay" viewBox="0 0 24 24"><path class="stroke" d="M4 12a8 8 0 1 0 2.34-5.66" /><path class="stroke" d="M4 4v4h4" /></symbol>
       <symbol id="i-source" viewBox="0 0 24 24"><path class="stroke" d="M12 2l9 5-9 5-9-5 9-5z" /><path class="stroke" d="M3 12l9 5 9-5" /><path class="stroke" d="M3 17l9 5 9-5" /></symbol>
+      <!-- M3 批次 6（plan §1.1：path 直取设计稿 05-library-m3.html defs）——飞书连接器卡/目录链、OCR 通道注记、删除清单 ES/MinIO 行 -->
+      <symbol id="i-feishu" viewBox="0 0 24 24"><path class="stroke" d="M3 7.5C5.5 4.5 9 3 12.5 3c3 0 5.5 1.2 7 3-3.5 1-6.8 2.8-9.2 5.2L3 7.5z" /><path class="stroke" d="M10.3 11.2C8.9 14 9.3 17.4 11.5 20c1.8-1.2 3.1-3 3.6-5.1M21 13c-3.2-.4-6.3.3-8.9 2" /></symbol>
+      <symbol id="i-scan" viewBox="0 0 24 24"><path class="stroke" d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M3 12h18" /></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path class="stroke" d="M12 2L2 7l10 5 10-5-10-5z" /><path class="stroke" d="M2 17l10 5 10-5M2 12l10 5 10-5" /></symbol>
+      <symbol id="i-box" viewBox="0 0 24 24"><path class="stroke" d="M21 8l-9-5-9 5v8l9 5 9-5V8z" /><path class="stroke" d="M3 8l9 5 9-5M12 13v8" /></symbol>
     </defs>
   </svg>
 </template>

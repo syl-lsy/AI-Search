@@ -29,7 +29,7 @@ import {
 } from '@/mocks/turnDetails'
 import { threadListFixture } from '@/mocks/threads'
 import { router } from '@/router'
-import type { SnapshotData } from '@/types/api'
+import type { KbChunkDetail, KbDocument, SnapshotData, Source } from '@/types/api'
 
 import { MockEventSource } from '../helpers/mockEventSource'
 
@@ -762,5 +762,97 @@ describe('快照入口接线（批次 6：SourcePanel 快照胶囊 → SnapshotM
     // 摘录预览不因外链不可用而缺席；外链钮被 isHttpUrl 守卫隐藏
     expect(document.querySelector('[data-testid="snapshot-excerpt"]')).not.toBeNull()
     expect(document.querySelector('[data-testid="snapshot-open-original"]')).toBeNull()
+  })
+})
+
+describe('溯源下钻守卫（CR-6/SA-2：§4.6 路径参数 sourceId 进 URL 前过 isUuid）', () => {
+  const KB_TURN = 'cccc4444-4444-4444-8444-444444444444'
+  const KB_CHUNK: KbChunkDetail = {
+    chunk_id: '5c2e0001-0000-4000-8000-000000000001',
+    document_id: '9a770001-0000-4000-8000-000000000002',
+    document_title: '内部设计文档-检索融合.md',
+    content: 'KB 候选与网络候选合并后统一 rerank...',
+    heading_path: ['第三章 检索融合'],
+    page: 12,
+    paragraph: 4,
+  }
+  const KB_DOC: KbDocument = {
+    document_id: KB_CHUNK.document_id,
+    doc_type: 'md',
+    title: '内部设计文档-检索融合.md',
+    file_size_bytes: 102_400,
+    status: 'ready',
+    fail_reason: null,
+    chunk_count: 42,
+    created_at: '2026-11-01T08:12:00Z',
+    parse_meta: { pages: null, tables: 3, code_blocks: 2 },
+    catalog_path: null,
+  }
+
+  function kbSource(sourceId: string, kbChunkId: string): Source {
+    return {
+      source_id: sourceId,
+      ref_no: 1,
+      source_type: 'kb',
+      title: '内部设计文档-检索融合.md',
+      url: null,
+      snippet: 'KB 候选与网络候选合并后统一 rerank...',
+      score: 0.8871,
+      snapshot_available: false,
+      kb_doc_id: KB_DOC.document_id,
+      kb_chunk_id: kbChunkId,
+    }
+  }
+
+  function installKbThread(source: Source): void {
+    mockedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/models') return modelsFixture
+      if (url === '/api/v1/threads') return threadListFixture
+      if (url === `/api/v1/threads/${THREAD_ID_B}`) {
+        return {
+          thread_id: THREAD_ID_B,
+          title: THREAD_TITLE_B,
+          mode_summary: 'fast',
+          turn_count: 1,
+          has_artifacts: false,
+          created_at: '2026-10-30T10:00:00Z',
+          updated_at: '2026-10-30T10:03:21Z',
+          turns: [
+            { turn_id: KB_TURN, mode: 'fast', status: 'completed', query: 'KB 溯源守卫用例', query_lang: 'zh', has_report: false, degraded: false, duration_ms: 3_200, created_at: '2026-10-30T10:02:00Z' },
+          ],
+        }
+      }
+      if (url === `/api/v1/turns/${KB_TURN}`) {
+        return { ...turnDetailFastCompleted, turn_id: KB_TURN, answer_md: 'KB 溯源回答 [1]。', sources: [source] }
+      }
+      if (url === `/api/v1/sources/${source.source_id}/kb-chunk`) return KB_CHUNK
+      if (url === `/api/v1/kb/documents/${KB_CHUNK.document_id}`) return KB_DOC
+      throw new Error(`unexpected GET ${url}`)
+    })
+  }
+
+  it('非法 sourceId → 守卫拦截零请求、弹窗不开（§4.6 路径参数进 URL 前过 isUuid，与 threadId 纪律对称）', async () => {
+    installKbThread(kbSource('not-a-uuid-source', '5c2e0001-0000-4000-8000-000000000001'))
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_B}`)
+    await flushPromises()
+    mockedGet.mockClear()
+    await wrapper.find('[data-testid="source-kb-drill"]').trigger('click')
+    await flushPromises()
+    // 守卫拦截：零请求（dispatcher 对未预期 URL 恒 throw——若守卫失守触网此处必红）；弹窗不开
+    expect(mockedGet).not.toHaveBeenCalled()
+    expect(document.querySelector('[data-testid="kb-chunk-drilldown"]')).toBeNull()
+  })
+
+  it('合法 sourceId + 非 UUID kb_chunk_id（legacy 形态）→ §4.6 请求照发（kbChunkId 无消费面、不再是前置门）', async () => {
+    installKbThread(kbSource('f00d9001-0000-4000-8000-000000000001', 'legacy-chunk-ref'))
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_B}`)
+    await flushPromises()
+    mockedGet.mockClear()
+    await wrapper.find('[data-testid="source-kb-drill"]').trigger('click')
+    await flushPromises()
+    expect(mockedGet).toHaveBeenCalledWith('/api/v1/sources/f00d9001-0000-4000-8000-000000000001/kb-chunk')
+    expect(document.querySelector('[data-testid="kb-chunk-drilldown"]')).not.toBeNull()
   })
 })
