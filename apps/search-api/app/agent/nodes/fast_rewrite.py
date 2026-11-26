@@ -80,6 +80,7 @@ from app.agent.decision_client import (
     run_decision,
 )
 from app.agent.graphs.signals import emit_stage
+from app.agent.nodes.kb_route import ROUTE_FALLBACK, correction_round_of
 from app.agent.guards import (
     ContentRejectedError,
     TurnCanceledSignal,
@@ -116,6 +117,14 @@ TRANSPORT_FALLBACK_QUERY_TYPE: str = "other"
 #: 两兜底路径的检索策略（nacos §1 v1.20 回落规则：兜底态 strategy=web、answerable=false）
 FALLBACK_SEARCH_STRATEGY: str = "web"
 
+#: 纠错重写反馈块（B19 plan §4.4「带反馈重写」——rewrite prompt 尾部追加；系统注入
+#: 声明行防混淆，零用户文本回显。第二趟强制 hybrid=web+kb 并行补查）
+_CORRECTION_FEEDBACK = (
+    "\n\n【纠错重写提示（系统注入，非用户输入）】上一趟知识库检索供给不足"
+    "（KB 零命中或得分过低）。本轮强制 hybrid：请重写 queries 以兼顾网络检索与"
+    "知识库检索（queries 将同时发 web 与 kb 两通道），纠正只查知识库导致的覆盖缺口。"
+)
+
 QueryType = Literal[
     "factoid",
     "list",
@@ -131,6 +140,10 @@ QueryType = Literal[
 #: - direct：免检索直答轮（零事实面）；recall：回顾整理轮（历史重新生成，免检索直达）；
 #: - verify ≡ answerable=true；web 默认全管道。
 SearchStrategy = Literal["direct", "verify", "web", "recall"]
+
+#: KB 检索档位三值（B19 plan §4.4 / nacos-config §3 kb.route v1.46——与
+#: kb_route.KB_ROUTE_VALUES 同域；hybrid 缺省灰度=存量轮零行为变化）
+KbRoute = Literal["kb_only", "kb_first", "hybrid"]
 
 #: 输入安全初判四值（B13：none=正常 / danger=危险意图 / profanity=纯辱骂发泄 /
 #: privacy=隐私侵害意图；politics=涉政敏感话题讨论请求（v1.32 +，reject-only）；
@@ -150,6 +163,9 @@ class RewriteOutput(BaseModel):
     存量轮零行为变化——字段由提示词热更启用）。
     `safety` 缺省 `none`（B13 灰度安全同款：旧提示词无本字段即全量放行，
     存量轮零行为变化；命中拦截面仅成功路径，见 `_safety_gate`）。
+    `kb_route` 缺省 `hybrid`（B19 灰度安全同款：旧提示词无本字段即全量 hybrid，
+    存量轮零行为变化；值域 kb_only|kb_first|hybrid——nacos-config §3 kb.route
+    v1.46；缺省/非法由 pydantic 枚举拒收进修复回喂，兜底路径落 ROUTE_FALLBACK）。
 
     v1.33 注：本 schema = **light 全职责路径**（kill switch 关闭态 / decision 失败
     兜底态）的输出契约——三分类字段（query_type/answerable/search_strategy）在
@@ -161,6 +177,7 @@ class RewriteOutput(BaseModel):
     query_type: QueryType
     answerable_from_knowledge: bool
     search_strategy: SearchStrategy = "web"
+    kb_route: KbRoute = "hybrid"
     safety: SafetyFlag = "none"
     time_range: Literal["day", "week", "month", "year"] | None = None
     memory_directive: str | None = None
@@ -169,14 +186,18 @@ class RewriteOutput(BaseModel):
 class RewriteSlimOutput(BaseModel):
     """light **瘦身调用**输出 schema（v1.33 决策生效 verify/web 轮——ADR-016②）。
 
-    只生成 decision 输出长度 0 天然不可承接的文本生成面四字段：queries /
+    只生成 decision 输出长度 0 天然不可承接的文本生成面字段：queries /
     time_range / memory_directive / safety（**safety 判定面本批留 light**——契约
     v1.33 冻结钉注，B13 两层防御不动）；query_type/answerable/search_strategy 三
     分类字段由 decision 回填（`_decision_slim_update`）。缺省值口径与 RewriteOutput
     一致（safety=none 灰度安全）。
+    `kb_route`（B19，修订注 3 Nacos fast.rewrite 键增量）：KB 检索档位由 light 判定
+    （decision 未承接该新增判定面）——schema 串与工具 schema 同形纪律（e2e 教训），
+    缺省 hybrid 灰度安全。
     """
 
     queries: list[str] = Field(min_length=1)
+    kb_route: KbRoute = "hybrid"
     safety: SafetyFlag = "none"
     time_range: Literal["day", "week", "month", "year"] | None = None
     memory_directive: str | None = None
@@ -330,6 +351,7 @@ def _decision_update(outcome: Any) -> dict[str, Any]:
         "query_type": outcome.query_type,
         "answerable_from_knowledge": _aligned_answerable(strategy, outcome.answerable),
         "search_strategy": strategy,
+        "kb_route": ROUTE_FALLBACK,  # B19：decision 未承接 kb_route 判定面——兜底 hybrid
         "time_range": None,
         "degraded": False,
     }
@@ -344,6 +366,7 @@ def _decision_slim_update(outcome: Any, slim: RewriteSlimOutput, spec: Mapping[s
         "query_type": outcome.query_type,
         "answerable_from_knowledge": _aligned_answerable(strategy, outcome.answerable),
         "search_strategy": strategy,
+        "kb_route": slim.kb_route,  # B19：kb_route 判定留 light（slim schema 增量同形）
         "time_range": slim.time_range,
         "rewritten_queries": _clamp_queries(slim.queries, spec, outcome.query_type),
         "degraded": False,
@@ -463,6 +486,7 @@ def _fallback_update(
         "query_type": query_type,
         "answerable_from_knowledge": False,
         "search_strategy": FALLBACK_SEARCH_STRATEGY,
+        "kb_route": ROUTE_FALLBACK,  # B19：两兜底路径一律 hybrid（plan §4.4 灰度硬约束）
         "time_range": None,
         "errors": [{"stage": "rewrite", "reason": reason}],
     }
@@ -492,6 +516,7 @@ def _success_update(parsed: RewriteOutput, spec: Mapping[str, Any]) -> dict[str,
             parsed.search_strategy, parsed.answerable_from_knowledge
         ),
         "search_strategy": parsed.search_strategy,
+        "kb_route": parsed.kb_route,  # B19：合法输出路径透传（缺省 hybrid）
         "time_range": parsed.time_range,
         "rewritten_queries": _clamp_queries(parsed.queries, spec, parsed.query_type),
         "degraded": False,
@@ -553,6 +578,14 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
       switch / decision 失败 / shadow / 瘦身失败兜底——现状代码路径逐字保留）。
     """
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
+
+    # B19 纠错第二趟（plan §4.4）：fuse_rerank 后确定性 gate 判不足 → 条件边 Send 回边
+    # （payload 携带 correction_round=1）——本趟入口补发 running 帧（首趟 running 由
+    # TurnRunner 图前发布；纠错趟自发布保持 running/done 配对——api.md §7.2「同 key
+    # 多次出现合法」），第二趟强制 hybrid（update 钉 ROUTE_FALLBACK + 持久化轮帽）。
+    correction_pass = correction_round_of(state) >= 1
+    if correction_pass:
+        emit_stage("rewrite", "running", detail="KB 供给不足——纠错重写（强制 hybrid 补查 web）")
 
     query = str(state.get("query") or "")
     query_lang = str(state.get("query_lang") or "en")
@@ -657,11 +690,23 @@ async def rewrite(state: Any, config: RunnableConfig | None = None) -> dict[str,
     if accepted is not None:
         await _safety_gate(accepted, spec, query_lang, config)
 
+    # B19 纠错第二趟收口：强制 hybrid（与 kb_route.resolve 第二趟判定同谓词双防线）
+    # + 轮帽持久化（correction_round ≥1 → 后续 fuse_rerank 条件边不再回边）。
+    if correction_pass:
+        update["kb_route"] = ROUTE_FALLBACK
+        update["correction_round"] = correction_round_of(state) + 1
+
     # strategy 恒随 done.extra 留痕（direct 形态为 api.md §7.4 钉死形态；verify/web
     # 轮为观测增量）+ 分支标注（fallback / memory_directive / decision_source /
     # decision_shadow）合并——decision_source 仅 decision 启用轮携带（api.md v1.26
-    # 键可省略口径：kill switch 轮与存量轮零携带）
+    # 键可省略口径：kill switch 轮与存量轮零携带）。
+    # B19：kb_route 仅非缺省值携带（api.md v1.33 判定行「键可省」——hybrid 存量轮
+    # 零键）；纠错趟 extra.correction=true 留痕（键可省同口径）。
     extra = {"strategy": update["search_strategy"], **extra_parts}
+    if update.get("kb_route") and update["kb_route"] != ROUTE_FALLBACK:
+        extra["kb_route"] = update["kb_route"]
+    if correction_pass:
+        extra["correction"] = True
     if decision_source is not None:
         extra["decision_source"] = decision_source
     emit_stage("rewrite", "done", extra=extra)
@@ -692,6 +737,8 @@ async def _light_slim_phase(
         RewriteSlimOutput, method="function_calling"
     )
     prompt_text = _render_prompt(state, query_lang)
+    if correction_round_of(state) >= 1:
+        prompt_text += _CORRECTION_FEEDBACK  # B19 纠错重写反馈（plan §4.4「带反馈重写」）
     try:
         raw = await _invoke_with_retry(
             chain,
@@ -775,6 +822,8 @@ async def _light_full_phase(
         RewriteOutput, method="function_calling"
     )
     prompt_text = _render_full_prompt(state, query_lang)
+    if correction_round_of(state) >= 1:
+        prompt_text += _CORRECTION_FEEDBACK  # B19 纠错重写反馈（plan §4.4「带反馈重写」）
 
     parts: dict[str, Any] = dict(extra_parts or {})
     try:

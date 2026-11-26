@@ -56,12 +56,17 @@
    **catalog_path 为空**（upload / 单文件语境）时完全维持旧口径
    `[doc.title] + 文档内标题链`（零去重、零行为变化——B17 既有行为）。
 7. **content_hash**：`content_hash()` = sha256(text.strip()) hex 64——per-chunk
-   （`Chunk.content_hash`，同文本同 hash）+ 文档级正文（`ChunkingResult.
-   document_content_hash` = 全文扁平正文 hash——**kb_documents.content_hash 接线
-   原料**（data-model §1.7 :272 / ADR-018④ / R26：正文 sha256 由入库流水线写入，
-   OQ-34 同步 diff 兜底判据）。★注：kb_chunks 表契约（§1.8）**无** content_hash
-   列、meta 七键亦不含——per-chunk hash 是否持久化由流水线/契约线裁决，本模块只
-   产出计算面。
+   （`Chunk.content_hash`，同文本同 hash）+ 文档级（`ChunkingResult.
+   document_content_hash`——**kb_documents.content_hash 接线原料**（data-model
+   §1.7 v1.21 / ADR-018④ / R26），**方案 A（2026-11-26 用户裁决，B19 plan §3.1）**：
+   输入 = `document_text + "\n" + 标题结构清单`——标题改名/增删/移动 → hash 变
+   → 同步 diff 判定序④ 判变更 → 整文档重导 + 重嵌（向量与轨迹永不陈旧）；标题
+   结构清单 = IR 全部 heading 节点的完整 heading_path（与 chunk 单轨迹同一物化
+   口径——目录链/接缝去重/回显剔除/空串滤除全继承，`_DocState.heading_enter`
+   时收集）join " > " 按 DFS 序逐行拼接；**无 heading 文档结构清单为空串 →
+   hash 与旧口径逐字节一致**（strip 归一化吃掉尾部分隔符——负例不变式）。
+   ★注：kb_chunks 表契约（§1.8）**无** content_hash 列、meta 七键亦不含——
+   per-chunk hash 是否持久化由流水线/契约线裁决，本模块只产出计算面。
 8. **字符范围**：char_start/char_end = chunk 新鲜内容（不含重叠尾巴）在
    `document_text`（`= "\n\n".join(全部叶子单元文本)`，heading 不入正文）中的
    扁平偏移；重叠尾巴为前片真实文本的前缀重复，不计入本 chunk 区间。
@@ -848,6 +853,10 @@ class _DocState:
     echo_open: bool = False
     #: (level, title, is_echo)——is_echo 项不入 heading_path（树与缓冲语义不受影响）
     heading_stack: list[tuple[int, str, bool]] = field(default_factory=list)
+    #: 标题结构清单收集器（content_hash 方案 A，plan B19 §3.1）：heading_enter 时
+    #: append 完整 heading_path 的 join 行——与 chunk 轨迹同一物化口径（目录链/
+    #: 接缝去重/回显剔除全继承），DFS 序 = 文档序
+    structure_lines: list[str] = field(default_factory=list)
     buffer: _Buffer = field(default_factory=_Buffer)
     last_piece: _Piece | None = None
     seq: int = 0
@@ -882,6 +891,9 @@ class _DocState:
         while self.heading_stack and self.heading_stack[-1][0] >= level:
             self.heading_stack.pop()
         self.heading_stack.append((level, title, is_echo))
+        # 方案 A 结构清单（plan B19 §3.1）：完整 heading_path join " > " 按行收集
+        # ——回显项经 heading_path 物化口径滤除（与 chunk 轨迹逐字同源）
+        self.structure_lines.append(" > ".join(self.heading_path))
 
     def flush(self) -> None:
         if not self.buffer.pieces:
@@ -1034,11 +1046,16 @@ def chunk_document(
     document_text = "\n\n".join(text_parts)
     state.flush()
 
+    # content_hash 方案 A（plan B19 §3.1，data-model §1.7 v1.21）：输入 =
+    # document_text + "\n" + 标题结构清单（结构清单 = heading 轨迹行 join "\n"）。
+    # 无 heading 文档结构清单为空串 → strip 吃掉尾部分隔符 → 与旧口径逐字节一致
+    # （负例不变式，fixture 锁定见 test_kb_chunker.TestDocumentContentHashPlanA）。
+    structure_block = "\n".join(state.structure_lines)
     return ChunkingResult(
         document_id=document_id,
         chunks=state.chunks,
         document_text=document_text,
-        document_content_hash=content_hash(document_text),
+        document_content_hash=content_hash(f"{document_text}\n{structure_block}"),
         skipped_units=state.skipped_units,
         oversized_units=state.oversized_units,
     )

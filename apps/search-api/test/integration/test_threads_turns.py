@@ -120,6 +120,7 @@ _SOURCE_KEYS = {
     "score",
     "snapshot_available",
     "kb_doc_id",
+    "kb_chunk_id",  # §2.5 v1.30（B19 SourceBrief 接线——web null，溯源下钻 §4.6 解析键）
 }
 _STAGE_KEYS = {
     "stage_key",
@@ -264,6 +265,7 @@ async def test_post_threads_success_and_turn_events_reconciliation(
         assert src["title"] and src["snippet"]
         assert src["snapshot_available"] is False  # M2（snapshot_id 列）起真实值
         assert src["kb_doc_id"] is None  # M3 起真实值
+        assert src["kb_chunk_id"] is None  # §2.5 v1.30：web 来源 null（KB 恒携带）
     assert [s["score"] for s in detail["sources"]] == [0.9]  # 搜索假体固定分值
     assert detail["images"] == []  # B2 桩不发 images 事件（M4 定回放口径）
     # stages[]：§2.5 形状 + running/done 配对聚合结果

@@ -16,6 +16,7 @@ Langfuse 配置缝 monkeypatch langfuse_settings 单例属性（test_trace_clean
 """
 
 import importlib.metadata
+import logging
 import os
 import uuid
 from typing import Any
@@ -299,3 +300,28 @@ async def test_usage_collector_receives_streamed_usage_via_callback_machinery() 
 
     assert [c.content for c in chunks] == ["a", "b", ""]
     assert collector.total() == {"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20}
+
+
+# ---------------------------------------------------------------------------
+# P3 护栏（b4 交付说明 §6.4 之 5——elastic_transport 请求体日志面不置细粒度级别）
+# ---------------------------------------------------------------------------
+
+
+def test_guard_elastic_transport_body_loggers_not_trace_or_debug():
+    """elastic_transport 打印请求/响应体（含 KB chunk 内容面）的 logger 未置
+    TRACE/DEBUG 级（b4 安全审计 P3#6 留档收口）。
+
+    形态注记（护栏按包真实现钉两面）：
+    - `elastic_transport.trace`：elastic-transport 7.x 时代的请求体 logger 名
+      （b4 审计原文所指）——本仓锁定的 8.19.1 已无该 logger，护栏断言其**若存在
+      也不可被置 TRACE(5)**（防未来版本回归/手滑 setLevel）；
+    - 8.19.1 现行：请求行+请求体落 `elastic_transport.node` 的 DEBUG
+      （elastic_transport/_node/_base.py :256 `logger.debug`——TRACE 打印请求体
+      的同族面）、`elastic_transport.transport` 同级别——断言未启用 DEBUG。
+    """
+    trace_level = 5  # elastic-transport 7.x TRACE 级（std logging 无内建 TRACE）
+    assert not logging.getLogger("elastic_transport.trace").isEnabledFor(trace_level)
+    for body_logger_name in ("elastic_transport.node", "elastic_transport.transport"):
+        body_logger = logging.getLogger(body_logger_name)
+        assert not body_logger.isEnabledFor(logging.DEBUG), body_logger_name
+        assert body_logger.getEffectiveLevel() > logging.DEBUG, body_logger_name

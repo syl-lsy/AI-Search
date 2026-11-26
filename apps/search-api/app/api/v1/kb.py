@@ -20,6 +20,7 @@ from app.dependencies import get_current_user, get_db
 from app.exception import BadRequestException
 from app.exception.kb import FeishuNotConfiguredException
 from app.schemas.kb import (
+    KbChunkDetail,
     KbDocumentListQuery,
     KbImportJobCreateRequest,
     KbUrlCollectRequest,
@@ -50,8 +51,15 @@ def get_kb_service(
     pipeline._default_spec_payload 同源：B15 SSRF 护栏据此读 Nacos spec
     safety.url_guard（缺省 lambda:{} 会恒落 defaults 种子，单键热更回退门
     失效——评审 P1 钉正；与 pipeline 自身装配 _default_spec_payload 同形态，
-    与 turn_service._capture_spec_payload 快照消费口径一致）。"""
-    return KbService(db, spec_payload_provider=_default_spec_payload)
+    与 turn_service._capture_spec_payload 快照消费口径一致）。es_indexer 注入
+    get_kb_es_indexer()（B18 删除级联 ES 腿——best-effort WARN 不阻断删除）。"""
+    from app.rag.indexers.es_indexer import get_kb_es_indexer
+
+    return KbService(
+        db,
+        spec_payload_provider=_default_spec_payload,
+        es_indexer=get_kb_es_indexer(),
+    )
 
 
 def get_kb_import_service(
@@ -233,4 +241,21 @@ async def get_import_job(
 ) -> dict[str, Any]:
     """导入任务详情（§4.9）：进度五数/失败分类/failures 清单；404001 不存在或越权。"""
     detail = await service.get_job(job_id, user_id=user_id)
+    return detail.model_dump(mode="json", exclude_unset=True)
+
+
+@router.get("/sources/{source_id}/kb-chunk")
+async def get_source_kb_chunk(
+    source_id: str,
+    user_id: Annotated[str, Depends(get_current_user)],
+    service: Annotated[KbService, Depends(get_kb_service)],
+) -> dict[str, Any]:
+    """KB 来源溯源下钻（api.md §4.6——REQ-053/A36，已冻结契约纯实现批 B19）。
+
+    路由层零业务逻辑：归属/存在/删除语义全在 KbService.get_chunk_drilldown
+    （404001 单码）；非 KB 来源 400001。投影 `model_dump(mode="json",
+    exclude_unset=True)`——node_token/node_id 可选键缺则省略（page/paragraph 恒
+    出现——DTO 构造时显式 set），本地/URL 来源两可选键省略不置 null。溯源内容
+    仅进 UI 不进 LLM（前端 DOMPurify——frontend-api.md §5）。"""
+    detail: KbChunkDetail = await service.get_chunk_drilldown(source_id, user_id=user_id)
     return detail.model_dump(mode="json", exclude_unset=True)

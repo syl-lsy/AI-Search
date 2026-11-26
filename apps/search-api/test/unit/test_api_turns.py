@@ -132,7 +132,8 @@ def _turn_row(**overrides: Any) -> SimpleNamespace:
 
 
 def _source_row(**overrides: Any) -> SimpleNamespace:
-    """sources 行假体：列名对齐 db/models/source.py（M1 基础列 + 0012 snapshot_id）。"""
+    """sources 行假体：列名对齐 db/models/source.py（M1 基础列 + 0012 snapshot_id +
+    0013 kb 两列——B19 落库接线投影面）。"""
     row = SimpleNamespace(
         id=uuid.uuid4(),
         ref_no=1,
@@ -142,6 +143,8 @@ def _source_row(**overrides: Any) -> SimpleNamespace:
         snippet="Send lets you fan out...",
         score=Decimal("0.9123"),
         snapshot_id=None,  # 0012/m2_deep 增列：None=无快照（fast 轮常态）
+        kb_doc_id=None,  # 0013/m3_kb 增列：None=web 卡常态（B19 起 kb 卡带真实值）
+        kb_chunk_ids=None,  # 0013/m3_kb 增列：命中切片 id 数组（kb_chunk_id 投影源）
     )
     for key, value in overrides.items():
         setattr(row, key, value)

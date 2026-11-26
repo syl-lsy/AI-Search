@@ -74,6 +74,8 @@ class MainState(TypedDict, total=False):
     query_type: QueryType
     answerable_from_knowledge: bool
     search_strategy: SearchStrategy  # v1.51 四值（与 fast_rewrite.SearchStrategy 逐字一致）
+    kb_route: str  # B19：kb_route 三档投影（与 FastState 同名回填——search_fanout 路由消费）
+    correction_round: int  # B19：纠错轮帽标记投影（与 FastState 同名回填）
     time_range: TimeRange
     rewritten_queries: list[str]
     candidates: list[Candidate]
@@ -138,6 +140,8 @@ class FastState(TypedDict, total=False):
     query_type: QueryType
     answerable_from_knowledge: bool
     search_strategy: SearchStrategy  # v1.44 B9② 三值 + v1.51 recall 第四值：direct/recall 条件边 + synthesis 变体消费（缺省/非法=web）
+    kb_route: str  # B19：kb_route 三档（kb_only|kb_first|hybrid——缺省/非法/两兜底一律 route.default〔初值 hybrid〕，search_fanout 消费；SSE 留痕 stage(rewrite,done).extra.kb_route 键可省）
+    correction_round: int  # B19 纠错轮帽标记（0=首趟；≥1=纠错第二趟——fuse_rerank 后条件边 Send 回边注入 + rewrite 落 state 持久化轮帽）
     time_range: TimeRange
     rewritten_queries: list[str]
     # 检索产出（Send 扇出并行写入 → merge_dedupe 消费）

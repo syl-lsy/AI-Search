@@ -314,6 +314,7 @@ def test_turn_detail_parses_contract_example_shape():
                 "score": 0.9123,
                 "snapshot_available": True,
                 "kb_doc_id": None,
+                "kb_chunk_id": None,  # §2.5 v1.30（B19 SourceBrief 接线——web null）
             }
         ],
         stages=[
@@ -366,6 +367,7 @@ def test_turn_detail_error_and_kb_source_payloads():
                 "score": 0.8871,
                 "snapshot_available": False,
                 "kb_doc_id": "9a770000-0000-4000-8000-000000000005",
+                "kb_chunk_id": "5c2e0000-0000-4000-8000-000000000005",
             }
         ],
         degraded_reason="source_failure",

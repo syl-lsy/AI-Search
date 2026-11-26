@@ -47,6 +47,9 @@ class SourceBrief(BaseModel):
     score: float
     snapshot_available: bool
     kb_doc_id: str | None
+    # §2.5 v1.30（M3）：KB 来源恒携带——溯源下钻 §4.6 解析键（kb_chunk_ids[0]）；
+    # web 来源 null
+    kb_chunk_id: str | None
 
 
 #: ImageBrief 可选键集（缺值 None 时序列化省略——api.md §7.2 v1.12 键可省）

@@ -8,6 +8,7 @@
 #   minio 9100+9101 / nacos 8081(v3 控制台)+8849(HTTP OpenAPI)+9849(gRPC) / litellm 4100 /
 #   langfuse-web 3100 / langfuse-worker(不暴露) / clickhouse(不暴露) / redis 16379 /
 #   crawl4ai 11235（随基础 compose 常驻——备胎必须已在跑，2026-11-03 用户裁决）/
+#   elasticsearch 19200（M3 B18 增，自建薄镜像 ai-search/elasticsearch-jieba:8.4.1，R22 前提=VM 10.44GiB）/
 #   opensandbox 8801（**不挂 profile**——OpenSandbox 提前部署为本批用户裁决增补，
 #   DEV §3.1 第 9 行「仅 M4 开工前验」由本裁决改写，文档巡检同步待办）
 #   backend 8300 / frontend 5173 为本机进程（make dev / make dev-frontend），不在本文件内。
@@ -411,6 +412,43 @@ services:
       retries: 12
       start_period: 15s
 
+  # ═══════════════════ 检索面 · Elasticsearch 8.4.1 + jieba（M3 B18 基建，ADR-017 混合检索 BM25 通道）═══════════════════
+  # 自建薄镜像叠加（deploy/es/Dockerfile：基底锁 tag 8.4.1 + jieba 插件产物目录直拷——插件
+  # descriptor 硬校验 elasticsearch.version=8.4.1，基底升版须重构建，R23；供应链/配方见
+  # deploy/es/PROVENANCE.md 与 scripts/build_es_jieba_plugin.sh）。
+  # pg 为事实源、ES 可整体重建（OQ-28）；应用侧 es_enabled 开关走 Nacos kb.es_enabled 灰度。
+  # VM 配额前提（R22）：docker info 实测 10.44GiB（2026-11-25 基建批复核）；堆 ≤ mem_limit/2
+  # 不变量：ES_JAVA_OPTS 512m ←→ mem_limit 缺省 1g——调大 mem_limit 不自动抬堆，调小须同步改堆行。
+  elasticsearch:
+    build:
+      context: ./deploy/es       # 相对 --project-directory（仓库根）解析
+    image: ai-search/elasticsearch-jieba:8.4.1   # 本地构建 tag（防 compose 误拉远端同名）
+    restart: always
+    ports:
+      - "127.0.0.1:${ES_PORT:-19200}:9200"   # 宿主 19200 = 9200+10000（对齐 postgres 15432 / redis 16379 惯例，ARCH §5）
+    environment:
+      discovery.type: single-node                # 探针 §4 实测配方（m3-probe-es-jieba-20261122.md）
+      xpack.security.enabled: "true"             # 2026-11-26 basic auth 提前落地（批次 4 P3 #10 用户裁决）；安全性=127.0.0.1 绑定 + basic auth 双层承担；回退=显式改回 "false" 并去 ELASTIC_PASSWORD 行
+      xpack.security.http.ssl.enabled: "false"   # security on 时 8.x 自动配置 HTTP TLS——应用侧 http:// 客户端会全挂，必须显式关闭（流量仅宿主 127.0.0.1 + docker 内网）
+      ELASTIC_PASSWORD: "${ES_PASSWORD:?ES_PASSWORD 必填（仓库根 .env）——鉴权已开启}"   # fail-fast：缺失时 ES 自动生成未知密码=全链路神秘故障，宁可起不来；es_settings（ES_ 前缀）读同值
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"          # 探针实测配方；不变量：堆 ≤ mem_limit/2（ES_MEM_LIMIT 缺省 1g）
+    mem_limit: "${ES_MEM_LIMIT:-1g}"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data    # 独立命名卷（ARCH §5 ES 行）；重建=删索引非删卷（OQ-28）
+    # 无 depends_on——与主链并行起（对齐 searxng/crawl4ai 备源先例：ES 不可达由应用层失败语义兜，不阻塞主栈）
+    healthcheck:
+      # 镜像内 /usr/bin/curl 在位（基建批 docker run 实测）；容器内端口 9200；yellow=索引未建中间态，
+      # 单节点 number_of_replicas:0 下建索引后即 green——宽进不误杀；
+      # basic auth（2026-11-26）：$$ 双写=容器内运行时展开（compose 对 $$ 不做宿主插值）；
+      # 凭据经 printf（sh 内建，不产子进程）拼 curl 配置流 -K - 喂入——argv/日志/输出零回显
+      # （docker top 只见变量名不见值）；-sf 失败即非零退出（无需 || exit 1）；
+      # timeout 8s > ES 侧 wait_for_status 5s 留余量，仍 < interval 10s
+      test: ["CMD-SHELL", "printf 'user = \"elastic:%s\"\\n' \"$$ELASTIC_PASSWORD\" | curl -sf -K - 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s'"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 30s          # jieba adapter 多 search 线程初始化 + JVM 冷启动慢（探针 §4）
+
   # ═══════════════════ 执行面 · OpenSandbox（本批用户裁决提前部署，不挂 profile）═══════════════════
   # 应用侧仍 SANDBOX_ENABLED=false（不启用），仅验基建面（M4 深验顺延）
   opensandbox:
@@ -447,4 +485,5 @@ volumes:
   clickhouse_data:
   clickhouse_logs:
   redis_data:
+  es_data:
   opensandbox_server_data:

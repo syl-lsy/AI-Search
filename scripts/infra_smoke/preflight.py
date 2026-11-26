@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """S0 基建 smoke · preflight —— 起栈前端口占用预检。
 
-范围（plan 阶段 0 措施 / DEV §3.1）：检查 11 个 host 端口未被占用——
+范围（plan 阶段 0 措施 / DEV §3.1）：检查 12 个 host 端口未被占用——
     15432(postgres) / 9100,9101(minio) / 8081,8849,9849(nacos) / 4100(litellm) /
-    3100(langfuse-web) / 11235(crawl4ai) / 16379(redis) / 8801(opensandbox)。
+    3100(langfuse-web) / 11235(crawl4ai) / 16379(redis) / 8801(opensandbox) /
+    19200(elasticsearch，M3 B18 基建批 2026-11-25 增)。
     （2026-11-06 用户裁决宿主端口重映射后的口径；容器内端口不变，不在预检范围）
 纪律：从仓库根运行；仅标准库；输出不含任何凭据；stdout 最后一行 = 单行紧凑 JSON 裁决。
 注意：本检查在【起栈前】运行——栈已在跑时「端口被占」属预期（先 make infra-down 或跳过本项）。
@@ -26,6 +27,7 @@ PORTS: dict[int, str] = {
     3100: "langfuse-web",
     11235: "crawl4ai",
     16379: "redis",
+    19200: "elasticsearch",
     8801: "opensandbox",
 }
 

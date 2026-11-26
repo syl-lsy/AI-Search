@@ -14,4 +14,6 @@ test_save_snapshot.py 哨兵节）。
 __all__ = ["DEEP_TOOL_NAMES"]
 
 #: 子代理可见工具名集（批次 2 装配面以此为单一事实源；fast 面零交集）
-DEEP_TOOL_NAMES = frozenset({"web_search", "firecrawl_read", "save_snapshot"})
+#: B19 +`kb_search`（plan §4.7 检索等价升级——经 KbRetriever 双通道 + filter_candidates
+#: + external_content 包裹；最小权限描述面：仅用户私有文档内容检索）
+DEEP_TOOL_NAMES = frozenset({"web_search", "firecrawl_read", "save_snapshot", "kb_search"})

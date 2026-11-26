@@ -154,9 +154,10 @@ def _service(
     session: _FakeSession,
     minio: _FakeMinio,
     *,
-    purger: _FakePurger | None = None,
+    purger: Any = None,
     fetcher: Any = None,
     spec: dict[str, Any] | None = None,
+    es_indexer: Any = None,
 ) -> kb_service.KbService:
     return kb_service.KbService(
         session,  # type: ignore[arg-type]
@@ -164,6 +165,7 @@ def _service(
         object_purger=purger or _FakePurger(),
         url_fetcher=fetcher,
         spec_payload_provider=lambda: spec if spec is not None else {},
+        es_indexer=es_indexer,
     )
 
 
@@ -546,6 +548,19 @@ async def test_get_document_rejects_non_uuid() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _FakeEsIndexer:
+    """KbEsIndexer 假体（删除级联 ES 腿消费面）：记录调用，可编程失败。"""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.calls: list[dict[str, str]] = []
+        self._exc = exc
+
+    async def delete_document(self, kb_doc_id: Any, *, user_id: str) -> None:
+        self.calls.append({"kb_doc_id": str(kb_doc_id), "user_id": user_id})
+        if self._exc is not None:
+            raise self._exc
+
+
 async def test_delete_document_cascades(monkeypatch: pytest.MonkeyPatch) -> None:
     row = _doc_row()
     session = _FakeSession().set_scalars_first(row)
@@ -557,6 +572,65 @@ async def test_delete_document_cascades(monkeypatch: pytest.MonkeyPatch) -> None
     assert session.deleted == [row]  # 行删（kb_chunks 经 FK CASCADE）
     assert len(session.executed) == 1  # sources 反向引用清理 UPDATE（零 REFERENCES 手工维护）
     assert purger.calls == [{"user_id": _USER_ID, "doc_id": _DOC_ID}]  # MinIO 前缀清理
+
+
+async def test_delete_document_es_leg_wired_and_ordered() -> None:
+    """删除级联 ES 腿（B18）：pg 行删 → ES 腿 → MinIO purge（pg 事实源先删，
+    ES/MinIO 均为可重建副本侧）；kwargs 与 import_worker 级联缝签名一致。"""
+    row = _doc_row()
+    session = _FakeSession().set_scalars_first(row)
+    order: list[str] = []
+
+    class _OrderedPurger:
+        async def purge(self, *, user_id: str, doc_id: str) -> None:
+            order.append("purge")
+
+    es_indexer = _FakeEsIndexer()
+
+    async def _record_delete(kb_doc_id: Any, *, user_id: str) -> None:
+        order.append("es")
+        es_indexer.calls.append({"kb_doc_id": str(kb_doc_id), "user_id": user_id})
+
+    es_indexer.delete_document = _record_delete  # type: ignore[method-assign]
+    service = _service(
+        session, _FakeMinio(), purger=_OrderedPurger(), es_indexer=es_indexer
+    )
+    result = await service.delete_document(_DOC_ID, user_id=_USER_ID)
+    assert result.deleted is True
+    assert es_indexer.calls == [{"kb_doc_id": _DOC_ID, "user_id": _USER_ID}]
+    assert order == ["es", "purge"]  # ES 腿在 MinIO purge 之前（plan B18 §6.1）
+
+
+async def test_delete_document_es_leg_failure_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch, log_records: list[dict]
+) -> None:
+    """ES 不可达：删除仍 deleted=true（api.md §4.5 契约零变更），
+    WARN 留痕（action=kb_purge_es）；残余孤儿归 audit 治理（plan B18 §6.2）。"""
+    row = _doc_row()
+    session = _FakeSession().set_scalars_first(row)
+    es_indexer = _FakeEsIndexer(exc=RuntimeError("es down"))
+    service = _service(session, _FakeMinio(), es_indexer=es_indexer)
+    result = await service.delete_document(_DOC_ID, user_id=_USER_ID)
+    assert result.deleted is True
+    assert es_indexer.calls  # ES 腿确被调用
+    warns = [
+        r
+        for r in log_records
+        if r.get("level").name == "WARNING"
+        and r.get("extra", {}).get("action") == "kb_purge_es"
+    ]
+    assert warns, "ES 删除腿失败必须落 WARN（action=kb_purge_es）"
+
+
+async def test_delete_document_es_leg_none_zero_calls() -> None:
+    """es_indexer 注入 None（缺省=现状）：零 ES 调用零异常（灰度安全兜底）。"""
+    row = _doc_row()
+    session = _FakeSession().set_scalars_first(row)
+    purger = _FakePurger()
+    service = _service(session, _FakeMinio(), purger=purger, es_indexer=None)
+    result = await service.delete_document(_DOC_ID, user_id=_USER_ID)
+    assert result.deleted is True
+    assert purger.calls == [{"user_id": _USER_ID, "doc_id": _DOC_ID}]  # 主流程照常
 
 
 async def test_delete_document_purge_failure_is_best_effort(
@@ -594,3 +668,185 @@ def test_registry_unsupported_type_is_normalization_family() -> None:
     # 白名单外扩展名在 registry 侧同样显式拒绝（UnsupportedTypeError——worker 段
     # 兜底防线；REST 段已在入口拒，正常不可达，此断言锁依赖面存在性）
     assert issubclass(UnsupportedTypeError, Exception)
+
+
+# ---------------------------------------------------------------------------
+# §4.6 溯源下钻 service 链（B19——Source→chunk→doc 解析 + 修订注 2 取舍）
+# ---------------------------------------------------------------------------
+
+
+class _DrilldownDb:
+    """get(Model, uuid) 按对象表解析的最小假 session（溯源链零 scalars 面）。"""
+
+    def __init__(self, objects: dict[tuple[type, str], Any]) -> None:
+        self._objects = objects
+
+    async def get(self, model: Any, obj_uuid: Any) -> Any:
+        return self._objects.get((model, str(obj_uuid)))
+
+
+def _drilldown_service(objects: dict[tuple[type, str], Any]) -> Any:
+    import uuid as uuid_module
+
+    return kb_service.KbService(
+        _DrilldownDb(objects),
+        minio_client=lambda: None,
+        object_purger=None,
+        spec_payload_provider=lambda: {},
+        es_indexer=None,
+    )
+
+
+def _uuid(value: str) -> Any:
+    import uuid as uuid_module
+
+    return uuid_module.UUID(value)
+
+
+_SRC_ID = "aaaaaaaa-1111-4111-8111-000000000001"
+_USER = "00000000-0000-4000-8000-000000000001"
+_CHUNK_ID = "5c2e1111-1111-4111-8111-000000000001"
+_DOC_ID = "9a772222-2222-4222-8222-000000000001"
+
+
+def _drilldown_fixtures(node_id: str | None) -> dict[tuple[type, str], Any]:
+    from app.db.models import KbChunk as KbChunkRow
+    from app.db.models import KbDocument as KbDocumentRow
+    from app.db.models import Source as SourceRow
+
+    source = SourceRow(
+        id=_uuid(_SRC_ID), turn_id=_uuid(_DOC_ID), user_id=_uuid(_USER),
+        ref_no=1, source_type="kb", title="KB 卡", url=None, snippet="s",
+        score=None, kb_doc_id=_uuid(_DOC_ID), kb_chunk_ids=[_CHUNK_ID],
+    )
+    chunk = KbChunkRow(
+        id=_uuid(_CHUNK_ID), kb_doc_id=_uuid(_DOC_ID), user_id=_uuid(_USER),
+        chunk_index=0, content="KB 原文内容", token_count=4,
+        meta={
+            "node_id": node_id,
+            "heading_path": ["第三章", "3.2 混合检索"],
+            "loc": {"origin": "local", "page": 12},
+        },
+    )
+    doc = KbDocumentRow(
+        id=_uuid(_DOC_ID), user_id=_uuid(_USER), doc_type="md",
+        title="内部设计文档-检索融合.md", status="ready",
+    )
+    return {
+        (SourceRow, _SRC_ID): source,
+        (KbChunkRow, _CHUNK_ID): chunk,
+        (KbDocumentRow, _DOC_ID): doc,
+    }
+
+
+async def test_drilldown_fs_node_source_full_projection() -> None:
+    """fs:node: 来源 → 六必选 + node_token/node_id 齐带；page 有值 paragraph null 键恒现。"""
+    service = _drilldown_service(_drilldown_fixtures("fs:node:tok42"))
+    detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    dumped = detail.model_dump(mode="json", exclude_unset=True)
+    assert dumped["chunk_id"] == _CHUNK_ID
+    assert dumped["document_id"] == _DOC_ID
+    assert dumped["document_title"] == "内部设计文档-检索融合.md"
+    assert dumped["content"] == "KB 原文内容"
+    assert dumped["heading_path"] == ["第三章", "3.2 混合检索"]
+    assert dumped["page"] == 12 and dumped["paragraph"] is None
+    assert dumped["node_token"] == "tok42"
+    assert dumped["node_id"] == "fs:node:tok42"
+
+
+async def test_drilldown_fs_blk_keeps_node_id_omits_token() -> None:
+    """修订注 2：fs:blk: → node_id 保留、node_token 键省略（exclude_unset 落实）。"""
+    service = _drilldown_service(_drilldown_fixtures("fs:blk:blk9"))
+    detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    dumped = detail.model_dump(mode="json", exclude_unset=True)
+    assert dumped["node_id"] == "fs:blk:blk9"
+    assert "node_token" not in dumped
+
+
+async def test_drilldown_loc_prefix_both_keys_omitted() -> None:
+    """loc: 前缀（本地/URL）→ 两可选键全省略（不置 null）。"""
+    service = _drilldown_service(_drilldown_fixtures("loc:blk:p1"))
+    detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    dumped = detail.model_dump(mode="json", exclude_unset=True)
+    assert "node_token" not in dumped and "node_id" not in dumped
+
+
+async def test_drilldown_non_kb_source_400001() -> None:
+    from app.db.models import KbChunk as KbChunkRow
+    from app.db.models import KbDocument as KbDocumentRow
+    from app.db.models import Source as SourceRow
+
+    objects = _drilldown_fixtures("loc:blk:p1")
+    web = SourceRow(
+        id=_uuid(_SRC_ID), turn_id=_uuid(_DOC_ID), user_id=_uuid(_USER),
+        ref_no=1, source_type="web", title="网页", url="https://a.example",
+        snippet="s", score=None,
+    )
+    objects = {k: v for k, v in objects.items() if k[0] is not SourceRow}
+    objects[(SourceRow, _SRC_ID)] = web
+    service = _drilldown_service(objects)
+    from app.exception.handler.errors import ERROR_MAP
+
+    with pytest.raises(kb_service.BadRequestException) as excinfo:
+        await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    assert ERROR_MAP[type(excinfo.value)][0] == "400001"
+
+
+async def test_drilldown_missing_and_mismatch_404001_single_code() -> None:
+    """不存在/越权/chunk 已删除/文档已删除/kb_chunk_ids 空 → 全部 404001 单码。"""
+    from app.db.models import KbChunk as KbChunkRow
+    from app.db.models import KbDocument as KbDocumentRow
+    from app.db.models import Source as SourceRow
+
+    # ① source 不存在
+    service = _drilldown_service({})
+    from app.exception.handler.errors import ERROR_MAP
+
+    with pytest.raises(kb_service.NotFoundException) as e:
+        await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    assert ERROR_MAP[type(e.value)][0] == "404001"
+    # ② 越权（user 不匹配）
+    service = _drilldown_service(_drilldown_fixtures(None))
+    with pytest.raises(kb_service.NotFoundException) as e:
+        await service.get_chunk_drilldown(_SRC_ID, user_id="99999999-9999-4999-8999-999999999999")
+    assert ERROR_MAP[type(e.value)][0] == "404001"
+    # ③ chunk 已删除（kb_chunk_ids 指向缺失行）
+    objects = _drilldown_fixtures(None)
+    objects = {k: v for k, v in objects.items() if k[0] is not KbChunkRow}
+    service = _drilldown_service(objects)
+    with pytest.raises(kb_service.NotFoundException) as e:
+        await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    assert ERROR_MAP[type(e.value)][0] == "404001"
+    # ④ 文档已删除 + 越权 chunk（user 不匹配）
+    partial = _drilldown_fixtures(None)
+    other_user = _uuid("99999999-9999-4999-8999-999999999999")
+    chunk = partial[(KbChunkRow, _CHUNK_ID)]
+    chunk.user_id = other_user  # 越权形态
+    doc = partial[(KbDocumentRow, _DOC_ID)]
+    objects = {(SourceRow, _SRC_ID): partial[(SourceRow, _SRC_ID)], (KbChunkRow, _CHUNK_ID): chunk}
+    service = _drilldown_service(objects)
+    with pytest.raises(kb_service.NotFoundException) as e:
+        await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    assert ERROR_MAP[type(e.value)][0] == "404001"
+    # ⑤ 文档缺失
+    objects[(KbDocumentRow, _DOC_ID)] = None
+    service = _drilldown_service(objects)
+    with pytest.raises(kb_service.NotFoundException) as e:
+        await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    assert ERROR_MAP[type(e.value)][0] == "404001"
+
+
+async def test_drilldown_source_row_without_chunk_ids_404001() -> None:
+    """来源行 kb_chunk_ids 空（异常态）→ 404001（不泄漏存在性）。"""
+    from app.db.models import Source as SourceRow
+    from app.exception.handler.errors import ERROR_MAP
+
+    source = SourceRow(
+        id=_uuid(_SRC_ID), turn_id=_uuid(_DOC_ID), user_id=_uuid(_USER),
+        ref_no=1, source_type="kb", title="KB 卡", url=None, snippet="s",
+        score=None, kb_doc_id=None, kb_chunk_ids=None,
+    )
+    service = _drilldown_service({(SourceRow, _SRC_ID): source})
+    with pytest.raises(kb_service.NotFoundException) as e:
+        await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    assert ERROR_MAP[type(e.value)][0] == "404001"

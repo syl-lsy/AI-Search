@@ -64,7 +64,7 @@ from langchain_core.runnables import RunnableConfig
 from app.agent.external_content import external_content
 from app.agent.graphs.signals import emit_stage
 from app.agent.guards import TurnCanceledSignal, ensure_not_canceled, llm_timeout_s
-from app.agent.llm import build_chat_model, resolve_chat_alias, resolve_thinking
+from app.agent.llm import build_chat_model, resolve_chat_alias
 from app.agent.nodes.synthesis import (
     _DIGEST_SNIPPET_MAX_CHARS,
     _DIGEST_TITLE_MAX_CHARS,
@@ -203,11 +203,18 @@ def _sources_block(sources: Any, top_n: int) -> str:
         )
         ref_no = item.get("ref_no")
         label = f"[{int(ref_no)}]" if isinstance(ref_no, (int, float)) else "-"
+        origin = item.get("origin")
+        is_kb = origin == "kb" or (isinstance(origin, list) and "kb" in (origin or []))
+        # B19：KB 卡 source="kb:{doc_id}" + type="kb"（§6.4.3 铁律原文形态）；
+        # web 卡 source=url + type="web"（既有面逐字节不变）
+        source_attr = (
+            f"kb:{item.get('kb_doc_id')}" if is_kb else str(item.get("url") or "")
+        )
         blocks.append(
             external_content(
                 f"{label} {title}\n{snippet}",
-                source=str(item.get("url") or ""),
-                kind="web",
+                source=source_attr,
+                kind="kb" if is_kb else "web",
             )
         )
     return "\n".join(blocks)
@@ -274,9 +281,12 @@ async def writer(state: Any, config: RunnableConfig | None = None) -> dict[str, 
     )
 
     alias = resolve_chat_alias(state, config)
-    # deep 档缺省 on（spec.deep.thinking 热更可切 off）——planner/reflect/writer 同档
-    # （v1.59 增量 C；OQ-34：deep 全节点 Standard 档经 chat_model_key 解析）
-    chain = build_chat_model(alias, thinking=resolve_thinking(spec, "deep"))
+    # 【2026-11-26 用户裁决：writer 写节点不思考——writer 2/2 撞 120s 包络根因缓解；
+    # synthesis 批次 9 同款先例】调用参数注入 off 档（三腿禁用键组，首键
+    # `enable_thinking=False` 为百炼生效键；deep_degraded_writer 强关同构先例）——
+    # **模式级 spec.deep.thinking 键不动**（planner/reflect 仍按 deep 档 on 缺省，
+    # v1.59 增量 C / OQ-34 Standard 档不变）。resolve_thinking 仍由 planner/reflect 消费。
+    chain = build_chat_model(alias, thinking="off")
 
     # 事件面入口帧（api.md §7.4:867）：有大纲标「撰写第 1 节」、退化回落「撰写报告」
     entry_label = "撰写第 1 节" if outline else "撰写报告"

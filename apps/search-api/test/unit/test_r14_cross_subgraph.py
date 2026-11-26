@@ -313,7 +313,8 @@ async def test_real_main_graph_messages_frames_only_from_synthesis(
     # 子图命名空间帧键=内层节点名（五节点全运行的证明）；B13 起 safety_check 首节点
     # 直通零更新 → 顶层 updates 记 {safety_check: None}（键名入集、None 被跳过不炸）
     assert top_update_nodes == {"fast", "safety_check"}
-    assert inner_update_nodes == {"rewrite", "web_search", "merge_dedupe", "fuse_rerank", "synthesis"}
+    # B19 +kb_search（五步闭环第五节点——WS→MG←KS 汇聚面）
+    assert inner_update_nodes == {"rewrite", "web_search", "kb_search", "merge_dedupe", "fuse_rerank", "synthesis"}
 
 
 async def test_deep_writer_messages_surface_and_runner_token_events(

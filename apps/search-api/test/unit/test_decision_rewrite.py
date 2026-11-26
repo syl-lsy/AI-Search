@@ -285,7 +285,7 @@ async def test_kill_switch_prompt_is_original_full_template(
     await rewrite({**_STATE}, _config())
 
     prompt = chain.prompts[0]
-    assert "一次完成五件事" in prompt  # 原全量模板（非减面版）
+    assert "一次完成六件事" in prompt  # B19 六件事形态（+KB 检索档位判定）
     assert "类型判定标准" in prompt  # {{type_rules}} 判据解析注入
     assert "Q: 什么是向量数据库" in prompt  # 历史装配照旧
     # schema 串与 RewriteOutput 工具 schema 同形（七字段全量枚举串）
@@ -605,12 +605,16 @@ async def test_shadow_mode_decision_observed_not_applied(
 
 
 def test_full_rewrite_template_is_original_five_task_form() -> None:
-    """全职责模板 = 原五件事全量形态（减面前形态锚定）：含 {{type_rules}} 引用、
-    五件事正文、七字段全量 schema 串（与 RewriteOutput 工具 schema 同形——本地
+    """全职责模板 = v1.33 全量形态 + B19 kb_route 增量：含 {{type_rules}} 引用、
+    六件事正文、八字段全量 schema 串（与 RewriteOutput 工具 schema 同形——本地
     light 校验率锚定）与坏例警示骨架。"""
     template = fast_rewrite._load_full_rewrite_template()
-    assert "一次完成五件事" in template
+    assert "一次完成六件事" in template
     assert "{{type_rules}}" in template
+    # B19：kb_route 字段说明+判据词表+schema 串同形（修订注 3——prompt schema 与
+    # 工具 schema 必须同形，本地 light 校验率锚定）
+    assert '"kb_route":"hybrid|kb_first|kb_only"' in template
+    assert "KB 检索档位判定" in template
     assert '"search_strategy":"direct|verify|web|recall"' in template
     assert '"query_type":"factoid|list|comparison|multi_facet|temporal|how_to|navigational|other"' in template
     assert '"safety":"none|danger|profanity|privacy|politics"' in template
@@ -621,15 +625,19 @@ def test_slim_prompt_is_reduced_form() -> None:
     """瘦身模板（Nacos 键 fast.rewrite 内置默认）= 三件事减面形态（decision 生效轮
     专用，零分类判据）；与全职责模板分离。"""
     slim = fast_rewrite.resolve_prompt("fast.rewrite")
-    assert "一次完成三件事" in slim
+    assert "一次完成四件事" in slim  # B19 四件事（+KB 检索档位初判）
+    assert '"kb_route":"hybrid|kb_first|kb_only"' in slim  # B19 schema 串同形
+    assert "KB 检索档位" in slim  # 判据词表在位（修订注 3 Nacos fast.rewrite 键增量）
     assert '"query_type"' not in slim
     assert fast_rewrite._load_full_rewrite_template() != slim
 
 
 def test_slim_output_schema_shape() -> None:
-    """RewriteSlimOutput 四字段形状（queries/time_range/memory_directive/safety——
-    safety 判定面留 light 的瘦身 schema）；缺省值与 RewriteOutput 同口径。"""
+    """RewriteSlimOutput 五字段形状（queries/kb_route/time_range/memory_directive/
+    safety——B19 +kb_route，safety 判定面留 light 的瘦身 schema）；缺省值与
+    RewriteOutput 同口径（kb_route=hybrid 灰度安全）。"""
     slim = RewriteSlimOutput(queries=["q"])
+    assert slim.kb_route == "hybrid"  # B19 缺省灰度
     assert slim.safety == "none"
     assert slim.time_range is None
     assert slim.memory_directive is None

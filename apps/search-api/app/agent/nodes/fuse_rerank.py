@@ -39,7 +39,8 @@ from langchain_core.runnables import RunnableConfig
 
 from app.agent.graphs.signals import emit_images, emit_sources, emit_stage
 from app.agent.guards import ensure_not_canceled
-from app.agent.nodes.merge_dedupe import image_descriptor_from_candidate
+from app.agent.nodes.kb_route import kb_supply_verdict, resolve_kb_route
+from app.agent.nodes.merge_dedupe import _is_kb_candidate, image_descriptor_from_candidate
 from app.agent.safety.config import load_content_guard_config
 from app.agent.safety.content_guard import filter_image_items
 from app.agent.state import Candidate
@@ -50,6 +51,7 @@ from app.core.logger import AgentLog
 __all__ = [
     "IMAGES_MAX_COUNT",
     "SNIPPET_MAX_CHARS",
+    "cap_rerank_candidates",
     "fuse_rerank",
     "has_kb_hit",
     "rerank_via_gateway",
@@ -65,6 +67,10 @@ _DEFAULT_RERANK_TIMEOUT_S = 2.0
 
 #: fuse_top_n 缺省（spec fast.fuse_top_n 缺失时回落，§3 初值 10）
 _DEFAULT_FUSE_TOP_N = 10
+
+#: rerank 输入基数上界缺省（plan §4.3 / ARCH §4.1——kb.max_rerank_candidates 缺省 30；
+#: 行为增量契约钉定 R27：合并超限按 origin/RRF 得分截取，被截者不进 rerank 不丢来源池）
+_DEFAULT_MAX_RERANK_CANDIDATES = 30
 
 #: images 事件条目上限（api.md §7.2「≤3 张（OQ-6）」；ARCH:413「按相关度取 3」——
 #: 语义化代码常量，口径已裁决不进 Nacos）
@@ -150,9 +156,52 @@ def _rerank_order(
     return [candidates[i] for i in order]
 
 
+def cap_rerank_candidates(
+    fused: list[Candidate], *, max_candidates: int = _DEFAULT_MAX_RERANK_CANDIDATES
+) -> list[Candidate]:
+    """rerank 输入基数上界截取（plan §4.3 / ARCH §4.1——R27 行为增量显式钉定）。
+
+    合并超限按 origin 分轴截取：**KB 卡优先保入**（rerank 仅 KB 命中触发——KB 是
+    rerank 的主要受益面，RRF 分与 web relevance 分数量级不可比、统一排序会系统性
+    截光 KB 卡），余量由 web 按得分降序竞争；**被截者不进 rerank 不丢来源池**
+    （来源池=candidates 全量；sources 事件只发 fused topN——供给面语义不变）；
+    保留集维持原 fused 相对序（确定性与 fallback 排序面不受影响）。
+    """
+    if len(fused) <= max_candidates:
+        return fused
+    kb_cards = [item for item in fused if _is_kb_candidate(item)]
+    web_cards = [item for item in fused if not _is_kb_candidate(item)]
+    kb_cards = sorted(kb_cards, key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    web_cards = sorted(web_cards, key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    kb_take = kb_cards[:max_candidates]
+    web_take = web_cards[: max(0, max_candidates - len(kb_take))]
+    kept_ids = {id(item) for item in kb_take} | {id(item) for item in web_take}
+    return [item for item in fused if id(item) in kept_ids]
+
+
 def _source_item(candidate: Candidate, ref_no: int) -> dict[str, Any]:
-    """候选 → §7.2 sources batch 条目（source_id 占位——TurnRunner 以行 id 回写）。"""
+    """候选 → §7.2 sources batch 条目（source_id 占位——TurnRunner 以行 id 回写）。
+
+    KB 卡（B19 §4.3）：source_type="kb"、url=None（kb 来源无 URL——§2.5 示例）、
+    kb_doc_id/kb_chunk_id **恒带**（§7.2 v1.30「KB 来源恒携带」）、title=heading
+    尾段（kb_search 已投影）、score=RRF 分、snapshot_available 恒 False（KB 无快照）。
+    web 卡形状零变化（kb_chunk_id 键可省——§7.2 v1.30「存量轮无此键按缺省 null 消费」
+    可选键口径）。
+    """
     score = candidate.get("score")
+    if _is_kb_candidate(candidate):
+        return {
+            "source_id": str(uuid.uuid4()),
+            "ref_no": ref_no,
+            "source_type": "kb",
+            "title": str(candidate.get("title") or ""),
+            "url": None,
+            "snippet": str(candidate.get("snippet") or ""),
+            "score": float(score) if isinstance(score, (int, float)) else 0.0,
+            "snapshot_available": False,
+            "kb_doc_id": str(candidate.get("kb_doc_id")) if candidate.get("kb_doc_id") else None,
+            "kb_chunk_id": str(candidate.get("chunk_id")) if candidate.get("chunk_id") else None,
+        }
     return {
         "source_id": str(uuid.uuid4()),
         "ref_no": ref_no,
@@ -259,6 +308,16 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
 
     errors: list[dict[str, Any]] = []
     extra: dict[str, Any] | None = None
+    # B19 基数上界（plan §4.3）：合并基数 > kb.max_rerank_candidates → rerank 前全局
+    # 截取（KB 优先保入——见 cap_rerank_candidates docstring；被截者不丢来源池）
+    kb_section = kb_section if isinstance(kb_section, Mapping) else {}
+    max_candidates_value = kb_section.get("max_rerank_candidates")
+    max_candidates = (
+        int(max_candidates_value)
+        if isinstance(max_candidates_value, int) and not isinstance(max_candidates_value, bool) and max_candidates_value > 0
+        else _DEFAULT_MAX_RERANK_CANDIDATES
+    )
+    fused_input = cap_rerank_candidates(fused_input, max_candidates=max_candidates)
     if has_kb_hit(fused_input):
         configurable = (config or {}).get("configurable") or {}
         mapping = configurable.get("model_mapping")
@@ -290,7 +349,19 @@ async def fuse_rerank(state: Any, config: RunnableConfig | None = None) -> dict[
                 node="fuse_rerank",
             ).warning()
     else:
-        fused = fused_input[:top_n]  # 常态直通（B3 无 kb_search——零 rerank 调用）
+        fused = fused_input[:top_n]  # 常态直通（零 KB 卡零 rerank 调用——门控保持）
+
+    # B19 kb_only 零候选兜底留痕（plan §4.4）：确定性 gate 判不足且路由 kb_only 且
+    # 纠错将触发 → errors kb_only_fallback_web（纠错回边补 web；不置 degraded——
+    # kb_only 零源 500101 对显式指令不友好，安全侧兜底转 web）
+    if not kb_supply_verdict(dict(state) | {"fused": fused_input}):
+        if resolve_kb_route(state, spec) == "kb_only":
+            errors.append({"stage": "search", "reason": "kb_only_fallback_web"})
+            AgentLog(
+                message="kb_only 路由 KB 零供给（确定性 gate 不足）——纠错回边补 web",
+                graph="fast",
+                node="fuse_rerank",
+            ).warning()
 
     fused = truncate_snippets(fused)
     emit_sources(

@@ -44,12 +44,13 @@ nacos-init:
 	export NACOS_INIT_USER NACOS_INIT_PASS; \
 		python3 scripts/nacos_init.py
 
-# S0 smoke 套件：起栈后七组件逐一跑并汇总 PASS/FAIL（任一 FAIL 整体非零退出；判定只基于七件）。
+# S0 smoke 套件：起栈后八组件逐一跑并汇总 PASS/FAIL（任一 FAIL 整体非零退出；判定只基于八件）。
+# elasticsearch 于 M3 B18 基建批纳入（19200 + jieba 插件 + 分词黄金断言），循环序沿 compose 服务族。
 # preflight.py（查端口空闲，起栈后跑必假阳性）与 gen_env.py 都是起栈前工具、不是 smoke——
 # 不进本循环：起栈前单独跑 make preflight + python3 scripts/infra_smoke/gen_env.py
 smoke-infra:
 	@overall=0; \
-	for s in postgres nacos minio langfuse litellm sandbox crawl4ai; do \
+	for s in postgres nacos minio langfuse litellm sandbox crawl4ai elasticsearch; do \
 		printf '== %s ==\n' "$$s"; \
 		if python3 scripts/infra_smoke/$${s}_smoke.py; then printf '%s: PASS\n' "$$s"; \
 		else printf '%s: FAIL\n' "$$s"; overall=1; fi; \
@@ -195,3 +196,9 @@ db-upgrade:
 # 降级：make db-downgrade version=-1（或目标 revision 号）
 db-downgrade:
 	uv run --package search-api alembic -c apps/search-api/alembic.ini downgrade $(version)
+
+# KB ES 存量回填/重建/审计（M3 批次 4 / B18——scripts/kb_es_backfill.py，plan §7）：
+# make kb-es-backfill（缺省 backfill）/ make kb-es-backfill ARGS="--mode rebuild"
+# / ARGS="--mode audit --purge-orphans"；幂等（count skip 判定 + 确定性 _id 先删后 bulk）
+kb-es-backfill:
+	uv run --package search-api python scripts/kb_es_backfill.py $(ARGS)

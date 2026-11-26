@@ -671,6 +671,42 @@ class CompactSpec(BaseModel):
         return self
 
 
+class KbRouteSpec(BaseModel):
+    """§3 kb.route（v1.46 B19——kb_route 三档与纠错轮阈值；全部【M4 评测后调】）。
+
+    子节缺失=合法（None——消费面回落 plan §5 必答项④建议值：default hybrid 灰度 /
+    correction_enabled false / min_kb_sources 2 / min_top1_score 0.012〔修订注 4：
+    单 query 双通道同命 rank1=1/61≈0.0164 的阈值上浮；**消费面按启用通道权重缩放
+    有效阈值**——es-only 常态单通道 rank1 可达，语义=「全通道同命 rank1 等效分」〕）。
+    min_kb_sources ≥ 1（0 会被消费面 `_positive_number` 回落 2——热更设 0 不生效，
+    校验面同边界拒收）。回退门三重灰度：
+    correction_enabled=false / route.default=hybrid / 双通道关闭降级（kb_route.py）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    default: Literal["kb_only", "kb_first", "hybrid"] = "hybrid"
+    correction_enabled: bool = False
+    min_kb_sources: int = Field(default=2, ge=1, le=100)
+    min_top1_score: float = Field(default=0.012, ge=0, le=1)
+
+
+class ReflectGateSpec(BaseModel):
+    """§3 deep.reflect_gate（v1.46 B19——reflect 置信度门控阈值组；确定性信号
+    gate 零 LLM）。
+
+    子节缺失=合法（None——消费面回落建议值：enabled false 灰度 / min_sources 5 /
+    min_top1_score 0.3（rerank relevance 量级）/ max_failed_ratio 0.2 /
+    min_outline_coverage 0.6）。enabled=false=现状路径直通（M4 评测把关后放开）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = False
+    min_sources: int = Field(default=5, ge=0, le=1000)
+    min_top1_score: float = Field(default=0.3, ge=0, le=1)
+    max_failed_ratio: float = Field(default=0.2, ge=0, le=1)
+    min_outline_coverage: float = Field(default=0.6, ge=0, le=1)
+
+
 class DeepSpec(BaseModel):
     model_config = ConfigDict(extra="allow")
     max_subagents: int = Field(ge=1)
@@ -693,6 +729,9 @@ class DeepSpec(BaseModel):
     recursion_limit: int = Field(gt=0)
     retry: RetrySpec
     compact: CompactSpec
+    #: §3 v1.46（B19）：reflect 置信度门控阈值组子节（缺失=门控缺省关闭——消费面
+    #: 回落建议值，enabled=false 灰度安全）
+    reflect_gate: ReflectGateSpec | None = None
 
     @model_validator(mode="after")
     def _check_deep_order(self) -> "DeepSpec":
@@ -1129,6 +1168,11 @@ class KbSpec(BaseModel):
     dual_channel_timeout_s: int | None = Field(default=None, ge=1, le=KB_DUAL_CHANNEL_TIMEOUT_MAX)
     #: ES 通道总开关/回退门（false=pgvector 单通道降级，灰度安全缺省）
     es_enabled: bool | None = None
+    #: §3 v1.46（B19 索引面开关）：向量通道启用门（false=向量腿短路——零向量占位行
+    #: 不进 cosine 查询；严格布尔，缺省 false 灰度）
+    embedding_enabled: bool | None = None
+    #: §3 v1.46：kb_route 三档与纠错轮阈值子节（缺失回落代码缺省——灰度安全）
+    route: KbRouteSpec | None = None
     # chunk 参数（热更面收敛本节，.env KB_ 值降为代码内置默认来源）
     chunk_size: int | None = Field(default=None, ge=1, le=KB_CHUNK_SIZE_MAX)
     chunk_overlap: int | None = Field(default=None, ge=0, le=KB_CHUNK_SIZE_MAX)
@@ -1145,6 +1189,11 @@ class KbSpec(BaseModel):
     @field_validator("es_enabled", mode="before")
     @classmethod
     def _check_es_enabled_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+    @field_validator("embedding_enabled", mode="before")
+    @classmethod
+    def _check_embedding_enabled_strict_bool(cls, value: Any) -> Any:
         return _strict_bool_or_raise(value)
 
     @field_validator("type_weights", mode="before")

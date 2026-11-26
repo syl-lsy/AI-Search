@@ -139,3 +139,24 @@ class KbImportJobDetail(KbImportJobEntry):
     """§4.9 详情（failures 按处理序排列；仅本端点返回、不设分页——自用 931+ 量级）。"""
 
     failures: list[KbImportFailure]
+
+
+class KbChunkDetail(BaseModel):
+    """§4.6 KB 来源溯源下钻响应 data（REQ-053；v1.30/v1.31 已批准——纯实现批 B19）。
+
+    六必选（chunk_id/document_id/document_title/content/heading_path/page/paragraph）
+    + 两可选（node_token/node_id 仅飞书来源携带、缺则省略——沿 v1.12 images 可选键
+    先例不置 null；**修订注 2**：fs:blk: 来源保留 node_id、省略 node_token）。
+    `page`/`paragraph` 键恒出现、值可空（无定位 null——契约字面）。
+    **溯源内容仅进 UI 不进 LLM**（content 前端渲染过 DOMPurify——frontend-api §5）。
+    """
+
+    chunk_id: str
+    document_id: str
+    document_title: str
+    content: str
+    heading_path: list[str]
+    page: int | None
+    paragraph: int | None
+    node_token: str | None = None
+    node_id: str | None = None

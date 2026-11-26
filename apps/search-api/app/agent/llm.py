@@ -115,9 +115,10 @@ def build_chat_model(alias: str, *, thinking: str = "on") -> Any:
     （chat-standard / qwen3.5-4b-ollama）流式透传已活体探针实证；非流式调用不受影响。
 
     **`thinking` 按模式分档（v1.59 增量 C，ARCH §6.7）**：
-    - `thinking="off"`（fast synthesis / regenerate 微图）→ 注入 `OFF_THINKING_EXTRA_BODY`
+    - `thinking="off"`（fast synthesis / regenerate 微图 / deep degraded_writer；
+      **deep writer 自 2026-11-26 用户裁决起强关 off 档**）→ 注入 `OFF_THINKING_EXTRA_BODY`
       三腿禁用键组（形态经网关注入探针钉死，见常量注释）；
-    - `thinking="on"`（deep planner/reflect/writer 等）→ **零禁用键注入**（=v1.58 后现状）。
+    - `thinking="on"`（deep planner/reflect）→ **零禁用键注入**（=v1.58 后现状）。
     任何非 "off" 取值按 on 处理（防御：档位枚举由 validator 与 resolve_thinking 双重收口）。
     """
     import app.utils.reasoning_chat_model  # noqa: F401 —— 注册副作用（幂等）

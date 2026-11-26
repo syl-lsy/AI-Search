@@ -38,6 +38,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 
 from app.agent.graphs.signals import emit_stage
+from app.agent.nodes.kb_route import resolve_kb_route
 from app.agent.guards import ensure_not_canceled
 from app.agent.safety.content_guard import filter_candidates
 from app.agent.safety.config import load_content_guard_config
@@ -50,17 +51,21 @@ WEB_SEARCH_TOP_K = 5
 
 
 def search_fanout(state: Any) -> list[Send] | str:
-    """rewrite 出边四目标路由（v1.44 B9③ direct / v1.51 recall / api.md §7.4 两形态）。
+    """rewrite 出边路由（v1.44 B9③ direct / v1.51 recall / B19 kb_route 三档）。
 
     判定顺序（契约钉死）：① `search_strategy ∈ {direct, recall}` → `"synthesis"`
     （免检索直达——direct 零事实面轮 / recall 回顾整理轮；**先于空 queries 判定**，
     两轮 queries 内容不参与路由）；② 空 queries → `"merge_dedupe"`（不悬挂，既有逻辑）；
-    ③ 其余 → `Send("web_search")×N`。缺省/非法 strategy（旧提示词形态、state 侧未声明值）
-    一律走 ③——灰度安全。
+    ③ `resolve_kb_route`（B19 kb_route 三档——缺省/非法/纠错第二趟/双通道全关一律
+    hybrid）：
+    - `hybrid` → `Send("web_search")×N + Send("kb_search")×N` 双 Send（RRF 融合收口
+      归 merge_dedupe——图拓扑 WS→MG←KS）；
+    - `kb_first`/`kb_only` → 仅 `Send("kb_search")×N`（纠错回边/兜底转 web 归
+      fuse_rerank 后确定性 gate——plan §4.4）。
 
     **目标复用**：recall 与 direct 共用 `"synthesis"` 目标（fast 子图条件边目标列表
-    `["web_search", "merge_dedupe", "synthesis"]` 零改动——子图内扩展、主图拓扑零改动，
-    ADR-012 子图内扩展第二例）。
+    零改动语义——B19 目标列表 +`"kb_search"` 为 plan 钉定的第五目标，仍子图内扩展、
+    主图拓扑零改动，ADR-012 子图内扩展）。
     """
     if state.get("search_strategy") in ("direct", "recall"):
         return "synthesis"
@@ -68,7 +73,8 @@ def search_fanout(state: Any) -> list[Send] | str:
     if not queries:
         return "merge_dedupe"
     total = len(queries)
-    return [
+    spec = state.get("spec")
+    web_sends = [
         Send(
             "web_search",
             {
@@ -80,11 +86,27 @@ def search_fanout(state: Any) -> list[Send] | str:
                 # B15 内容侧护栏：spec 随 Send 输入投影进节点（不回写 state）——
                 # web_search 写 candidates 处逐候选注入扫描的配置源（fast 子图 state
                 # 的 spec 键不进 Send 输入，节点侧只能自携）
-                "spec": state.get("spec"),
+                "spec": spec,
             },
         )
         for index, query in enumerate(queries)
     ]
+    kb_sends = [
+        Send(
+            "kb_search",
+            {
+                "query": str(query),
+                "search_query_index": index,
+                "search_query_total": total,
+                "user_id": state.get("user_id"),
+                "spec": spec,  # B15 同款投影：通道开关/漏斗参数/护栏 spec 自携
+            },
+        )
+        for index, query in enumerate(queries)
+    ]
+    if resolve_kb_route(state, spec) != "hybrid":
+        return kb_sends  # kb_first/kb_only：仅 KB Send（不足兜底归确定性 gate）
+    return web_sends + kb_sends  # hybrid：双 Send（web 段在前——供给序 web 优先）
 
 
 async def web_search(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:

@@ -11,14 +11,19 @@
   的登记行由 worker 消费（REQUEUE_STATUSES 与 main._KB_REQUEUE_STATUSES 逐字一致，
   test_kb_pipeline::test_requeue_status_set_matches_contract 锁死）；
 - ready 分支（data-model §1.7 :275 / api.md §4.1 钉注）：es_enabled=false 灰度态
-  pgvector 单通道确认即 ready；true 双通道——ES 确认点=B19 seam 未实装，本批留痕
-  放行（不永卡 indexing）。
+  pgvector 单通道确认即 ready（不触碰 ES——灰度分支先于 es_indexer 判定）；true
+  双通道（B18）——es_indexer 已接线时 indexing 段真写入 ES，确认成功才
+  indexing→ready；es_indexer=None（接线缺失）留痕放行兜底（不永卡 indexing）。
+- chunking 段 embedding 接线（plan §3.3 A3）：`kb.embedding_enabled=true` → 切分后
+  调 rag.embedding.embed_texts（输入 build_embedding_input——标题轨迹前置单一事实
+  源），失败重试 1 次耗尽 → `chunking: embedding 写入失败: {类型名}` + failed（零
+  content 回显）；false（缺省）=零向量占位逐字节现状。
 
 边界纪律：图外 worker 组件（ADR-011）——短事务自管 session（repo 内），MinIO/归一化
 等非库耗时工作不占库连接；DTO 进 DTO 出（行投影 dict 经 KbDocumentRepository 归一）。
-组件缝（normalize_document / chunk_forest / put_ir_json / get_ir_json）为模块级名，
-测试经 monkeypatch 替换（test_kb_pipeline.stub_pipeline_seams）。日志走 LogRecord
-子类体系（BusinessLog），零内容回显。
+组件缝（normalize_document / chunk_forest / put_ir_json / get_ir_json / _es_retry_sleep）
+为模块级名，测试经 monkeypatch 替换（test_kb_pipeline.stub_pipeline_seams）。日志走
+LogRecord 子类体系（BusinessLog），零内容回显。
 """
 
 import asyncio
@@ -34,6 +39,12 @@ from app.core.logger import BusinessLog
 from app.db.models import KbChunk, KbDocument
 from app.db.session import get_session_factory
 from app.rag.chunker import Chunk, ChunkingConfig, chunk_forest
+from app.rag.embedding import build_embedding_input, embed_texts
+from app.rag.indexers.es_indexer import (
+    EsIndexError,
+    _es_error_status,
+    is_retryable_es_error,
+)
 from app.rag.ir_schema import IrNode
 from app.rag.normalizers import normalize_document
 from app.rag.normalizers.registry import SPEC_DATA_ID
@@ -59,6 +70,41 @@ _TERMINAL_STATUSES: frozenset[str] = frozenset({"ready", "failed"})
 #: 一期定死（kb_settings.embedding_dim 缺省 1024 = text-embedding-v4；§1.8）
 _EMBEDDING_DIM = kb_settings.embedding_dim
 
+#: ES 写入失败退避序列（plan B18 §5.3——首试后 2 次重试，秒）
+_ES_RETRY_BACKOFF: tuple[float, ...] = (1.0, 3.0)
+
+#: 退避 sleep 缝（模块级名——单测 monkeypatch 免真等 4s）
+_es_retry_sleep = asyncio.sleep
+
+#: embedding 写入尝试次数（plan §3.3 A3：失败重试恰 1 次——首试 + 1；耗尽即 failed）
+_EMBEDDING_ATTEMPTS = 1 + 1
+
+#: 模型映射 dataId（embedding 别名来源——nacos-config §5 `embedding` 键；
+#: 与 scripts/kb_embedding_backfill.py 同一事实源）
+_MODEL_MAPPING_DATA_ID = "ai_search.model.mapping.json"
+
+
+class EmbeddingWriteError(Exception):
+    """chunking 段 embedding 写入失败（plan §3.3 失败语义）。
+
+    消息仅异常类型名/维度数/计数——**零 content 回显**（沿 B18 `_es_failure` 脱敏
+    纪律）；process_document 外层转 `chunking: embedding 写入失败: {类型名}`。
+    """
+
+
+def collect_node_kinds(root: IrNode) -> dict[str, str]:
+    """IR 树 node.id → node.type.value 全量映射（ES kind 派生——与 chunker 同一
+    事实源：Chunk.kind = 首来源单元 node.type.value，pg 读回经本映射还原）。"""
+
+    def _walk(node: IrNode, into: dict[str, str]) -> None:
+        into[node.id] = node.type.value
+        for child in node.children:
+            _walk(child, into)
+
+    kinds: dict[str, str] = {}
+    _walk(root, kinds)
+    return kinds
+
 
 # ---------------------------------------------------------------------------
 # 纯函数面（test_kb_pipeline 直接消费）
@@ -67,17 +113,31 @@ _EMBEDDING_DIM = kb_settings.embedding_dim
 
 @dataclass(frozen=True)
 class IndexingConfirmation:
-    """indexing → ready 确认分支投影（§4.1 ready 分支钉注）。"""
+    """indexing → ready 确认分支投影（§4.1 ready 分支钉注；B18 语义）。
+
+    `es_pending_seam` 语义反转（B18 起）：仅 es_enabled=true 且 es_indexer 未接线
+    时为 true（留痕放行兜底——灰度安全，不因装配遗漏全量文档 failed）；false =
+    灰度单通道或真写入路径。
+    """
 
     es_enabled: bool
     channel: str  # "pgvector"（灰度单通道）| "dual"（双通道）
-    es_pending_seam: bool  # ES 确认点=B19 seam 未实装——true 时留痕放行
+    es_pending_seam: bool  # 仅 es_indexer 未接线时 true（留痕放行兜底）
 
 
-def resolve_indexing_confirmation(es_enabled: bool) -> IndexingConfirmation:
-    """es_enabled → 确认分支：false 灰度单通道即 ready；true 双通道留痕放行（B19）。"""
+def resolve_indexing_confirmation(
+    es_enabled: bool, es_indexer: Any | None = None
+) -> IndexingConfirmation:
+    """es_enabled × es_indexer 接线态 → 确认分支。
+
+    - false → 灰度单通道即 ready（分支先于 es_indexer 判定，接线缺失不影响灰度态）；
+    - true + 缝已接线 → 双通道真写入；
+    - true + es_indexer=None → 留痕放行兜底（es_pending_seam=True）。
+    """
     if es_enabled:
-        return IndexingConfirmation(es_enabled=True, channel="dual", es_pending_seam=True)
+        return IndexingConfirmation(
+            es_enabled=True, channel="dual", es_pending_seam=es_indexer is None
+        )
     return IndexingConfirmation(
         es_enabled=False, channel="pgvector", es_pending_seam=False
     )
@@ -89,6 +149,17 @@ def read_es_enabled(spec: dict[str, Any]) -> bool:
     if not isinstance(kb, dict):
         return False
     return kb.get("es_enabled") is True
+
+
+def read_embedding_enabled(spec: dict[str, Any]) -> bool:
+    """Agent Spec `kb.embedding_enabled` 读取（严格布尔；非 True 值 → false 灰度安全）。
+
+    false（缺省）= chunking 段零向量占位逐字节现状；true = 真嵌入写入（plan §3.3）。
+    """
+    kb = spec.get("kb") if isinstance(spec, dict) else None
+    if not isinstance(kb, dict):
+        return False
+    return kb.get("embedding_enabled") is True
 
 
 def project_parse_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -142,7 +213,8 @@ def original_ext_for_doc_type(doc_type: str) -> str:
 
 
 def embedding_placeholder() -> list[float]:
-    """零向量占位（B18 向量通道落地前 NOT NULL 列写入缝；维度一期定死）。"""
+    """零向量占位（`kb.embedding_enabled=false` 灰度态 NOT NULL 列写入缝；
+    维度一期定死——true 态由 chunking 段真向量覆盖，plan §3.3）。"""
     return [0.0] * _EMBEDDING_DIM
 
 
@@ -160,11 +232,12 @@ class KbDocumentRepository:
     """
 
     async def load(self, doc_id: uuid.UUID | str) -> dict[str, Any] | None:
-        """行投影（流水线消费八键；行不存在 → None）。
+        """行投影（流水线消费九键；行不存在 → None）。
 
         parse_meta：飞书附件行建行时预置 feishu 四键（同步 diff 寻址——B20 B 线），
         normalizing 段合并保留该子对象（漏保留则 node_token 丢失、同步 diff 恒判
-        「新增」重复建行）。
+        「新增」重复建行）。catalog_path：B18 ES doc 级目录链字段（本地/URL 来源
+        恒 null——ES doc 落 null 不阻断）。
         """
         async with get_session_factory()() as session:
             row = await session.get(KbDocument, _as_uuid(doc_id))
@@ -179,6 +252,7 @@ class KbDocumentRepository:
                 "source_url": row.source_url,
                 "file_object_key": row.file_object_key,
                 "parse_meta": row.parse_meta,
+                "catalog_path": row.catalog_path,
             }
 
     async def transition(
@@ -227,16 +301,24 @@ class KbDocumentRepository:
         user_id: uuid.UUID | str,
         chunks: list[Chunk],
         content_hash: str,
+        embeddings: list[list[float]] | None = None,
     ) -> bool:
-        """切片全量替换（先删后插——重跑幂等；embedding 走零向量占位缝）。
+        """切片全量替换（先删后插——重跑幂等）。
 
-        kb_chunks 无 user 冗余删面：按 kb_doc_id 删（§1.8 归属键）。行写入零状态
-        变更——kb_documents.chunk_count/content_hash 由调用方 transition 落列。
+        `embeddings=None` → 零向量占位（`kb.embedding_enabled=false` 灰度态，
+        逐字节现状）；否则按 chunks 同序写入真向量（plan §3.3 A3——向量与 chunk
+        行同批原子写入，无零向量中间态窗口）。kb_chunks 无 user 冗余删面：按
+        kb_doc_id 删（§1.8 归属键）。行写入零状态变更——kb_documents.chunk_count/
+        content_hash 由调用方 transition 落列。
         """
         doc_uuid = _as_uuid(doc_id)
+        if embeddings is not None and len(embeddings) != len(chunks):
+            raise EmbeddingWriteError(
+                f"embedding 数量不符: got={len(embeddings)} expect={len(chunks)}"
+            )
         async with get_session_factory()() as session:
             await session.execute(delete(KbChunk).where(KbChunk.kb_doc_id == doc_uuid))
-            for chunk in chunks:
+            for position, chunk in enumerate(chunks):
                 session.add(
                     KbChunk(
                         kb_doc_id=doc_uuid,
@@ -244,12 +326,44 @@ class KbDocumentRepository:
                         chunk_index=chunk.chunk_index,
                         content=chunk.content,
                         token_count=chunk.token_count,
-                        embedding=embedding_placeholder(),
+                        embedding=(
+                            embeddings[position]
+                            if embeddings is not None
+                            else embedding_placeholder()
+                        ),
                         meta=chunk_row_meta(chunk),
                     )
                 )
             await session.commit()
         return True
+
+    async def list_chunks_by_doc(self, doc_id: uuid.UUID | str) -> list[dict[str, Any]]:
+        """pg 事实源读回文档 chunks（ORDER BY chunk_index——B18 indexing 段消费）。
+
+        ES 写入不重切（chunking 段已 replace_chunks+transition；resume-from-indexing
+        也走本读回路径——幂等且与 OQ-34 content_hash 落列口径自洽）。行投影为
+        es_mapping.build_chunk_doc 消费面（chunk_id/kb_doc_id/user_id/chunk_index/
+        content/token_count/meta 七键/created_at）。
+        """
+        async with get_session_factory()() as session:
+            result = await session.scalars(
+                select(KbChunk)
+                .where(KbChunk.kb_doc_id == _as_uuid(doc_id))
+                .order_by(KbChunk.chunk_index.asc())
+            )
+            return [
+                {
+                    "chunk_id": chunk.id,
+                    "kb_doc_id": chunk.kb_doc_id,
+                    "user_id": chunk.user_id,
+                    "chunk_index": chunk.chunk_index,
+                    "content": chunk.content,
+                    "token_count": chunk.token_count,
+                    "meta": chunk.meta or {},
+                    "created_at": chunk.created_at,
+                }
+                for chunk in result.all()
+            ]
 
     async def list_requeue_ids(self) -> list[uuid.UUID]:
         """启动钩子登记行 → 重入队 id 列表（status IN REQUEUE_STATUSES）。"""
@@ -264,6 +378,37 @@ def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
+async def build_es_doc_meta(
+    row: dict[str, Any], *, minio: Any
+) -> dict[str, Any]:
+    """ES doc 级三键装配（B18 §5.2 步骤 2；回填脚本同源复用）。
+
+    catalog_path 取行值；doc_kind/node_kinds 由 ir.json 一次 GET 派生
+    （collect_node_kinds——kind 与 chunker 同一事实源）。IR 不可达（异常态）→
+    WARN 留痕 + None 继续——辅助过滤字段不阻断写入（kind/raw_type 才是 chunk 级
+    过滤字段，恒可得）。
+    """
+    doc_kind: str | None = None
+    node_kinds: dict[str, str] = {}
+    try:
+        root = await get_ir_json(str(row["user_id"]), str(row["id"]), client=minio)
+        doc_kind = root.doc_kind
+        node_kinds = collect_node_kinds(root)
+    except Exception as exc:  # noqa: BLE001 —— IR 缺失不阻断 ES 写入（B18 §4.3）
+        BusinessLog(
+            message=f"kb doc_kind/node_kinds IR 派生失败（{type(exc).__name__}）"
+            "——doc 级辅助字段落 null 继续",
+            action="kb_es_doc_kind",
+            entity="kb_document",
+            entity_id=str(row["id"]),
+        ).warning(exc)
+    return {
+        "catalog_path": row.get("catalog_path"),
+        "doc_kind": doc_kind,
+        "node_kinds": node_kinds,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 流水线
 # ---------------------------------------------------------------------------
@@ -272,9 +417,11 @@ def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
 class KbPipeline:
     """KB 入库流水线：进程内队列 + worker 池，逐文档推进六态状态机。
 
-    依赖全注入（repo / spec 快照供给 / MinIO 工厂 / worker 数）——单测注入假体
-    零网络零 DB（test_kb_pipeline）；生产形态经 `get_kb_pipeline` 装配。
+    依赖全注入（repo / spec 快照供给 / MinIO 工厂 / worker 数 / ES 索引器）——
+    单测注入假体零网络零 DB（test_kb_pipeline）；生产形态经 `get_kb_pipeline` 装配。
     `worker_count=0` 不 spawn worker（unit 直驱 `process_document`）。
+    `es_indexer=None` 时 es_enabled=true 走留痕放行兜底（灰度安全——不因装配
+    遗漏全量文档 failed）；注入 KbEsIndexer 时 indexing 段真写入 ES。
     """
 
     def __init__(
@@ -284,11 +431,15 @@ class KbPipeline:
         spec_payload_provider: Callable[[], dict[str, Any]],
         minio_client: Callable[[], Any],
         worker_count: int = 1,
+        es_indexer: Any | None = None,
+        mapping_provider: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self._repo = repo
         self._spec_payload_provider = spec_payload_provider
         self._minio_client_factory = minio_client
         self._worker_count = worker_count
+        self._es_indexer = es_indexer
+        self._mapping_provider = mapping_provider or _default_model_mapping
         self._workers: list[asyncio.Task[None]] = []
         self._queue: asyncio.Queue[str] | None = None
 
@@ -392,17 +543,28 @@ class KbPipeline:
             # status == "indexing"（含 resume：indexing 直入确认段）
             stage = "indexing"
             confirmation = resolve_indexing_confirmation(
-                read_es_enabled(self._spec_payload_provider())
+                read_es_enabled(self._spec_payload_provider()), self._es_indexer
             )
-            if confirmation.es_pending_seam:
-                # ES 确认点=B19 seam 未实装——留痕放行，不永卡 indexing（§1.7 :275）
+            if not confirmation.es_enabled:
+                # 灰度单通道：pgvector 确认即 ready——分支先于 es_indexer 判定，
+                # 不触碰 ES（灰度态行为与接线缺失解耦，§1.19「启用通道均确认」）
+                pass
+            elif confirmation.es_pending_seam:
+                # es_enabled=true 但缝未接线（装配缺失/单测未注入）——留痕放行
+                # 兜底（灰度安全，不永卡 indexing；B18 起 WARN 升级自 B19 info 留痕）
                 BusinessLog(
-                    message="B19 seam 未实装：es_enabled=true 双通道确认留痕"
+                    message="B18 缝未接线：es_enabled=true 双通道确认留痕"
                     "（es_pending_seam），灰度放行 indexing→ready",
                     action="kb_indexing_confirm",
                     entity="kb_document",
                     entity_id=str(doc_id),
-                ).info()
+                ).warning()
+            else:
+                # 双通道真写入（B18）：pg 读回 → ES 先删后 bulk → 确认成功才 ready
+                #（失败语义 §5.3：retryable 重试 2 次，耗尽 → failed 不静默 ready）
+                chunks = await self._repo.list_chunks_by_doc(doc_id)
+                doc_meta = await self._build_doc_meta(row)
+                await self._write_es_with_retry(doc_id, row["user_id"], chunks, doc_meta)
             ready_at = datetime.now(UTC)
             if not await self._transition(
                 doc_id, {"indexing"}, "ready", {"ready_at": ready_at}
@@ -431,7 +593,72 @@ class KbPipeline:
                 entity_id=str(doc_id),
             ).error(exc)
 
-    # ---- 阶段实现（normalizing / chunking）----
+    # ---- 阶段实现（indexing 确认段 / normalizing / chunking）----
+
+    async def _build_doc_meta(self, row: dict[str, Any]) -> dict[str, Any]:
+        """ES doc 级三键装配（B18 §5.2 步骤 2）——委托模块级 `build_es_doc_meta`
+        （回填脚本同源复用，生产路径与脚本零分叉）。"""
+        return await build_es_doc_meta(row, minio=self._minio())
+
+    async def _write_es_with_retry(
+        self,
+        doc_id: str,
+        user_id: Any,
+        chunks: list[dict[str, Any]],
+        doc_meta: dict[str, Any],
+    ) -> None:
+        """ES 写入（retryable 重试 2 次，退避 1s/3s——plan B18 §5.3）。
+
+        `ensure_index` 与 `index_chunks` **同处重试 try 面内**（就绪后不重复调用——
+        幂等但省一次往返）：ensure 阶段的连接拒/超时同属瞬态，必须与写入共用同一
+        retryable 判定与退避节奏，否则 ES 瞬态不可达命中 ensure 即零重试终态 failed。
+        retryable = 连接族 + HTTP 429/5xx（es_indexer.is_retryable_es_error）；
+        耗尽/不可重试 → EsIndexError 带「类型名(状态码) + attempts」，attempts 为
+        **真实已尝试次数**（不可重试首试即失败 → attempts=1，不谎报总预算）——
+        process_document 外层转 `indexing: ES 写入失败: …`（零 chunk 内容回显、
+        零内部 host:port 回显）。
+        重试中行状态仍 indexing（乐观卫期望集不变）；行被并发改写 → ready 迁移
+        rowcount 0 → aborted 收口。
+        """
+        es_indexer = self._es_indexer
+        assert es_indexer is not None  # 调用前置：resolve 确认缝已接线
+        attempts_total = 1 + len(_ES_RETRY_BACKOFF)
+        index_ready = False
+        for attempt in range(attempts_total):
+            try:
+                if not index_ready:
+                    await es_indexer.ensure_index()
+                    index_ready = True
+                await es_indexer.index_chunks(
+                    doc_id,
+                    user_id=user_id,
+                    chunks=chunks,
+                    doc_meta=doc_meta,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 —— retryable 判定后转 failed/重试
+                is_last = attempt == attempts_total - 1
+                if is_last or not is_retryable_es_error(exc):
+                    raise self._es_failure(exc, attempt + 1) from exc
+                await _es_retry_sleep(_ES_RETRY_BACKOFF[attempt])
+
+    @staticmethod
+    def _es_failure(exc: Exception, attempts: int) -> Exception:
+        """重试耗尽/不可重试异常 → EsIndexError（detail 仅类型/状态/attempts 零内容）。
+
+        attempts = **真实已尝试次数**（调用方传 `attempt + 1`；不可重试首试即失败
+        → 1，不谎报重试总预算）。状态码提取复用 es_indexer._es_error_status
+        （status_code 兼容属性 → meta.status 兜底，与 retryable 判定同一事实源）。
+        EsIndexError 原样透传（indexer 侧 detail 已是计数形态——bulk 失败 N/M item，
+        不二次包装制造噪音）。
+        """
+        if isinstance(exc, EsIndexError):
+            return exc
+        status = _es_error_status(exc)
+        status_part = f"{status} " if isinstance(status, int) else ""
+        return EsIndexError(
+            f"ES 写入失败: {type(exc).__name__}({status_part}attempts={attempts})"
+        )
 
     def _minio(self) -> Any:
         return self._minio_client_factory()
@@ -486,24 +713,69 @@ class KbPipeline:
         """ir.json 装载（rebuild_siblings 内置）→ 逐级切分 → kb_chunks 全量替换。
 
         返回 (chunk_count, document_content_hash)——chunking→indexing 迁移落列原料
-        （OQ-34 写入接线）。
+        （OQ-34 写入接线）。`kb.embedding_enabled=true` 时切分后先调 embed（输入走
+        build_embedding_input 单一事实源——标题轨迹前置），失败重试 1 次耗尽 →
+        EmbeddingWriteError（外层转 `chunking: embedding 写入失败: {类型名}`）；
+        false（缺省）=零向量占位逐字节现状。
         """
         user_id = str(row["user_id"])
         doc_id = str(row["id"])
         root = await get_ir_json(user_id, doc_id, client=self._minio())
-        config = ChunkingConfig.from_spec(self._spec_payload_provider())
+        spec = self._spec_payload_provider()
+        config = ChunkingConfig.from_spec(spec)
         results = await asyncio.to_thread(
             chunk_forest, root, document_id=doc_id, config=config
         )
         chunks = [chunk for result in results for chunk in result.chunks]
         content_hash = results[0].document_content_hash if results else ""
+        embeddings: list[list[float]] | None = None
+        if read_embedding_enabled(spec):
+            embeddings = await self._embed_chunks(chunks)
         await self._repo.replace_chunks(
             doc_id,
             user_id=row["user_id"],
             chunks=chunks,
             content_hash=content_hash,
+            embeddings=embeddings,
         )
         return len(chunks), content_hash
+
+    async def _embed_chunks(self, chunks: list[Chunk]) -> list[list[float]]:
+        """chunk 全量向量化（plan §3.3 A3——embed 先于 replace_chunks 短事务，
+        不占库连接）。
+
+        失败重试恰 1 次（`_EMBEDDING_ATTEMPTS`），耗尽 → EmbeddingWriteError
+        （消息仅类型名/维度/计数——零 content 回显）；维度≠1024 / 数量不符 →
+        同域失败（防静默脏向量）。
+        """
+        texts = [
+            build_embedding_input(chunk.content, chunk.heading_path) for chunk in chunks
+        ]
+        vectors: list[list[float]] | None = None
+        last_exc: Exception | None = None
+        for _attempt in range(_EMBEDDING_ATTEMPTS):
+            try:
+                vectors = await embed_texts(
+                    texts, mapping=self._mapping_provider()
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 —— 重试 1 次后转 EmbeddingWriteError
+                last_exc = exc
+        if vectors is None:
+            assert last_exc is not None  # 循环耗尽必有异常
+            raise EmbeddingWriteError(
+                f"embedding 写入失败: {type(last_exc).__name__}"
+            ) from last_exc
+        if len(vectors) != len(chunks):
+            raise EmbeddingWriteError(
+                f"embedding 数量不符: got={len(vectors)} expect={len(chunks)}"
+            )
+        for vector in vectors:
+            if len(vector) != _EMBEDDING_DIM:
+                raise EmbeddingWriteError(
+                    f"embedding 维度不符: got={len(vector)} expect={_EMBEDDING_DIM}"
+                )
+        return vectors
 
 
 # ---------------------------------------------------------------------------
@@ -525,18 +797,35 @@ def _default_spec_payload() -> dict[str, Any]:
     return dict(snapshot.payload) if snapshot is not None else {}
 
 
+def _default_model_mapping() -> dict[str, Any] | None:
+    """模型映射快照 payload（embedding 别名来源；未装载/缺失回落 None——
+    embed_texts 内置 text-embedding-v4 兜底。回填脚本 `_spec_mapping` 同款缝）。"""
+    from app.config_center import get_asset_center
+
+    try:
+        snapshot = get_asset_center().snapshot(_MODEL_MAPPING_DATA_ID)
+    except RuntimeError:
+        return None
+    return dict(snapshot.payload) if snapshot is not None else None
+
+
 def get_kb_pipeline() -> KbPipeline:
     """进程级单例（REST BackgroundTasks 入队缝；单测经 dependency_overrides 替换）。
 
-    首次调用惰性装配（真实 repo + MinIO 惰性工厂 + spec 快照供给）。start()/stop()
-    由宿主 lifespan 承担（未 start 时仅入队不消费——登记行经启动钩子重入队承接）。
+    首次调用惰性装配（真实 repo + MinIO 惰性工厂 + spec 快照供给 + ES 索引器——
+    B18 双通道写入；灰度态 es_enabled=false 分支不触碰 ES，接线在位零影响）。
+    start()/stop() 由宿主 lifespan 承担（未 start 时仅入队不消费——登记行经启动
+    钩子重入队承接）。
     """
     global _kb_pipeline_instance
     if _kb_pipeline_instance is None:
+        from app.rag.indexers.es_indexer import get_kb_es_indexer
+
         _kb_pipeline_instance = KbPipeline(
             repo=KbDocumentRepository(),
             spec_payload_provider=_default_spec_payload,
             minio_client=get_kb_minio_client,
             worker_count=1,
+            es_indexer=get_kb_es_indexer(),
         )
     return _kb_pipeline_instance

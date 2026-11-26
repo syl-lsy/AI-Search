@@ -725,3 +725,115 @@ async def test_material_summary_capped_by_shared_constant(
 
     assert "正常开头。" in prompt  # 截断头部在场
     assert "尾部哨兵" not in prompt  # 1200 字符之后的尾部被截断
+
+
+# ---------------------------------------------------------------------------
+# B19 reflect 置信度门控（plan §4.5——确定性信号 gate 零 LLM）
+# ---------------------------------------------------------------------------
+
+
+def _gate_spec(**gate: Any) -> dict[str, Any]:
+    base = {"enabled": True, "min_sources": 5, "min_top1_score": 0.3,
+            "max_failed_ratio": 0.2, "min_outline_coverage": 0.6}
+    base.update(gate)
+    return {"deep": {"reflect_gate": base}}
+
+
+async def test_gate_all_green_short_circuits_zero_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """① 全绿 → 直接 sufficient（done 裸帧 + gaps=[]），零 LLM 调用。"""
+    model, emitted, aliases = _install(monkeypatch, _FakeChain([{"sufficient": True, "gaps": []}]))
+    state = _state_with(
+        spec=_gate_spec(),
+        collected_sources=[
+            {"url": f"https://s.example/{i}", "score": 0.5} for i in range(5)
+        ],
+        outline=[{"section": "一", "intent": "i"}, {"section": "二", "intent": "i"}],
+        subagent_reports=[{"name": "research-0"}, {"name": "research-1"}],
+        errors=[],
+    )
+    update = await deep_reflect.reflect(state, _config())
+    assert update == {"gaps": []}
+    assert aliases == []  # 零 LLM 调用
+    assert (emitted[-1][0], emitted[-1][1]) == ("reflect", "done")
+
+
+async def test_gate_red_any_signal_goes_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """② 任一红（来源数不足）→ 现状 LLM 深评（零行为变化）。"""
+    chain = _FakeChain([{"sufficient": True, "gaps": []}])
+    model, emitted, aliases = _install(monkeypatch, chain)
+    state = _state_with(
+        spec=_gate_spec(),
+        collected_sources=[{"url": "https://s.example/0", "score": 0.9}],
+        outline=[{"section": "一", "intent": "i"}],
+        subagent_reports=[{"name": "research-0"}],
+    )
+    await deep_reflect.reflect(state, _config())
+    assert len(aliases) == 1  # LLM 深评照常
+
+
+async def test_gate_disabled_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """③ enabled=false（灰度缺省）→ 直通 LLM（现状路径；无键同）。"""
+    chain = _FakeChain([{"sufficient": True, "gaps": []}])
+    _, _, aliases = _install(monkeypatch, chain)
+    state = _state_with(
+        spec=_gate_spec(enabled=False),
+        collected_sources=[{"url": "https://s.example/0", "score": 0.9} for _ in range(9)],
+    )
+    await deep_reflect.reflect(state, _config())
+    assert len(aliases) == 1
+
+
+async def test_gate_top1_below_threshold_red(monkeypatch: pytest.MonkeyPatch) -> None:
+    """修订注 4：来源足但 top1 分 < 阈值 → 红（LLM 深评）。"""
+    chain = _FakeChain([{"sufficient": True, "gaps": []}])
+    _, _, aliases = _install(monkeypatch, chain)
+    state = _state_with(
+        spec=_gate_spec(),
+        collected_sources=[{"url": f"https://s.example/{i}", "score": 0.1} for i in range(6)],
+        outline=[{"section": "一", "intent": "i"}],
+        subagent_reports=[{"name": "research-0"}],
+    )
+    await deep_reflect.reflect(state, _config())
+    assert len(aliases) == 1
+
+
+async def test_gate_failed_ratio_red(monkeypatch: pytest.MonkeyPatch) -> None:
+    """failed 比例 > max_failed_ratio → 红（5 来源 + 2 失败 = 2/7 > 0.2）。"""
+    chain = _FakeChain([{"sufficient": True, "gaps": []}])
+    _, _, aliases = _install(monkeypatch, chain)
+    state = _state_with(
+        spec=_gate_spec(),
+        collected_sources=[{"url": f"https://s.example/{i}", "score": 0.9} for i in range(5)],
+        errors=[
+            {"stage": "search", "reason": "source_failure", "source": "a"},
+            {"stage": "search", "reason": "source_failure", "source": "b"},
+        ],
+        outline=[{"section": "一", "intent": "i"}],
+        subagent_reports=[{"name": "research-0"}],
+    )
+    await deep_reflect.reflect(state, _config())
+    assert len(aliases) == 1
+
+
+async def test_gate_outline_coverage_red(monkeypatch: pytest.MonkeyPatch) -> None:
+    """outline 覆盖代理口径红（1 报告 / 3 章节 = 0.33 < 0.6）→ LLM 深评。"""
+    chain = _FakeChain([{"sufficient": True, "gaps": []}])
+    _, _, aliases = _install(monkeypatch, chain)
+    state = _state_with(
+        spec=_gate_spec(),
+        collected_sources=[{"url": f"https://s.example/{i}", "score": 0.9} for i in range(5)],
+        outline=[{"section": s, "intent": "i"} for s in ("一", "二", "三")],
+        subagent_reports=[{"name": "research-0"}],
+    )
+    await deep_reflect.reflect(state, _config())
+    assert len(aliases) == 1
+
+
+def test_gate_topology_zero_change_router_table() -> None:
+    """④ 拓扑零改动：route_reflect 判据逐字不变（门控为节点内步骤级扩展——判据仍
+    是 gaps/轮数/degraded_reason 三元，零新增信号）。"""
+    import inspect
+
+    graph_src = inspect.getsource(route_reflect)
+    assert "kb" not in graph_src.lower()  # 门控不触路由面
+    assert "_loop_continues" in graph_src or "gaps" in graph_src

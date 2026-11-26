@@ -23,7 +23,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api.v1 import kb as kb_routes
 from app.dependencies import get_current_user, get_db
-from app.exception import NotFoundException
+from app.exception import BadRequestException, NotFoundException
 from app.exception.kb import (
     FileTooLargeException,
     FileUnsupportedTypeException,
@@ -459,3 +459,167 @@ def test_kb_routes_registered() -> None:
 
 def test_kb_router_prefix_shape() -> None:
     assert kb_routes.router.prefix == "/api/v1"
+
+
+# ---------------------------------------------------------------------------
+# §4.6 KB 来源溯源下钻（B19——已冻结契约纯实现批；修订注 2 fs:blk: 取舍）
+# ---------------------------------------------------------------------------
+
+
+class _FakeDrilldownService:
+    """假 service：按 source_id 返回 DTO 或抛领域异常（路由链路面）。"""
+
+    def __init__(self, outcomes: dict[str, Any]) -> None:
+        self._outcomes = outcomes
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_chunk_drilldown(self, source_id: str, *, user_id: str) -> Any:
+        self.calls.append((source_id, user_id))
+        outcome = self._outcomes.get(source_id)
+        if outcome is None:
+            raise NotFoundException("来源不存在")  # 与真 service 同语义（不存在/越权）
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _drilldown_dto(**overrides: Any) -> Any:
+    from app.schemas.kb import KbChunkDetail
+
+    payload = {
+        "chunk_id": "5c2e1111-1111-4111-8111-000000000001",
+        "document_id": "9a772222-2222-4222-8222-000000000001",
+        "document_title": "内部设计文档-检索融合.md",
+        "content": "KB 候选与网络候选合并后统一 rerank...",
+        "heading_path": ["第三章 检索融合", "3.2 混合检索"],
+        "page": 12,
+        "paragraph": 4,
+    }
+    payload.update(overrides)
+    # page/paragraph 恒出现（值可空）——None 也显式 set；可选键 None 不传（unset 省略）
+    return KbChunkDetail.model_validate({
+        k: v for k, v in payload.items() if v is not None or k in ("page", "paragraph")
+    })
+
+
+async def test_kb_chunk_drilldown_200_six_required_fields(monkeypatch):
+    """① 200 六必选逐字段（api.md §4.6 响应示例逐字对齐）+ 本地来源两可选键省略。"""
+    dto = _drilldown_dto()
+    fake = _FakeDrilldownService({"src-1": dto})
+    app.dependency_overrides[kb_routes.get_kb_service] = lambda: fake
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            response = await client.get(
+                "/api/v1/sources/src-1/kb-chunk",
+                headers={"X-User-Id": _USER_ID},
+            )
+    finally:
+        app.dependency_overrides.pop(kb_routes.get_kb_service, None)
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["chunk_id"] == "5c2e1111-1111-4111-8111-000000000001"
+    assert data["document_id"] == "9a772222-2222-4222-8222-000000000001"
+    assert data["document_title"] == "内部设计文档-检索融合.md"
+    assert data["content"] == "KB 候选与网络候选合并后统一 rerank..."
+    assert data["heading_path"] == ["第三章 检索融合", "3.2 混合检索"]
+    assert data["page"] == 12
+    assert data["paragraph"] == 4
+    assert "node_token" not in data and "node_id" not in data
+    assert fake.calls == [("src-1", _USER_ID)]
+
+
+async def test_kb_chunk_drilldown_feishu_fs_node_both_keys(monkeypatch):
+    """② 飞书 fs:node: 来源 → node_token + node_id 两可选键齐带（回跳外链消费面）
+    + page/paragraph 键恒出现值可空。"""
+    dto = _drilldown_dto(
+        node_token="tok789", node_id="fs:node:tok789", page=None, paragraph=None
+    )
+    fake = _FakeDrilldownService({"src-2": dto})
+    app.dependency_overrides[kb_routes.get_kb_service] = lambda: fake
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            response = await client.get(
+                "/api/v1/sources/src-2/kb-chunk",
+                headers={"X-User-Id": _USER_ID},
+            )
+    finally:
+        app.dependency_overrides.pop(kb_routes.get_kb_service, None)
+    data = response.json()["data"]
+    assert data["node_token"] == "tok789"
+    assert data["node_id"] == "fs:node:tok789"
+    assert data["page"] is None and data["paragraph"] is None
+
+
+async def test_kb_chunk_drilldown_fs_blk_keeps_node_id_only(monkeypatch):
+    """② 修订注 2：fs:blk: 来源 → 保留 node_id、省略 node_token（契约字面取舍，
+    收官用户裁决候选）。"""
+    dto = _drilldown_dto(node_id="fs:blk:blk42")
+    fake = _FakeDrilldownService({"src-3": dto})
+    app.dependency_overrides[kb_routes.get_kb_service] = lambda: fake
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            response = await client.get(
+                "/api/v1/sources/src-3/kb-chunk",
+                headers={"X-User-Id": _USER_ID},
+            )
+    finally:
+        app.dependency_overrides.pop(kb_routes.get_kb_service, None)
+    data = response.json()["data"]
+    assert data["node_id"] == "fs:blk:blk42"
+    assert "node_token" not in data
+
+
+async def test_kb_chunk_drilldown_non_kb_source_400001(monkeypatch):
+    """③ 非 KB 来源（source_type=web）→ 400001。"""
+    fake = _FakeDrilldownService(
+        {"src-4": BadRequestException("非 KB 来源", detail="source_type=web")}
+    )
+    app.dependency_overrides[kb_routes.get_kb_service] = lambda: fake
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            response = await client.get(
+                "/api/v1/sources/src-4/kb-chunk",
+                headers={"X-User-Id": _USER_ID},
+            )
+    finally:
+        app.dependency_overrides.pop(kb_routes.get_kb_service, None)
+    assert response.status_code == 400
+    assert response.json()["code"] == "400001"
+
+
+async def test_kb_chunk_drilldown_404001_single_code(monkeypatch):
+    """④ 已删除/越权/不存在 → 404001 单码（不泄漏存在性）。"""
+    fake = _FakeDrilldownService(
+        {
+            "src-5": NotFoundException("来源不存在"),
+            "src-6": NotFoundException("chunk 或文档已删除"),
+        }
+    )
+    app.dependency_overrides[kb_routes.get_kb_service] = lambda: fake
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            for source_id in ("src-5", "src-6", "src-missing"):
+                response = await client.get(
+                    f"/api/v1/sources/{source_id}/kb-chunk",
+                    headers={"X-User-Id": _USER_ID},
+                )
+                assert response.status_code == 404
+                assert response.json()["code"] == "404001"
+    finally:
+        app.dependency_overrides.pop(kb_routes.get_kb_service, None)
+
+
+async def test_kb_chunk_drilldown_route_registered():
+    """⑤ 路由表注册齐全（api.md §6 端点总表 #39）。"""
+    paths = {route.path for route in app.routes}
+    assert "/api/v1/sources/{source_id}/kb-chunk" in paths

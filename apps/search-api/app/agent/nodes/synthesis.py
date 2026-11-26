@@ -384,11 +384,18 @@ def _sources_block(fused: list[dict[str, Any]]) -> str:
     for index, item in enumerate(fused, start=1):
         title = html.escape(str(item.get("title") or ""), quote=True)
         snippet = html.escape(str(item.get("snippet") or ""), quote=True)
+        origin = item.get("origin")
+        is_kb = origin == "kb" or (isinstance(origin, list) and "kb" in (origin or []))
+        # B19（§6.4.3 铁律原文 `kb:doc_id` 形态 + plan §4.3）：KB 卡 source="kb:{doc_id}"
+        # + type="kb"；web 卡 source=url + type="web"（既有面逐字节不变——负例）
+        source_attr = (
+            f"kb:{item.get('kb_doc_id')}" if is_kb else str(item.get("url") or "")
+        )
         blocks.append(
             external_content(
                 f"[{index}] {title}\n{snippet}",
-                source=str(item.get("url") or ""),
-                kind="web",
+                source=source_attr,
+                kind="kb" if is_kb else "web",
             )
         )
     return "\n".join(blocks)

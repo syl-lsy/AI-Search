@@ -2938,3 +2938,98 @@ async def test_turn_without_source_surplus_persists_zero_extra_rows() -> None:
     assert sorted(row.ref_no for row in added_sources) == [1, 2]
     done = [e for e in await _drain_all(bus, str(turn.id)) if e.event_type == "done"]
     assert done[0].data["source_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# B19 KB 来源落库接线（plan B5——0013 列消费面：kb_doc_id/kb_chunk_ids）
+# ---------------------------------------------------------------------------
+
+
+_KB_DOC_ID_STR = "44444444-4444-4444-8444-000000000001"
+_KB_CHUNK_ID_STR = "55555555-5555-4555-8555-000000000001"
+
+
+async def test_sources_batch_kb_card_persists_kb_columns() -> None:
+    """KB 卡 batch → Source 行 kb_doc_id/kb_chunk_ids 列真实落库（溯源 §4.6 解析键
+    的持久化前提）；事件 batch 回写零变化（三面对账面）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session))
+    ctx = turn_service._RunContext(
+        turn_id=str(turn.id),
+        thread_id=str(turn.thread_id),
+        user_id=str(turn.user_id),
+    )
+    batch = [
+        {
+            "source_id": str(uuid.uuid4()),
+            "ref_no": 1,
+            "source_type": "kb",
+            "title": "第一章",
+            "url": None,
+            "snippet": "KB 切片摘要",
+            "score": 0.0163,
+            "snapshot_available": False,
+            "kb_doc_id": _KB_DOC_ID_STR,
+            "kb_chunk_id": _KB_CHUNK_ID_STR,
+        },
+        {
+            "source_id": str(uuid.uuid4()),
+            "ref_no": 2,
+            "source_type": "web",
+            "title": "web 卡",
+            "url": "https://a.example",
+            "snippet": "网页摘要",
+            "score": 0.9,
+            "snapshot_available": False,
+            "kb_doc_id": None,
+        },
+    ]
+    await scheduler._publish_and_persist(ctx, "sources", {"batch": batch}, sources_batch=batch)
+    rows = sorted(
+        (obj for obj in session.added if isinstance(obj, Source)), key=lambda r: r.ref_no
+    )
+    kb_row, web_row = rows
+    assert str(kb_row.kb_doc_id) == _KB_DOC_ID_STR  # 0013 列真实值（非 None）
+    assert kb_row.kb_chunk_ids == [_KB_CHUNK_ID_STR]  # jsonb 数组=溯源解析键载体
+    assert kb_row.url is None
+    assert web_row.kb_doc_id is None and web_row.kb_chunk_ids is None  # web 卡回归
+    # 事件 batch 回写：source_id 行 id 对账 + kb 键透传（SSE/turn_events/§2.5 三面同源）
+    published = next(e for e in await _drain_all(bus, str(turn.id)) if e.event_type == "sources")
+    kb_card = published.data["batch"][0]
+    assert kb_card["kb_chunk_id"] == _KB_CHUNK_ID_STR
+    assert kb_card["source_id"] == str(kb_row.id)
+
+
+async def test_supply_appends_kb_card_persists_kb_columns() -> None:
+    """供给面补行同口径（引用供给编号恒等——批次 5 终审 P0 教训）：KB 扩展卡补建行
+    携带 kb 两列（§2.5 sources[] 补行不丢溯源解析键）。"""
+    bus = _bus()
+    turn = _TurnRow(status="running")
+    session = _FakeSession(turn=turn)
+    scheduler = _scheduler(bus, _FakeSessionFactory(session))
+    ctx = turn_service._RunContext(
+        turn_id=str(turn.id),
+        thread_id=str(turn.thread_id),
+        user_id=str(turn.user_id),
+        sources_count=1,
+    )
+    fused = [
+        {**_SRC, "ref_no": 1},
+        {
+            "source_type": "kb",
+            "title": "KB 扩展卡",
+            "url": None,
+            "snippet": "KB 供给面片段",
+            "score": 0.02,
+            "kb_doc_id": _KB_DOC_ID_STR,
+            "kb_chunk_id": _KB_CHUNK_ID_STR,
+        },
+    ]
+    await scheduler._persist_supply_appends(ctx, fused)
+    rows = [obj for obj in session.added if isinstance(obj, Source)]
+    assert len(rows) == 1 and rows[0].ref_no == 2
+    assert str(rows[0].kb_doc_id) == _KB_DOC_ID_STR
+    assert rows[0].kb_chunk_ids == [_KB_CHUNK_ID_STR]
+    assert ctx.sources_count == 2

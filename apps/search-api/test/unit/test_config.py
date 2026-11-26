@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from app.core.config import (
     CommonSettings,
     DBSettings,
+    ESSettings,
     KbSettings,
     LangfuseSettings,
     LitellmSettings,
@@ -695,11 +696,78 @@ def test_db_password_does_not_leak_into_other_groups(monkeypatch):
     assert DBSettings(_env_file=None).password.get_secret_value() == "db-only-secret"
 
 
+# ---- ES 组（ES_，M3 批次 4 B18）----
+
+
+def test_es_defaults(monkeypatch):
+    """ES 组六缺省值（host 127.0.0.1 / port 19200 / 空串 auth 缺省 / 前缀
+    ai_search；plan B18 §3）。
+
+    ★鉴权已开启形态（2026-11-26 basic auth 批，b4 §6）：部署侧 compose 强制
+    ELASTIC_PASSWORD（`${ES_PASSWORD:?}` fail-fast）+ es_settings 读连接凭据
+    ——本测断言的空串 auth 只是「环境变量全缺省时的连接参数缺省值」，非部署
+    形态（b4 交付说明 §6.5：旧 docstring「零 .env 可跑/探针零鉴权配方」表述
+    过期，本测仅刷新表述，断言面不变）。"""
+    for key in ("ES_HOST", "ES_PORT", "ES_USERNAME", "ES_PASSWORD", "ES_INDEX_PREFIX"):
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key.lower(), raising=False)
+    settings = ESSettings(_env_file=None)
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 19200
+    assert settings.username == ""
+    assert settings.password.get_secret_value() == ""
+    assert settings.index_prefix == "ai_search"
+
+
+def test_es_reads_exact_env_names(monkeypatch):
+    """ES 组精确变量名命中：五键逐一映射（ES_MEM_LIMIT 为 compose 消费型不声明）。"""
+    monkeypatch.setenv("ES_HOST", "127.0.0.2")
+    monkeypatch.setenv("ES_PORT", "19201")
+    monkeypatch.setenv("ES_USERNAME", "elastic")
+    monkeypatch.setenv("ES_PASSWORD", "es-only-secret")
+    monkeypatch.setenv("ES_INDEX_PREFIX", "ai_search_test")
+    settings = ESSettings(_env_file=None)
+    assert settings.host == "127.0.0.2"
+    assert settings.port == 19201
+    assert settings.username == "elastic"
+    assert settings.password.get_secret_value() == "es-only-secret"
+    assert settings.index_prefix == "ai_search_test"
+
+
+def test_es_mem_limit_is_compose_consumed_not_declared(monkeypatch):
+    """ES_MEM_LIMIT 为 compose 消费型（注入容器 mem_limit，应用不读取）——
+    不入 ESSettings（沿 SEARXNG_SECRET 反例先例；extra=ignore 兜住不报错）。"""
+    monkeypatch.setenv("ES_MEM_LIMIT", "2g")
+    settings = ESSettings(_env_file=None)  # 未声明字段被 extra=ignore 吞掉，不炸
+    assert not hasattr(settings, "mem_limit")
+    assert "mem_limit" not in ESSettings.model_fields
+
+
+def test_es_index_prefix_rejects_illegal_chars(monkeypatch):
+    """index_prefix 非法字符拒收：大写/连字符/空格/超长一律 ValidationError
+    （ES 索引名合法字符子集收紧——防 \\/*?"<>| 空格,# 等注入索引名）。"""
+    for bad in ("AI_SEARCH", "ai-search", "ai search", "ai/search", "a" * 33):
+        monkeypatch.setenv("ES_INDEX_PREFIX", bad)
+        with pytest.raises(ValidationError):
+            ESSettings(_env_file=None)
+
+
+def test_es_password_secretstr_masks(monkeypatch):
+    """ES_PASSWORD SecretStr 打码：repr / str / model_dump(json) 全打码，
+    取值仅经 get_secret_value()（配置层安全口径）。"""
+    monkeypatch.setenv("ES_PASSWORD", "es-only-secret")
+    settings = ESSettings(_env_file=None)
+    assert "es-only-secret" not in repr(settings)
+    assert "es-only-secret" not in str(settings)
+    assert "es-only-secret" not in settings.model_dump_json()
+    assert settings.password.get_secret_value() == "es-only-secret"
+
+
 # ---- 模块级单例 ----
 
 
 def test_module_singletons_instantiated():
-    """十一个分组单例随模块导入即实例化（业务代码 import 即用，无第二实例化路径）。"""
+    """十二个分组单例随模块导入即实例化（业务代码 import 即用，无第二实例化路径）。"""
     from app.core import config as config_module
 
     pairs = (
@@ -714,6 +782,7 @@ def test_module_singletons_instantiated():
         ("sandbox_settings", SandboxSettings),
         ("sse_settings", SseSettings),
         ("kb_settings", KbSettings),
+        ("es_settings", ESSettings),
     )
     for name, cls in pairs:
         assert isinstance(getattr(config_module, name), cls), name

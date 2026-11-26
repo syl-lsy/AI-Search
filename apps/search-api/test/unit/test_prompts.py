@@ -195,7 +195,7 @@ def test_rewrite_prompt_slimmed_v1_33() -> None:
         PROMPTS_CONFIG["prompts"]["fast.rewrite"],
         load_builtin_prompt("fast.rewrite"),
     ):
-        assert "一次完成三件事" in text
+        assert "一次完成四件事" in text  # B19 四件事（+kb_route 字段说明+判据）
         assert "① 指代消解" in text
         assert "② 产出 queries" in text
         assert "③ 输入安全初判" in text

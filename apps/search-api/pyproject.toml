@@ -67,6 +67,14 @@ dependencies = [
     #    R8/R16 同口径；test_kb_feishu_client.py）。传递依赖 websockets<16,>=11
     #    由 uv.lock 既有解析 15.0.1 满足（依赖组迁移零重解析漂移——lock 后已核对）。
     "lark-oapi==1.8.0",
+    # ── M3 批次 4（B18）ES BM25 写入通道：官方 elasticsearch[async] 客户端，
+    #    == 8.4.1 与 server 8.4.1 精确同版（jieba 插件 descriptor 已把 server 锁死在
+    #    8.4.1——client 同版使兼容矩阵退化为单点，plan B18 §4.5；升版=R23 三联动：
+    #    server+client+插件重构建）。helpers.async_bulk 的逐 item 错误聚合是写入
+    #    失败判定的依赖面（pipeline EsIndexError 转 failed 不静默 ready）。
+    #    传递依赖 elastic-transport + aiohttp（aiohttp 沿 uv.lock 既有 3.14.5 解析，
+    #    lock 后核对未被抬版）。
+    "elasticsearch[async]==8.4.1",
 ]
 
 [build-system]
@@ -130,6 +138,11 @@ dev = [
     # == 钉版（2026-11-13 PyPI 当日稳定版 2.10.1）；其传递依赖自带 pip（uv venv 默认无 pip，
     #    环境枚举所需随装即用）
     "pip-audit==2.10.1",
+    # B19 P3#6（b4 交付说明 §三 #6 收口）：golden BM25 探针 scripts/probe_es_bm25_golden.py
+    #   直依赖 openpyxl（黄金集 xlsx 题面读取）——原靠 docling 传递依赖隐性供货（版本
+    #   漂移不受控面），dev 组显式声明 == 锁定（值 = uv.lock 既有解析 3.1.5，零新装面）。
+    #   dev-only 不进生产闭包。
+    "openpyxl==3.1.5",
 ]
 
 [tool.pytest.ini_options]
@@ -140,4 +153,5 @@ markers = [
     "requires_langfuse: 需要 Langfuse 运行（读 .env.test LANGFUSE_ 组；缺凭证时 skip）",
     "requires_llm: 需要 LiteLLM 网关与本地 light 模型（读 .env LITELLM_ 组；网关/别名不可达时 skip）",
     "requires_search: 需要搜索源凭证（读 .env MCP 凭证组；缺凭证逐源 skip）",
+    "requires_es: 需要真实 Elasticsearch（core/config es_settings 缺省 127.0.0.1:19200；ES 不可达时 skip——make infra-up 起 elasticsearch）",
 ]

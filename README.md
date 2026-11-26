@@ -25,7 +25,7 @@ make dev-frontend                        # Vite :5173（/api 代理 → http://1
 
 ## S0 基础设施栈（批次 1 已闭环）
 
-`deploy/docker-compose.yml`，11 个服务（含 searxng，见下方备源组件）全部绑 127.0.0.1：
+`deploy/docker-compose.yml`，12 个服务（含 searxng 备源与 elasticsearch 全文索引，见下方备源组件段）全部绑 127.0.0.1：
 
 | 组件 | 宿主端口 | 说明 |
 |---|---|---|
@@ -37,6 +37,7 @@ make dev-frontend                        # Vite :5173（/api 代理 → http://1
 | redis | 16379 | 共享缓存（litellm `REDIS_DB=1` 索引隔离复用） |
 | crawl4ai | 11235 | 自部署读取备胎（`url_reader_backup`，MCP `/mcp/sse`） |
 | opensandbox | 8801 | 代码沙箱（M4 启用） |
+| elasticsearch 8.4.1 | 19200 | KB BM25 全文索引（自建 jieba 镜像 `ai-search/elasticsearch-jieba:8.4.1`；M3 批次 4/B18 落地；**xpack basic auth 已开启**——.env `ES_USERNAME=elastic`/`ES_PASSWORD` 必填，缺则 compose 拒起；`make kb-es-backfill` 回填/重建/审计，`kb.es_enabled` 灰度开关） |
 
 备源组件（批次 4 已落地）：SearXNG :18080（镜像锁 tag `2026.9.8-3fdc6d753`；`make infra-up` 起栈自启，需 .env `SEARXNG_SECRET`——该版本镜像对默认 secret_key 硬拒绝启动）；接入性验证 PASS（延迟 P50 1.32s / P95 3.02s，显著优于 AnySearch 实测 5.9~7.9s；上游引擎 CAPTCHA/限流残余风险与回退门 `searxng.enabled=false` 见 ARCHITECTURE §10 R12）。批次 5（2026-11-11）起标准 `make dev` 形态下链首**真装载**（`.env` 的 `SEARXNG_*` 经 `McpCredentialSettings` 生效——此前后端未声明三字段导致 `.env` 有值但 wrapper 装不上，降级链退化为 AnySearch 独担；缺口已修），且 Nacos 运行时 mcp.json 已发布 v1.18（六源含 searxng、anysearch 降为次级）。
 
@@ -48,7 +49,7 @@ python3 scripts/infra_smoke/gen_env.py    # 生成 .env 容器侧密钥（自动
 # 上游密钥人工填 .env 的 <secret> 占位（Tavily / BoCha / AnySearch、智谱 / 百炼等，脚本不代填）
 make infra-up                             # 起栈（compose --project-directory . -f deploy/docker-compose.yml）
 NACOS_INIT_USER=<管理员> NACOS_INIT_PASS=<密码> make nacos-init   # 五 dataId 初始化（覆写保护默认开，AI 不经手）
-make smoke-infra                          # 七组件逐一 smoke（postgres/nacos/minio/langfuse/litellm/sandbox/crawl4ai）
+make smoke-infra                          # 八组件逐一 smoke（postgres/nacos/minio/langfuse/litellm/sandbox/crawl4ai/elasticsearch）
 ```
 
 初始化细节（Nacos 鉴权与只读账号、dataId 顺序）见 `AGENTS.md`「S0 基建 UI 初始化 checklist」与 `docs/s0-batch1-handoff.md`。
@@ -67,6 +68,7 @@ make smoke-infra                          # 七组件逐一 smoke（postgres/nac
 | `make test-frontend` | 前端三层一次跑全（unit/integration/component，含 80% 覆盖率门禁） |
 | `make test-frontend-unit` / `-integration` / `-component` | 前端分层单跑 |
 | `make test-changed` | 按 git 变更跑关联测试（开发期快速回归，非 git 仓库明确报错） |
+| `make kb-es-backfill` | KB ES 存量回填/重建/审计（M3 批次 4/B18；缺省 backfill 幂等；`ARGS="--mode rebuild"` 删索引重建、`ARGS="--mode audit"` 只读核对，`--purge-orphans` 清孤儿） |
 | `make typecheck` | 前端 vue-tsc 全量静态检查 + 后端段（链式调 `typecheck-backend`） |
 | `make typecheck-backend` | 后端正式门禁：pyright basic + ruff（B1 钉版 pyright==1.1.414 / ruff==0.17.4） |
 | `make build-frontend` | 前端生产构建（vue-tsc + vite build → `frontend/dist/`；批次 9 安全审计 R2 生产 CSP 形态核对入口——产物 script 应全为 src 外链） |

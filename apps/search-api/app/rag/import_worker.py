@@ -697,7 +697,8 @@ class FeishuImportWorker:
 
     依赖全注入（jobs/docs 仓储、client 工厂、入库流水线、spec 快照供给、MinIO
     工厂、级联清理协作者）——单测注入假体零网络零 DB；生产经 `get_import_worker`
-    装配。`es_indexer` 为 B18 seam（真 ES 删除腿未实装——注入 None 时零操作）。
+    装配。`es_indexer` 为删除级联 ES 腿（B18 实装——生产注入 get_kb_es_indexer()，
+    注入 None 时零操作=灰度安全兜底）。
     """
 
     def __init__(
@@ -1335,9 +1336,10 @@ class FeishuImportWorker:
 
         docx：blocks → **共享构建段**（`_build_docx_tree`——tokens/obj_map 全量供给
         + sheet(30) 回填，评审 P1：与 ingest 同组合是同源比对的结构前提；config 取
-        `ChunkingConfig()` 缺省不影响 hash——document_content_hash 只由叶子单元文本
-        构成、与切分窗配置无关）→ 全文扁平正文 hash；file：下载原件 → 归一化正文 →
-        同口径 hash。拉取失败 → 哨兵值（与本地恒异 → 保守重导，不静默跳过）。
+        `ChunkingConfig()` 缺省不影响 hash——B19 方案 A 起 document_content_hash 由
+        叶子单元文本 + 标题结构清单构成，仍与切分窗配置无关）→ 全文扁平正文 +
+        结构清单 hash；file：下载原件 → 归一化正文 → 同口径 hash。拉取失败 →
+        哨兵值（与本地恒异 → 保守重导，不静默跳过）。
         """
         try:
             from app.rag.chunker import ChunkingConfig, chunk_forest
@@ -1544,11 +1546,13 @@ def get_import_worker() -> FeishuImportWorker:
     """进程级单例（REST BackgroundTasks / 定时任务 / 启动钩子重入队同缝）。
 
     首次调用惰性装配：真仓储 + get_default_feishu_client（凭据只经 settings 单例读）
-    + KB 入库流水线单例 + MinIO 惰性工厂；es_indexer=None（真 ES 删除腿挂 B18——
-    app/rag/indexers 落地后注入）。start()/stop() 由宿主 lifespan 承担。
+    + KB 入库流水线单例 + MinIO 惰性工厂 + ES 索引器（B18——级联删除 ES 腿接线，
+    消费点与签名零改动）。start()/stop() 由宿主 lifespan 承担。
     """
     global _import_worker_instance
     if _import_worker_instance is None:
+        from app.rag.indexers.es_indexer import get_kb_es_indexer
+
         _import_worker_instance = FeishuImportWorker(
             jobs=KbImportJobRepository(),
             docs=FeishuImportDocRepository(),
@@ -1556,5 +1560,6 @@ def get_import_worker() -> FeishuImportWorker:
             pipeline=get_kb_pipeline(),
             spec_payload_provider=_default_spec_payload,
             minio_client=get_kb_minio_client,
+            es_indexer=get_kb_es_indexer(),
         )
     return _import_worker_instance

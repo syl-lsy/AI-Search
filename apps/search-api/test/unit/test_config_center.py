@@ -381,14 +381,38 @@ class TestKbSeedDefaults:
     兜住双投影。
     """
 
-    def test_kb_seed_has_exactly_thirteen_keys(self):
+    def test_kb_seed_keys_b19_surface(self):
+        """kb 节键集锁定（nacos-config §3 v1.46 B19 增 `embedding_enabled` + `route`
+        子节——13 → 15 键；键面扩容=文档性扩展，校验层全部 Optional 灰度安全）。"""
         kb = BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
-        assert len(kb) == 13
+        assert len(kb) == 15
         assert set(kb) == {
             "top_k_per_query", "rerank_timeout_s",
             "per_query_top_k", "rrf_k", "kb_fuse_top_k", "max_rerank_candidates",
             "dual_channel_timeout_s", "es_enabled", "chunk_size", "chunk_overlap",
             "type_weights", "chunking", "normalizer",
+            "embedding_enabled", "route",
+        }
+        # v1.46 建议值（修订注 4：min_top1_score=0.012——单 query 双通道同命 rank1
+        # =1/61≈0.0164 的阈值上浮；plan 0.05 不可达会致门控/纠错恒触发）
+        assert kb["embedding_enabled"] is False
+        assert kb["route"] == {
+            "default": "hybrid",
+            "correction_enabled": False,
+            "min_kb_sources": 2,
+            "min_top1_score": 0.012,
+        }
+
+    def test_deep_reflect_gate_seed(self):
+        """deep.reflect_gate 子节（v1.46 B19——enabled 缺省 false 灰度；min_top1_score
+        =0.3 按 rerank relevance 实测量级钉定）。"""
+        deep = BUILTIN_DEFAULTS[SPEC_DATA_ID]["deep"]
+        assert deep["reflect_gate"] == {
+            "enabled": False,
+            "min_sources": 5,
+            "min_top1_score": 0.3,
+            "max_failed_ratio": 0.2,
+            "min_outline_coverage": 0.6,
         }
 
     def test_kb_legacy_two_keys_unchanged(self):

@@ -382,3 +382,118 @@ def test_rerank_via_gateway_raises_on_http_error() -> None:
             ))
     finally:
         fuse_module.httpx.AsyncClient = original
+
+
+# ---------------------------------------------------------------------------
+# B19 基数上界截取 + KB 来源卡 + kb_only 兜底留痕（plan §4.3 / R27）
+# ---------------------------------------------------------------------------
+
+
+def _kb_card(chunk_id: str, *, score: float = 0.05, doc_id: str = "44444444-4444-4444-8444-000000000001") -> dict[str, Any]:
+    return {
+        "chunk_id": chunk_id,
+        "kb_doc_id": doc_id,
+        "title": "第一章",
+        "content": f"KB 正文 {chunk_id}",
+        "snippet": f"KB 正文 {chunk_id}",
+        "score": score,
+        "origin": "kb",
+        "heading_path": ["示例文档", "第一章"],
+        "node_id": f"loc:blk:{chunk_id}",
+    }
+
+
+def _capped_state(fused: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {"fused": list(fused), "query": "q", "spec": _spec(), "images_raw": []}
+    state.update(extra)
+    return state
+
+
+class TestRerankBaseCap:
+    async def test_31_candidates_rerank_documents_exactly_30(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """① 基数上界（R27 行为增量显式测试）：31 候选 → rerank documents 恰 30。"""
+        seen = _mock_reranker(monkeypatch, [1.0] * 30)
+        fused = [
+            {**_cand(f"https://a.example/{i}"), "score": 0.9 - i * 0.01} for i in range(20)
+        ] + [_kb_card(f"kb-{i}", score=0.05) for i in range(11)]
+        _stages(monkeypatch)
+        _sources(monkeypatch)
+        await fuse_rerank(_capped_state(fused))
+        assert len(seen[0]) == 30
+
+    async def test_truncated_not_into_rerank_but_candidates_pool_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """② 被截者不进 rerank 不丢来源池：KB 卡优先保入（rerank 主要受益面），
+        web 按得分竞争余量；sources 事件=fused topN（供给面语义不变）。"""
+        seen = _mock_reranker(monkeypatch, [1.0] * 30)
+        kb_cards = [_kb_card(f"kb-{i}", score=0.05) for i in range(25)]
+        web = [{**_cand(f"https://a.example/{i}"), "score": 0.5} for i in range(10)]
+        batches = _sources(monkeypatch)
+        _stages(monkeypatch)
+        await fuse_rerank(_capped_state(kb_cards + web))
+        docs = seen[0]
+        assert len(docs) == 30
+        assert sum(1 for d in docs if d == "第一章") == 25  # KB 全保（rerank documents=投影 title）
+        assert sum(1 for d in docs if d.startswith("t:")) == 5  # web 得分竞争余量
+        assert len(batches[0]["batch"]) == 10  # topN 截断照常（供给面=fused 序 topN）
+
+    async def test_zero_kb_round_beyond_cap_web_only_slice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """纯 web 轮超上界 → 按得分截 30 进 rerank——零 rerank 门控保持（回归）。"""
+        seen = _mock_reranker(monkeypatch, [1.0] * 30)
+        web = [{**_cand(f"https://a.example/{i}"), "score": 0.9 - i * 0.01} for i in range(35)]
+        _stages(monkeypatch)
+        _sources(monkeypatch)
+        await fuse_rerank(_capped_state(web))
+        assert seen == []  # 纯 web 零 rerank（门控回归——被截者不进 rerank）
+
+
+class TestKbSourceCard:
+    async def test_kb_source_item_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """③ KB 来源卡 _source_item：source_type=kb / kb_doc_id+kb_chunk_id 恒带 /
+        url=None / title=heading 尾段 / snapshot_available=False。"""
+        _mock_reranker(monkeypatch, [1.0])
+        batches = _sources(monkeypatch)
+        kb = _kb_card("kb-1", score=0.0163)
+        await fuse_rerank(_capped_state([kb]))
+        card = batches[0]["batch"][0]
+        assert card["source_type"] == "kb"
+        assert card["kb_doc_id"] == "44444444-4444-4444-8444-000000000001"
+        assert card["kb_chunk_id"] == "kb-1"
+        assert card["url"] is None
+        assert card["title"] == "第一章"
+        assert card["snapshot_available"] is False
+
+    async def test_web_source_item_keeps_legacy_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """④ web 卡形状回归：source_type=web / kb_doc_id=None（既有面零变化）。"""
+        batches = _sources(monkeypatch)
+        await fuse_rerank(_capped_state([_cand("https://a.example/1")]))
+        card = batches[0]["batch"][0]
+        assert card["source_type"] == "web"
+        assert card["kb_doc_id"] is None
+
+
+class TestKbOnlyFallbackTrace:
+    async def test_kb_only_zero_hit_correction_on_marks_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """kb_only + 零 KB + correction_enabled → errors kb_only_fallback_web
+        （纠错回边补 web 留痕——不置 degraded）。"""
+        _mock_reranker(monkeypatch, [])
+        spec = _spec()
+        spec["kb"]["es_enabled"] = True
+        spec["kb"]["route"] = {"default": "hybrid", "correction_enabled": True}
+        state = _capped_state([], spec=spec, kb_route="kb_only")
+        _sources(monkeypatch)
+        _stages(monkeypatch)
+        update = await fuse_rerank(state)
+        assert update["errors"] == [{"stage": "search", "reason": "kb_only_fallback_web"}]
+        assert "degraded" not in update
+
+    async def test_kb_only_gray_off_no_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """correction_enabled=false（灰度缺省）→ 零留痕（现状路径）。"""
+        _mock_reranker(monkeypatch, [])
+        spec = _spec()
+        spec["kb"]["es_enabled"] = True
+        spec["kb"]["route"] = {"default": "hybrid", "correction_enabled": False}
+        state = _capped_state([], spec=spec, kb_route="kb_only")
+        _sources(monkeypatch)
+        _stages(monkeypatch)
+        update = await fuse_rerank(state)
+        assert update.get("errors") is None or update["errors"] == []

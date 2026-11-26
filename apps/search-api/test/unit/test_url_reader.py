@@ -558,7 +558,8 @@ def test_deep_tool_names_declare_snapshot_as_deep_only() -> None:
     """契约 3 工具面（DEV §9）：子代理可见面 = web_search + firecrawl_read + save_snapshot。"""
     from app.agent.tools.deep_tools import DEEP_TOOL_NAMES
 
-    assert set(DEEP_TOOL_NAMES) == {"web_search", "firecrawl_read", "save_snapshot"}
+    # B19 +kb_search（plan §4.7 deep 检索等价升级——KB 语料=外部内容三防线在位）
+    assert set(DEEP_TOOL_NAMES) == {"web_search", "firecrawl_read", "save_snapshot", "kb_search"}
     assert DEEP_TOOL_NAMES.isdisjoint(SEARCH_SOURCE_NAMES)
 
 

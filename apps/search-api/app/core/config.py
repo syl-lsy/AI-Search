@@ -2,7 +2,8 @@
 
 组划分与 docs/ARCHITECTURE.md §7 .env 变量清单一一对应：无前缀=通用组，
 DB_/MINIO_/NACOS_/LITELLM_/MCP 凭据组（无前缀）/LANGFUSE_/SANDBOX_/SSE_/KB_/LOG_
-各一组；`db_settings` 等单例全局读取，业务代码禁止另建 Settings 实例重复读环境。
+FEISHU_/ES_ 各一组；`db_settings` 等单例全局读取，业务代码禁止另建 Settings 实例
+重复读环境。
 
 compose 消费型变量**不在此声明**（注入对应容器、应用不读取，§7 例外清单）：
 - NACOS_AUTH_* 四变量（注入 nacos 容器开启鉴权）；
@@ -12,7 +13,10 @@ compose 消费型变量**不在此声明**（注入对应容器、应用不读�
   Langfuse 容器侧五件套与 AI_API_KEY（SALT/ENCRYPTION_KEY/NEXTAUTH_SECRET/
   DB_PASSWORD/AI_API_KEY）、ZHIPU_*/DASHSCOPE_*/OTEL_*/LANGSMITH_* 等上游组；
 - SEARXNG_SECRET（注入 searxng 容器 Flask secret_key，应用不读取；test_config.py
-  按反例断言其不入 McpCredentialSettings）。
+  按反例断言其不入 McpCredentialSettings）；
+- ES_MEM_LIMIT（注入 elasticsearch 容器 mem_limit，应用不读取；M3 批次 4 B18；
+  不变量「堆 ≤ mem_limit/2」——ES_JAVA_OPTS 512m 钉在 compose 侧，test_config.py
+  按反例断言其不入 ESSettings）。
 pydantic-settings 对未声明的环境变量按 extra="ignore" 忽略——勿按前缀全量声明进组
 （单测 test_config.py 按 §7 例外清单逐组兜住）。
 
@@ -27,6 +31,7 @@ pydantic-settings 对未声明的环境变量按 extra="ignore" 忽略——勿�
 （config_center，五 dataId 键位见 docs/contract/nacos-config.md）；与环境无关的
 纯逻辑值 → 代码常量。密钥绝不入 Nacos。
 """
+import re
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
@@ -266,6 +271,34 @@ class FeishuSettings(BaseSettingsWithEnv):
     model_config = {"env_prefix": "FEISHU_"}
 
 
+# Elasticsearch（ES_，M3 批次 4 / B18）：应用读五键（host/port/username/password/
+# index_prefix）——rag/indexers/es_client.py 工厂经 es_settings 单例读；连接目标仅取
+# 自部署配置（本组字段），不来自请求参数或用户输入（SSRF 面口径同模块 docstring）。
+# ES_MEM_LIMIT 为 compose 消费型（注入容器 mem_limit，应用不读取）——沿
+# SEARXNG_SECRET 例外清单先例，组注记、不声明字段。
+# 开关不在 settings：kb.es_enabled 是 Nacos Agent Spec 键（pipeline.read_es_enabled，
+# 非严格布尔缺省 false 灰度安全）——本组零开关键。六键全缺省=零 .env 可跑
+# （新机器 cp .env.example .env 不填 ES_ 段即可起 ES 并跑通）。
+class ESSettings(BaseSettingsWithEnv):
+    host: str = "127.0.0.1"
+    port: Port = 19200  # 9200+10000 惯例（postgres 15432 / redis 16379 同族）
+    username: str = ""  # 空=不带 basic auth（compose 侧 xpack.security.enabled=false）
+    password: SecretStr = SecretStr("")  # 与 username 成对；SecretStr 全链路打码
+    index_prefix: str = "ai_search"  # 索引名前缀（data-model §1.19 {prefix}_kb_chunks）
+    model_config = {"env_prefix": "ES_"}
+
+    @field_validator("index_prefix")
+    @classmethod
+    def _validate_index_prefix(cls, value: str) -> str:
+        # ES 索引名合法字符子集收紧：小写字母/数字/下划线
+        #（防 \/*?"<>| 空格,# 等非法字符注入索引名）
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", value):
+            raise ValueError(
+                f"ES_INDEX_PREFIX 必须为小写字母/数字/下划线（1~32 位），得到：{value!r}"
+            )
+        return value
+
+
 # ---- 模块级单例：业务代码 import 即用（与分组一一对应）----
 
 common_settings = CommonSettings()
@@ -280,3 +313,4 @@ sandbox_settings = SandboxSettings()
 sse_settings = SseSettings()
 kb_settings = KbSettings()
 feishu_settings = FeishuSettings()
+es_settings = ESSettings()

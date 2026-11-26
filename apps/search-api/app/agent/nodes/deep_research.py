@@ -109,6 +109,8 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agent.external_content import external_content
+from app.agent.nodes.kb_search import _candidate_from_row
+from app.rag.retrieval import kb_channels_enabled
 from app.agent.graphs.signals import emit_sources, emit_stage
 from app.agent.guards import TurnCanceledSignal, ensure_not_canceled
 from app.agent.llm import build_chat_model, resolve_chat_alias
@@ -249,6 +251,9 @@ class _Deps:
     #: B15 内容侧护栏（research() 装载一次：load_content_guard_config(spec)——缺子节
     #: 回落 defaults 种子=部署即启用；None=直构测试面护栏关闭）
     guards: ContentGuardConfig | None = None
+    #: B19 KB 检索通道（TurnRunner configurable 注入 get_kb_retriever()；None=通道
+    #: 关闭/装配缺失——工具面降级引导文本，灰度安全）
+    kb_retriever: Any | None = None
 
 
 class _Recorder:
@@ -297,21 +302,54 @@ class _Recorder:
         self.searched.setdefault(query, None)
 
     def add_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """新 URL 候选入册并发射 sources 批次（ref_no 首现冻结；重叠 URL 跳过）。"""
+        """新候选入册并发射 sources 批次（ref_no 首现冻结；重叠键跳过）。
+
+        B19 KB 卡（plan §4.7 deep 检索等价升级）：无 url 候选（origin="kb"）不再
+        静默丢——入册键 = `kb:{chunk_id}`（ref_by_url 统一账本键域扩展），batch 条目
+        source_type="kb" + kb_doc_id/kb_chunk_id 恒带（api.md §7.2 v1.30「KB 来源
+        恒携带」）+ url=None（§2.5 示例形态）。web 卡形态零变化。
+        """
         batch: list[dict[str, Any]] = []
         for candidate in candidates:
             url = candidate.get("url")
-            if not isinstance(url, str) or not url or url in self.ref_by_url:
-                continue
-            self.ref_by_url[url] = len(self.ref_by_url) + 1
+            is_kb = candidate.get("origin") == "kb" or (
+                isinstance(candidate.get("origin"), list) and "kb" in (candidate.get("origin") or [])
+            )
+            if is_kb:
+                ledger_key = f"kb:{candidate.get('chunk_id')}"
+                if not candidate.get("chunk_id") or ledger_key in self.ref_by_url:
+                    continue
+            else:
+                ledger_key = url if isinstance(url, str) and url else None
+                if not ledger_key or ledger_key in self.ref_by_url:
+                    continue
+            self.ref_by_url[ledger_key] = len(self.ref_by_url) + 1
             # M2 批次 3 增量：state 侧候选附 ref_no（增量键）——ref_no 冻结账本入 state，
             # supplement（deep_supplement._next_ref_no）与 finalize（批次 4）跨节点续编
-            # 消费；批次 payload 形态零变更（下方 batch 仍 9 键）
-            self.candidates.append({**candidate, "ref_no": self.ref_by_url[url]})
+            # 消费；web 卡 payload 形态零变更
+            self.candidates.append({**candidate, "ref_no": self.ref_by_url[ledger_key]})
+            if is_kb:
+                chunk_id = str(candidate.get("chunk_id"))
+                score = candidate.get("score")
+                batch.append(
+                    {
+                        "source_id": str(uuid_module.uuid4()),  # 占位——TurnRunner 以行 id 回写
+                        "ref_no": self.ref_by_url[ledger_key],
+                        "source_type": "kb",
+                        "title": str(candidate.get("title") or ""),
+                        "url": None,
+                        "snippet": str(candidate.get("snippet") or ""),
+                        "score": float(score) if isinstance(score, (int, float)) else 0.0,
+                        "snapshot_available": False,
+                        "kb_doc_id": str(candidate.get("kb_doc_id")) if candidate.get("kb_doc_id") else None,
+                        "kb_chunk_id": chunk_id,
+                    }
+                )
+                continue
             batch.append(
                 {
                     "source_id": str(uuid_module.uuid4()),  # 占位——TurnRunner 以行 id 回写
-                    "ref_no": self.ref_by_url[url],
+                    "ref_no": self.ref_by_url[ledger_key],
                     "source_type": "web",
                     "title": str(candidate.get("title") or url),
                     "url": url,
@@ -511,6 +549,92 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
         return external_content(_neutralize_content(text), source="web_search", kind="web")
 
     @tool
+    async def kb_search(query: str) -> str:
+        """检索用户知识库中的私有文档切片（标题/相关度/原文摘录）。仅当问题指向用户上传或导入的私有文档内容时使用；公共网络信息请改用 web_search。"""
+        if deps.kb_retriever is None:
+            return "（系统注：知识库检索通道未启用，请改用 web_search。）"
+        retriever = deps.kb_retriever
+        es_on, vec_on = kb_channels_enabled(deps.spec if isinstance(deps.spec, Mapping) else {})
+        if not (es_on or vec_on):
+            return "（系统注：知识库检索通道未启用，请改用 web_search。）"
+        query = (query or "").strip()
+        if not query:
+            return "（系统注：query 不能为空，请给出检索词。）"
+        recorder.record_search(query)
+        raw_kb = deps.spec.get("kb") if isinstance(deps.spec, Mapping) else None
+        kb_section = raw_kb if isinstance(raw_kb, Mapping) else {}
+        timeout_s = float(kb_section.get("dual_channel_timeout_s") or 3)
+        top_k = kb_section.get("per_query_top_k") if isinstance(kb_section.get("per_query_top_k"), int) else 30
+        bm_rows: list[dict[str, Any]] = []
+        vec_rows: list[dict[str, Any]] = []
+        failed_channels: list[str] = []
+        # 修订注 5（修正——fast 同构）：两通道 asyncio.gather 真并发 + 各腿
+        # asyncio.timeout(timeout_s) 包络——并发下整轮最坏 ≈timeout_s；单腿超时
+        # 仅该腿降级、另一腿结果保留
+        async def _run_bm25() -> list[dict[str, Any]]:
+            async with asyncio.timeout(timeout_s):
+                return await retriever.bm25_search(
+                    query, user_id=deps.user_id, k=top_k
+                )
+
+        async def _run_vector() -> list[dict[str, Any]]:
+            async with asyncio.timeout(timeout_s):
+                return await retriever.vector_search(
+                    query, user_id=deps.user_id, k=top_k
+                )
+
+        legs: list[tuple[str, Any]] = []
+        if es_on:
+            legs.append(("bm25", _run_bm25()))
+        if vec_on:
+            legs.append(("vector", _run_vector()))
+        outcomes = await asyncio.gather(
+            *(leg for _, leg in legs), return_exceptions=True
+        )
+        for (channel, _), outcome in zip(legs, outcomes):
+            if isinstance(outcome, BaseException):  # noqa: BLE001 —— 通道失败互兜底
+                failed_channels.append(channel)
+                recorder.record_error(
+                    {
+                        "stage": "search",
+                        "reason": (
+                            "kb_es_unavailable"
+                            if channel == "bm25"
+                            else "kb_vector_unavailable"
+                        ),
+                    }
+                )
+                del outcome
+            elif channel == "bm25":
+                bm_rows = outcome
+            else:
+                vec_rows = outcome
+        row_list = bm_rows + vec_rows
+        candidates = [
+            _candidate_from_row(row, query_index=0, rank=rank)
+            for rank, row in enumerate(row_list, start=1)
+        ]
+        # B15 顺序锁：add_candidates 前逐候选注入扫描——drop 不占 ref_no（ref_no 首现
+        # 冻结发生在 add_candidates，过滤先于入册即来源卡/[n] 自然一致）
+        filtered, filter_errors = filter_candidates(candidates, deps.guards, stage="search")
+        for error in filter_errors:
+            recorder.record_error(error)
+        recorder.add_candidates(filtered)
+        if not filtered:
+            return "（系统注：知识库无相关内容，请调整检索词或改用 web_search。）"
+        lines: list[str] = []
+        for item in filtered:
+            # ref_no 以入册账本为准（add_candidates 首现冻结——单一事实源）
+            ref_no = deps.recorder.ref_by_url.get(f"kb:{item.get('chunk_id')}")
+            lines.append(
+                f"[{ref_no}] {item.get('title')}（score={item.get('score', 0.0)}）\n摘录: {str(item.get('content') or '')[:300]}"
+            )
+        text = "\n\n".join(lines)
+        if failed_channels:
+            text += f"\n\n（系统注：知识库通道 {'/'.join(failed_channels)} 暂不可用，结果可能不全。）"
+        return external_content(_neutralize_content(text), source="kb_search", kind="kb")
+
+    @tool
     async def firecrawl_read(url: str, offset: int = 0, limit: int | None = None) -> str:
         """读取 URL 页面正文（token 窗口；外部内容包裹；读取成功自动保存网页快照）。"""
         guidance = await _read_guidance_or_none(url, deps)
@@ -620,7 +744,7 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
             f" reused={meta.get('reused')}"
         )
 
-    return [web_search, firecrawl_read, save_snapshot_tool]
+    return [web_search, kb_search, firecrawl_read, save_snapshot_tool]
 
 
 # ---- 装配面（OQ-33 探针钉正形态）----
@@ -1015,6 +1139,8 @@ async def research(state: Any, config: RunnableConfig | None = None) -> dict[str
         time_range=state.get("time_range") if isinstance(state.get("time_range"), str) else None,
         # B15：内容侧护栏轮内装载一次（缺子节回落 defaults 种子=部署即启用）
         guards=load_content_guard_config(spec),
+        # B19：KB 检索通道注入（fast kb_search 同一 configurable 缝；None=灰度关闭）
+        kb_retriever=configurable.get("kb_retriever"),
     )
 
     sem = asyncio.Semaphore(_max_subagents(deep_spec))

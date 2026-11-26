@@ -181,6 +181,12 @@ export interface StageExtra {
   decision_source?: string
   /** api.md §7.2/§2.5 v1.27 finalize 越界引用剔除计数留痕：deep 轮 stage(write,done) extra 携带剔除处数（**仅 >0 时携带**，零剔除零键——键可省略不置 null，沿 v1.12 images 先例）；观测/评测判读键、前端零渲染义务（宽松 number 类型；值本身即计数无值域扩容面） */
   citation_dropped?: number
+  /** api.md v1.33 零面判定行（B19）：kb_route 三档路由留痕——值域 kb_only|kb_first|hybrid，仅 stage(rewrite,done) 携带且仅非缺省值（hybrid=灰度缺省键可省，沿 v1.12 images 先例不置 null）；前端零渲染义务（宽松 string 同 strategy/decision_source 先例，值域扩容零类型形状变更） */
+  kb_route?: string
+  /** api.md v1.33 零面判定行（B19）：fast 有界纠错轮标记——纠错第二趟的 stage(rewrite,done) extra 携带 correction:true（纠错轮=既有 stage 事件重复发射〔同 key 多次出现合法〕，零新事件类型）；前端零渲染义务（宽松 boolean） */
+  correction?: boolean
+  /** api.md v1.33 零面判定行（B19）：融合链路观测投影（A35 可观测留痕）——stage(search,done) extra 携带 {per_query_top_k, rrf_k, kb_fuse_top_k, es_hits, vec_hits, type_weights}（通道活跃副本才携带，键可省）；观测/评测判读键、前端零渲染义务（宽松 Record<string, unknown>） */
+  kb_funnel?: Record<string, unknown>
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */

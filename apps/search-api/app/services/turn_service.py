@@ -600,7 +600,14 @@ async def get_turn_detail(
                 score=float(row.score) if row.score is not None else 0.0,
                 # M2（0012/m2_deep）起真实推导：深度已读原文行带 snapshot_id → true
                 snapshot_available=row.snapshot_id is not None,
-                kb_doc_id=None,  # 分期口径：M3（kb_doc_id 列）起真实值
+                # M3（0013 列 + B19 接线）起真实值：kb_doc_id 行列直投；
+                # kb_chunk_id = kb_chunk_ids[0]（溯源下钻 §4.6 解析键——web 行 None）
+                kb_doc_id=str(row.kb_doc_id) if row.kb_doc_id is not None else None,
+                kb_chunk_id=(
+                    str(row.kb_chunk_ids[0])
+                    if isinstance(row.kb_chunk_ids, list) and row.kb_chunk_ids
+                    else None
+                ),
             )
             for row in source_rows
         ],
@@ -1739,10 +1746,22 @@ class ThreadScheduler:
                         url=card.get("url"),
                         snippet=card.get("snippet"),
                         score=Decimal(str(score)) if score is not None else None,
+                        # B19 KB 来源回链（供给面补行同口径——引用供给编号恒等）
+                        kb_doc_id=card.get("kb_doc_id"),
+                        kb_chunk_ids=(
+                            [str(card["kb_chunk_id"])] if card.get("kb_chunk_id") else None
+                        ),
                     )
                 )
             await session.commit()
         ctx.sources_count = len(fused)
+
+    def _kb_retriever(self) -> Any:
+        """KB 检索通道生产装配（B19——惰性单例 get_kb_retriever；与 get_kb_pipeline
+        的 es_indexer 惰性 import 同款：装配缺失/依赖未装不阻断服务启动）。"""
+        from app.rag.retrieval import get_kb_retriever
+
+        return get_kb_retriever()
 
     async def _publish_and_persist(
         self,
@@ -1781,6 +1800,11 @@ class ThreadScheduler:
                         url=item.get("url"),
                         snippet=item.get("snippet"),
                         score=Decimal(str(score)) if score is not None else None,
+                        # B19 KB 来源回链（0013 列接线——plan B5）：web 卡两列 None
+                        kb_doc_id=item.get("kb_doc_id"),
+                        kb_chunk_ids=(
+                            [str(item["kb_chunk_id"])] if item.get("kb_chunk_id") else None
+                        ),
                     )
                 )
             business["batch"] = [
@@ -2622,6 +2646,9 @@ class ThreadScheduler:
                             "search_chain": search_chain,
                             "read_chain": read_chain,
                             "tools_registry": tools_registry,
+                            # B19：KB 检索通道（fast kb_search / deep kb_search 工具
+                            # 同一 configurable 缝——get_kb_retriever 生产装配单例）
+                            "kb_retriever": self._kb_retriever(),
                             # M2 批次 3（deep guards 预算/超时图内通路——cancel_flags
                             # 进程级引用注入先例同款；deep 消费、fast 节点零消费零影响）：
                             # - usage_collector：轮级累计 collector 引用（deep_guards 读

@@ -38,13 +38,17 @@ _BUCKET = minio_settings.bucket_kb
 class _FakeRepo:
     """KbDocumentRepository 假体：记录全部状态迁移与失败落列（零 DB）。"""
 
-    def __init__(self, row: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, row: dict[str, Any] | None = None, *, chunks: list[dict[str, Any]] | None = None
+    ) -> None:
         self.row = row
         self.transitions: list[dict[str, Any]] = []
         self.failures: list[str] = []
         self.chunk_replacements: list[dict[str, Any]] = []
         self.transition_results: list[bool] = []  # 逐次返回值（空=恒 True）
         self.requeue_ids: list[uuid.UUID] = []
+        self._chunks = chunks if chunks is not None else []
+        self.listed_chunks: list[uuid.UUID] = []  # list_chunks_by_doc 调用记录（B18）
 
     async def load(self, doc_id: uuid.UUID) -> dict[str, Any] | None:
         return self.row
@@ -76,15 +80,26 @@ class _FakeRepo:
         user_id: uuid.UUID,
         chunks: list[Chunk],
         content_hash: str,
+        embeddings: list[list[float]] | None = None,
     ) -> bool:
         self.chunk_replacements.append(
-            {"chunks": list(chunks), "content_hash": content_hash, "user_id": user_id}
+            {
+                "chunks": list(chunks),
+                "content_hash": content_hash,
+                "user_id": user_id,
+                "embeddings": embeddings,
+            }
         )
         if self.row is not None:
             self.row["status"] = "indexing"
             self.row["chunk_count"] = len(chunks)
             self.row["content_hash"] = content_hash
         return True
+
+    async def list_chunks_by_doc(self, doc_id: uuid.UUID) -> list[dict[str, Any]]:
+        """pg 事实源读回（B18 indexing 段消费——ORDER BY chunk_index 假体直返）。"""
+        self.listed_chunks.append(doc_id)
+        return list(self._chunks)
 
     async def list_requeue_ids(self) -> list[uuid.UUID]:
         return list(self.requeue_ids)
@@ -228,12 +243,15 @@ def _make_pipeline(
     repo: _FakeRepo,
     minio: _FakeMinio,
     spec: dict[str, Any] | None = None,
+    *,
+    es_indexer: Any | None = None,
 ) -> kb_pipeline.KbPipeline:
     return kb_pipeline.KbPipeline(
         repo=repo,
         spec_payload_provider=lambda: spec if spec is not None else {},
         minio_client=lambda: minio,
         worker_count=0,  # unit 直驱 process_document，不 spawn worker
+        es_indexer=es_indexer,
     )
 
 
@@ -338,10 +356,19 @@ def test_resolve_indexing_confirmation_branches() -> None:
     assert gray.channel == "pgvector"
     assert gray.es_pending_seam is False
 
+    # es_indexer 未接线（缺省 None）→ 留痕放行兜底（灰度安全——不因装配遗漏全量 failed）
     dual = kb_pipeline.resolve_indexing_confirmation(True)
     assert dual.es_enabled is True
     assert dual.channel == "dual"
-    assert dual.es_pending_seam is True  # ES 确认点=B19 seam——本批留痕放行
+    assert dual.es_pending_seam is True
+
+
+def test_resolve_indexing_confirmation_seam_wired() -> None:
+    """es_enabled=true + es_indexer 已注入 → es_pending_seam 反转为 False（真写入路径）。"""
+    dual = kb_pipeline.resolve_indexing_confirmation(True, object())
+    assert dual.es_enabled is True
+    assert dual.channel == "dual"
+    assert dual.es_pending_seam is False
 
 
 async def test_es_enabled_true_walks_ready_with_trace(
@@ -355,9 +382,9 @@ async def test_es_enabled_true_walks_ready_with_trace(
     trace = [
         r
         for r in log_records
-        if "B19" in str(r.get("message", "")) or "es_pending_seam" in str(r.get("extra", {}))
+        if "B18" in str(r.get("message", "")) or "es_pending_seam" in str(r.get("extra", {}))
     ]
-    assert trace, "es_enabled=true 分支必须留痕（B19 seam 未实装，灰度放行）"
+    assert trace, "es_enabled=true 分支必须留痕（B18 缝未接线兜底，灰度放行）"
 
 
 def test_read_es_enabled_defaults_gray_safe() -> None:
@@ -615,6 +642,140 @@ def test_zero_vector_placeholder_shape() -> None:
     assert all(v == 0 for v in vec)  # 零向量占位——B18 向量通道落地前 NOT NULL 列写入缝
 
 
+# ---------------------------------------------------------------------------
+# A3（plan §3.3）：chunking 段 embedding 接线（embedding_enabled 分支）
+# ---------------------------------------------------------------------------
+
+
+def _fake_embed(*, calls: list[list[str]], exc: Exception | None = None, dim: int = 1024):
+    """embed_texts 假体（记录输入批；可编程异常/维度）。"""
+
+    async def _embed(texts: Any, **_kwargs: Any) -> list[list[float]]:
+        calls.append(list(texts))
+        if exc is not None:
+            raise exc
+        return [[0.5] * dim for _ in texts]
+
+    return _embed
+
+
+async def test_embedding_enabled_true_embeds_chunks_with_heading_path(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """① true + mock embed → 真向量入库：输入走 build_embedding_input（标题轨迹
+    前置口径——plan §3.2 单一事实源），向量随 chunk 行同批进 replace_chunks。"""
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(kb_pipeline, "embed_texts", _fake_embed(calls=calls))
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"embedding_enabled": True}})
+
+    terminal = await pipeline.process_document(_DOC_ID)
+
+    assert terminal == "ready"
+    assert len(calls) == 1  # 单批（2 chunks）
+    assert calls[0] == [
+        "标题轨迹：示例文档\n切片正文0",
+        "标题轨迹：示例文档\n切片正文1",
+    ]
+    embeddings = repo.chunk_replacements[0]["embeddings"]
+    assert isinstance(embeddings, list) and len(embeddings) == 2
+    assert all(len(vector) == 1024 for vector in embeddings)
+    assert all(any(value != 0 for value in vector) for vector in embeddings)
+
+
+async def test_embedding_disabled_zero_embed_calls_placeholder_unchanged(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """② false（缺省）→ 字节级哨兵：零 embed 调用 + replace_chunks 走占位分支
+    （embeddings=None——生产路径逐字节写零向量，与 B19 前现状等价）。"""
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("embedding_enabled=false 不得调用 embed（零向量现状哨兵）")
+
+    monkeypatch.setattr(kb_pipeline, "embed_texts", _boom)
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"))
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"embedding_enabled": False}})
+
+    terminal = await pipeline.process_document(_DOC_ID)
+
+    assert terminal == "ready"
+    assert repo.chunk_replacements[0]["embeddings"] is None  # 占位分支（零向量）
+    placeholder = kb_pipeline.embedding_placeholder()
+    assert len(placeholder) == 1024 and all(v == 0 for v in placeholder)
+
+
+async def test_embedding_failure_retries_once_then_failed(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """③ embed 失败重试 1 次后 failed：fail_reason 前缀精确全等（阶段前缀 +
+    脱敏类型名——零原文回显，沿 B18 `_es_failure` 语义）。"""
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        kb_pipeline,
+        "embed_texts",
+        _fake_embed(calls=calls, exc=RuntimeError("上游原文含敏感内容")),
+    )
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"embedding_enabled": True}})
+
+    terminal = await pipeline.process_document(_DOC_ID)
+
+    assert terminal == "failed"
+    assert len(calls) == 2  # 重试恰 1 次（首试 + 1）
+    assert repo.failures == ["chunking: embedding 写入失败: RuntimeError"]
+    assert "上游原文含敏感内容" not in repo.failures[0]
+    assert repo.chunk_replacements == []  # embed 失败不写 chunk 行
+
+
+async def test_embedding_dimension_mismatch_failed(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⑤ 返回维度≠1024 → failed（防静默脏向量；阶段前缀 chunking）。"""
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(kb_pipeline, "embed_texts", _fake_embed(calls=calls, dim=3))
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"embedding_enabled": True}})
+
+    terminal = await pipeline.process_document(_DOC_ID)
+
+    assert terminal == "failed"
+    assert len(repo.failures) == 1
+    assert repo.failures[0].startswith("chunking: ")
+    assert "维度" in repo.failures[0]
+    assert "0.5" not in repo.failures[0]  # 零向量值回显
+    assert repo.chunk_replacements == []
+
+
+async def test_resume_at_chunking_embeds_once_and_stays_idempotent(
+    fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """④ resume-from-chunking：重入 chunking 段对全量 chunks 恰 embed 一次（单批），
+    终态 ready 后再次 process_document 幂等直返零 embed（终态不重复）。"""
+    repo = _FakeRepo(_row("chunking"))
+    tree = IrNode(
+        id="loc:doc:resume-embed",
+        type="document",
+        title="续跑文档",
+        doc_kind="upload",
+        meta={"raw_type": "x"},
+    )
+    await put_ir_json(_USER_ID, _DOC_ID, tree, client=fake_minio)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(kb_pipeline, "embed_texts", _fake_embed(calls=calls))
+    monkeypatch.setattr(kb_pipeline, "chunk_forest", _make_chunk_forest(n=2))
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"embedding_enabled": True}})
+
+    assert await pipeline.process_document(_DOC_ID) == "ready"
+    assert len(calls) == 1 and len(calls[0]) == 2
+
+    assert await pipeline.process_document(_DOC_ID) == "ready"
+    assert len(calls) == 1  # 终态幂等——再次调用零额外 embed
+
+
 async def test_normalizing_preserves_feishu_parse_meta_for_attachment_rows(
     stub_pipeline_seams, fake_minio
 ) -> None:
@@ -646,3 +807,402 @@ async def test_normalizing_preserves_feishu_parse_meta_for_attachment_rows(
 
 def test_serialize_import_health() -> None:
     assert callable(serialize_ir)
+
+
+# ---------------------------------------------------------------------------
+# B18 ES BM25 写入通道（indexing 段 seam 替换——plan B18 §5）
+# ---------------------------------------------------------------------------
+
+
+class _FakeEsIndexer:
+    """KbEsIndexer 假体：记录调用序列；可编程失败（fail_times/ensure_fail_times 次后成功）。"""
+
+    def __init__(
+        self,
+        *,
+        fail_exc: Exception | None = None,
+        fail_times: int = 0,
+        ensure_fail_exc: Exception | None = None,
+        ensure_fail_times: int = 0,
+    ) -> None:
+        self.calls: list[tuple[str, str]] = []  # (方法名, doc_id) 顺序留痕
+        self.index_kwargs: list[dict[str, Any]] = []
+        self._fail_exc = fail_exc
+        self._fail_left = fail_times
+        self._ensure_fail_exc = ensure_fail_exc
+        self._ensure_fail_left = ensure_fail_times
+
+    async def ensure_index(self) -> None:
+        self.calls.append(("ensure_index", ""))
+        if self._ensure_fail_left > 0:
+            self._ensure_fail_left -= 1
+            assert self._ensure_fail_exc is not None
+            raise self._ensure_fail_exc
+
+    async def index_chunks(
+        self,
+        kb_doc_id: Any,
+        *,
+        user_id: Any,
+        chunks: list[dict[str, Any]],
+        doc_meta: dict[str, Any],
+    ) -> None:
+        self.calls.append(("index_chunks", str(kb_doc_id)))
+        self.index_kwargs.append(
+            {
+                "kb_doc_id": kb_doc_id,
+                "user_id": user_id,
+                "chunks": list(chunks),
+                "doc_meta": dict(doc_meta),
+            }
+        )
+        if self._fail_left > 0:
+            self._fail_left -= 1
+            assert self._fail_exc is not None
+            raise self._fail_exc
+
+    async def delete_document(self, kb_doc_id: Any, *, user_id: Any) -> None:
+        self.calls.append(("delete_document", str(kb_doc_id)))
+
+
+class _RaisingEsIndexer:
+    """哨兵假体：任何方法被调即 AssertionError（es_enabled=false 零 ES 调用锁死）。"""
+
+    async def ensure_index(self) -> None:
+        raise AssertionError("es_enabled=false 分支不得触 ES（ensure_index）")
+
+    async def index_chunks(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("es_enabled=false 分支不得触 ES（index_chunks）")
+
+    async def delete_document(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("es_enabled=false 分支不得触 ES（delete_document）")
+
+    async def count_by_doc(self, *args: Any, **kwargs: Any) -> int:
+        raise AssertionError("es_enabled=false 分支不得触 ES（count_by_candidate）")
+
+
+def _pg_chunk_row(index: int) -> dict[str, Any]:
+    """kb_chunks 行投影假体（list_chunks_by_doc 返回形态）。"""
+    return {
+        "chunk_id": uuid.UUID(f"22222222-2222-4222-8222-22222222220{index}"),
+        "kb_doc_id": uuid.UUID(_DOC_ID),
+        "user_id": uuid.UUID(_USER_ID),
+        "chunk_index": index,
+        "content": f"切片正文{index}",
+        "token_count": 4,
+        "meta": {
+            "node_id": f"loc:blk:{index}",
+            "heading_path": ["示例文档"],
+            "loc": {"page": index + 1},
+            "references": [],
+            "raw_type": "p",
+            "char_start": 0,
+            "char_end": 4,
+        },
+        "created_at": None,
+    }
+
+
+async def test_es_enabled_false_zero_es_calls_and_transition_unchanged(
+    stub_pipeline_seams, fake_minio
+) -> None:
+    """哨兵测试（字节级不变自证）：es_enabled=false → es_indexer 任何方法零调用 +
+    transition 参数与现状逐字段相同（ready 迁移仅 ready_at 一个字段）。"""
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"))
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": False}}, es_indexer=_RaisingEsIndexer()
+    )
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "ready"
+    assert [(t["expect"], t["to"]) for t in repo.transitions] == [
+        ({"pending"}, "normalizing"),
+        ({"normalizing"}, "chunking"),
+        ({"chunking"}, "indexing"),
+        ({"indexing"}, "ready"),
+    ]
+    ready_fields = repo.transitions[-1]["fields"]
+    assert set(ready_fields.keys()) == {"ready_at"}
+    assert ready_fields["ready_at"] is not None
+
+
+async def test_es_enabled_true_real_write_then_ready(
+    stub_pipeline_seams, fake_minio
+) -> None:
+    """缝已接线 + es_enabled=true：ensure_index → index_chunks 恰一次 → ready；
+    chunks 走 pg 事实源读回（list_chunks_by_doc），doc_meta 携带 IR 派生三键。"""
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0), _pg_chunk_row(1)])
+    repo.row["catalog_path"] = "研发 > 手册"
+    fake = _FakeEsIndexer()
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "ready"
+    # ensure_index 先于 index_chunks；写入恰一次（无重试）
+    assert fake.calls == [("ensure_index", ""), ("index_chunks", _DOC_ID)]
+    kwargs = fake.index_kwargs[0]
+    assert kwargs["kb_doc_id"] == _DOC_ID  # str 形态（ES _id 确定性键同域）
+    assert kwargs["user_id"] == uuid.UUID(_USER_ID)  # 行投影原值透传
+    assert [c["chunk_index"] for c in kwargs["chunks"]] == [0, 1]
+    # doc_meta：catalog_path 取行值；doc_kind/node_kinds 由 ir.json 派生（假归一化
+    # 产物单根树 loc:doc:stub/type=document——kind 派生与 chunker 同一事实源）
+    assert kwargs["doc_meta"]["catalog_path"] == "研发 > 手册"
+    assert kwargs["doc_meta"]["doc_kind"] == "upload"
+    assert kwargs["doc_meta"]["node_kinds"] == {"loc:doc:stub": "document"}
+    # ready 前 ES 写入已确认（先写入后迁移）
+    assert repo.transitions[-1]["to"] == "ready"
+    assert repo.listed_chunks == [_DOC_ID]  # str 形态（process_document 入参同域）
+
+
+async def test_es_write_retryable_failure_exhausts_and_fails(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retryable（HTTP 503）三连失败：首试 + 2 重试后 failed，
+    fail_reason 阶段化前缀 `indexing:`、零 chunk 内容回显；退避 1s/3s。"""
+    from elastic_transport import ApiResponseMeta
+    from elasticsearch.exceptions import ApiError as EsApiError
+
+    def _api_error(status: int) -> EsApiError:
+        meta = ApiResponseMeta(
+            status=status, http_version="1.1", headers={}, duration=0, node=None
+        )
+        return EsApiError("boom", meta, {})
+
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer(fail_exc=_api_error(503), fail_times=3)
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    sleeps: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(kb_pipeline, "_es_retry_sleep", _fake_sleep)
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "failed"
+    assert fake.calls.count(("index_chunks", _DOC_ID)) == 3  # 首次 + 2 重试
+    assert sleeps == [1.0, 3.0]
+    # 正向全等（脱敏锁死）：状态码 + 真实尝试数 3，原始 message/正文零回显
+    assert repo.failures == ["indexing: ES 写入失败: ApiError(503 attempts=3)"]
+
+
+async def test_es_write_transient_failure_recovers(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retryable 单次失败 + 次试成功 → ready（瞬态不误杀）。"""
+    from elastic_transport import ApiResponseMeta
+    from elasticsearch.exceptions import ApiError as EsApiError
+
+    meta = ApiResponseMeta(
+        status=429, http_version="1.1", headers={}, duration=0, node=None
+    )
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer(fail_exc=EsApiError("too many requests", meta, {}), fail_times=1)
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    sleeps: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(kb_pipeline, "_es_retry_sleep", _fake_sleep)
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "ready"
+    assert fake.calls.count(("index_chunks", _DOC_ID)) == 2  # 首试失败 + 重试成功
+    assert sleeps == [1.0]
+    assert repo.failures == []
+
+
+async def test_es_write_non_retryable_failure_fails_immediately(
+    stub_pipeline_seams, fake_minio
+) -> None:
+    """bulk item 失败（EsIndexError 非 retryable）→ 不重试直接 failed。"""
+    from app.rag.indexers.es_indexer import EsIndexError
+
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0), _pg_chunk_row(1)])
+    fake = _FakeEsIndexer(
+        fail_exc=EsIndexError("ES 写入失败: bulk 失败 1/2 item"), fail_times=1
+    )
+    pipeline = _make_pipeline(repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake)
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "failed"
+    assert fake.calls.count(("index_chunks", _DOC_ID)) == 1  # 零重试
+    assert repo.failures == ["indexing: ES 写入失败: bulk 失败 1/2 item"]
+
+
+async def test_es_ensure_index_retryable_failure_recovers(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ensure_index 首抛 retryable（连接拒）→ 重试面内按同判据重试 → 二次成功 → ready。
+
+    回归锁（评审 P2 #2/#12 同根）：ensure_index 曾在重试 try 面之外，ES 瞬态不可达
+    命中它即零重试终态 failed。现判据=ensure_index 恰 2 次 + 退避 [1.0] + 零失败。
+    """
+    from elastic_transport import ConnectionError as EsConnectionError
+
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer(
+        ensure_fail_exc=EsConnectionError("connection refused"),
+        ensure_fail_times=1,
+    )
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    sleeps: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(kb_pipeline, "_es_retry_sleep", _fake_sleep)
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "ready"
+    assert fake.calls.count(("ensure_index", "")) == 2  # 首试失败 + 重试成功
+    assert fake.calls.count(("index_chunks", _DOC_ID)) == 1  # 仅在索引就绪后写一次
+    assert sleeps == [1.0]
+    assert repo.failures == []
+
+
+async def test_es_ensure_index_retryable_exhausts_and_fails_desensitized(
+    stub_pipeline_seams, fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ensure_index 恒 retryable → 重试耗尽 → failed；fail_reason 阶段化前缀 +
+    脱敏（原始异常串含内部 host:port 不得回显，仅类型名/attempts 计数）。"""
+    from elastic_transport import ConnectionError as EsConnectionError
+
+    raw = "connect to 127.0.0.1:19200 refused (connection aborted)"
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer(ensure_fail_exc=EsConnectionError(raw), ensure_fail_times=99)
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    sleeps: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(kb_pipeline, "_es_retry_sleep", _fake_sleep)
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "failed"
+    assert fake.calls.count(("ensure_index", "")) == 3  # 首次 + 2 重试
+    assert fake.calls.count(("index_chunks", _DOC_ID)) == 0  # 索引未就绪不写
+    assert sleeps == [1.0, 3.0]
+    # 正向全等（脱敏锁死）：仅 类型名 + attempts 计数，原始 message/host/port 零回显
+    assert repo.failures == ["indexing: ES 写入失败: ConnectionError(attempts=3)"]
+
+
+async def test_es_ensure_index_non_retryable_fails_immediately_with_real_attempts(
+    stub_pipeline_seams, fake_minio
+) -> None:
+    """ensure_index 抛不可重试异常（HTTP 400）→ 首试即 failed，零重试；
+    fail_reason 的 attempts 必须是**真实尝试数 1**（曾误传总预算 3 → 谎报 attempts=3）。"""
+    from elastic_transport import ApiResponseMeta
+    from elasticsearch.exceptions import ApiError as EsApiError
+
+    meta = ApiResponseMeta(
+        status=400, http_version="1.1", headers={}, duration=0, node=None
+    )
+    _seed_original(fake_minio)
+    repo = _FakeRepo(_row("pending"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer(
+        ensure_fail_exc=EsApiError("illegal argument", meta, {}),
+        ensure_fail_times=99,
+    )
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "failed"
+    assert fake.calls.count(("ensure_index", "")) == 1  # 不可重试 → 零重试
+    assert fake.calls.count(("index_chunks", _DOC_ID)) == 0
+    assert repo.failures == ["indexing: ES 写入失败: ApiError(400 attempts=1)"]
+
+
+async def test_resume_at_indexing_es_true_reads_pg_chunks_without_rechunk(
+    fake_minio,
+) -> None:
+    """resume-at-indexing（es_enabled=true）：直入写入段——pg 读回 + 先删后 bulk，
+    不重切（chunk_forest 零调用）；ir.json 缺失（异常态）→ doc_kind=None 继续。"""
+    repo = _FakeRepo(_row("indexing"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer()
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+
+    def _no_chunk_forest(*a: Any, **k: Any) -> Any:
+        raise AssertionError("resume at indexing 不得重切")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(kb_pipeline, "chunk_forest", _no_chunk_forest)
+        terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "ready"
+    assert [(t["expect"], t["to"]) for t in repo.transitions] == [({"indexing"}, "ready")]
+    assert fake.calls == [("ensure_index", ""), ("index_chunks", _DOC_ID)]
+    kwargs = fake.index_kwargs[0]
+    assert kwargs["doc_meta"]["doc_kind"] is None  # ir.json 不可达 → None 不阻断
+    assert kwargs["doc_meta"]["node_kinds"] == {}
+
+
+async def test_doc_kind_ir_failure_warns_and_continues(
+    fake_minio, log_records: list[dict]
+) -> None:
+    """doc_kind IR 获取异常 → WARN 留痕 + 存 None 继续（doc_kind 辅助字段不阻断写入）。"""
+    repo = _FakeRepo(_row("indexing"), chunks=[_pg_chunk_row(0)])
+    fake = _FakeEsIndexer()
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake
+    )
+    terminal = await pipeline.process_document(_DOC_ID)
+    assert terminal == "ready"
+    warns = [r for r in log_records if r.get("level").name == "WARNING"]
+    assert warns, "IR 不可达必须 WARN 留痕"
+
+
+def test_collect_node_kinds_walks_ir_tree() -> None:
+    """IR 树 node.id → node.type.value 全量映射（kind 派生与 chunker 同一事实源）。"""
+    from app.rag.ir_schema import IrNode, IrNodeType
+
+    root = IrNode(
+        id="loc:doc:1",
+        type=IrNodeType.DOCUMENT,
+        title="文档",
+        meta={"raw_type": "normalizer.document"},
+        children=[
+            IrNode(
+                id="loc:blk:0",
+                type=IrNodeType.HEADING,
+                title="章",
+                level=2,
+                meta={"raw_type": "h2"},
+                children=[
+                    IrNode(
+                        id="loc:blk:1",
+                        type=IrNodeType.CODE,
+                        text="print(1)",
+                        meta={"raw_type": "code_block"},
+                    )
+                ],
+            ),
+            IrNode(
+                id="loc:blk:2",
+                type=IrNodeType.PARAGRAPH,
+                text="正文",
+                meta={"raw_type": "p"},
+            ),
+        ],
+    )
+    kinds = kb_pipeline.collect_node_kinds(root)
+    assert kinds == {
+        "loc:doc:1": "document",
+        "loc:blk:0": "heading",
+        "loc:blk:1": "code",
+        "loc:blk:2": "paragraph",
+    }

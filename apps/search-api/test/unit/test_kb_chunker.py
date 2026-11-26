@@ -1185,7 +1185,11 @@ def test_placeholder_table_without_rows_renders_literal_into_corpus() -> None:
 
     assert result.document_text.count("[sheet]") == 1
     assert any("[sheet]" in c.content for c in result.chunks)
-    assert result.document_content_hash == content_hash(result.document_text)
+    # 文档 hash = 方案 A（B19 §3.1）：document_text + "\n" + 标题结构清单——
+    # 本夹具唯一 heading =「第一章」（doc.title 旅行记录），结构清单单行
+    assert result.document_content_hash == content_hash(
+        result.document_text + "\n" + "旅行记录 > 第一章"
+    )
     assert result.skipped_units == 0  # 不再判空跳过
 
 
@@ -1249,3 +1253,246 @@ def test_catalog_path_blank_segments_filtered_from_chain() -> None:
     )
     r3 = chunk_document(doc3, config=ChunkingConfig())
     assert r3.chunks[0].heading_path == ["空间乙", "文档丙", "乙节"]
+
+
+# ---------------------------------------------------------------------------
+# content_hash 方案 A（plan B19 §3.1 / §7 T1——标题结构清单入 hash 输入）
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentContentHashPlanA:
+    """方案 A（2026-11-26 用户裁决，data-model §1.7 v1.21）：文档级 hash 输入 =
+    `document_text + "\\n" + 标题结构清单`。
+
+    标题结构清单 = IR 全部 heading 节点的完整 heading_path（与 chunk 单轨迹**同一
+    物化口径**——目录链/接缝去重/回显剔除/空串滤除全部既有规则继承）join " > "
+    按 DFS 序逐行拼接。效果传导：标题改名/增删/移动 → document_content_hash 变
+    → 飞书同步 diff 判定序④ content_hash 比对判变更 → 整文档单元三存储级联重导
+    → 重切 + 重嵌——向量与轨迹永不陈旧。
+
+    负例不变式（⑥）：无 heading 文档 → 结构清单空串 → hash 与旧口径（纯正文
+    sha256(strip)）逐字节一致。
+    """
+
+    def _headed_doc(self, *, title_a: str = "行程", title_b: str = "交通") -> IrNode:
+        """规范夹具：H1 标题甲 + 段一 + H2 标题乙 + 段二（heading 不入正文——
+        标题面扰动可脱离正文单独观测）。"""
+        return _doc(
+            [
+                _heading("h1", 1, title_a),
+                _para("p1", "正文一。"),
+                _heading("h2", 2, title_b),
+                _para("p2", "正文二。"),
+            ]
+        )
+
+    def test_1_heading_rename_changes_hash(self) -> None:
+        """① 标题改名 → hash 变（document_text 相同——变化只能来自结构清单）。"""
+        r1 = chunk_document(self._headed_doc(title_b="交通"), config=CFG)
+        r2 = chunk_document(self._headed_doc(title_b="交通改"), config=CFG)
+        assert r1.document_text == r2.document_text
+        assert r1.document_content_hash != r2.document_content_hash
+
+    def test_2_heading_add_remove_changes_hash(self) -> None:
+        """② 标题增/删 → hash 变；删回到原结构 = 原值（对称回归）。"""
+        r_base = chunk_document(
+            _doc([_heading("h1", 1, "行程"), _para("p1", "甲。"), _para("p2", "乙。")]),
+            config=CFG,
+        )
+        r_added = chunk_document(
+            _doc(
+                [
+                    _heading("h1", 1, "行程"),
+                    _para("p1", "甲。"),
+                    _heading("h2", 2, "新增节"),
+                    _para("p2", "乙。"),
+                ]
+            ),
+            config=CFG,
+        )
+        assert r_base.document_text == r_added.document_text
+        assert r_base.document_content_hash != r_added.document_content_hash
+        # 删除回到原结构 → hash 回到原值（幂等回归面）
+        r_removed = chunk_document(
+            _doc([_heading("h1", 1, "行程"), _para("p1", "甲。"), _para("p2", "乙。")]),
+            config=CFG,
+        )
+        assert r_removed.document_content_hash == r_base.document_content_hash
+
+    def test_3_heading_move_changes_hash(self) -> None:
+        """③ 标题移动（跨级换位/同级换位）→ hash 变。
+
+        跨级换位夹具 document_text 不变（唯一差异=结构清单）——移动检测由结构
+        清单（非正文变化）承载的直接证明。
+        """
+        # 跨级：H1-甲 > H2-乙 ⇄ H1-乙 > H2-甲（正文同一串，轨迹层级互换）
+        r_a = chunk_document(
+            _doc(
+                [
+                    _heading("h1", 1, "甲"),
+                    _heading("h2", 2, "乙"),
+                    _para("p1", "唯一段。"),
+                ]
+            ),
+            config=CFG,
+        )
+        r_b = chunk_document(
+            _doc(
+                [
+                    _heading("h1", 1, "乙"),
+                    _heading("h2", 2, "甲"),
+                    _para("p1", "唯一段。"),
+                ]
+            ),
+            config=CFG,
+        )
+        assert r_a.document_text == r_b.document_text
+        assert r_a.document_content_hash != r_b.document_content_hash
+        # 同级换位（节序对调）
+        r_c = chunk_document(
+            _doc(
+                [
+                    _heading("h1", 1, "甲"),
+                    _para("p1", "段甲"),
+                    _heading("h1b", 1, "乙"),
+                    _para("p2", "段乙"),
+                ]
+            ),
+            config=CFG,
+        )
+        r_d = chunk_document(
+            _doc(
+                [
+                    _heading("h1", 1, "乙"),
+                    _para("p2", "段乙"),
+                    _heading("h1b", 1, "甲"),
+                    _para("p1", "段甲"),
+                ]
+            ),
+            config=CFG,
+        )
+        assert r_c.document_content_hash != r_d.document_content_hash
+
+    def test_4_content_change_changes_hash(self) -> None:
+        """④ 正文变（标题不变）→ hash 变。"""
+        r1 = chunk_document(self._headed_doc(), config=CFG)
+        doc2 = _doc(
+            [
+                _heading("h1", 1, "行程"),
+                _para("p1", "正文一改。"),
+                _heading("h2", 2, "交通"),
+                _para("p2", "正文二。"),
+            ]
+        )
+        r2 = chunk_document(doc2, config=CFG)
+        assert r1.document_content_hash != r2.document_content_hash
+
+    def test_5_same_input_hash_stable_fixture_pinned(self) -> None:
+        """⑤ 正文+标题均不变 → hash 逐字节不变（回归）+ 夹具字面锁定
+        （锁定公式：sha256(strip(document_text + "\n" + 结构清单))）。"""
+        r1 = chunk_document(self._headed_doc(), config=CFG)
+        r2 = chunk_document(self._headed_doc(), config=CFG)
+        assert r1.document_content_hash == r2.document_content_hash
+        # 夹具字面锁定（公式级：输入串按 §3.1 钉死形态显式构造）
+        expected_input = (
+            "正文一。\n\n正文二。\n"
+            "旅行记录 > 行程\n"
+            "旅行记录 > 行程 > 交通"
+        )
+        expected = hashlib.sha256(expected_input.encode("utf-8")).hexdigest()
+        assert (
+            r1.document_content_hash
+            == "210d533fe4744d2c7296358772019a1d62309aabee136e11b808c99858754923"
+        )
+        assert r1.document_content_hash == expected
+
+    def test_6_no_heading_doc_hash_unchanged_old_caliber(self) -> None:
+        """⑥ 负例不变式：无 heading 文档 → 结构清单空串 → hash 与旧口径
+        （content_hash(document_text) = sha256(text.strip())）逐字节一致。"""
+        r = chunk_document(_doc([_para("p1", "正文内容。")]), config=CFG)
+        assert r.document_content_hash == content_hash(r.document_text)
+        assert (
+            r.document_content_hash
+            == "ae5f4f0126bce854d5fc430a8266e549b715dbf4c61657f277dba7a2ebf0b3d6"
+        )
+        assert (
+            hashlib.sha256("正文内容。".encode("utf-8")).hexdigest()
+            == r.document_content_hash
+        )
+
+    def test_7_structure_list_carries_catalog_chain_and_echo_rules(self) -> None:
+        """⑦ 结构清单含目录链前缀（heading_path 同源物化口径）：目录链差异入
+        hash；交界回显剔除口径与轨迹一致（回显标题改名 → 不再回显 → hash 变）。"""
+        # 同正文同标题、仅 catalog_path 不同 → hash 变（链前缀入结构清单）
+        r_cat = chunk_document(
+            _doc_at(
+                "d1",
+                [_heading("h1", 1, "架构"), _para("p1", "正文。")],
+                title="第一章",
+                catalog=["面试题库", "LLMs"],
+            ),
+            config=CFG,
+        )
+        r_plain = chunk_document(
+            _doc_at(
+                "d2",
+                [_heading("h1", 1, "架构"), _para("p1", "正文。")],
+                title="第一章",
+                catalog=[],
+            ),
+            config=CFG,
+        )
+        assert r_cat.document_text == r_plain.document_text
+        assert r_cat.document_content_hash != r_plain.document_content_hash
+        # 交界回显（catalog 链含 doc.title 同名段）：回显标题不入轨迹——改名后
+        # 不再回显 → 轨迹含新名 → hash 变（回显剔除规则随同源口径入结构清单）
+        echo_doc = _doc_at(
+            "d3",
+            [
+                _heading("h1", 1, "LLMs"),
+                _heading("h2", 1, "正文章"),
+                _para("p1", "正文。"),
+            ],
+            title="LLMs",
+            catalog=["面试题库", "LLMs"],
+        )
+        r_echo = chunk_document(echo_doc, config=CFG)
+        # 回显标题「LLMs」轨迹行 = 链本身（回显不入轨迹）——改名后不再回显，
+        # 其轨迹行变为 链+新名 → hash 变（改名方向与还原方向均成立）
+        echo_doc_renamed = _doc_at(
+            "d4",
+            [
+                _heading("h1", 1, "LLMs改"),
+                _heading("h2", 1, "正文章"),
+                _para("p1", "正文。"),
+            ],
+            title="LLMs",
+            catalog=["面试题库", "LLMs"],
+        )
+        r_renamed = chunk_document(echo_doc_renamed, config=CFG)
+        assert r_echo.document_text == r_renamed.document_text
+        assert r_echo.document_content_hash != r_renamed.document_content_hash
+
+    def test_8_strip_boundary_whitespace_stable_internal_is_content_change(self) -> None:
+        """空白扰动口径（ask 点名面——按 strip 归一化既有语义钉定）：
+
+        - 输入**首尾**空白经 strip 归一 → hash 稳定（既有 content_hash 行为）；
+        - 无 heading 文档尾部空白扰动 → 稳定（负例不变式的空白面）；
+        - 有 heading 文档尾部空白扰动 → 落在结构清单之前（strip 鞭长莫及）
+          → hash 变——属正文变化面（方案 A：document_text 原文入 hash）。
+        """
+        assert content_hash("  abc  ") == content_hash("abc")
+        r_a = chunk_document(_doc([_para("p1", "正文。")]), config=CFG)
+        r_b = chunk_document(_doc([_para("p1", "正文。\n")]), config=CFG)
+        assert r_a.document_content_hash == r_b.document_content_hash
+        r_c = chunk_document(self._headed_doc(), config=CFG)
+        doc_trailing = _doc(
+            [
+                _heading("h1", 1, "行程"),
+                _para("p1", "正文一。 "),
+                _heading("h2", 2, "交通"),
+                _para("p2", "正文二。"),
+            ]
+        )
+        r_d = chunk_document(doc_trailing, config=CFG)
+        assert r_c.document_content_hash != r_d.document_content_hash

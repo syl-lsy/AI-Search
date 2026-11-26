@@ -352,6 +352,73 @@ async def _invoke(chain: Any, prompt: str, *, timeout_s: float, config: Any = No
         return await chain.ainvoke(prompt, config=config)
 
 
+
+def _reflect_gate_sufficient(state: Mapping[str, Any]) -> bool:
+    """deep.reflect_gate 置信度门控（B19 plan §4.5——**确定性信号 gate 零 LLM**）。
+
+    判定（全绿 → True 直接 sufficient 走既有 done 出口，跳过 LLM 判定；任一红或
+    enabled=false（缺省灰度）→ False 走现状 LLM 深评，零行为变化）：
+    - len(collected_sources) ≥ min_sources；
+    - top1 source score ≥ min_top1_score（检索/rerank relevance 量级——修订注 4
+      「按实测量级复核」结论：0~1 量级，0.3 中带初值）；
+    - failed 比例 ≤ max_failed_ratio（errors[] source_failure 计数 /
+      (失败+来源数)——零来源零失败=0.0）；
+    - outline 要点覆盖率 ≥ min_outline_coverage（**确定性代理口径**：subagent_reports
+      数 / outline 章节数——语义级覆盖判定不可确定性计算，代理口径供 M4 校准，
+      ARCH B19 行「M4 先做历史 trace gate 绿率离线分析再定默认档」）。
+
+    键缺失回落建议值（nacos-config §3 v1.46：enabled=False / min_sources=5 /
+    min_top1_score=0.3 / max_failed_ratio=0.2 / min_outline_coverage=0.6——
+    validator ReflectGateSpec 同源双投影）。
+    """
+    raw_spec = state.get("spec")
+    spec = raw_spec if isinstance(raw_spec, Mapping) else {}
+    raw_deep = spec.get("deep")
+    deep = raw_deep if isinstance(raw_deep, Mapping) else {}
+    raw_gate = deep.get("reflect_gate")
+    gate = raw_gate if isinstance(raw_gate, Mapping) else {}
+    if gate.get("enabled") is not True:
+        return False
+    sources = state.get("collected_sources")
+    sources = [s for s in sources if isinstance(s, Mapping)] if isinstance(sources, list) else []
+    min_sources = gate.get("min_sources")
+    min_sources = min_sources if isinstance(min_sources, int) and min_sources >= 0 else 5
+    if len(sources) < min_sources:
+        return False
+    min_top1 = gate.get("min_top1_score")
+    min_top1 = min_top1 if isinstance(min_top1, (int, float)) and not isinstance(min_top1, bool) and min_top1 >= 0 else 0.3
+    top1 = max((float(s.get("score") or 0.0) for s in sources), default=0.0)
+    if top1 < float(min_top1):
+        return False
+    max_failed_ratio = gate.get("max_failed_ratio")
+    max_failed_ratio = (
+        max_failed_ratio
+        if isinstance(max_failed_ratio, (int, float)) and not isinstance(max_failed_ratio, bool) and max_failed_ratio >= 0
+        else 0.2
+    )
+    errors = state.get("errors")
+    failed = (
+        len([e for e in errors if isinstance(e, Mapping) and e.get("reason") == "source_failure"])
+        if isinstance(errors, list)
+        else 0
+    )
+    ratio = failed / (failed + len(sources)) if (failed + len(sources)) else 0.0
+    if ratio > float(max_failed_ratio):
+        return False
+    min_coverage = gate.get("min_outline_coverage")
+    min_coverage = (
+        min_coverage
+        if isinstance(min_coverage, (int, float)) and not isinstance(min_coverage, bool) and min_coverage >= 0
+        else 0.6
+    )
+    outline = state.get("outline")
+    outline = outline if isinstance(outline, list) else []
+    reports = state.get("subagent_reports")
+    reports = [r for r in reports if isinstance(r, Mapping)] if isinstance(reports, list) else []
+    coverage = (len(reports) / len(outline)) if outline else 1.0
+    return coverage >= float(min_coverage)
+
+
 async def reflect(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """reflect 节点（deep 子图）：判定 → gaps 归一写入 / 兜底 sufficient；
     事件面按回路走向二选一——进 supplement 发 running（label=反思第 n/{rounds} 轮 +
@@ -365,6 +432,13 @@ async def reflect(state: Any, config: RunnableConfig | None = None) -> dict[str,
     if trip is not None:
         emit_stage("reflect", "done")
         return {"gaps": [], "degraded_reason": trip}
+
+    # B19 reflect 置信度门控（plan §4.5）：确定性信号 gate 全绿 → 直接 sufficient
+    # 走既有 done 出口（零 LLM 调用——拓扑零改动，节点内步骤级扩展）；任一红或
+    # enabled=false（缺省灰度）→ 现状 LLM 深评（零行为变化）
+    if _reflect_gate_sufficient(state):
+        emit_stage("reflect", "done")
+        return {"gaps": []}
 
     spec = state.get("spec")
     spec = spec if isinstance(spec, Mapping) else {}

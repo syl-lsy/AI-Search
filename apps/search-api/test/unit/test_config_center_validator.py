@@ -1713,6 +1713,23 @@ class TestKbSpecRules:
             validate_asset(SPEC_DATA_ID, payload)
 
     @pytest.mark.parametrize(
+        ("value", "legal"), [(1, True), (2, True), (0, False), (-1, False)]
+    )
+    def test_kb_route_min_kb_sources_ge_one(self, value, legal):
+        """§3 kb.route.min_kb_sources ≥ 1（三源 parity 修正）：消费面
+        `_positive_number` 对 0 回落 2（热更设 0 不生效），校验面同步拒收 0/负数
+        ——「下限 1」为唯一合法边界。"""
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, v=value: p["kb"]["route"].update({"min_kb_sources": v}),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
         ("candidates", "fuse", "legal"),
         [(29, 30, False), (30, 30, True), (31, 30, True)],
     )

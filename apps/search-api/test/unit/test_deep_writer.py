@@ -1,8 +1,9 @@
 """unit 层：writer 节点（M2 批次 4——ARCH §4.2 writer 行 / DEV §5.4 五步闭环）。
 
 钉住的语义（冻结契约，逐条对应测试）：
-- 强模型通道（chat_model_key → 轮内映射快照别名，build_chat_model + deep thinking 档
-  ——OQ-34 Standard 全程）；deep.report_writer 六占位符模板消费（{sections_hint,
+- 强模型通道（chat_model_key → 轮内映射快照别名，build_chat_model + **关思考档**
+  ——2026-11-26 用户裁决 writer 不思考，off 档强关〔enable_thinking=false 等三腿
+  禁用键组〕；OQ-34 Standard 全程）；deep.report_writer 六占位符模板消费（{sections_hint,
   query_lang, cite_rules, memory_block, subagent_reports_block, sources_block}——
   nacos-config.md §1；cite_rules 承载 common.citation_rules，fast.synthesis 同款）；
 - 按 outline 分节流式（REQ-014「正在撰写第 x 节」）：入口 stage(write,running,
@@ -32,6 +33,7 @@ from typing import Any
 import pytest
 
 from app.agent.guards import TurnCanceledSignal
+from app.agent.llm import OFF_THINKING_EXTRA_BODY
 from app.agent.nodes import deep_writer
 from app.agent.nodes.deep_writer import writer
 from app.agent.state import DeepState
@@ -580,3 +582,33 @@ async def test_config_passthrough_to_model(
     await writer(_state_with(), config)
 
     assert model.configs[0] is config
+
+
+async def test_writer_forces_thinking_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """writer 强关思考（**2026-11-26 用户裁决：writer 写节点不思考**——e2e deep writer
+    2/2 轮撞满 deep.llm_timeout_s=120s 包络走兜底产出，thinking 拖时长是根因；
+    synthesis 批次 9 同款先例，deep_degraded_writer 强关 off 档同构先例）。
+
+    注入形态 = `build_chat_model` off 档三腿禁用键组（首键 `enable_thinking=False` 即
+    百炼生效键——批次 9 探针钉死 `think:false` 被上游忽略）；**模式级
+    `spec.deep.thinking` 键不动**（planner/reflect 仍按 on 档），故以
+    `spec.deep.thinking="on"` 断言 writer 仍强关。
+    """
+    model = _FakeStreamModel([[*_REPORT_PIECES]])
+    captured: dict[str, Any] = {}
+
+    def fake_build(alias: str, **kw: Any) -> Any:
+        captured["alias"] = alias
+        captured.update(kw)
+        return model
+
+    monkeypatch.setattr(deep_writer, "build_chat_model", fake_build)
+    monkeypatch.setattr(deep_writer, "emit_stage", lambda *a, **k: None)
+
+    await writer(
+        _state_with(spec={"deep": {"thinking": "on", "llm_timeout_s": 5}}), _config()
+    )
+
+    assert captured["thinking"] == "off"  # 强关档（忽略 spec.deep.thinking=on）
+    # off 档组首键 = 百炼生效键（本裁决的核心注入键；组形态由 test_llm_factory 锁死）
+    assert OFF_THINKING_EXTRA_BODY["enable_thinking"] is False

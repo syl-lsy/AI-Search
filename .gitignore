@@ -53,3 +53,7 @@ out/*
 
 #测试相关的Jupyter Notebook文件
 notebooks/*
+
+
+# KB 评测金标/测试集语料（2026-11-26 用户裁决：语料资产不入库——已跟踪的 100条.xlsx 需 git rm --cached 出库）
+resources/*.xlsx
