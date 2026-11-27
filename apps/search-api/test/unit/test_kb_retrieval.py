@@ -258,16 +258,47 @@ async def test_vector_search_embeds_query_and_binds_params():
     assert "CAST(:qvec AS vector)" in sql  # 绑定值显式 cast（非拼接）
     assert "user_id = :uid" in sql
     assert "LIMIT :k" in sql
+    # ready 门（评审 P1③）新增 :doc_status 绑定键——四绑定面
     assert params == {
         "qvec": "[0.100000,0.200000,0.300000]",
         "uid": _USER_ID,
         "k": 30,
+        "doc_status": "ready",
     }
     assert rows[0]["chunk_id"] == "22222222-2222-4222-8222-000000000001"
     assert rows[0]["channel"] == "vector"
     assert rows[0]["heading_path"] == ["示例文档", "第二章"]
     assert rows[0]["node_id"] == "loc:blk:9"
     assert rows[0]["score"] == pytest.approx(0.87)
+
+
+async def test_vector_search_gates_chunks_on_document_ready():
+    """ready 门回归（评审 P1③；data-model kb_documents.status「非 ready 文档不参与
+    检索——ready 门不变」）：向量腿 EXISTS 半连接 kb_documents 过滤 status='ready'
+    ——ES 写入重试耗尽置 failed 而 kb_chunks 已持久化的切片不再进向量腿（BM25 腿
+    结构性排除，两通道统一 ready 门）；chunking→indexing 窗口期同理收口。
+    门值绑定参数（:doc_status）非字面拼接；原有 qvec/uid/k 三绑定面不变。"""
+    session = _FakeSession([_Row()])
+
+    async def fake_embed(texts, *, mapping=None):
+        return [[0.1, 0.2, 0.3]]
+
+    retriever = KbRetriever(
+        es_client_factory=None,
+        session_factory=_FakeSessionFactory(session),
+        embed_fn=fake_embed,
+    )
+    await retriever.vector_search("pgvector 混合检索", user_id=_USER_ID, k=30)
+    stmt, params = session.executed[0]
+    sql = str(stmt)
+    assert "EXISTS" in sql.upper()  # 半连接形态（或等价 join）
+    assert "kb_documents" in sql  # ready 门联结面
+    assert "status = :doc_status" in sql
+    assert params["doc_status"] == "ready"
+    # 原三绑定面不变
+    assert params["qvec"] == "[0.100000,0.200000,0.300000]"
+    assert params["uid"] == _USER_ID
+    assert params["k"] == 30
 
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,13 @@ async function scrollToTopUntilFab(page: Page, scroller: Locator): Promise<void>
  * 停驻不可区分「接管生效」与「流式恰好静默」——400ms 停驻判据误判，token 恢复后被
  * following 态贴底拉回（Expected 936 / Received 1136=满贴底值）。相位是黑盒外唯一可靠观测；
  * toPass 重滚保留（单次赋值与同帧 stickToBottom 的竞态仍需等价用户滚轮重滚）。
+ *
+ * 【2026-11-27 横窗 15s→60s（同步语义修复，断言面零改动）】密集 token 批窗口内每次赋值
+ * 都会在 scroll 事件派发前被 onContentGrew→stickToBottom 拉回贴底——事件合并读终值，位移
+ * 恒 0、相位永不翻转（11 连吞实测签名=恒 following）。本地 qwen 高速档下 15s 窗可整窗
+ * 密集（三轮全量门禁 2 红 1 绿 + 单跑红，回看态探针证相位机制本身正常），60s 横窗跨过
+ * synthesis 全程必含分节/批次静默段——「循环退出条件=相位翻转」的设计前提重新成立。
+ * 成功即早退，对已绿路径零行为变化。
  */
 async function scrollUpUntilTakenOver(scroller: Locator, upPx: number): Promise<void> {
   await expect(async () => {
@@ -71,7 +78,7 @@ async function scrollUpUntilTakenOver(scroller: Locator, upPx: number): Promise<
       el.scrollTop = top
     }, Math.max(0, maxScroll - upPx))
     await expect(scroller).toHaveAttribute('data-scroll-phase', 'taken_over', { timeout: 1_000 })
-  }).toPass({ timeout: 15_000, intervals: [400] })
+  }).toPass({ timeout: 60_000, intervals: [400] })
 }
 
 /** 等流式内容长到两屏（fab「距底超一视口高」显示前提；超时由调用方以 skip/条件处置） */
@@ -180,6 +187,9 @@ test.describe('A26 流式自动滚动（REQ-043）', () => {
   })
 
   test('重叠带消歧：接管后视口停留（距底 <40px）不被自动拽回（A26 第四条 GWT）', async ({ page }) => {
+    // 用例级 timeout 放宽：openLiveAnswerPage ≈30s 预算 + scrollUpUntilTakenOver 横窗
+    // 60s（2026-11-27 密集 token 档吞赋值根因，见 helper 注记）+ 收尾断言，默认 120s 贴边
+    test.setTimeout(180_000)
     await openLiveAnswerPage(page)
     const scroller = page.getByTestId('answer-scroll')
     const stillStreaming = await page.getByTestId('stop-btn').count()

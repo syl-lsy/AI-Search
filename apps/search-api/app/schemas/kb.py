@@ -146,7 +146,8 @@ class KbChunkDetail(BaseModel):
 
     六必选（chunk_id/document_id/document_title/content/heading_path/page/paragraph）
     + 两可选（node_token/node_id 仅飞书来源携带、缺则省略——沿 v1.12 images 可选键
-    先例不置 null；**修订注 2**：fs:blk: 来源保留 node_id、省略 node_token）。
+    先例不置 null；**修订注 2**：fs:blk: 来源保留 node_id；node_token 由文档
+    parse_meta.feishu 补读、取不到才省略——GWT#2 补桥用户裁决）。
     `page`/`paragraph` 键恒出现、值可空（无定位 null——契约字面）。
     **溯源内容仅进 UI 不进 LLM**（content 前端渲染过 DOMPurify——frontend-api §5）。
     """

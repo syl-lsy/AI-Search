@@ -471,6 +471,33 @@ async def test_index_chunks_splits_large_batches(monkeypatch: pytest.MonkeyPatch
     assert batch_sizes == [500, 101]
 
 
+async def test_index_chunks_non_final_batch_errors_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """多批回归（评审 P1）：601 条 → 两批（500+101），失败落在**非末批**（首批
+    1 条 400 确定性失败、末批全成）——逐批覆盖语义会吞掉首批错误、把部分写入
+    当成功；正确语义 = 跨批累积 errors（列表拼接），循环后统一走 item_statuses
+    分型判定 → EsIndexError（计数含非末批失败）。"""
+    client = _FakeEsClient()
+    indexer = _make_indexer(client)
+
+    async def _fake_async_bulk(cl: Any, actions: list[dict], **kwargs: Any) -> tuple[int, list]:
+        if len(actions) == 500:  # 首批（非末批）
+            return (499, [_bulk_error_item(400)])
+        return (len(actions), [])  # 末批全成（旧实现据此误判整体成功）
+
+    monkeypatch.setattr(es_indexer, "async_bulk", _fake_async_bulk)
+    rows = [_chunk_row(i) for i in range(601)]
+    with pytest.raises(es_indexer.EsIndexError) as excinfo:
+        await indexer.index_chunks(
+            _KB_DOC_ID, user_id=_USER_ID, chunks=rows, doc_meta={"node_kinds": {}}
+        )
+    message = str(excinfo.value)
+    assert "bulk 失败 1/601 item" in message
+    assert "成功 600" in message
+    assert excinfo.value.item_statuses == ()  # 400 确定性失败零分型（不重试）
+
+
 def test_get_kb_es_indexer_singleton(monkeypatch: pytest.MonkeyPatch):
     """get_kb_es_indexer 进程级单例（生产装配缝；测试后复位）。"""
     monkeypatch.setattr(es_indexer, "_kb_es_indexer_instance", None)

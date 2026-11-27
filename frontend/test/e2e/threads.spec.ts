@@ -151,9 +151,12 @@ test.describe('Threads 历史线程页主链路（真服务）', () => {
     const row = smokeRow(page)
     await expect(row).toBeVisible({ timeout: 10_000 })
     // ── 重命名：菜单 → 弹层 → 输入 → 提交 → 行内标题更新（真后端 PATCH §2.10）──
+    // menuitem 定位走 page 级：ThreadActionMenu v1.25 裁剪修复把菜单层 Teleport 到 body
+    // （组件注释同款纪律「menuitem 查询走 document」，rootEl 内已无菜单层）——行内后代
+    // 查找永不解析；同一时刻仅一个菜单层在开（组件 layer 状态机互斥），page 级定位唯一。
     await row.hover()
     await row.getByTestId('tam-trigger').click()
-    await row.getByRole('menuitem', { name: '重命名' }).click()
+    await page.getByRole('menuitem', { name: '重命名' }).click()
     const renameInput = page.getByTestId('tam-rename-input')
     await expect(renameInput).toBeVisible()
     const newTitle = `${SMOKE_PREFIX}-e2e-${Date.now()}`
@@ -174,19 +177,19 @@ test.describe('Threads 历史线程页主链路（真服务）', () => {
     if (await pinBadge.isVisible()) {
       await renamedRow.hover()
       await renamedRow.getByTestId('tam-trigger').click()
-      await renamedRow.getByRole('menuitem', { name: '取消置顶' }).dispatchEvent('click')
+      await page.getByRole('menuitem', { name: '取消置顶' }).dispatchEvent('click')
       await expect(pinBadge).not.toBeVisible()
     }
 
     await renamedRow.hover()
     await renamedRow.getByTestId('tam-trigger').click()
-    await renamedRow.getByRole('menuitem', { name: '置顶', exact: true }).dispatchEvent('click')
+    await page.getByRole('menuitem', { name: '置顶', exact: true }).dispatchEvent('click')
     await expect(pinBadge).toBeVisible()
 
     // ── 取消置顶（恢复原状态——用例可重复运行）──
     await renamedRow.hover()
     await renamedRow.getByTestId('tam-trigger').click()
-    await renamedRow.getByRole('menuitem', { name: '取消置顶' }).dispatchEvent('click')
+    await page.getByRole('menuitem', { name: '取消置顶' }).dispatchEvent('click')
     await expect(pinBadge).not.toBeVisible()
   })
 

@@ -103,6 +103,7 @@ class _FakeKbService:
         return self._created
 
     async def collect_url(self, url: str, *, user_id: str) -> KbDocumentCollected:
+        self._timeline.append("collect")
         self.collect_calls.append({"url": url, "user_id": user_id})
         if self._exc:
             raise self._exc
@@ -267,6 +268,14 @@ def test_get_kb_service_wires_default_spec_provider() -> None:
     assert service._spec_payload_provider is _default_spec_payload
 
 
+def test_get_kb_service_wires_url_fetcher() -> None:
+    """生产装配缝（评审 P1①）：get_kb_service 必须注入 url_fetcher——api.md §4.2
+    「Firecrawl 抓正文后走 4.1 同一流水线」；None 通道使 collect_url 恒抛
+    422001「通道不可用」（生产 URL 收藏端到端断裂）。"""
+    service = kb_routes.get_kb_service(db=None)
+    assert service._url_fetcher is not None
+
+
 async def test_upload_unsupported_type_error_envelope(fake_service, fake_pipeline) -> None:
     fake_service(_FakeKbService(exc=FileUnsupportedTypeException("不支持的文件类型")))
     async with _client() as client:
@@ -330,6 +339,45 @@ async def test_collect_url_duplicate(fake_service, fake_pipeline) -> None:
         )
     assert resp.status_code == 200
     assert resp.json()["data"]["duplicated"] is True
+
+
+async def test_collect_url_new_entry_commits_then_enqueues(
+    fake_service, fake_pipeline
+) -> None:
+    """入库入队回归（评审 P1②）：新建 URL 行须走 4.1 同一流水线——显式 commit 后
+    BackgroundTasks enqueue（时序同上传路由：handler → commit → enqueue；worker
+    新 session 才能读到已提交行）。记录序 collect → commit → enqueue。"""
+    timeline: list[str] = []
+    pipeline = _FakePipeline(timeline)
+    fake_service(_FakeKbService(collected=_collected(), timeline=timeline))
+    app.dependency_overrides[get_kb_pipeline] = lambda: pipeline
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                "/api/v1/kb/urls", json={"url": "https://example.com/article"}
+            )
+    finally:
+        app.dependency_overrides.pop(get_kb_pipeline, None)
+    assert resp.status_code == 200
+    assert timeline == ["collect", "commit", "enqueue"]
+    assert pipeline.enqueued == [resp.json()["data"]["document_id"]]
+
+
+async def test_collect_url_duplicate_skips_enqueue(fake_service, fake_pipeline) -> None:
+    """同 URL 重复收藏（duplicated=true）：返回既有条目零建行——不重复入队
+    （既有行已在库/已处理；重复 enqueue 会无谓重跑流水线）。"""
+    pipeline = _FakePipeline()
+    fake_service(_FakeKbService(collected=_collected(duplicated=True)))
+    app.dependency_overrides[get_kb_pipeline] = lambda: pipeline
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                "/api/v1/kb/urls", json={"url": "https://example.com/article"}
+            )
+    finally:
+        app.dependency_overrides.pop(get_kb_pipeline, None)
+    assert resp.status_code == 200
+    assert pipeline.enqueued == []
 
 
 async def test_collect_url_invalid_422001(fake_service, fake_pipeline) -> None:

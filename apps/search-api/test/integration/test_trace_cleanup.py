@@ -23,7 +23,10 @@ OTel 原生消费（OTLP /api/public/otel/v1/traces），events_only 收口后�
 get_client() 走 os.environ 回填，cleanup_expired_traces 走 core/config 的
 langfuse_settings 单例，同一部署栈）；凭据值只在内存流转，绝不打印、绝不进
 断言消息。缺凭证时 skip（给 reason，不让命令红掉）；Langfuse 栈连接不可达
-skip（环境未起），HTTP 4xx/5xx 照常 fail（配置/代码问题不掩蔽）。
+skip（环境未起），HTTP 4xx 照常 fail（配置/代码问题不掩蔽）——例外：两条轮询面
+（`_wait_visible`/`_wait_deleted`）把 5xx 视为可重试瞬态（langfuse#8834 删除收敛窗
+实测 2026-11-27：删除侧「过期 65，删除 65，失败 0」而 v2 /observations 查询间歇
+500，且同一家族 500 也命中清理前可见性轮询），死线兜底不变。
 
 删除可见性（langfuse#8834）：DELETE 受理 ≠ 查询立即可见——Langfuse 的删除经
 队列落 ClickHouse 后异步收敛，v2 查询在观测清理收敛前仍可能非空。故第 ④ 步按
@@ -131,11 +134,26 @@ async def _v2_rows(client: httpx.AsyncClient, trace_id: str) -> list[dict]:
 
 
 async def _wait_visible(client: httpx.AsyncClient, trace_id: str) -> None:
-    """轮询 v2 observations 直至测试 trace 可见（OTel 导出异步收敛）。"""
+    """轮询 v2 observations 直至测试 trace 可见（OTel 导出异步收敛）。
+
+    5xx 耐受与 `_wait_deleted` 同口径（langfuse#8834 收敛窗家族：v2 查询间歇 500
+    实测同样命中清理前可见性轮询——2026-11-27 `_wait_deleted` 修复后复跑红一次，
+    裸 HTTPStatusError 500 排除法定位到本函数）；4xx 照常上抛；可见死线不变。
+    """
     deadline = time.monotonic() + INGESTION_DEADLINE_S
     while time.monotonic() < deadline:
-        if await _v2_rows(client, trace_id):
-            return
+        try:
+            visible = bool(await _v2_rows(client, trace_id))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise  # 4xx=凭证/请求面问题，照常 fail
+            print(
+                f"[lag] v2 observations HTTP {exc.response.status_code}"
+                "（服务端瞬态，langfuse#8834 收敛窗）——按可重试继续轮询"
+            )
+        else:
+            if visible:
+                return
         await asyncio.sleep(POLL_INTERVAL_S)
     pytest.fail(
         f"测试 trace 在 {INGESTION_DEADLINE_S}s 内未见于 Langfuse v2 observations（导出管道滞后？）"
@@ -147,12 +165,27 @@ async def _wait_deleted(client: httpx.AsyncClient, trace_id: str) -> None:
 
     打印实测滞后秒数（ARCH §7「滞后观察」的量化数据，随 `-rP` 在 passed 输出里可见）；
     超时仍非空则 fail 并带上滞后，不把「未收敛」误判成「未删除」。
+
+    5xx 耐受（2026-11-27 真实栈实证，langfuse#8834 收敛窗家族）：删除受理侧已成功
+    （日志「过期 65，删除 65，失败 0」）而 v2 /observations 查询间歇 500——轮询面把
+    5xx 视为可重试瞬态继续轮询；4xx 照常立即上抛（不掩蔽凭证/配置问题）；死线内
+    不清空仍 fail（清空终态断言不变）。
     """
     started = time.monotonic()
     deadline = started + DELETION_DEADLINE_S
     rows: list[dict] | None = None
     while time.monotonic() < deadline:
-        rows = await _v2_rows(client, trace_id)
+        try:
+            rows = await _v2_rows(client, trace_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise  # 4xx=凭证/请求面问题，照常 fail
+            print(
+                f"[lag] v2 observations HTTP {exc.response.status_code}"
+                "（服务端瞬态，langfuse#8834 收敛窗）——按可重试继续轮询"
+            )
+            await asyncio.sleep(POLL_INTERVAL_S)
+            continue
         if not rows:
             lag_s = time.monotonic() - started
             print(f"[lag] trace {trace_id} 删除收敛（v2 观测清空）耗时 {lag_s:.1f}s")
@@ -163,6 +196,118 @@ async def _wait_deleted(client: httpx.AsyncClient, trace_id: str) -> None:
         f"trace 删除后 {DELETION_DEADLINE_S}s 内 v2 observations 仍非空"
         f"（实测滞后 {lag_s:.1f}s——langfuse#8834 收敛未完成或删除未生效）"
     )
+
+
+# ---- _wait_deleted 轮询语义单测（mock 客户端零网络，锁鲁棒性修复的语义面）----
+# 2026-11-27 真实栈实证（langfuse#8834 删除收敛窗家族）：删除侧日志「过期 65，删除 65，
+# 失败 0」而 v2 /observations 查询间歇 500——旧实现把轮询直接红掉（全量套件与本用例
+# 单跑两次复现）。以下三例锁定：5xx=可重试继续轮询 / 4xx=立即 fail（不掩蔽配置问题）/
+# 死线内不清空仍 fail（清空终态断言不变）。
+
+
+class _StubResponse:
+    """httpx.Response 最小形态：raise_for_status 走真 httpx（HTTPStatusError 带 response）。"""
+
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self._inner = httpx.Response(
+            status_code,
+            request=httpx.Request("GET", "http://langfuse.test/api/public/v2/observations"),
+        )
+        self._payload = payload if payload is not None else {}
+
+    def raise_for_status(self) -> None:
+        self._inner.raise_for_status()
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _StubObservationsClient:
+    """前 N 次 GET 返回 5xx、之后返回 final_payload（terminal_status 非空则恒返回该状态码）。"""
+
+    def __init__(
+        self,
+        server_errors: int = 0,
+        terminal_status: int | None = None,
+        final_payload: dict | None = None,
+    ) -> None:
+        self.calls = 0
+        self._server_errors = server_errors
+        self._terminal_status = terminal_status
+        self._final_payload = final_payload if final_payload is not None else {"data": []}
+
+    async def get(self, url: str, params=None):  # noqa: ANN001, ARG002 —— 测试桩
+        self.calls += 1
+        if self.calls <= self._server_errors:
+            return _StubResponse(500)
+        if self._terminal_status is not None:
+            return _StubResponse(self._terminal_status)
+        return _StubResponse(200, self._final_payload)
+
+
+async def test_wait_deleted_treats_5xx_polls_as_retryable(monkeypatch):
+    """v2 observations 间歇 500 → 按可重试瞬态继续轮询至清空（不立即红）。"""
+    monkeypatch.setitem(globals(), "POLL_INTERVAL_S", 0.001)
+    stub = _StubObservationsClient(server_errors=2)
+    await _wait_deleted(stub, "a" * 32)  # 不抛即通过
+    assert stub.calls == 3  # 500×2 被耐受，第 3 次清空收敛
+
+
+async def test_wait_deleted_4xx_fails_fast(monkeypatch):
+    """4xx（凭证/请求面）仍立即上抛——不掩蔽配置问题，不作重试。"""
+    monkeypatch.setitem(globals(), "POLL_INTERVAL_S", 0.001)
+    stub = _StubObservationsClient(terminal_status=401)
+    with pytest.raises(httpx.HTTPStatusError):
+        await _wait_deleted(stub, "a" * 32)
+    assert stub.calls == 1  # 未重试
+
+
+async def test_wait_deleted_deadline_fail_semantics_unchanged(monkeypatch):
+    """死线内观测行始终不清空 → 仍 fail（清空终态断言不变，修复不得放宽）。"""
+    monkeypatch.setitem(globals(), "POLL_INTERVAL_S", 0.001)
+    monkeypatch.setitem(globals(), "DELETION_DEADLINE_S", 0.05)
+
+    class _NeverClear(_StubObservationsClient):
+        async def get(self, url: str, params=None):  # noqa: ANN001, ARG002 —— 测试桩
+            self.calls += 1
+            return _StubResponse(200, {"data": [{"id": "o1"}]})
+
+    stub = _NeverClear()
+    with pytest.raises(pytest.fail.Exception):
+        await _wait_deleted(stub, "a" * 32)
+
+
+async def test_wait_visible_treats_5xx_polls_as_retryable(monkeypatch):
+    """`_wait_visible` 同口径 5xx 耐受：间歇 500 → 继续轮询至可见（不立即红）。
+
+    2026-11-27 实证：`_wait_deleted` 修复后复跑红一次（3.34s，裸 HTTPStatusError
+    500——crons 侧 500 会包成 TraceCleanupException，排除法唯一落点=可见性轮询），
+    同一环境性家族两条轮询面都命中。
+    """
+    monkeypatch.setitem(globals(), "POLL_INTERVAL_S", 0.001)
+    stub = _StubObservationsClient(
+        server_errors=2, final_payload={"data": [{"id": "o1"}]}
+    )
+    await _wait_visible(stub, "a" * 32)  # 不抛即通过
+    assert stub.calls == 3  # 500×2 被耐受，第 3 次可见收敛
+
+
+async def test_wait_visible_4xx_fails_fast(monkeypatch):
+    """`_wait_visible` 4xx（凭证/请求面）仍立即上抛——不掩蔽配置问题。"""
+    monkeypatch.setitem(globals(), "POLL_INTERVAL_S", 0.001)
+    stub = _StubObservationsClient(terminal_status=401)
+    with pytest.raises(httpx.HTTPStatusError):
+        await _wait_visible(stub, "a" * 32)
+    assert stub.calls == 1  # 未重试
+
+
+async def test_wait_visible_deadline_fail_semantics_unchanged(monkeypatch):
+    """死线内始终不可见 → 仍 fail（可见死线断言不变，修复不得放宽）。"""
+    monkeypatch.setitem(globals(), "POLL_INTERVAL_S", 0.001)
+    monkeypatch.setitem(globals(), "INGESTION_DEADLINE_S", 0.05)
+    stub = _StubObservationsClient()  # 200 但 data 恒空 = 永不可见
+    with pytest.raises(pytest.fail.Exception):
+        await _wait_visible(stub, "a" * 32)
 
 
 @pytest.mark.requires_langfuse

@@ -2,7 +2,8 @@
  * test/component/kb-chunk-drilldown.test.ts — KbChunkDrilldown 溯源下钻弹窗
  * （frontend-api.md §5 KbChunkDrilldown 行 v1.33/v1.34；api.md §4.6 消费面；plan-m3-b6-f6 §1.3）。
  * ThreadModal 壳（role=dialog/aria-modal/Esc/×/遮罩）+ 文档面（§4.4 合流：catalog_path/parse_meta）
- * + 切片面（§4.6：heading_path 面包屑/page·paragraph pills/content DOMPurify 后文本插值/meta-mono）
+ * + 切片面（§4.6：heading_path 面包屑/page·paragraph pills/content 文本插值直渲〔类标签原文
+ *   逐字保真，不经 DOMPurify——A36〕/meta-mono）
  * + 「打开飞书原文」外链（node_token 存在且过 isHttpUrl 守卫才渲染）+ 404001 占位卡降级 + 焦点双相位。
  */
 import { flushPromises, mount } from '@vue/test-utils'
@@ -105,7 +106,22 @@ describe('KbChunkDrilldown — 壳与切片面（§4.6）', () => {
     w2.unmount()
   })
 
-  it('content 先 DOMPurify 消毒再文本插值：<script> 不执行、无脚本元素、pre-wrap 保留', async () => {
+  it('content 类标签纯文本保真（A36 溯源原文预览）：不经 DOMPurify 逐字渲染，不剥失不变形', async () => {
+    const tagged = {
+      ...CHUNK,
+      content: '代码示例：#include <stdio.h> 后 return 0\n比较表达式 a<b 且 c>d',
+    }
+    const w = mountModal({ open: true, chunk: tagged, doc: DOC })
+    await nextTick()
+    const contentEl = document.querySelector('[data-testid="kb-chunk-content"]')
+    expect(contentEl).not.toBeNull()
+    // 类标签形态原文逐字保真（DOMPurify 会剥失 <stdio.h>、把「且 c」吞进虚构 <b> 结构）
+    expect(contentEl!.textContent).toContain('#include <stdio.h> 后 return 0')
+    expect(contentEl!.textContent).toContain('a<b 且 c>d')
+    w.unmount()
+  })
+
+  it('content 文本插值转义：`<script>` 注入不执行、无脚本元素、pre-wrap 保留', async () => {
     const hostile = { ...CHUNK, content: '<script>window.__pwned = true</script>正文第一行\n正文第二行' }
     const w = mountModal({ open: true, chunk: hostile, doc: DOC })
     await nextTick()

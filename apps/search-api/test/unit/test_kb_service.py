@@ -456,6 +456,83 @@ async def test_collect_url_title_falls_back_to_host(monkeypatch: pytest.MonkeyPa
     assert collected.title == "fallback.example"
 
 
+async def test_collect_url_fetcher_url_rejected_422001_with_trace(
+    monkeypatch: pytest.MonkeyPatch, log_records: list[dict]
+) -> None:
+    """第二道护栏（读取链逐源复验）拒收 → 422001 + url_rejected 留痕（零建行
+    零落象）；文案与通用「抓取失败」区分。"""
+    from app.agent.safety.content_guard import UrlRejectedError
+
+    session = _FakeSession().set_scalars_first(None)
+    minio = _FakeMinio()
+
+    async def _pass(url: str, guard: Any) -> Any:
+        from app.agent.safety.url_guard import UrlGuardResult
+
+        return UrlGuardResult(ok=True, reason=None)
+
+    async def _rejected_read(url: str, spec: Any) -> str:
+        raise UrlRejectedError(
+            "url 被安全护栏拒绝（ip_forbidden）——零物理读取", reason="ip_forbidden"
+        )
+
+    monkeypatch.setattr(kb_service, "validate_url_async", _pass)
+    service = _service(session, minio, fetcher=_fetcher_with(_rejected_read))
+    with pytest.raises(kb_service.KbUrlInvalidException) as exc:
+        await service.collect_url("https://example.com/a", user_id=_USER_ID)
+    assert "拒收" in exc.value.message  # 与「URL 抓取失败」文案区分
+    assert "ip_forbidden" in exc.value.detail  # reason 枚举（零 URL/host 回显）
+    assert minio.objects == {}  # 零落象
+    assert session.added == []  # 零建行
+    trace = [r for r in log_records if "url_rejected" in str(r.get("message", ""))]
+    assert trace, "第二道护栏拒收必须 url_rejected 语义留痕"
+
+
+async def test_collect_url_rejects_oversized_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """抓取正文超 KB_MAX_FILE_MB 同口径上限 → 422001（零落象零建行）。"""
+    session = _FakeSession().set_scalars_first(None)
+    minio = _FakeMinio()
+
+    async def _fetch(url: str, spec: Any) -> str:
+        return "a" * (1024 * 1024 + 1)  # 超 1MB 一字节
+
+    async def _pass(url: str, guard: Any) -> Any:
+        from app.agent.safety.url_guard import UrlGuardResult
+
+        return UrlGuardResult(ok=True, reason=None)
+
+    monkeypatch.setattr(kb_service, "validate_url_async", _pass)
+    monkeypatch.setattr(kb_service.kb_settings, "max_file_mb", 1)
+    service = _service(session, minio, fetcher=_fetcher_with(_fetch))
+    with pytest.raises(kb_service.KbUrlInvalidException) as exc:
+        await service.collect_url("https://example.com/big", user_id=_USER_ID)
+    assert "上限" in exc.value.message or "上限" in exc.value.detail
+    assert minio.objects == {}
+    assert session.added == []
+
+
+async def test_collect_url_rejects_empty_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """抓取正文空白（strip 后空串）→ 422001（零落象零建行）。"""
+    session = _FakeSession().set_scalars_first(None)
+    minio = _FakeMinio()
+
+    async def _fetch(url: str, spec: Any) -> str:
+        return "  \n\t  "
+
+    async def _pass(url: str, guard: Any) -> Any:
+        from app.agent.safety.url_guard import UrlGuardResult
+
+        return UrlGuardResult(ok=True, reason=None)
+
+    monkeypatch.setattr(kb_service, "validate_url_async", _pass)
+    service = _service(session, minio, fetcher=_fetcher_with(_fetch))
+    with pytest.raises(kb_service.KbUrlInvalidException) as exc:
+        await service.collect_url("https://example.com/empty", user_id=_USER_ID)
+    assert "为空" in exc.value.message or "为空" in exc.value.detail
+    assert minio.objects == {}
+    assert session.added == []
+
+
 # ---------------------------------------------------------------------------
 # §4.3/4.4 投影
 # ---------------------------------------------------------------------------
@@ -709,7 +786,12 @@ _CHUNK_ID = "5c2e1111-1111-4111-8111-000000000001"
 _DOC_ID = "9a772222-2222-4222-8222-000000000001"
 
 
-def _drilldown_fixtures(node_id: str | None) -> dict[tuple[type, str], Any]:
+def _drilldown_fixtures(
+    node_id: str | None,
+    *,
+    doc_type: str = "md",
+    parse_meta: dict[str, Any] | None = None,
+) -> dict[tuple[type, str], Any]:
     from app.db.models import KbChunk as KbChunkRow
     from app.db.models import KbDocument as KbDocumentRow
     from app.db.models import Source as SourceRow
@@ -729,8 +811,8 @@ def _drilldown_fixtures(node_id: str | None) -> dict[tuple[type, str], Any]:
         },
     )
     doc = KbDocumentRow(
-        id=_uuid(_DOC_ID), user_id=_uuid(_USER), doc_type="md",
-        title="内部设计文档-检索融合.md", status="ready",
+        id=_uuid(_DOC_ID), user_id=_uuid(_USER), doc_type=doc_type,
+        title="内部设计文档-检索融合.md", status="ready", parse_meta=parse_meta,
     )
     return {
         (SourceRow, _SRC_ID): source,
@@ -755,12 +837,62 @@ async def test_drilldown_fs_node_source_full_projection() -> None:
 
 
 async def test_drilldown_fs_blk_keeps_node_id_omits_token() -> None:
-    """修订注 2：fs:blk: → node_id 保留、node_token 键省略（exclude_unset 落实）。"""
+    """修订注 2 基线：fs:blk: → node_id 保留；文档 parse_meta 无 feishu 面时
+    node_token 键省略（exclude_unset 落实）。"""
     service = _drilldown_service(_drilldown_fixtures("fs:blk:blk9"))
     detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
     dumped = detail.model_dump(mode="json", exclude_unset=True)
     assert dumped["node_id"] == "fs:blk:blk9"
     assert "node_token" not in dumped
+
+
+async def test_drilldown_fs_blk_supplements_token_from_doc_parse_meta() -> None:
+    """GWT#2 补桥（用户裁决）：fs:blk: chunk + 文档 parse_meta.feishu.node_token →
+    node_token 下发（回跳可达）；node_id 保持 fs:blk: 形态。库面实测：飞书导入行
+    doc_type=docx、源标记=parse_meta.feishu 面在场。"""
+    service = _drilldown_service(
+        _drilldown_fixtures(
+            "fs:blk:blk9",
+            doc_type="docx",
+            parse_meta={"feishu": {"node_token": "MJgewCcz2iycFukzjG0cxBV2nld"}},
+        )
+    )
+    detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    dumped = detail.model_dump(mode="json", exclude_unset=True)
+    assert dumped["node_token"] == "MJgewCcz2iycFukzjG0cxBV2nld"
+    assert dumped["node_id"] == "fs:blk:blk9"
+
+
+@pytest.mark.parametrize(
+    "parse_meta",
+    [
+        {"feishu": {}},  # 面在场但无 token
+        {"feishu": {"node_token": ""}},  # 空串
+        {"feishu": {"node_token": "   "}},  # 纯空白
+        {"feishu": {"node_token": 123}},  # 非字符串
+        {"pages": 3},  # 无 feishu 面
+    ],
+)
+async def test_drilldown_feishu_meta_without_usable_token_keeps_omitted(
+    parse_meta: dict[str, Any],
+) -> None:
+    """token 取不到（缺失/空/非字符串）→ 键省略（不置 null，键可省语义）。"""
+    service = _drilldown_service(
+        _drilldown_fixtures("fs:blk:blk9", doc_type="docx", parse_meta=parse_meta)
+    )
+    detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    dumped = detail.model_dump(mode="json", exclude_unset=True)
+    assert "node_token" not in dumped
+
+
+async def test_drilldown_local_doc_unaffected_by_parse_meta() -> None:
+    """web/doc 本地来源（loc: 前缀）即便 parse_meta 带无关键 → 两可选键全省略。"""
+    service = _drilldown_service(
+        _drilldown_fixtures("loc:blk:p1", doc_type="docx", parse_meta={"pages": 3})
+    )
+    detail = await service.get_chunk_drilldown(_SRC_ID, user_id=_USER)
+    dumped = detail.model_dump(mode="json", exclude_unset=True)
+    assert "node_token" not in dumped and "node_id" not in dumped
 
 
 async def test_drilldown_loc_prefix_both_keys_omitted() -> None:

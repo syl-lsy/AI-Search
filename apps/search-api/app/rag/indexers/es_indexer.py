@@ -154,13 +154,21 @@ class KbEsIndexer:
             return  # 零 chunk（异常态防御）：清理残留后直接成功
         client = self._client()
         total = len(actions)
+        # 跨批累积（评审 P1 回归钉死）：successes/errors 若逐批覆盖，非末批 item
+        # 失败会被末批结果静默吞掉（部分写入被当成功）——errors 列表拼接、成功数
+        # 累加，循环后统一走 item_statuses 分型判定
+        all_errors: list[Any] = []
+        total_successes = 0
         for batch in split_bulk_batches(actions):
             successes, errors = await async_bulk(
                 client, batch, raise_on_error=False, refresh=False
             )
+            total_successes += successes if isinstance(successes, int) else 0
+            if isinstance(errors, list):
+                all_errors.extend(errors)
         # async_bulk 双形态返回（stats_only False/True 重载）——list 形态才有
         # 逐 item 明细；非 list 视为零失败（stats 形态本通道不使用，防御性兜底）
-        error_items = errors if isinstance(errors, list) else []
+        error_items = all_errors
         if error_items:
             item_statuses = _bulk_item_statuses(error_items)
             if item_statuses and all(
@@ -172,13 +180,13 @@ class KbEsIndexer:
                 statuses_text = "/".join(str(s) for s in sorted(set(item_statuses)))
                 failure = EsIndexError(
                     f"ES 写入失败: bulk 失败 {len(error_items)}/{total} item"
-                    f"（成功 {successes}）status={statuses_text}（瞬态 item 分型）"
+                    f"（成功 {total_successes}）status={statuses_text}（瞬态 item 分型）"
                 )
                 failure.item_statuses = item_statuses
                 raise failure
             raise EsIndexError(
                 f"ES 写入失败: bulk 失败 {len(error_items)}/{total} item"
-                f"（成功 {successes}）"
+                f"（成功 {total_successes}）"
             )
 
     async def delete_document(self, kb_doc_id: Any, *, user_id: Any) -> None:

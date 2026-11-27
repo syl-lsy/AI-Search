@@ -8,8 +8,12 @@
  *  - 文档面（§4.4 合流源）：文档标题 + 【知识库】徽标 + catalog_path 目录链（非空才渲染）+
  *    parse_meta chips（null 段不渲染）——doc prop 为 null（获取失败）整块降级隐藏，不遮蔽切片面；
  *  - 切片面（§4.6）：heading_path 面包屑（空数组不渲染）→ page/paragraph 定位 pills（null 不渲染
- *    对应段）→ content 原文（纯文本 pre-wrap、max-height 200px 内滚、先 DOMPurify 再文本插值——
- *    溯源内容仅进 UI 不进 LLM，SnapshotModal 同源卫生链）→ meta-mono 行（chunk_id/document_id
+ *    对应段）→ content 原文（纯文本 pre-wrap、max-height 200px 内滚、文本插值直渲——
+ *    Vue 文本插值已转义、安全只增不减，不经 DOMPurify 以保类标签原文逐字保真〔A36 溯源
+ *    原文预览；契约已同口径钉正：frontend-api.md §5 v1.38 / api.md §4.6 v1.35。
+ *    SnapshotModal 快照摘录仍走 DOMPurify 消毒层，两路线分叉各自成立〕；溯源内容仅进
+ *    UI 不进 LLM）
+ *    → meta-mono 行（chunk_id/document_id
  *    恒在；node_id/node_token 可选键缺则不渲染）。
  * 「打开飞书原文」外链（v1.34）：node_token 存在 且 isHttpUrl 守卫通过才渲染（feishuJumpUrl），
  * href = https://www.feishu.cn/wiki/{node_token}、target=_blank + rel="noopener noreferrer"。
@@ -18,7 +22,6 @@
  */
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import DOMPurify from 'dompurify'
 
 import ThreadModal from '@/components/threads/ThreadModal.vue'
 import UiIcon from '@/components/icons/UiIcon.vue'
@@ -41,9 +44,6 @@ const { t } = useI18n()
 
 const contentEl = ref<HTMLElement | null>(null)
 let previouslyFocused: HTMLElement | null = null
-
-/** content 纵深消毒（先 DOMPurify 再文本插值——文本插值已转义，消毒层纵深防御） */
-const safeContent = computed(() => (props.chunk !== null ? DOMPurify.sanitize(props.chunk.content) : ''))
 
 /** 目录链段（catalog_path 按「 / 」分段展示——纯展示拆分，root→leaf 末位 leaf 高亮） */
 const catalogSegments = computed<string[]>(() => {
@@ -130,7 +130,7 @@ onUnmounted(() => {
           <span v-if="chunk.paragraph !== null" class="loc-pill">{{ $t('answer.kbChunkParagraph', { n: chunk.paragraph }) }}</span>
         </div>
         <span class="kb-sec-label">{{ $t('answer.kbChunkContentLabel') }}</span>
-        <div class="chunk-content" data-testid="kb-chunk-content">{{ safeContent }}</div>
+        <div class="chunk-content" data-testid="kb-chunk-content">{{ chunk.content }}</div>
         <div class="meta-mono" data-testid="kb-chunk-meta">
           chunk_id {{ chunk.chunk_id }} · document_id {{ chunk.document_id }}
           <template v-if="chunk.node_id"> · node_id {{ chunk.node_id }}</template>

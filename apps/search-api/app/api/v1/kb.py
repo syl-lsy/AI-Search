@@ -43,21 +43,39 @@ _DOC_TYPE_VALUES: frozenset[str] = frozenset({"pdf", "md", "txt", "docx", "url"}
 _CONNECTOR_VALUES: frozenset[str] = frozenset({"feishu"})
 
 
+async def _read_chain_url_fetcher(url: str, spec: dict[str, Any]) -> str:
+    """生产 url_fetcher 缝实现（api.md §4.2「Firecrawl 抓正文后走 4.1 同一流水线」）：
+    薄委托护栏面守卫函数 `url_reader.read_via_chain`——MCP 清单快照 → registry bind
+    + resolve_read_chain（主位 firecrawl / 备位 crawl4ai 条件装载）→ **逐源读取前
+    B15 url_guard 复验**（TOCTOU）→ registry.read 全量正文。
+
+    路由层不直连护栏内部件（registry/guard 装载）：B15 架构不变量由 AST 哨兵
+    `test_registry_read_call_sites_all_guarded` 锁死。链不可用 →
+    SearchChainUnavailable；读取失败沿链序换源后上抛末次异常
+    （service.collect_url 归一 KbUrlInvalidException 422001）。
+    """
+    from app.agent.tools.url_reader import read_via_chain
+
+    return await read_via_chain(url, spec)
+
+
 def get_kb_service(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> KbService:
-    """KB 服务依赖缝（单测经 dependency_overrides 替换；url_fetcher 一期缺省
-    None——collect_url 对未配置通道显式 422001，不静默）。spec 快照供给接
+    """KB 服务依赖缝（单测经 dependency_overrides 替换）。spec 快照供给接
     pipeline._default_spec_payload 同源：B15 SSRF 护栏据此读 Nacos spec
     safety.url_guard（缺省 lambda:{} 会恒落 defaults 种子，单键热更回退门
     失效——评审 P1 钉正；与 pipeline 自身装配 _default_spec_payload 同形态，
     与 turn_service._capture_spec_payload 快照消费口径一致）。es_indexer 注入
-    get_kb_es_indexer()（B18 删除级联 ES 腿——best-effort WARN 不阻断删除）。"""
+    get_kb_es_indexer()（B18 删除级联 ES 腿——best-effort WARN 不阻断删除）。
+    url_fetcher 注入生产读取链通道（评审 P1① 钉正——api.md §4.2「Firecrawl
+    抓正文后走 4.1 同一流水线」；None 缺位会使 collect_url 恒 422001）。"""
     from app.rag.indexers.es_indexer import get_kb_es_indexer
 
     return KbService(
         db,
         spec_payload_provider=_default_spec_payload,
+        url_fetcher=_read_chain_url_fetcher,
         es_indexer=get_kb_es_indexer(),
     )
 
@@ -118,9 +136,18 @@ async def collect_url(
     body: KbUrlCollectRequest,
     user_id: Annotated[str, Depends(get_current_user)],
     service: Annotated[KbService, Depends(get_kb_service)],
+    pipeline: Annotated[KbPipeline, Depends(get_kb_pipeline)],
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
-    """URL 收藏（§4.2）：护栏 → 去重 → 抓取落象 pending。"""
+    """URL 收藏（§4.2）：护栏 → 去重 → 抓取落象 pending → 入库入队走 4.1 同一
+    流水线（api.md §4.2「Firecrawl 抓正文后走 4.1 同一流水线」）。duplicated=true
+    =返回既有条目，零建行零入队。"""
     collected = await service.collect_url(body.url, user_id=user_id)
+    # 显式提交后才入队（与上传路由同时序钉正）：handler → background → get_db
+    # teardown——teardown commit 晚于 background，worker 新 session 须读到已提交行
+    await service.db.commit()
+    if not collected.duplicated:
+        background_tasks.add_task(pipeline.enqueue, collected.document_id)
     return collected.model_dump(mode="json", exclude_unset=True)
 
 

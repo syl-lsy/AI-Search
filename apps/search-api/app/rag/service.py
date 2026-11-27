@@ -7,7 +7,9 @@
 - §4.2 URL 收藏：B15 SSRF 护栏校验（guard=None kill switch 直通——与 safety.enabled
   解耦口径）→ 拒收 422001 + `url_rejected` 语义留痕（零抓取零建行）→ 同 URL
   重复返回既有条目 duplicated=true（零抓取）→ 新 URL 抓取落象（title 取 H1 /
-  host 兜底，file_size_bytes 恒 null）；
+  host 兜底，file_size_bytes 恒 null）；读取链第二道护栏（逐源读取前复验）拒收
+  同口径留痕、文案区分「被护栏拒收」；正文空/超 KB_MAX_FILE_MB 上限拒收零落象
+  （P2 定正：与上传同口径的正文边界）；
 - §4.3/§4.4 投影（to_kb_document：parse_meta 三键投影、source_url 可选键缺则省略）
   与过滤转发（status/doc_type/limit/offset）；
 - §4.5 删除级联：行删（kb_chunks 经 FK CASCADE）+ sources 反向引用清理
@@ -27,7 +29,7 @@ from typing import Any, Callable
 from sqlalchemy import func, select, update
 
 from app.agent.safety.config import load_content_guard_config
-from app.agent.safety.content_guard import validate_url_async
+from app.agent.safety.content_guard import UrlRejectedError, validate_url_async
 from app.core.config import kb_settings, minio_settings
 from app.core.logger import BusinessLog
 from app.db.models import KbChunk as KbChunkRow
@@ -115,6 +117,20 @@ def validate_upload(
 
 def _truncate_title(title: str) -> str:
     return title[:_TITLE_MAX]
+
+
+def _feishu_node_token(parse_meta: Any) -> str | None:
+    """文档 parse_meta.feishu.node_token 补读（GWT#2 补桥；可回跳键、非密钥，契约
+    已批准下发）。
+
+    库面实测（2026-11-27）：飞书导入行 doc_type 仍为 docx（`_DOC_TYPE_VALUES` 无
+    feishu 值），飞书来源的唯一标记是 parse_meta.feishu 面在场——故不以 doc_type
+    判别，而按「feishu 面 + token 有值」下发；缺失/空串/非字符串 → None（调用方
+    维持键省略语义，不置 null）。
+    """
+    feishu = parse_meta.get("feishu") if isinstance(parse_meta, dict) else None
+    token = feishu.get("node_token") if isinstance(feishu, dict) else None
+    return token.strip() if isinstance(token, str) and token.strip() else None
 
 
 def to_kb_document(row: Any) -> KbDocument:
@@ -324,15 +340,38 @@ class KbService(BaseService):
             )
         try:
             fetched = await self._url_fetcher(url, spec)
+        except UrlRejectedError as exc:
+            # 第二道护栏（读取链逐源读取前复验 url_guard，DNS rebinding TOCTOU 面）
+            # 拒收：语义留痕零 URL/host 回显，文案与通用「抓取失败」区分
+            reason = exc.reason or "unknown"
+            BusinessLog(
+                message=f"url_rejected：第二道读取链护栏拒收（reason={reason}）",
+                action="collect_url",
+                entity="kb_url",
+            ).warning()
+            raise KbUrlInvalidException(
+                "URL 被安全护栏拒收", detail=f"reason={reason}", original_exception=exc
+            ) from exc
         except Exception as exc:
             raise KbUrlInvalidException(
                 "URL 抓取失败", detail=f"fetcher={type(self._url_fetcher).__name__}",
                 original_exception=exc,
             ) from exc
+        if not fetched.strip():  # 空正文入库无意义（零建行零落象）
+            raise KbUrlInvalidException(
+                "URL 抓取内容为空", detail="正文 strip 后为空串（零落象）"
+            )
+        body = fetched.encode("utf-8")
+        max_bytes = kb_settings.max_file_mb * 1024 * 1024
+        if len(body) > max_bytes:  # 与上传 20MB 上限同口径（KB_MAX_FILE_MB 读配置）
+            raise KbUrlInvalidException(
+                "URL 抓取内容超过大小上限",
+                detail=f"len={len(body)} > {kb_settings.max_file_mb}MB（零落象）",
+            )
         title = _truncate_title(extract_url_title(fetched, url))
         doc_id = uuid.uuid4()
         key = original_object_key(user_id, str(doc_id), original_ext_for_doc_type("url"))
-        await self._put_original(key, fetched.encode("utf-8"))
+        await self._put_original(key, body)
         created_at = datetime.now(UTC)
         row = KbDocumentRow(
             id=doc_id,
@@ -431,9 +470,10 @@ class KbService(BaseService):
 
         投影：六必选 + 两可选——meta.heading_path jsonb list 直投；meta.loc
         {page?, para?} 缺则 null 键恒出现；meta.node_id 形态 `fs:node:{token}` 解析
-        token（两可选键齐带）、`fs:blk:` 前缀保留 node_id 省略 node_token（修订注 2
-        ——收官用户裁决候选）、其余前缀两键省略。**不拉 ir.json**（溯源 O(1) 契约
-        走 meta 物化字段）；content 仅进 UI 不进 LLM（转义归前端 DOMPurify）。
+        token（两可选键齐带）、`fs:blk:` 前缀保留 node_id，node_token 缺省时从
+        文档 `parse_meta.feishu.node_token` 补读（GWT#2 补桥——回跳可达；取不到维持
+        键省略）、其余前缀两键省略。**不拉 ir.json**（溯源 O(1) 契约走 meta 物化
+        字段）；content 仅进 UI 不进 LLM（转义归前端 DOMPurify）。
         """
         try:
             source_uuid = uuid.UUID(source_id)
@@ -486,8 +526,14 @@ class KbService(BaseService):
             payload["node_token"] = node_id.removeprefix("fs:node:")
             payload["node_id"] = node_id
         elif isinstance(node_id, str) and node_id.startswith("fs:blk:"):
-            # 修订注 2：fs:blk: 保留 node_id、省略 node_token（无 wiki 外跳 token）
+            # 修订注 2 基线：fs:blk: 保留 node_id（无 wiki 外跳 token）；node_token
+            # 由文档 parse_meta.feishu 补桥（GWT#2 用户裁决——库面 fs:blk: 占绝对
+            # 多数，chunk meta 无 token 时回跳恒不可达）
             payload["node_id"] = node_id
+        if "node_token" not in payload:
+            token = _feishu_node_token(doc.parse_meta)
+            if token is not None:
+                payload["node_token"] = token
         return KbChunkDetail.model_validate(payload)
 
     # ---- §4.5 删除级联 ----

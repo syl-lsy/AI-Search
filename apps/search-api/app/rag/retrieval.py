@@ -49,6 +49,13 @@ __all__ = [
 #: 分词，multi_match 逐字段用各自 search_analyzer，同份 query 天然双路）
 _BM25_FIELDS: tuple[str, ...] = ("content", "heading_path^2", "content.en")
 
+#: 检索 ready 门（data-model kb_documents.status 钉定「非 ready 文档不参与检索——
+#: ready 门不变」）：向量腿 EXISTS 半连接 kb_documents 收口（场景：ES 写入重试
+#: 耗尽置 failed 而 kb_chunks 已持久化——失败文档切片不得进向量腿；chunking→
+#: indexing 窗口期同理被过滤）；BM25 腿结构性排除（ES 仅成功写入+失败级联删除）
+#: ——两通道统一 ready 门。门值走绑定参数 :doc_status，非字面拼接（绑定纪律）
+_READY_STATUS = "ready"
+
 _kb_retriever_instance: "KbRetriever | None" = None
 
 
@@ -146,8 +153,11 @@ class KbRetriever:
         模板；**调用前提 = kb.embedding_enabled=true**——false 灰度态消费面短路
         不发本查询，通道级判定而非行级零向量过滤）。
 
-        参数绑定：qvec（向量文本形态绑定值，CAST 显式定型）/ uid / k 三绑定；
-        user_id 过滤恒携带；行投影同 bm25_search（channel:"vector"，heading_path/
+        参数绑定：qvec（向量文本形态绑定值，CAST 显式定型）/ uid / k / doc_status
+        四绑定；user_id 过滤恒携带；**ready 门（评审 P1③ 钉正——data-model「非
+        ready 文档不参与检索」）**：EXISTS 半连接 kb_documents 过滤
+        d.status = :doc_status（失败/非 ready 文档切片不进向量腿，与 BM25 腿
+        结构性排除统一）；行投影同 bm25_search（channel:"vector"，heading_path/
         node_id 直读 meta 七键物化列）。
         """
         vectors = await self._embed_fn([query_text])
@@ -158,12 +168,24 @@ class KbRetriever:
             " 1 - (embedding <=> CAST(:qvec AS vector)) AS score"
             " FROM kb_chunks"
             " WHERE user_id = :uid"
+            "   AND EXISTS ("
+            "     SELECT 1 FROM kb_documents d"
+            "     WHERE d.id = kb_chunks.kb_doc_id"
+            "       AND d.user_id = :uid"
+            "       AND d.status = :doc_status"
+            "   )"
             " ORDER BY embedding <=> CAST(:qvec AS vector)"
             " LIMIT :k"
         )
         async with self._session_factory() as session:
             result = await session.execute(
-                stmt, {"qvec": qvec, "uid": str(user_id), "k": int(k)}
+                stmt,
+                {
+                    "qvec": qvec,
+                    "uid": str(user_id),
+                    "k": int(k),
+                    "doc_status": _READY_STATUS,
+                },
             )
             rows = result.all()
         out: list[dict[str, Any]] = []

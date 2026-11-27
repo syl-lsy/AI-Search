@@ -24,6 +24,7 @@ nacos-config §2 v1.8 备位条件装载、R12；TDD 红绿，unit 全 mock 零�
 import ast
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -589,6 +590,7 @@ def test_firecrawl_read_rejects_metadata_url_zero_physical_read() -> None:
     with pytest.raises(UrlRejectedError) as exc_info:
         asyncio.run(_read(registry, chain, url="http://169.254.169.254/latest/meta-data/"))
     assert "ip_forbidden" in str(exc_info.value)
+    assert exc_info.value.reason == "ip_forbidden"  # 生产者侧结构化 reason 不漏传
     assert registry._scripted.calls == []  # 零物理调用
 
 
@@ -668,3 +670,212 @@ def test_registry_read_call_sites_all_guarded() -> None:
         f"registry.read 出现护栏面之外的调用点（SSRF 面未过 url_guard）: "
         f"{sorted(sites - allowed)}"
     )
+
+
+# ---- read_via_chain：KB URL 收藏通道的护栏面守卫函数（B15 架构不变量） ----
+#
+# 背景（批次 7 评审 P1 修复轮）：KB URL 收藏的读取链曾直调 registry.read 落在护栏面
+# 外——读取时点不复验 url_guard（DNS rebinding TOCTOU）。守卫函数把该通道收回
+# url_reader 面，逐源读取前复验、链序换源语义与原实现一致。
+# P2 轮：快照不可得（异常/None/空 payload）时**不得 bind 空表**——进程级共享
+# registry 的 _entries 被清空会殃及并发 deep 轮的读取链。
+
+
+class _BindTrackingRegistry(_ReadRegistry):
+    """bind 调用轨迹版 registry 假体（P2：快照不可得路径断言零 bind）。"""
+
+    def __init__(self, tool: _ScriptedTool) -> None:
+        super().__init__(tool)
+        self.bind_calls: list[Any] = []
+
+    def bind(self, mcp_payload: Any) -> None:
+        self.bind_calls.append(mcp_payload)
+
+
+def _two_source_chain() -> Any:
+    """两源链（首源失败→次源）：生产 resolve_read_chain 当前恒单源（主位/备位互斥
+    装载），多源形态是链序换源语义的显式注入面（READ_PRIMARY_SOURCES 扩容预备）。"""
+    from app.agent.tools.registry import ReadChain
+
+    return ReadChain(
+        sources=["firecrawl", "crawl4ai"],
+        backup="crawl4ai",
+        degraded=True,
+        detail="firecrawl→crawl4ai",
+    )
+
+
+def _patch_validate(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    ok: bool = True,
+    reason: str = "ok",
+    events: list[str] | None = None,
+) -> list[str]:
+    """替换 url_reader 面的 validate_url_async：记录每次校验（守卫时序断言用）。"""
+    import app.agent.tools.url_reader as url_reader_module
+
+    calls: list[str] = []
+
+    async def _fake(url: str, guard: Any) -> Any:
+        calls.append(url)
+        if events is not None:
+            events.append("validate")
+        return SimpleNamespace(ok=ok, reason=reason)
+
+    monkeypatch.setattr(url_reader_module, "validate_url_async", _fake)
+    return calls
+
+
+class _TracingTool(_ScriptedTool):
+    """读取事件轨迹版脚本工具（与 validate 事件共表——时序断言）。"""
+
+    def __init__(self, script: list[Any], events: list[str]) -> None:
+        super().__init__(script)
+        self.events = events
+
+    async def ainvoke(self, args: dict[str, Any]) -> Any:
+        self.events.append("read")
+        return await super().ainvoke(args)
+
+
+def test_read_via_chain_guard_rejection_zero_physical_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """guard 拒收 → 换源；全源拒收 → UrlRejectedError（零物理读取，reason 进报文）。"""
+    from app.agent.safety.content_guard import UrlRejectedError
+    from app.agent.tools.url_reader import read_via_chain
+
+    calls = _patch_validate(monkeypatch, ok=False, reason="ip_forbidden")
+    tool = _ScriptedTool([{"markdown": "正文"}])
+    registry = _ReadRegistry(tool)
+    with pytest.raises(UrlRejectedError) as exc_info:
+        asyncio.run(
+            read_via_chain(
+                "http://169.254.169.254/latest/meta-data/",
+                None,
+                registry=registry,
+                chain=_two_source_chain(),
+            )
+        )
+    assert "ip_forbidden" in str(exc_info.value)
+    assert exc_info.value.reason == "ip_forbidden"  # 生产者侧结构化 reason 不漏传
+    assert tool.calls == []  # 零物理读取
+    assert len(calls) == 2  # 每源读取前各复验一次（拒收即换源）
+
+
+def test_read_via_chain_falls_back_to_next_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """链序换源：首源读取异常 → 次源成功返回（失败换源语义与原实现一致）。"""
+    from app.agent.tools.registry import SourceCallError
+    from app.agent.tools.url_reader import read_via_chain
+
+    _patch_validate(monkeypatch, ok=True)
+    tool = _ScriptedTool([SourceCallError("transport down"), {"markdown": "次源正文"}])
+    registry = _ReadRegistry(tool)
+    text = asyncio.run(
+        read_via_chain(
+            "https://a.example/", None, registry=registry, chain=_two_source_chain()
+        )
+    )
+    assert text == "次源正文"
+    assert len(tool.calls) == 2  # 两源各物理调用一次
+
+
+def test_read_via_chain_validates_before_every_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOCTOU 复验时序：每次 registry.read 之前都过一次 validate（次数=源数）。"""
+    from app.agent.tools.url_reader import read_via_chain
+
+    events: list[str] = []
+    calls = _patch_validate(monkeypatch, ok=True, events=events)
+    tool = _TracingTool(
+        [SourceCallError("first down"), {"markdown": "次源正文"}], events
+    )
+    registry = _ReadRegistry(tool)
+    asyncio.run(
+        read_via_chain(
+            "https://a.example/", None, registry=registry, chain=_two_source_chain()
+        )
+    )
+    assert events == ["validate", "read", "validate", "read"]
+    assert len(calls) == 2 and calls == ["https://a.example/"] * 2
+
+
+def test_read_via_chain_empty_chain_raises_unavailable() -> None:
+    """空链 → SearchChainUnavailable（调用方归一 422001；零物理读取）。"""
+    from app.agent.tools.registry import ReadChain, SearchChainUnavailable
+    from app.agent.tools.url_reader import read_via_chain
+
+    tool = _ScriptedTool([{"markdown": "正文"}])
+    chain = ReadChain(
+        sources=[], backup=None, degraded=True, detail="主位与备位链全部不可用（跳过读原文）"
+    )
+    with pytest.raises(SearchChainUnavailable):
+        asyncio.run(
+            read_via_chain("https://a.example/", None, registry=_ReadRegistry(tool), chain=chain)
+        )
+    assert tool.calls == []
+
+
+def test_read_via_chain_resolves_snapshot_chain_when_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产解析路径：MCP 清单快照（非空）→ registry.bind + resolve_read_chain → 读取。"""
+    import app.config_center as config_center_module
+    from app.agent.tools.url_reader import read_via_chain
+
+    _patch_validate(monkeypatch, ok=True)
+    payload = _read_mcp_payload()
+    monkeypatch.setattr(
+        config_center_module,
+        "get_asset_center",
+        lambda: SimpleNamespace(snapshot=lambda data_id: SimpleNamespace(payload=payload)),
+    )
+    tool = _ScriptedTool([{"markdown": "快照解析正文"}])
+    registry = _BindTrackingRegistry(tool)
+    text = asyncio.run(read_via_chain("https://a.example/", None, registry=registry))
+    assert text == "快照解析正文"
+    assert registry.bind_calls == [payload]  # 非空快照才 bind（一次）
+    assert registry._scripted.calls == [
+        {"url": "https://a.example/", "formats": ["markdown"]}
+    ]
+
+
+@pytest.mark.parametrize("mode", ["exception", "snapshot_none", "empty_payload"])
+def test_read_via_chain_snapshot_unavailable_skips_bind_and_raises(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """快照不可得（异常/None/空 payload）→ **零 bind**（不清空进程级共享 registry
+    条目，防殃及并发 deep 轮）+ SearchChainUnavailable（零物理读取）。"""
+    import app.config_center as config_center_module
+    from app.agent.tools.registry import SearchChainUnavailable
+    from app.agent.tools.url_reader import read_via_chain
+
+    def _boom() -> Any:
+        raise RuntimeError("资产中心未启动（单测/Studio 直跑）")
+
+    if mode == "exception":
+        monkeypatch.setattr(config_center_module, "get_asset_center", _boom)
+    elif mode == "snapshot_none":
+        monkeypatch.setattr(
+            config_center_module,
+            "get_asset_center",
+            lambda: SimpleNamespace(snapshot=lambda data_id: None),
+        )
+    else:
+        monkeypatch.setattr(
+            config_center_module,
+            "get_asset_center",
+            lambda: SimpleNamespace(
+                snapshot=lambda data_id: SimpleNamespace(payload={})
+            ),
+        )
+    tool = _ScriptedTool([{"markdown": "正文"}])
+    registry = _BindTrackingRegistry(tool)
+    with pytest.raises(SearchChainUnavailable):
+        asyncio.run(read_via_chain("https://a.example/", None, registry=registry))
+    assert registry.bind_calls == []  # 零 bind（共享 registry 条目不被清空）
+    assert tool.calls == []  # 零物理读取

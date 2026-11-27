@@ -119,8 +119,14 @@ test.describe('Library 知识库页主链路（真服务）', () => {
     expect(await rows.count()).toBe(50)
     // 页码分页（R-3）：点第 2 页 → 整页替换（行集合 differ：首行标题变化；行数仍 50 不累积）
     const firstRowTitle = await rows.first().locator('.doc-name').textContent()
+    const firstRowDocId = await rows.first().getAttribute('data-doc-id')
     await page.getByTestId('kb-pager-page-2').click()
     await expect(page.getByTestId('kb-pager-page-2')).toHaveAttribute('aria-current', 'page')
+    // 整页替换落地锚点：store goToPage 乐观置页码（aria-current 即翻），行集替换待双请求
+    // （limit=50 主拉 + limit=1 ready 计数）全部落地才写 documents——toHaveCount(50) 对旧页
+    // 行集恒真、不构成替换完成的信号；先等首行 data-doc-id 变化再读，否则全量负载下读到
+    // 旧页首行（与 firstRowTitle 恒等——两轮门禁红/单跑绿分裂的竞态实证 2026-11-27）
+    await expect(rows.first()).not.toHaveAttribute('data-doc-id', firstRowDocId!, { timeout: 10_000 })
     await expect(rows).toHaveCount(50, { timeout: 10_000 })
     const secondPageTitle = await rows.first().locator('.doc-name').textContent()
     expect(secondPageTitle).not.toBe(firstRowTitle)

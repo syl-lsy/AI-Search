@@ -63,7 +63,14 @@ DEFAULT_RESOLVER: Resolver = _socket_resolver
 
 class UrlRejectedError(Exception):
     """URL 被护栏拒收（reason 携带枚举词——零 URL/host 回显）。未接线工具面抛出、
-    接线面转为系统注 + errors 留痕（未来接线沿同语义消费）。"""
+    接线面转为系统注 + errors 留痕（未来接线沿同语义消费）。
+
+    `reason` 结构化携带拒收枚举词（消费面留痕用——消息文本仍含枚举词，向后兼容）。
+    """
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _warn(message: str) -> None:
