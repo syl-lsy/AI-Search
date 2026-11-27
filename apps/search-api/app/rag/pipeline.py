@@ -694,8 +694,21 @@ class KbPipeline:
             ).warning(exc)
             data = b""
         # 归一化（同步 CPU 面下放线程池；缝名模块级——测试经 monkeypatch 替换）
+        # 来源语义按行投影派生（处置线⑳ doc_kind:url 接线；data-model §1.18：
+        # doc_kind 六值含 url、来源语义由 doc_kind/loc.origin 承载、ID 仍 loc:*
+        # 前缀不编码来源）：URL 收藏行（doc_type=url）→ doc_kind="url" +
+        # source_url 进 UrlLoc（可回跳字段）；上传/飞书附件行恒 "upload" 零变化。
+        # ES doc_meta.doc_kind 由 ir.json root 单一事实源派生（build_es_doc_meta），
+        # IR root 正确即 ES 面自动正确。
+        doc_kind = "url" if row["doc_type"] == "url" else "upload"
+        source_url = row.get("source_url") if doc_kind == "url" else None
         result = await asyncio.to_thread(
-            normalize_document, data, ext, doc_kind="upload", file_object_key=key
+            normalize_document,
+            data,
+            ext,
+            doc_kind=doc_kind,
+            file_object_key=key,
+            source_url=source_url,
         )
         root: IrNode = result.document
         root.title = row["title"]  # 标题富化（§1.18 heading_path 构成公式 doc.title 段）

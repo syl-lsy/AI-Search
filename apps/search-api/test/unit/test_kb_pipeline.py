@@ -25,10 +25,15 @@ import pytest
 from app.core.config import minio_settings
 from app.rag import pipeline as kb_pipeline
 from app.rag.chunker import Chunk
-from app.rag.ir_schema import IrNode, serialize_ir
+from app.rag.ir_schema import IrNode, LocalLoc, UrlLoc, serialize_ir
 from app.rag.normalizers.errors import NormalizationError
 from app.rag.normalizers.result import NormalizationResult
-from app.rag.storage import ir_object_key, original_object_key, put_ir_json
+from app.rag.storage import (
+    get_ir_json,
+    ir_object_key,
+    original_object_key,
+    put_ir_json,
+)
 
 _USER_ID = "00000000-0000-4000-8000-000000000001"
 _DOC_ID = "7d2f0a1e-0000-4000-8000-0000000000b1"
@@ -803,6 +808,96 @@ async def test_normalizing_preserves_feishu_parse_meta_for_attachment_rows(
     parse_meta = chunking_transition["fields"]["parse_meta"]
     assert parse_meta["feishu"] == feishu_meta  # 四键原样保留
     assert "parser" in parse_meta  # 归一化产物键照常合入
+
+
+# ---------------------------------------------------------------------------
+# 处置线⑳ doc_kind:url 接线（M3 退出批——URL 收藏通道来源语义落 IR/ES）
+# ---------------------------------------------------------------------------
+
+
+def _source_aware_normalize(calls: list[dict[str, Any]]):
+    """kwargs 驱动归一化假体（与 markdown_mapper.make_loc 同构）：收到
+    doc_kind="url" → UrlLoc（source_url 投影），其余 → LocalLoc；calls 捕获
+    normalize_document 缝收到的 kwargs（红→绿断言面）。"""
+
+    def _normalize(data: bytes, ext: str, **kwargs: Any) -> NormalizationResult:
+        calls.append(dict(kwargs))
+        doc_kind = kwargs.get("doc_kind", "upload")
+        source_url = kwargs.get("source_url")
+        if doc_kind == "url":
+            loc: LocalLoc | UrlLoc = UrlLoc(origin="url", source_url=source_url or "")
+        else:
+            loc = LocalLoc(origin="local", file_object_key=kwargs.get("file_object_key"))
+        document = IrNode(
+            id="loc:doc:stub",
+            type="document",
+            title=None,
+            doc_kind=doc_kind,
+            loc=loc,
+            meta={"raw_type": "normalizer.document"},
+        )
+        parse_meta = {"pages": None, "tables": 0, "code_blocks": 0, "parser": "markitdown"}
+        return NormalizationResult(document=document, parse_meta=parse_meta)
+
+    return _normalize
+
+
+async def _run_url_or_upload_row(row: dict[str, Any], fake_minio, monkeypatch):
+    """共驱：kwargs 驱动归一化缝 + es_enabled=true 双通道全链至 ready；
+    返回 (calls, fake_es, ir_root)。"""
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(kb_pipeline, "normalize_document", _source_aware_normalize(calls))
+    monkeypatch.setattr(kb_pipeline, "chunk_forest", _make_chunk_forest())
+    fake_es = _FakeEsIndexer()
+    repo = _FakeRepo(row)
+    _seed_original(fake_minio)
+    pipeline = _make_pipeline(
+        repo, fake_minio, spec={"kb": {"es_enabled": True}}, es_indexer=fake_es
+    )
+    outcome = await pipeline.process_document(str(row["id"]))
+    assert outcome == "ready"
+    root = await get_ir_json(_USER_ID, str(row["id"]), client=fake_minio)
+    return calls, fake_es, root
+
+
+async def test_url_row_marks_doc_kind_url_and_projects_source_url(
+    fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """处置线⑳ URL 收藏通道（doc_type=url 行）：归一化缝按来源收
+    doc_kind="url" + source_url；IR root.doc_kind=url 且 root.loc=UrlLoc
+    （source_url 进可回跳字段、不混入 loc:* ID 前缀）；ES doc_meta.doc_kind
+    派生 url（IR root 单一事实源）。"""
+    row = _row("pending")
+    row["doc_type"] = "url"
+    row["source_url"] = "https://example.com/article"
+    calls, fake_es, root = await _run_url_or_upload_row(row, fake_minio, monkeypatch)
+
+    # ① 归一化缝收到来源语义参数
+    assert calls[0]["doc_kind"] == "url"
+    assert calls[0]["source_url"] == "https://example.com/article"
+    # ② IR root：doc_kind=url + UrlLoc（source_url 可回跳字段；id 仍 loc:doc: 前缀）
+    assert root.doc_kind == "url"
+    assert root.id.startswith("loc:doc:")
+    assert isinstance(root.loc, UrlLoc)
+    assert root.loc.source_url == "https://example.com/article"
+    # ③ ES doc_meta 派生（IR root 单一事实源）
+    assert fake_es.index_kwargs[0]["doc_meta"]["doc_kind"] == "url"
+
+
+async def test_upload_row_keeps_doc_kind_upload_without_source_url(
+    fake_minio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """上传通道零变化（回归保护）：doc_type=md 行恒 doc_kind="upload"、
+    source_url 不投影（None）；root.loc 仍 LocalLoc。"""
+    row = _row("pending")  # doc_type="md"、source_url=None
+    calls, fake_es, root = await _run_url_or_upload_row(row, fake_minio, monkeypatch)
+
+    assert calls[0]["doc_kind"] == "upload"
+    assert calls[0]["source_url"] is None
+    assert root.doc_kind == "upload"
+    assert isinstance(root.loc, LocalLoc)
+    assert root.loc.file_object_key == calls[0]["file_object_key"]
+    assert fake_es.index_kwargs[0]["doc_meta"]["doc_kind"] == "upload"
 
 
 def test_serialize_import_health() -> None:
