@@ -201,6 +201,15 @@ class DeepState(TypedDict, total=False):
     time_range: TimeRange
     subtopics: list[str]
     outline: list[dict[str, Any]]  # [{section, intent}] 报告章节骨架
+    # B22 批次 4（deep 门独立灰度——与 MainState/FastState 同名投影，R14①）：
+    approval_choice: str  # 阶段 2 输入（TurnRunner 注入）：kb_only|web_only|both|custom
+    approval_note: str  # 阶段 2 输入（评审 F1/F4）：审批补充指令（R35 sanitize 后）
+    kb_gate_action: str  # deep 门节点判定动作：await|web_only|hybrid（deep_route_after_gate 消费）
+    kb_gate_verdict: str  # 门判定面：has_hit|no_hit（extra.hitl + turn_approvals 投影源）
+    kb_gate_subqueries: list[dict[str, Any]]  # hits_summary：[{query_index, top_k_count, top1_score?}]
+    kb_gate_previews: list[dict[str, Any]]  # 预览物化 ≤preview_count 条（§7.2 previews 形态）
+    kb_gate_payload: dict[str, Any] | None  # 阶段 2 恢复载荷（含 planner 键——R30 兼容扩展）
+    kb_gate_ms: int  # 门段耗时（timing 观测面——extra.hitl.gate_ms 同源）
     # research/reflect 累积（deepagents 子代理，B4）
     subagent_reports: Annotated[list[dict[str, Any]], add]  # M2 批次 2 reducer 改造：
     #   扇出合流（research 门控/后续 supplement 轮各自增量追加，superstep 末拼接）；

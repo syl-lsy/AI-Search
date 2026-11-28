@@ -189,7 +189,7 @@ export interface StageExtra {
   correction?: boolean
   /** api.md v1.33 零面判定行（B19）：融合链路观测投影（A35 可观测留痕）——stage(search,done) extra 携带 {per_query_top_k, rrf_k, kb_fuse_top_k, es_hits, vec_hits, type_weights}（通道活跃副本才携带，键可省）；观测/评测判读键、前端零渲染义务（宽松 Record<string, unknown>） */
   kb_funnel?: Record<string, unknown>
-  /** api.md §7.2/§2.5 v1.37 B22 HITL 门留痕（REQ-069）：仅门轮（含 shadow）的 stage(rewrite,done) 携带 {gate: triggered|shadow, verdict: has_hit|no_hit, subqueries: [{query_index, top_k_count, top1_score?}], gate_ms?}（评测/审计判读键——弹窗率分子=has_hit、误弹窗率=has_hit∧web_only；非门轮零键不置 null，前端零渲染义务；宽松 Record<string, unknown> 同 kb_funnel 先例） */
+  /** api.md §7.2/§2.5 v1.37 B22 HITL 门留痕（REQ-069）：仅门轮（含 shadow）携带 {gate: triggered|shadow, verdict: has_hit|no_hit, subqueries: [{query_index, top_k_count, top1_score?}], gate_ms?}——载体按模式（api.md §7.2 v1.39 载体钉正）：fast=stage(rewrite,done)、deep=stage(plan,done)（类型形状零变更）（评测/审计判读键——弹窗率分子=has_hit、误弹窗率=has_hit∧web_only；非门轮零键不置 null，前端零渲染义务；宽松 Record<string, unknown> 同 kb_funnel 先例） */
   hitl?: Record<string, unknown>
 }
 

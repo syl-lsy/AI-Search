@@ -52,6 +52,11 @@ __all__ = [
     "GATE_CONCURRENCY_LIMIT",
     "GateQueryResult",
     "approval_wait",
+    "deep_hitl_gate_armed",
+    "deep_kb_gate",
+    "deep_route_after_gate",
+    "deep_route_after_planner",
+    "deep_route_by_approval",
     "evaluate_noise_floor",
     "hitl_gate_armed",
     "kb_gate",
@@ -651,6 +656,242 @@ async def kb_gate(state: Any, config: RunnableConfig | None = None) -> dict[str,
     if not all_empty:
         # 预览物化仅 has_hit 形态（no_hit 无预览、shadow 有值留预览供观测——
         # §2.5 approval shadow 形态 previews 不投影，本键为 TurnRunner 投影源）
+        update["kb_gate_previews"] = _materialize_previews(
+            results, preview_count=preview_count, preview_chars=preview_chars
+        )
+        update["kb_gate_payload"] = payload
+    else:
+        update["kb_gate_previews"] = []
+        update["kb_gate_payload"] = None
+    if errors:
+        update["errors"] = errors
+    return update
+
+
+# ---- deep 门（B22 批次 4 第一段：plan §3.3 / ARCH v1.83 §4.2 分期注）----
+#
+# 与 fast 的三点差异（机制面）：
+# 1. 独立灰度键：读 `hitl.deep_enabled`（fast 的 hitl_gate_armed/kb_gate 读
+#    `hitl.enabled` 零触碰——约束①互不牵动）；无 correction_round 判定（deep 无纠错回边）；
+# 2. 检索单位=planner 子课题（state.subtopics）；payload 增 `planner` 键
+#    {subtopics, outline}（R30 兼容扩展——schema_version=1 不变，data-model §1.20
+#    :622 planner? 预留；批次 2 fast payload 无 planner 键零回归）；
+# 3. 深检索由子代理工具承载、无 Send 形态——零命中/通道失败/门内异常 → route 送
+#    research 同一执行继续（web/kb 消费面桩化归第二段 R36）；has_hit → approval_wait
+#    空操作终结（复用批次 2 节点）。判定器/多信号地板/预览物化/候选去重全部复用
+#    本模块既有纯函数（约束⑥复用不重构）。
+
+
+def deep_hitl_gate_armed(state: Mapping[str, Any], spec: Mapping[str, Any] | None) -> bool:
+    """deep 门前置判定（**零 IO**——deep_route_after_planner 消费）。
+
+    armed = `hitl.deep_enabled=true`〔独立灰度键——enabled 零消费，约束①〕∧
+    `query_type ∉ hitl.skip_query_types`〔缺省 navigational/temporal 不进门；
+    deep planner 产 temporal 可达、navigational 恒死键〔判导航输出 factoid，
+    deep_planner.py:16〕〕∧ `kb_available=true`〔双通道全关=「不可用」与「零命中」
+    两件事〕。无 correction_round 判定（deep 无纠错回边）。G3：deep_enabled 缺省
+    false 恒 False=现状路径逐字节。"""
+    hitl = _hitl_section(spec)
+    if hitl.get("deep_enabled") is not True:
+        return False
+    skip = hitl.get("skip_query_types")
+    skip_types = tuple(skip) if isinstance(skip, (list, tuple)) else _DEFAULT_SKIP_QUERY_TYPES
+    if str(state.get("query_type") or "other") in skip_types:
+        return False
+    return kb_available(spec)
+
+
+def deep_route_after_planner(state: Mapping[str, Any]) -> str:
+    """planner 出条件边（deep_enabled 门分支——G3 缺省=false→research 现状逐字节，
+    条件边与普通边执行面等价零事件差异）。"""
+    spec = state.get("spec")
+    spec = spec if isinstance(spec, Mapping) else {}
+    if deep_hitl_gate_armed(state, spec):
+        return "kb_gate"
+    return "research"
+
+
+def deep_route_by_approval(state: Mapping[str, Any]) -> str:
+    """START 条件入口两阶段恢复（plan §3.3）：无 `approval_choice`（阶段 1）→
+    planner（现状 START→planner 边的条件化改写，行为逐字节）；阶段 2（choice 在场
+    ——subtopics/outline 已随初始 state 由 TurnRunner 注入，**不重规划**零
+    stage(plan)）→ research。choice 四值在 deep 面同达 research（kb_only/web_only
+    的执行面差异=子代理工具作用域，桩化归第二段）。"""
+    if state.get("approval_choice"):
+        return "research"
+    return "planner"
+
+
+def deep_route_after_gate(state: Mapping[str, Any]) -> str:
+    """deep kb_gate 出条件边两叉（plan §3.3）：
+
+    - `await`（enforce 有命中）→ `approval_wait`（空操作终结——图自然 END，
+      TurnRunner 落 awaiting + 载荷后协程返回）；
+    - 其余（web_only 零命中继续 / hybrid shadow·通道失败·门内异常回落）→
+      `research` 同一执行继续（web/kb 消费面=子代理工具，桩化归第二段 R36）。"""
+    if state.get("kb_gate_action") == "await":
+        return "approval_wait"
+    return "research"
+
+
+async def deep_kb_gate(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
+    """deep KB 审批门节点（plan §3.3 / ARCH §4.2 分期注）。
+
+    判定树与 fast kb_gate 同构（判定零 LLM，ADR-019 决策②）——检索管线复用
+    retrieve_top_k_single_query（多信号地板/R38 异常语义/部分成功语义全同源）：
+
+    1. **前置竞态防御**：deep_enabled 关（扇出边 armed 后 spec 快照漂移的纵深兜底）
+       → 现状直通零检索（action=hybrid）；
+    2. **逐子课题检索**（state.subtopics，信号量帽 GATE_CONCURRENCY_LIMIT=4）；
+    3. **任一子课题全部通道失败** → hybrid + errors[] hitl_gate_error（不判无）；
+    4. **门内代码异常** → 同 3（R38）；
+    5. **地板后全空** → action=web_only：**图不终结**——route 送 research 继续
+       （零命中子代理 kb_search 桩化归第二段）；payload=None、errors[] hitl_no_hit；
+    6. **任一有值** → has_hit：enforce=await（approval_wait END，TurnRunner 落
+       awaiting）；shadow=hybrid（research 照跑）。
+
+    留痕面：`stage(plan, done).extra.hitl` 判定帧（gate=triggered|shadow + verdict +
+    subqueries + gate_ms——同 key 多次出现合法 §7.2；deep 侧 plan 帧归属随批次 4
+    契约增量钉正，api.md §7.4:1723 挂账注）；AgentLog graph="deep"。
+    """
+    ensure_not_canceled(config)  # 门在阶段 1 内有协程——节点边界取消感知
+    spec = state.get("spec")
+    spec = spec if isinstance(spec, Mapping) else {}
+    hitl = _hitl_section(spec)
+    if hitl.get("deep_enabled") is not True:
+        # 前置竞态防御（armed 已在 planner 出边判定；零检索直通=纵深兜底）
+        return {"kb_gate_action": "hybrid"}
+
+    subtopics = [str(s) for s in (state.get("subtopics") or [])]
+    if not subtopics:
+        return {"kb_gate_action": "hybrid"}
+    outline = [dict(o) if isinstance(o, Mapping) else {"section": str(o)} for o in (state.get("outline") or [])]
+
+    configurable = (config or {}).get("configurable") or {}
+    retriever: KbRetriever | None = configurable.get("kb_retriever")
+    raw_kb = spec.get("kb")
+    kb_section = raw_kb if isinstance(raw_kb, Mapping) else {}
+    kb_section = kb_section if isinstance(kb_section, Mapping) else {}
+    es_on, vec_on = kb_channels_enabled(spec)
+    shadow = hitl.get("shadow") is True
+    preview_count = _int_or(hitl.get("preview_count"), 3)
+    preview_chars = _int_or(hitl.get("preview_chars"), 200)
+    query_type = str(state.get("query_type") or "other")
+    weights = _weights_for(kb_section, query_type)
+    if retriever is None:
+        AgentLog(
+            message="deep_kb_gate kb_retriever 未注入——回落现状路径",
+            graph="deep",
+            node="kb_gate",
+        ).warning()
+        return {
+            "kb_gate_action": "hybrid",
+            "errors": [_gate_error("hitl_gate_error", {"stage": "kb_gate"})],
+        }
+
+    started = perf_counter()
+    try:
+        semaphore = asyncio.Semaphore(GATE_CONCURRENCY_LIMIT)
+
+        async def _one(index: int, subtopic: str) -> GateQueryResult:
+            async with semaphore:
+                return await retrieve_top_k_single_query(
+                    retriever,
+                    subtopic,
+                    user_id=state.get("user_id"),
+                    query_index=index,
+                    es_on=es_on,
+                    vec_on=vec_on,
+                    per_query_top_k=_int_or(kb_section.get("per_query_top_k"), 30),
+                    rrf_k=_int_or(kb_section.get("rrf_k"), 60),
+                    kb_fuse_top_k=_int_or(kb_section.get("kb_fuse_top_k"), 20),
+                    type_weights=weights,
+                    dual_channel_timeout_s=float(kb_section.get("dual_channel_timeout_s") or 3),
+                    rerank_alias=str(
+                        (configurable.get("model_mapping") or MODEL_MAPPING_CONFIG).get("rerank")
+                        or MODEL_MAPPING_CONFIG["rerank"]
+                    ),
+                    rerank_timeout_s=float(kb_section.get("rerank_timeout_s") or 2),
+                    preview_rerank_cap=preview_count,
+                    noise_floor=hitl.get("noise_floor"),
+                    guards=load_content_guard_config(spec),
+                )
+
+        results = list(await asyncio.gather(*(_one(i, s) for i, s in enumerate(subtopics))))
+    except Exception as exc:  # noqa: BLE001 —— 门内代码异常回落现状（R38 不判无）
+        AgentLog(
+            message=f"deep_kb_gate 门内异常回落现状：{type(exc).__name__}",
+            graph="deep",
+            node="kb_gate",
+        ).warning()
+        return {
+            "kb_gate_action": "hybrid",
+            "errors": [_gate_error("hitl_gate_error", {"stage": "kb_gate"})],
+        }
+    gate_ms = int((perf_counter() - started) * 1000)
+
+    if any(result.status == "channel_failed" for result in results):
+        AgentLog(
+            message="deep_kb_gate 子课题通道全败回落现状（不判无）",
+            graph="deep",
+            node="kb_gate",
+        ).warning()
+        return {
+            "kb_gate_action": "hybrid",
+            "errors": [_gate_error("hitl_gate_error", {"stage": "kb_gate"})],
+        }
+
+    subqueries: list[dict[str, Any]] = []
+    for index, result in enumerate(results):
+        entry: dict[str, Any] = {"query_index": index, "top_k_count": result.top_k_count}
+        if result.top1_rerank is not None:
+            entry["top1_score"] = result.top1_rerank
+        subqueries.append(entry)
+    all_empty = all(result.top_k_count == 0 for result in results)
+    verdict = "no_hit" if all_empty else "has_hit"
+
+    errors: list[dict[str, Any]] = []
+    if all_empty:
+        action = "hybrid" if shadow else "web_only"
+        if not shadow:
+            errors.append(_gate_error("hitl_no_hit", {"subqueries": subqueries}))
+        payload = None  # no_hit 轻量无载荷（data-model §1.20 gate_payload null）
+    else:
+        action = "hybrid" if shadow else "await"
+        payload = {
+            "schema_version": GATE_PAYLOAD_SCHEMA_VERSION,
+            "rewritten_queries": subtopics,
+            "query_type": query_type,
+            "time_range": state.get("time_range"),
+            "query_lang": state.get("query_lang"),
+            "kb_candidates": _dedupe_candidates(results),
+            # R30 兼容扩展：planner 产物持久化（阶段 2 跳过 planner——ARCH §4.2
+            # 分期注「planner 产物（subtopics/outline，体量小）持久化进 gate_payload」；
+            # schema_version=1 不变——data-model §1.20 :622 planner? 预留键承载）
+            "planner": {"subtopics": subtopics, "outline": outline},
+        }
+
+    # 判定面留痕帧（deep 侧 plan 帧——api.md §7.4:1723 挂账注批次 4 契约增量随批钉正）
+    emit_stage(
+        "plan",
+        "done",
+        extra={
+            "hitl": {
+                "gate": "shadow" if shadow else "triggered",
+                "verdict": verdict,
+                "subqueries": subqueries,
+                "gate_ms": gate_ms,
+            }
+        },
+    )
+
+    update: dict[str, Any] = {
+        "kb_gate_action": action,
+        "kb_gate_verdict": verdict,
+        "kb_gate_subqueries": subqueries,
+        "kb_gate_ms": gate_ms,
+    }
+    if not all_empty:
         update["kb_gate_previews"] = _materialize_previews(
             results, preview_count=preview_count, preview_chars=preview_chars
         )

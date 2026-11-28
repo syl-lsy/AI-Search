@@ -63,6 +63,13 @@ from app.agent.nodes.deep_reflect import reflect, route_reflect
 from app.agent.nodes.deep_research import research
 from app.agent.nodes.deep_supplement import supplement as supplement_node
 from app.agent.nodes.deep_writer import writer as writer_node
+from app.agent.nodes.kb_gate import (
+    approval_wait,
+    deep_kb_gate,
+    deep_route_after_gate,
+    deep_route_after_planner,
+    deep_route_by_approval,
+)
 from app.agent.state import DeepState
 
 
@@ -71,7 +78,15 @@ def build_deep_graph() -> Any:
     supplement/guards/writer/finalize/degraded_writer 真节点 + 两处条件边（reflect
     出口 supplement/guards；guards 出口 writer/degraded_writer）。降级路径 guards →
     degraded_writer → END 直通（:480 DG --> E——不进 finalize，引用核对由
-    degraded_writer 内联承载）；正常路径 guards → writer → finalize → END。"""
+    degraded_writer 内联承载）；正常路径 guards → writer → finalize → END。
+
+    B22 批次 4（deep 门独立灰度，plan §3.3 / ARCH v1.83 §4.2 分期注）：START 条件
+    入口（approval_choice 在场=阶段 2 直达 research 跳过 planner——planner 产物
+    持久化恢复）+ planner 条件边（deep_enabled armed → kb_gate；否则 research
+    现状逐字节）+ kb_gate 条件边（await → approval_wait 空操作终结｜web_only/
+    hybrid → research 同一执行继续——deep 无 Send 形态，消费面=子代理工具）。
+    G3：deep_enabled 缺省 false 时门分支不可达、存量路径执行序零变化（条件边与
+    普通边执行面等价零事件差异）。"""
     builder = StateGraph(DeepState)
     builder.add_node("planner", planner)
     builder.add_node("research", research)
@@ -81,8 +96,12 @@ def build_deep_graph() -> Any:
     builder.add_node("writer", writer_node)
     builder.add_node("finalize", finalize_node)
     builder.add_node("degraded_writer", degraded_writer_node)
-    builder.add_edge(START, "planner")
-    builder.add_edge("planner", "research")
+    builder.add_node("kb_gate", deep_kb_gate)
+    builder.add_node("approval_wait", approval_wait)
+    builder.add_conditional_edges(START, deep_route_by_approval, ["planner", "research"])
+    builder.add_conditional_edges(
+        "planner", deep_route_after_planner, ["kb_gate", "research"]
+    )
     builder.add_edge("research", "reflect")
     builder.add_conditional_edges(
         "reflect", route_reflect, {"supplement": "supplement", "guards": "guards"}
@@ -91,9 +110,13 @@ def build_deep_graph() -> Any:
     builder.add_conditional_edges(
         "guards", route_guards, {"writer": "writer", "degraded_writer": "degraded_writer"}
     )
+    builder.add_conditional_edges(
+        "kb_gate", deep_route_after_gate, ["approval_wait", "research"]
+    )
     builder.add_edge("writer", "finalize")
     builder.add_edge("finalize", END)
     builder.add_edge("degraded_writer", END)
+    builder.add_edge("approval_wait", END)
     return builder.compile()
 
 

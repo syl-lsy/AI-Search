@@ -226,6 +226,63 @@ _READ_EMPTY_GUIDANCE = (
 #: URL 协议白名单（api.md §7.2 安全面，fast fuse_rerank._url_allowed 同判据）
 _URL_PROTOCOLS = ("http", "https")
 
+# ---- R36 工具面约束（B22 批次 4 第二段——桩非摘除，plan §3.3/ARCH §4.2 分期注）----
+#
+# 桩注三常量：**固定文本零插值零 payload 回显**（与既有系统注先例 _SEARCH_EMPTY_GUIDANCE/
+# kb_search 通道未启用注同款 plain-string 安全管道——无动态内容进提示词面）。桩调用
+# 零副作用（短路与 record_search/add_candidates 之前）。摘除被否决：被禁工具保留在
+# 工具表（R36——模型幻觉调用不存在的工具名会空转）。G3：deep_enabled=false 时
+# approval_choice/kb_gate_action 恒缺席 → resolve_tool_scope=None → 零桩化逐字节现状。
+
+#: kb_only 裁决 → web_search 桩注（ask 钉文本「本轮仅限知识库」）
+_STUB_WEB_NOTE_KB_ONLY = (
+    "（系统注：本轮已裁决仅限知识库，web 搜索在本轮不可用；请仅使用 kb_search 检索用户知识库。）"
+)
+#: web_only 用户裁决 → kb_search 桩注（同口径「本轮仅限网络」）
+_STUB_KB_NOTE_WEB_ONLY = (
+    "（系统注：本轮已裁决仅限网络来源，知识库检索在本轮不可用；请仅使用 web_search。）"
+)
+#: 门判零命中（kb_gate_action=web_only，research 同一执行继续）→ kb_search 桩注
+#: （plan §3.3 :225 逐字——与既有空召回「请调整检索词」引导措辞可判别：
+#: 桩=裁决性禁止，空结果=可重试引导）
+_STUB_KB_NOTE_NO_HIT = "（系统注：知识库无相关内容，请仅使用网络来源。）"
+#: kb_only 裁决 → firecrawl_read/save_snapshot 桩注（批次 4 第四段评审前置修复②——
+#: KB 切片文本外链可被子代理直读，外部 web 内容绕进仅 KB 轮违背用户裁决；读原文面
+#: 同口径桩化；矩阵只动 kb_only 行——web_only 下读/快照正常 web 允许）
+_STUB_READ_NOTE_KB_ONLY = (
+    "（系统注：本轮已裁决仅限知识库，网页读取与快照在本轮不可用；请仅使用 kb_search 检索用户知识库。）"
+)
+#: kb_only 裁决 → supplement 网络补搜短路注（批次 4 第四段评审前置修复①——补搜面
+#: 直连 registry.search 不经工具桩，须节点级短路；固定注进 errors[].detail 留痕面）
+_STUB_SUPPLEMENT_NOTE_KB_ONLY = (
+    "（系统注：本轮已裁决仅限知识库，网络补搜在本轮不可用；报告仅基于知识库与已有材料继续。）"
+)
+
+#: tool_scope 值域："kb_only" | "web_only" | "no_hit" | None（None=现状零桩化）
+_TOOL_SCOPE_KB_ONLY = "kb_only"
+_TOOL_SCOPE_WEB_ONLY = "web_only"
+_TOOL_SCOPE_NO_HIT = "no_hit"
+
+
+def resolve_tool_scope(state: Mapping[str, Any]) -> str | None:
+    """裁决/门作用域解析（R36——research 节点 _Deps 装载消费；纯函数零 IO）。
+
+    - `approval_choice=kb_only` → "kb_only"（web_search 桩化——本轮仅限知识库）；
+    - `approval_choice=web_only` → "web_only"（kb_search 桩化——用户裁决仅网络）；
+    - 无 choice 且 `kb_gate_action=web_only` → "no_hit"（门判零命中：图不终结、
+      research 同一执行继续——kb_search 桩表达「仅 web」，plan §3.3）；
+    - both/custom/全缺席/非法值 → None（现状零桩化——G3：deep_enabled=false 时
+      两键恒缺席；custom 缺省范围=两者，plan §3.2 映射表）。
+    """
+    choice = str(state.get("approval_choice") or "")
+    if choice == _TOOL_SCOPE_KB_ONLY:
+        return _TOOL_SCOPE_KB_ONLY
+    if choice == _TOOL_SCOPE_WEB_ONLY:
+        return _TOOL_SCOPE_WEB_ONLY
+    if str(state.get("kb_gate_action") or "") == "web_only":
+        return _TOOL_SCOPE_NO_HIT
+    return None
+
 
 # ---- 依赖容器与记录器 ----
 
@@ -254,6 +311,10 @@ class _Deps:
     #: B19 KB 检索通道（TurnRunner configurable 注入 get_kb_retriever()；None=通道
     #: 关闭/装配缺失——工具面降级引导文本，灰度安全）
     kb_retriever: Any | None = None
+    #: B22 批次 4（R36 工具面约束）：resolve_tool_scope(state) 解析结果——kb_only=
+    #: web_search 桩化；web_only=用户裁决仅网络（kb_search 桩化）；no_hit=门判零命中
+    #: 同一执行继续（kb_search 桩化）；None=现状零桩化（G3 缺省，research() 装载）
+    tool_scope: str | None = None
 
 
 class _Recorder:
@@ -501,6 +562,10 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
     @tool
     async def web_search(query: str) -> str:
         """搜索本子课题：返回带 URL/标题/摘要/相关度的检索结果列表。"""
+        if deps.tool_scope == _TOOL_SCOPE_KB_ONLY:
+            # R36 桩（kb_only 裁决）：固定系统注——短路与 record_search/物理检索之前
+            # （零副作用零回显）；工具保留在表（摘除会诱发幻觉调用空转）
+            return _STUB_WEB_NOTE_KB_ONLY
         if deps.registry is None or not deps.search_chain.sources:
             return _SEARCH_EMPTY_GUIDANCE
         query = (query or "").strip()
@@ -551,6 +616,12 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
     @tool
     async def kb_search(query: str) -> str:
         """检索用户知识库中的私有文档切片（标题/相关度/原文摘录）。仅当问题指向用户上传或导入的私有文档内容时使用；公共网络信息请改用 web_search。"""
+        if deps.tool_scope == _TOOL_SCOPE_WEB_ONLY:
+            # R36 桩（web_only 用户裁决）：固定系统注——短路与 retriever 判读之前
+            return _STUB_KB_NOTE_WEB_ONLY
+        if deps.tool_scope == _TOOL_SCOPE_NO_HIT:
+            # R36 桩（门判零命中·research 同一执行继续）：plan §3.3 :225 逐字
+            return _STUB_KB_NOTE_NO_HIT
         if deps.kb_retriever is None:
             return "（系统注：知识库检索通道未启用，请改用 web_search。）"
         retriever = deps.kb_retriever
@@ -637,6 +708,10 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
     @tool
     async def firecrawl_read(url: str, offset: int = 0, limit: int | None = None) -> str:
         """读取 URL 页面正文（token 窗口；外部内容包裹；读取成功自动保存网页快照）。"""
+        if deps.tool_scope == _TOOL_SCOPE_KB_ONLY:
+            # R36 桩（kb_only 裁决·批次 4 第四段修复②）：KB 切片外链直读会绕进
+            # 仅 KB 轮——读原文面同口径桩化（短路与 URL 守卫之前，零物理读取）
+            return _STUB_READ_NOTE_KB_ONLY
         guidance = await _read_guidance_or_none(url, deps)
         if guidance is not None:
             return guidance
@@ -723,6 +798,10 @@ def _build_contract_tools(deps: _Deps) -> list[Any]:
     @tool("save_snapshot")
     async def save_snapshot_tool(url: str, content: str) -> str:
         """显式保存网页快照（读取成功时已自动保存；仅补存未快照内容时调用）。"""
+        if deps.tool_scope == _TOOL_SCOPE_KB_ONLY:
+            # R36 桩（kb_only 裁决·批次 4 第四段修复②）：模型可直携 URL 调用
+            # （同桩判定——非「输入仅来自 firecrawl_read 产物」的自然短路形态）
+            return _STUB_READ_NOTE_KB_ONLY
         rejected = await _url_guard_rejection_reason(url.strip(), deps)
         if rejected is not None:
             recorder.record_error({"stage": "read", "reason": "url_rejected"})
@@ -1141,6 +1220,9 @@ async def research(state: Any, config: RunnableConfig | None = None) -> dict[str
         guards=load_content_guard_config(spec),
         # B19：KB 检索通道注入（fast kb_search 同一 configurable 缝；None=灰度关闭）
         kb_retriever=configurable.get("kb_retriever"),
+        # B22 批次 4（R36 工具面约束）：裁决/门作用域（approval_choice/kb_gate_action
+        # 解析——桩化唯一激活点；None=现状零桩化）
+        tool_scope=resolve_tool_scope(state),
     )
 
     sem = asyncio.Semaphore(_max_subagents(deep_spec))

@@ -83,10 +83,16 @@ from langchain_core.runnables import RunnableConfig
 
 from app.agent.graphs.signals import emit_sources, emit_stage
 from app.agent.guards import ensure_not_canceled
-from app.agent.nodes.deep_research import _merge_candidates, _merge_urls
+from app.agent.nodes.deep_research import (
+    _STUB_SUPPLEMENT_NOTE_KB_ONLY,
+    _merge_candidates,
+    _merge_urls,
+    resolve_tool_scope,
+)
 from app.agent.safety.config import load_content_guard_config
 from app.agent.safety.content_guard import filter_candidates
 from app.agent.tools.registry import SearchChain, SearchChainUnavailable
+from app.core.logger import AgentLog
 
 __all__ = ["MAX_GAPS_PER_ROUND", "SUPPLEMENT_TOP_K", "supplement"]
 
@@ -155,16 +161,6 @@ async def supplement(state: Any, config: RunnableConfig | None = None) -> dict[s
     + reflect_round 递增（有界性）；零执行面零帧直通。"""
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：同 research/reflect）
 
-    configurable = (config or {}).get("configurable") or {}
-    chain = configurable.get("search_chain")
-    if not isinstance(chain, SearchChain):
-        raise SearchChainUnavailable("搜索链未注入（registry 未启动）——无法执行 supplement")
-    if not chain.sources:
-        raise SearchChainUnavailable(chain.detail or "搜索链不可用")
-    registry = configurable.get("tools_registry")
-    if registry is None:
-        raise SearchChainUnavailable("搜索链未注入（registry 未启动）——无法执行 supplement")
-
     is_mapping = isinstance(state, dict)
     prior_searched: list[str] = (
         [str(q) for q in state.get("searched_queries") or [] if isinstance(q, str) and q]
@@ -182,6 +178,45 @@ async def supplement(state: Any, config: RunnableConfig | None = None) -> dict[s
         if is_mapping
         else []
     )
+
+    # B22 批次 4 第四段（评审前置修复①补搜绕桩）：kb_only 裁决下网络补搜短路——
+    # 补搜面直连 registry.search（:230）不经 research 工具桩，须节点级短路。短路点
+    # 在 chain/registry 校验之前（裁决>链状态——research 工具桩同款优先序）；固定
+    # 系统注零插值零 payload 回显（deep_research.py 桩注常量族同款安全管道）+
+    # errors[]/AgentLog 留痕；**有界性不受影响**：reflect_round 递增不依赖补搜产出
+    # （本函数 :196 同源——回路经轮次帽+600s 包络兜底不空转）；短路轮零 stage 帧
+    # 零搜索零批次（不伪造搜索发生）。web_only/both/no_hit/None 补搜行为不变。
+    scope = resolve_tool_scope(state if is_mapping else {})
+    if scope == "kb_only":
+        AgentLog(
+            message="supplement 网络补搜 kb_only 短路（裁决桩，零外呼）",
+            graph="deep",
+            node="supplement",
+        ).warning()
+        return {
+            "searched_queries": _merge_urls(prior_searched, {}),
+            "visited_urls": _merge_urls(prior_visited, {}),
+            "collected_sources": _merge_candidates(prior_collected, []),
+            "reflect_round": _safe_round(state) + 1,
+            "errors": [
+                {
+                    "stage": "search",
+                    "reason": "supplement_stubbed_kb_only",
+                    "detail": _STUB_SUPPLEMENT_NOTE_KB_ONLY,
+                }
+            ],
+        }
+
+    configurable = (config or {}).get("configurable") or {}
+    chain = configurable.get("search_chain")
+    if not isinstance(chain, SearchChain):
+        raise SearchChainUnavailable("搜索链未注入（registry 未启动）——无法执行 supplement")
+    if not chain.sources:
+        raise SearchChainUnavailable(chain.detail or "搜索链不可用")
+    registry = configurable.get("tools_registry")
+    if registry is None:
+        raise SearchChainUnavailable("搜索链未注入（registry 未启动）——无法执行 supplement")
+
     visited = set(prior_visited)  # 已读 URL 账本（「已读」语义——research record_visited 仅 read/snapshot 登记）
     # 评审修复 1：registered 账本 = state.collected_sources url 集（research/supplement
     # 两段**已发射** URL 的单一事实源，ref_no 冻结语义天然承载——已发射未读 URL 重现时
