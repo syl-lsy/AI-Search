@@ -18,7 +18,16 @@ T = TypeVar("T")
 SearchMode = Literal["fast", "deep"]
 OnConflict = Literal["reject", "enqueue", "interrupt", "rollback"]
 TurnStatus = Literal[
-    "pending", "running", "queued", "completed", "degraded", "failed", "canceled"
+    "pending",
+    "running",
+    "queued",
+    # v1.37（B22 HITL 审批门，REQ-069）：挂起态——占线（409001 未终态集）/无协程
+    # （不在 ACTIVE_STATUSES）/孤儿清理豁免（data-model.md §1.3 v1.23 第 8 值）
+    "awaiting_approval",
+    "completed",
+    "degraded",
+    "failed",
+    "canceled",
 ]
 
 

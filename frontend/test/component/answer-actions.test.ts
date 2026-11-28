@@ -66,6 +66,10 @@ function makeTurn(partial: Partial<TurnState> = {}): TurnState {
     memorySaved: null,
     durationMs: 7420,
     exportAvailable: false,
+    approval: null,
+    approvalPreviews: null,
+    awaitingMs: null,
+    rewrittenQueries: null,
     ...partial,
   }
 }

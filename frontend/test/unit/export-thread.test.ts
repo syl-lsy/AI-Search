@@ -125,6 +125,24 @@ describe('buildThreadMarkdown（整线程 Markdown 组装）', () => {
     expect(buildThreadMarkdown('', turns).startsWith('# 未命名会话')).toBe(true)
     expect(buildThreadMarkdown('   ', turns).startsWith('# 未命名会话')).toBe(true)
   })
+
+  it('OQ-04（B22 v1.40）：审批面零进导出链——ExportableTurn 投影面仅 {question, answer_md, sources}（结构面无 approval/previews/note/awaiting_ms 字段），approved 轮数据零进导出正文', () => {
+    // 调用方（App 顶栏/AnswerActions 单答）从 TurnState 投影 ExportableTurn——审批回看折叠条为
+    // 纯 UI 面（TurnBlock/ApprovalRecall 组件内消费），导出链路结构上不可达审批数据。
+    // 本用例钉投影纪律：approved 轮（含 note/预览/等待时长）导出正文零审批痕迹。
+    const approvedTurn: ExportableTurn = {
+      question: 'KB 里怎么融合检索？',
+      answer_md: 'RRF 以倒数排名融合两路候选。',
+      sources: [],
+    }
+    const md = buildThreadMarkdown('审批门线程', [approvedTurn])
+    expect(md).toContain('## 问：KB 里怎么融合检索？')
+    // 审批回看面文案/数据关键词零命中（折叠条「已按『…』回答」/note 前缀「补充指令」/预览）
+    expect(md).not.toContain('已按')
+    expect(md).not.toContain('补充指令')
+    expect(md).not.toContain('知识库命中')
+    expect(md).not.toContain('heading_path')
+  })
 })
 
 describe('buildThreadLink（会话链接）', () => {

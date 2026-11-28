@@ -60,6 +60,7 @@ export type ErrorCode =
   | '409005' // 线程有进行中轮次，不可删除（api.md §0 v1.18，REQ-059）
   | '409006' // 轮次不支持重新生成（api.md §0 v1.28，REQ-063——非 {degraded,failed} 终态/零来源/regenerate 进行中重复点击单码覆盖；deep 有源 degraded/failed 轮 v1.28 起可重生成，原「deep 轮一律拒收」收窄为 deep 零源/进行中形态）
   | '409007' // 已有进行中的知识库导入任务（api.md §0 v1.30，REQ-067——已批准（2026-11-22 确认点②）；pending/running 导入任务存在时重复触发 POST /kb/import/jobs；409004 记忆抽取同族语义）
+  | '409008' // 轮次不在待审批态或审批裁决冲突（api.md §0 v1.37，REQ-069——B22 HITL 审批门：非 awaiting_approval 轮调用 POST /turns/{id}/approval；或同轮已按不同 choice 裁决后再提交/超时收口后的人为裁决；同 choice 重复提交为幂等 200 不产生本码；定号注：计划草案 409007 已被 kb_import_jobs 占用顺延）
   | '413001' // 文件超过大小上限
   | '415001' // 不支持的文件类型
   | '422001' // URL 非法
@@ -131,18 +132,19 @@ export type ChatModelKey = 'qwen' | 'glm' | 'deepseek'
 /** §0 on_conflict 四策略（对齐 LangGraph Agent Server multitask_strategy） */
 export type OnConflictStrategy = 'reject' | 'enqueue' | 'interrupt' | 'rollback'
 
-/** §2.5 status 枚举（v1.4 起 +queued；canceling 仅为 cancel 端点响应信号、非枚举值 §2.7） */
+/** §2.5 status 枚举（v1.4 起 +queued；v1.37 起 +awaiting_approval——B22 HITL 审批门挂起态：占线/无协程/孤儿清理豁免；canceling 仅为 cancel 端点响应信号、非枚举值 §2.7） */
 export type TurnStatus =
   | 'pending'
   | 'running'
   | 'queued'
+  | 'awaiting_approval'
   | 'completed'
   | 'degraded'
   | 'failed'
   | 'canceled'
 
-/** §2.5 cancel_reason 枚举（仅 status=canceled 时非空） */
-export type CancelReason = 'user' | 'superseded' | 'rolled_back'
+/** §2.5 cancel_reason 枚举（仅 status=canceled 时非空；v1.38 起 +timeout——B22 审批等待超时静默收口，hitl.on_timeout=cancel 裁决） */
+export type CancelReason = 'user' | 'superseded' | 'rolled_back' | 'timeout'
 
 /** §2.2 mode_summary（线程内轮次模式聚合，写入时计算） */
 export type ThreadModeSummary = 'fast' | 'deep' | 'mixed'
@@ -187,6 +189,8 @@ export interface StageExtra {
   correction?: boolean
   /** api.md v1.33 零面判定行（B19）：融合链路观测投影（A35 可观测留痕）——stage(search,done) extra 携带 {per_query_top_k, rrf_k, kb_fuse_top_k, es_hits, vec_hits, type_weights}（通道活跃副本才携带，键可省）；观测/评测判读键、前端零渲染义务（宽松 Record<string, unknown>） */
   kb_funnel?: Record<string, unknown>
+  /** api.md §7.2/§2.5 v1.37 B22 HITL 门留痕（REQ-069）：仅门轮（含 shadow）的 stage(rewrite,done) 携带 {gate: triggered|shadow, verdict: has_hit|no_hit, subqueries: [{query_index, top_k_count, top1_score?}], gate_ms?}（评测/审计判读键——弹窗率分子=has_hit、误弹窗率=has_hit∧web_only；非门轮零键不置 null，前端零渲染义务；宽松 Record<string, unknown> 同 kb_funnel 先例） */
+  hitl?: Record<string, unknown>
 }
 
 /** §2.5 usage（turns.usage jsonb：与 LiteLLM 用量列风格一致） */
@@ -436,6 +440,10 @@ export interface TurnDetail {
   feedback_helpful?: boolean | null
   /** M6（记忆 P1）起返回——M5 及之前无此字段，故可省（memory-api.md 镜像） */
   memory_hits?: MemoryHits
+  /** v1.37（B22/REQ-069）审批门投影四形态（非门轮键整体省略不置 null；pending 即轮 status=awaiting_approval——刷新恢复以本字段为准源重新打开弹层；v1.38 钉：status=canceled 的审批行 approval 键整体省略——审计留痕在 turn_approvals 表，回看面无审批折叠条） */
+  approval?: TurnApproval
+  /** v1.37（B22）awaiting_approval 累计时长毫秒——非零才携带（键可省口径；duration_ms 同步扣除 awaiting 时长〔hitl-OQ-03〕） */
+  awaiting_ms?: number
 }
 
 /* -------------------------------------------------------------
@@ -457,6 +465,61 @@ export interface FeedbackResponse {
   turn_id: Uuid
   helpful: boolean | null
   updated_at: IsoTimestamp | null
+}
+
+/* -------------------------------------------------------------
+ * 2.13 POST /api/v1/turns/{turn_id}/approval —— 审批裁决（v1.37 增，B22/REQ-069/A54）
+ * ----------------------------------------------------------- */
+
+/** §2.5/§7.2 v1.37 审批裁决四选项（hitl-OQ 裁决值域） */
+export type ApprovalChoice = 'kb_only' | 'web_only' | 'both' | 'custom'
+
+/** §2.13 请求体：choice 必填枚举（缺失/非法→400001）；note 可选 ≤500 字（任意 choice 可附带——协议面无 choice 限制；服务端过 query 同款 sanitize 管道〔R35〕后落库，不改检索范围） */
+export interface ApprovalDecisionRequest {
+  choice: ApprovalChoice
+  note?: string
+}
+
+/** §2.13 响应 data：202=首次成功（阶段 2 已调度）/ 200=幂等重复（返回已记录裁决，不重复触发阶段 2）；信封 code 恒 "0"、status 恒 "running" */
+export interface ApprovalDecisionData {
+  turn_id: Uuid
+  status: 'running'
+  choice: ApprovalChoice
+}
+
+/** §7.2 approval_requested previews 条目（≤hitl.preview_count 条、excerpt 服务端截断 ≤preview_chars、按门内 rerank 分跨子问题全局去重排序；分数不下发） */
+export interface ApprovalPreview {
+  kb_doc_id: Uuid
+  chunk_id: Uuid
+  title: string
+  heading_path: string[]
+  excerpt: string
+  query_index: number
+}
+
+/** §2.5 v1.37 approval 投影四形态（非门轮键整体省略不置 null；v1.38 钉：status=canceled 的审批行 approval 键整体省略——审计留痕在 turn_approvals 表）：pending=待裁决（轮 status=awaiting_approval）/ approved=已裁决（含超时/系统收口，decided_by 区分）/ no_hit=web 直达轻量留痕 / shadow=shadow 观测态（previews 不投影） */
+export type TurnApproval =
+  | { status: 'pending'; verdict: 'has_hit'; expires_at: IsoTimestamp; previews: ApprovalPreview[] }
+  | { status: 'approved'; choice: ApprovalChoice; note?: string; decided_by: 'user' | 'timeout' | 'system' }
+  | { status: 'no_hit'; verdict: 'no_hit' }
+  | { status: 'shadow'; verdict: 'has_hit' | 'no_hit' }
+
+/** §7.2 approval_requested（审批请求，B22 HITL 门——仅 enforce 弹窗形态；阶段 1 门判定落库后发布，入 turn_events 落库子集可重放；受 seq 幂等门保护） */
+export interface SseApprovalRequestedEvent extends SseBase {
+  verdict: 'has_hit'
+  /** 等待窗截止（服务端超时判据 expires_at；前端倒计时仅消费做展示，不做本地超时动作） */
+  expires_at: IsoTimestamp
+  previews: ApprovalPreview[]
+}
+
+/** §7.2 approval_resolved（审批收口——裁决提交/超时收口/用户取消/interrupt·rollback 四路径；与 approval_requested 成对可重放） */
+export interface SseApprovalResolvedEvent extends SseBase {
+  /** timeout 收口=缺省策略值 hybrid 对应 both；cancel 收口无 choice——键省略 */
+  choice?: ApprovalChoice
+  decided_by: 'user' | 'timeout' | 'system'
+  /** 收口路径留痕：submit=裁决提交 | timeout=超时收口 | cancel=用户取消 | conflict=interrupt/rollback 直接收尾 */
+  resolved_by: 'submit' | 'timeout' | 'cancel' | 'conflict'
+  next_stage?: 'search'
 }
 
 /* -------------------------------------------------------------
@@ -939,7 +1002,7 @@ export interface SseErrorEvent extends SseBase {
   stage_key?: StageKey
 }
 
-/** SSE 事件类型枚举（§7.2 全集：stage/token/thinking/sources/images/context_compact/memory/done/followups/error） */
+/** SSE 事件类型枚举（§7.2 全集：stage/token/thinking/sources/images/context_compact/memory/done/followups/approval_requested/approval_resolved/error） */
 export type SseEventName =
   | 'stage'
   | 'token'
@@ -950,6 +1013,8 @@ export type SseEventName =
   | 'memory'
   | 'done'
   | 'followups'
+  | 'approval_requested'
+  | 'approval_resolved'
   | 'error'
 
 /** SSE data payload 按事件名的映射（turnStream.ts 解析时按 event 收窄的依据） */
@@ -963,6 +1028,8 @@ export interface SseDataMap {
   memory: SseMemoryEvent
   done: SseDoneEvent
   followups: SseFollowupsEvent
+  approval_requested: SseApprovalRequestedEvent
+  approval_resolved: SseApprovalResolvedEvent
   error: SseErrorEvent
 }
 

@@ -145,3 +145,18 @@ class UsageCollector(BaseCallbackHandler):
             if self._total_tokens > 0:
                 out["total_tokens"] = self._total_tokens
             return out
+
+    def restore_totals(self, usage: Mapping[str, Any]) -> None:
+        """注入前段累计（B22 两阶段——plan §3.3「usage_collector 必须跨阶段累计，
+        否则 token 预算护栏失效」）：阶段 2 恢复时由 resume_turn 以 awaiting 快照
+        （turns.usage 列，阶段 1 收口预写）回灌，done.usage/§2.5 usage 承载两阶段
+        合计；仅接受已知三键正整数（畸形键忽略——快照列防御）。"""
+        with self._lock:
+            for key, attr in (
+                ("prompt_tokens", "_prompt_tokens"),
+                ("completion_tokens", "_completion_tokens"),
+                ("total_tokens", "_total_tokens"),
+            ):
+                value = usage.get(key) if isinstance(usage, Mapping) else None
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    setattr(self, attr, getattr(self, attr) + value)

@@ -11,6 +11,11 @@ REQ-042 同线程并发提问四策略（api.md §0 错误码表 / ARCHITECTURE 
 - TurnNotRegenerableException：POST /turns/{id}/regenerate 前置不满足（409006
   「轮次不支持重新生成」，api.md §2.12 v1.19 / REQ-063）——单码覆盖非
   {degraded,failed} 终态 / 零来源 / deep 轮 / 进行中重复点击（条件推进落败）。
+- ApprovalConflictException：POST /turns/{id}/approval 裁决冲突或轮不在待审批态
+  （409008「轮次不在待审批态或审批裁决冲突」，api.md §2.13 v1.37 / §0 v1.37 定
+  号注——计划草案原写 409007 已被 kb_import_jobs 占用顺延 / REQ-069）——单码
+  覆盖非 awaiting_approval 轮 / 同轮不同 choice 再提交 / 超时收口后再到的人为
+  裁决（含同 choice）；同 choice 重复提交幂等 200 不产生本码（§2.13 幂等条）。
 默认消息取 api.md §0「含义」列原文；业务代码可按场景传更具体的 message
 （如带排队深度上限说明），响应体 message 一律用异常自身的 message。
 """
@@ -31,3 +36,7 @@ class ThreadBusyException(BusinessException):
 
 class TurnNotRegenerableException(BusinessException):
     """轮次不支持重新生成（409006）：§2.12 regenerate 前置不满足 / 并发双击落败。"""
+
+
+class ApprovalConflictException(BusinessException):
+    """轮次不在待审批态或审批裁决冲突（409008）：§2.13 approval 裁决面确定性拒绝。"""

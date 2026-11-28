@@ -1253,6 +1253,85 @@ class KbSpec(BaseModel):
         return self
 
 
+class HitlNoiseFloorSpec(BaseModel):
+    """§3 hitl.noise_floor（v1.50 B22——多信号确定性地板；R29 权重上调缓解）。
+
+    缺省态=行为等价「不设」（OQ-17 缺省态：enabled=false + 双阈值 0.0——shadow 期
+    仍按纯「Top K 有值」口径观测）。多信号形态=向量相似度腿主防线（A2 病态 query
+    防线——批次 0 探针实证纯标点 query rerank 分反高于真实 0.499 vs 0.368）+ rerank
+    分腿**与组合**（两腿均判空才算该子问题空——收窄「有值」口径不替换零命中语义，
+    plan §4.2）；判定零 LLM（ADR-019 决策②）。
+    量纲注（§3 v1.50）：`rerank_top1_min` 为 reranker 分数形态、量纲独立——**不可
+    复用 `kb.route.min_top1_score=0.012`**（那是 RRF 分按启用通道权重缩放的语义，
+    对 rerank 分无意义）；阈值标定输入=shadow 期 stage extra.hitl.subqueries[]
+    .top1_score 分布（批次 2 shadow 复测）+ b22-probe-shadow-20261127.md。
+    键名严禁含 key/secret/token/password（撞 §2 密钥嗅探——全局递归嗅探自动覆盖）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = False
+    vector_sim_min: float = Field(default=0.0, ge=0, le=1)
+    rerank_top1_min: float = Field(default=0.0, ge=0, le=1)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _check_enabled_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+
+class HitlSpec(BaseModel):
+    """§3 hitl 节（v1.50 B22 HITL 审批门；REQ-069/A54；ADR-019）。
+
+    判定器纯确定性零 LLM——本节**无判定模型键、无判定提示词键**。热更生效边界=
+    轮次发起时快照（OQ-11 同源）。缺省全灰度安全：
+    - `enabled=false`（fast 门总开关，严格布尔 kill switch）= 现状逐字节（门不存在、
+      零额外检索、零事件、零状态面）；
+    - `deep_enabled=false`（deep 门独立开关，第二批独立灰度，hitl-OQ-05）；
+    - `shadow=true`（只观测：门照常检索落留痕、行为一律现状 hybrid——开启顺序
+      enabled+shadow 跑基线→放行数字→shadow=false）；
+    - `no_hit_action` 校验为**单值 "web"**（hitl-OQ-B 裁决：零命中→web 直达不弹窗，
+      只为把裁决写进契约可审计，枚举外拒收）；
+    - `skip_query_types` 为 8 值枚举子集数组（越界值拒收、空数组合法=全部进门）；
+      不进门题型走现状 hybrid（「不进门」≠web 直达，hitl-OQ-15）；
+    - 两个「动作」键语义区分（§3 v1.50 注）：`no_hit_action`=**门判零命中**后的
+      去向（已裁决=web）；`on_timeout`=**弹窗后用户未回应**时的去向（hybrid=按
+      两者都要继续 / cancel=静默收尾 canceled）。
+    键名严禁含 key/secret/token/password（撞 §2 密钥嗅探）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = False
+    deep_enabled: bool = False
+    shadow: bool = True
+    no_hit_action: Literal["web"] = "web"
+    skip_query_types: list[str] = Field(
+        default_factory=lambda: ["navigational", "temporal"]
+    )
+    preview_count: int = Field(default=3, ge=1, le=5)
+    preview_chars: int = Field(default=200, ge=100, le=500)
+    timeout_s: int = Field(default=120, ge=30, le=600)
+    on_timeout: Literal["hybrid", "cancel"] = "hybrid"
+    note_max_chars: int = Field(default=500, ge=100, le=1000)
+    noise_floor: HitlNoiseFloorSpec | None = None
+
+    @field_validator("enabled", "deep_enabled", "shadow", mode="before")
+    @classmethod
+    def _check_switches_strict_bool(cls, value: Any) -> Any:
+        return _strict_bool_or_raise(value)
+
+    @field_validator("skip_query_types")
+    @classmethod
+    def _check_skip_query_types(cls, value: list[str]) -> list[str]:
+        """8 值枚举子集数组（QUERY_TYPES 同源——type_weights 键域单一事实源）；
+        越界值拒收、空数组合法=全部进门。"""
+        unknown = sorted({item for item in value if item not in QUERY_TYPES})
+        if unknown:
+            raise ValueError(
+                f"hitl.skip_query_types 须为 8 值枚举子集，越界值 {unknown}"
+            )
+        return value
+
+
 class HistorySpec(BaseModel):
     """§3 v1.1：弃用迁移期与 memory.short_term 并存（以新为准），校验保持宽容。"""
 
@@ -1298,9 +1377,9 @@ class MemorySpec(BaseModel):
 
 
 class SpecPayload(_Envelope):
-    """Agent Spec：fast/deep 必带；turn/followups/safety/routing/memory/kb/history 缺失时
+    """Agent Spec：fast/deep 必带；turn/followups/safety/routing/memory/kb/hitl/history 缺失时
     组装层按契约回落内置默认并告警（§3 各节注），校验层不拒收缺节（safety 节缺失=
-    合法 fail-open 语义，B13）。"""
+    合法 fail-open 语义，B13；hitl 节缺失=合法回落 enabled=false 灰度安全，§3 v1.50）。"""
 
     model_config = ConfigDict(extra="allow")
     fast: FastSpec
@@ -1310,6 +1389,7 @@ class SpecPayload(_Envelope):
     followups: FollowupsSpec | None = None
     safety: SafetySpec | None = None  # §3 B13：节缺失=合法（fail-open，安全检查不挡检索）
     kb: KbSpec | None = None
+    hitl: HitlSpec | None = None  # §3 v1.50 B22：节缺失=合法（回落 enabled=false 灰度）
     history: HistorySpec | None = None
     memory: MemorySpec | None = None
 

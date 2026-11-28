@@ -44,7 +44,9 @@ class Turn(Base):
     thread_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("threads.id"))
     user_id: Mapped[uuid.UUID] = mapped_column()  # 裸 uuid（无 FK，随 DDL 契约）
     mode: Mapped[str] = mapped_column(String(8))  # fast|deep
-    status: Mapped[str] = mapped_column(String(12), server_default="pending")
+    # 0014_b22_hitl_gate 扩宽 varchar(12)→varchar(24)（§1.3 v1.23 列宽扩容注：
+    # 第 8 值 awaiting_approval=18 字符超旧列宽；取值校验在 schema/service 层）
+    status: Mapped[str] = mapped_column(String(24), server_default="pending")
     query: Mapped[str] = mapped_column(Text)  # 原始问题（≤2000 字符，api 层校验）
     query_lang: Mapped[str | None] = mapped_column(String(4))  # zh|en（TurnRunner 注入）
     rewritten_queries: Mapped[list[Any]] = mapped_column(JSONB, server_default=text("'[]'"))

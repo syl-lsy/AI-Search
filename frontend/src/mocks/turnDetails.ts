@@ -8,7 +8,7 @@
  * B14 兜底收束轮 digest/partial 两形态 + politics 拒答轮（api.md §7.4 v1.25 兜底收束形态，
  * PRD A51 五条 GWT / §9 v1.29 fixture——B14 测试资产增补批）。
  */
-import type { TurnDetail } from '@/types/api'
+import type { ApprovalPreview, TurnDetail } from '@/types/api'
 
 export const THREAD_ID_FAST = '7d2f0a1e-1c3b-4e5a-9d8f-0a1b2c3d4e5f'
 export const TURN_ID_FAST = 'c31b9d74-2a41-4f6e-b3c2-5d6e7f809a1b'
@@ -352,4 +352,87 @@ export const turnDetailPoliticsRefused: TurnDetail = {
   incognito: false,
   cancel_reason: null,
   followups: null,
+}
+
+/* ==================== B22 HITL 审批门 fixtures（api.md §2.5 v1.37/v1.38，批次 3 第三段） ==================== */
+
+export const TURN_ID_AWAITING = 'a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d'
+
+/** 审批预览样例（api.md §7.2 previews 六键——KB 语料样例文本；类标签保真/纯展示用例共用） */
+export const approvalPreviewFixtures: ApprovalPreview[] = [
+  {
+    kb_doc_id: '9a77f0e1-1c3b-4e5a-9d8f-0a1b2c3d4e5f',
+    chunk_id: '5c2e8a3b-2d4f-4a6b-8c9d-000000000001',
+    title: '内部设计文档-检索融合.md',
+    heading_path: ['知识库', '检索融合', 'RRF 融合'],
+    excerpt: 'KB 候选与网络候选合并后统一 rerank：RRF 以倒数排名融合两路候选，k=60 抑制排名头部效应（≤200 字符服务端截断）',
+    query_index: 0,
+  },
+  {
+    kb_doc_id: '9a77f0e1-1c3b-4e5a-9d8f-0a1b2c3d4e5f',
+    chunk_id: '5c2e8a3b-2d4f-4a6b-8c9d-000000000002',
+    title: 'ADR-017-混合检索融合管道.md',
+    heading_path: ['知识库', '架构决策', 'ADR-017'],
+    excerpt: '双通道检索自 bm25_search 与 vector_search 并行起跑，各腿 top30 进入 RRF 融合（类标签 <code>原文</code> 逐字保真）',
+    query_index: 1,
+  },
+]
+
+/**
+ * awaiting 挂起态（§2.5 v1.37——刷新恢复弹层重开数据面：approval=pending 全量 + awaiting_ms
+ * 非零携带 + rewritten_queries 顶层权威源；2.3 turns[].status 对应 awaiting_approval）
+ */
+export const turnDetailFastAwaiting: TurnDetail = {
+  turn_id: TURN_ID_AWAITING,
+  thread_id: THREAD_ID_FAST,
+  mode: 'fast',
+  status: 'awaiting_approval',
+  query: 'KB 里怎么融合检索？',
+  query_lang: 'zh',
+  rewritten_queries: ['KB 融合检索怎么做？', 'RRF 融合权重怎么设？'],
+  parent_turn_id: null,
+  answer_md: '',
+  sources: [],
+  images: [],
+  stages: [
+    { stage_key: 'rewrite', status: 'done', label: '改写意图', started_at: '2026-11-01T08:12:00Z', ended_at: '2026-11-01T08:12:01Z', duration_ms: 320, extra: { hitl: { gate: 'triggered', verdict: 'has_hit', subqueries: [{ query_index: 0, top_k_count: 3 }] } } },
+  ],
+  degraded: false,
+  degraded_reason: null,
+  error: null,
+  usage: USAGE_ZERO,
+  duration_ms: 0,
+  export_available: false,
+  created_at: '2026-11-01T08:12:00Z',
+  finished_at: null,
+  incognito: false,
+  cancel_reason: null,
+  followups: null,
+  approval: { status: 'pending', verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [...approvalPreviewFixtures] },
+  awaiting_ms: 9200,
+}
+
+/** 已裁决回看态（§2.5 approved 形态——2.5 无 previews 键〔回看面预览数据源=流式域缓存〕；note 可选携带） */
+export const turnDetailFastApproved: TurnDetail = {
+  ...turnDetailFastCompleted,
+  turn_id: TURN_ID_AWAITING,
+  query: 'KB 里怎么融合检索？',
+  rewritten_queries: ['KB 融合检索怎么做？', 'RRF 融合权重怎么设？'],
+  status: 'running',
+  answer_md: '',
+  sources: [],
+  images: [],
+  stages: [
+    { stage_key: 'rewrite', status: 'done', label: '改写意图', started_at: '2026-11-01T08:12:00Z', ended_at: '2026-11-01T08:12:01Z', duration_ms: 320, extra: { hitl: { gate: 'triggered', verdict: 'has_hit', subqueries: [{ query_index: 0, top_k_count: 3 }] } } },
+  ],
+  duration_ms: 0,
+  approval: { status: 'approved', choice: 'kb_only', note: '回答时优先引用知识库的 ADR-017 结论', decided_by: 'user' },
+  awaiting_ms: 9200,
+}
+
+/** web 直达轮（no_hit 轻量留痕形态——回看面零审批痕迹的负向 fixture） */
+export const turnDetailFastNoHit: TurnDetail = {
+  ...turnDetailFastCompleted,
+  approval: { status: 'no_hit', verdict: 'no_hit' as const },
+  awaiting_ms: 0,
 }

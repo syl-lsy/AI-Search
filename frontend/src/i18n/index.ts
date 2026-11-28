@@ -105,6 +105,29 @@ const zhCN = {
     kbChunkContentLabel: '切片原文（content · 纯文本，不走 markdown）',
     kbChunkOpenFeishu: '打开飞书原文',
     kbChunkClose: '关闭',
+    // B22 HITL 审批弹层与回看态（frontend-api §7 v1.40 词条登记；批次 3 实施随批——
+    // approvalNoteLimit/approvalTimeoutContinued/approvalCloseConfirm* 为实施新增键，契约
+    // 登记缺口随批上报：前者为 §3 派发表 approval_resolved 行 timeout 收口 toast 文案，
+    // 后四者为第二段组件架构裁决新增的壳关闭确认四文案〔通用壳 HitlSheet 机制、业务注入〕）
+    approvalTitle: '知识库里找到相关内容',
+    approvalKbOnly: '仅知识库',
+    approvalWebOnly: '仅网络',
+    approvalBoth: '两者都要',
+    approvalCustom: '自定义',
+    approvalCancelTurn: '取消本轮',
+    approvalTimeoutHint: '即将按『两者都要』继续',
+    approvalTimeoutContinued: '已按『两者都要』继续',
+    approvalCloseConfirmTitle: '确认取消本轮？',
+    approvalCloseConfirmBody: '取消后本轮不会生成回答，也不进入历史',
+    approvalCloseConfirmOk: '确认取消',
+    approvalCloseConfirmStay: '继续等待',
+    approvalRecallChoice: '已按『{choice}』回答 · 查看当时的知识库命中',
+    // 无 previews 降级形态（批次 3 评审 M4）：刷新恢复的 approved 无预览缓存——条文案不含
+    // 「查看命中」承诺，降级为裁决摘要（实施新增键，契约登记缺口随批上报）
+    approvalRecallChoiceBrief: '已按『{choice}』回答',
+    approvalNoteLabel: '补充指令',
+    approvalWaitedSeconds: '审批等待 {n} 秒',
+    approvalNoteLimit: '已达 500 字上限，超出部分不再录入',
     snapshotMetaType: '类型',
     stop: '停止',
     followPlaceholder: '提出后续问题…（深度报告后默认快速，携带报告上下文）',
@@ -405,6 +428,29 @@ const enUS: typeof zhCN = {
     kbChunkContentLabel: 'Chunk content (plain text, no markdown)',
     kbChunkOpenFeishu: 'Open in Feishu',
     kbChunkClose: 'Close',
+    // B22 HITL approval sheet & review rail (frontend-api §7 v1.40; batch 3 —
+    // approvalNoteLimit/approvalTimeoutContinued/approvalCloseConfirm* are implementation-added
+    // keys, contract registration gap reported: the former is the §3 dispatch-row timeout toast
+    // text, the latter four are the shell close-confirm copy added by the 2026-11-28 ruling)
+    approvalTitle: 'Found related content in your knowledge base',
+    approvalKbOnly: 'Knowledge base only',
+    approvalWebOnly: 'Web only',
+    approvalBoth: 'Both',
+    approvalCustom: 'Custom',
+    approvalCancelTurn: 'Cancel this turn',
+    approvalTimeoutHint: 'Continuing with "both" shortly',
+    approvalTimeoutContinued: 'Continued with "both"',
+    approvalCloseConfirmTitle: 'Cancel this turn?',
+    approvalCloseConfirmBody: 'No answer will be generated and this turn will not appear in history',
+    approvalCloseConfirmOk: 'Confirm cancel',
+    approvalCloseConfirmStay: 'Keep waiting',
+    approvalRecallChoice: 'Answered with "{choice}" · View knowledge base hits',
+    // No-previews degraded form (review M4): refreshed approved rows have no preview cache —
+    // strip copy drops the "view hits" promise and degrades to a decision summary
+    approvalRecallChoiceBrief: 'Answered with "{choice}"',
+    approvalNoteLabel: 'Custom instruction',
+    approvalWaitedSeconds: 'Waited {n}s for approval',
+    approvalNoteLimit: '500-character limit reached; further input is not recorded',
     snapshotMetaType: 'Type',
     stop: 'Stop',
     followPlaceholder: 'Ask a follow-up… (defaults to Fast after a deep report)',

@@ -383,10 +383,13 @@ def test_turn_detail_error_and_kb_source_payloads():
 def test_shared_literal_enums():
     assert SearchMode.__args__ == ("fast", "deep")  # type: ignore[attr-defined]
     assert OnConflict.__args__ == ("reject", "enqueue", "interrupt", "rollback")  # type: ignore[attr-defined]
+    # TurnStatus 八值（api.md §2.5 v1.37/data-model §1.3 v1.23——B22 awaiting_approval
+    # 第 8 值随 0014 落地；本钉同步契约扩员，非放宽）
     assert TurnStatus.__args__ == (  # type: ignore[attr-defined]
         "pending",
         "running",
         "queued",
+        "awaiting_approval",
         "completed",
         "degraded",
         "failed",

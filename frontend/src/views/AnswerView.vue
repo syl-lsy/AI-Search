@@ -34,6 +34,7 @@ import { normalizeError, ApiError } from '@/api/client'
 import { fetchDocument, fetchKbChunk } from '@/api/kb'
 import { fetchSnapshot } from '@/api/sources'
 import { fetchThread } from '@/api/threads'
+import ApprovalSheet from '@/components/answer/ApprovalSheet.vue'
 import KbChunkDrilldown from '@/components/answer/KbChunkDrilldown.vue'
 import OutlineAnchor from '@/components/answer/OutlineAnchor.vue'
 import type { OutlineItem } from '@/components/answer/OutlineAnchor.vue'
@@ -125,6 +126,23 @@ const panelGroups = computed<SourcePanelGroup[]>(() => {
   return out
 })
 const canStop = computed(() => liveTurn.value !== null)
+
+/**
+ * B22 HITL 审批弹层装配（v1.40 批次 3 第三段，§3 生命周期 15——§1 AnswerView 行审批动作入口）：
+ * awaiting 轮独立扫描（liveTurn 只认 running|queued——awaiting 不是流式、停止钮不出现，
+ * 停止语义由弹层「取消本轮」承接）；线程单 in-flight 不变式下至多一轮 awaiting（取轮序最后一轮）。
+ * 弹层可见性由状态派生（awaiting ∧ approval pending）——刷新恢复路径：loadThread 逐轮 2.5 对账
+ * （§5 loadThread Promise.allSettled safeReconcile）→ approval=pending 投影落位 → 弹层重开
+ * （恢复只依赖 2.5 不依赖事件重放）；rewrittenQueries = 2.5 顶层权威源（store 对账捕获）。
+ */
+const awaitingTurn = computed(() => {
+  for (let i = turnIds.value.length - 1; i >= 0; i -= 1) {
+    const t = store.turns[turnIds.value[i]!]
+    if (t && t.status === 'awaiting_approval') return t
+  }
+  return null
+})
+const followBarEl = ref<HTMLElement | null>(null)
 
 watch(isStreaming, (v) => controller?.setStreaming(v), { immediate: true })
 
@@ -455,7 +473,10 @@ async function loadThread(tid: string): Promise<void> {
     if (seq !== loadSeq) return
     for (const turn of detail.turns) {
       const status = store.turns[turn.turn_id]?.status
-      if (status === 'running' || status === 'queued') store.subscribe(turn.turn_id)
+      // awaiting_approval 纳入订阅（B22 批次 3 第三段刷新恢复缺口修复——api.md §7.1:815
+      // 「订阅照常建立」：等待期仅心跳无业务事件是预期；裁决后 approval_resolved/阶段 2
+      // 事件流经同一订阅可达，弹层乐观置 running 后不等 SSE 的收敛依赖本连接）
+      if (status === 'running' || status === 'queued' || status === 'awaiting_approval') store.subscribe(turn.turn_id)
     }
     await refreshOutlineMetrics(() => seq === loadSeq)
   } catch (e) {
@@ -574,7 +595,7 @@ onUnmounted(() => {
         </div>
 
         <!-- 底部固定追问框（常驻模式切换 REQ-007；运行中提交钮=停止 §2） -->
-        <div class="follow-bar">
+        <div ref="followBarEl" class="follow-bar">
           <!-- 卡片宿主（相对定位包含块）：fab 与卡片同参照系——宿主顶边=卡片顶边，
               .fab-above-input 的 bottom=宿主 100%+--space-2 即「卡片顶上方 8px」（e2e
               A28 几何断言以卡片（follow-bar testid 元素）顶边为基准，gap 恒=--space-2） -->
@@ -619,6 +640,17 @@ onUnmounted(() => {
         :doc="kbChunkDoc"
         :unavailable="kbChunkUnavailable"
         @close="kbChunkOpen = false"
+      />
+
+      <!-- B22 HITL 审批弹层（v1.40 批次 3 第三段装配，§1 AnswerView 行/§3 生命周期 15）：
+           awaiting 轮挂起即弹层（SSE approval_requested 或刷新恢复 2.5 对账双入口，状态派生）；
+           anchorEl=.follow-bar 宿主（底部 sheet 覆盖层遮住 SearchCard、不改其布局——e2e A28
+           几何以 follow-bar 为基准不破坏）；rewrittenQueries=2.5 顶层权威源（「命中的子问题」行） -->
+      <ApprovalSheet
+        v-if="awaitingTurn !== null"
+        :turn-id="awaitingTurn.turnId"
+        :anchor-el="followBarEl"
+        :rewritten-queries="awaitingTurn.rewrittenQueries ?? undefined"
       />
     </template>
   </section>

@@ -20,12 +20,16 @@ import { i18n } from '@/i18n'
 import { modelsFixture } from '@/mocks/models'
 import {
   THREAD_ID_FAST,
+  TURN_ID_AWAITING,
   TURN_ID_DEEP,
   TURN_ID_DIRECT,
   TURN_ID_FAST,
   turnDetailDeepCompleted,
   turnDetailDirectCompleted,
+  turnDetailFastApproved,
+  turnDetailFastAwaiting,
   turnDetailFastCompleted,
+  turnDetailFastNoHit,
 } from '@/mocks/turnDetails'
 import { threadListFixture } from '@/mocks/threads'
 import { router } from '@/router'
@@ -854,5 +858,98 @@ describe('溯源下钻守卫（CR-6/SA-2：§4.6 路径参数 sourceId 进 URL �
     await flushPromises()
     expect(mockedGet).toHaveBeenCalledWith('/api/v1/sources/f00d9001-0000-4000-8000-000000000001/kb-chunk')
     expect(document.querySelector('[data-testid="kb-chunk-drilldown"]')).not.toBeNull()
+  })
+})
+
+describe('B22 HITL 审批门接线（v1.40 批次 3 第三段：刷新恢复弹层重开 + awaiting 订阅 + 回看折叠条）', () => {
+  /** 审批门线程 2.3 骨架（status=awaiting_approval|running 复用） */
+  function approvalThreadDetail(status: 'awaiting_approval' | 'running') {
+    return {
+      thread_id: THREAD_ID_FAST,
+      title: '审批门线程',
+      mode_summary: 'fast' as const,
+      turn_count: 1,
+      has_artifacts: false,
+      created_at: '2026-11-01T08:12:00Z',
+      updated_at: '2026-11-01T09:40:11Z',
+      turns: [
+        {
+          turn_id: TURN_ID_AWAITING,
+          mode: 'fast' as const,
+          status,
+          query: 'KB 里怎么融合检索？',
+          query_lang: 'zh' as const,
+          has_report: false,
+          degraded: false,
+          duration_ms: 0,
+          created_at: '2026-11-01T08:12:00Z',
+        },
+      ],
+    }
+  }
+
+  it('awaiting 轮线程加载（刷新恢复）：2.5 对账 approval=pending → ApprovalSheet 弹层重开（恢复只依赖 2.5 不依赖事件重放，§3 生命周期 15）+ awaiting 轮照常建立订阅（api.md §7.1 等待期事件流——裁决后 approval_resolved/阶段 2 事件可达）', async () => {
+    mockedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/models') return modelsFixture
+      if (url === '/api/v1/threads') return threadListFixture
+      if (url === `/api/v1/threads/${THREAD_ID_FAST}`) return approvalThreadDetail('awaiting_approval')
+      if (url === `/api/v1/turns/${TURN_ID_AWAITING}`) return turnDetailFastAwaiting
+      throw new Error(`unexpected GET ${url}`)
+    })
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_FAST}`)
+    await flushPromises()
+
+    // 刷新恢复：2.5 approval=pending 全量在 payload → 弹层重开（Teleport body 壳面板）
+    const panel = document.querySelector('[data-testid="hitl-sheet"]')
+    expect(panel).not.toBeNull()
+    expect(panel!.getAttribute('aria-label')).toBe('知识库里找到相关内容')
+    expect(panel!.textContent).toContain('内部设计文档-检索融合.md') // 预览数据随 2.5 恢复
+    // awaiting 轮照常建立订阅（等待期事件流；此前仅 running|queued 订阅为刷新恢复缺口）
+    expect(MockEventSource.instances.some((i) => i.url.includes(TURN_ID_AWAITING))).toBe(true)
+    // 占线判定面互不侵入（v1.40 第四段补）：liveTurn/canStop 仍只认 running|queued——
+    // awaiting 态停止钮不出现（停止语义由弹层「取消本轮」承接，§3 生命周期 15）、
+    // 提交钮在位（追问条非占线形态，placeholder 非 followDisabledHint）
+    expect(wrapper!.find('[data-testid="follow-bar"] [data-testid="stop-btn"]').exists()).toBe(false)
+    expect(wrapper!.find('[data-testid="follow-bar"] [data-testid="submit-btn"]').exists()).toBe(true)
+  })
+
+  it('approved 回看轮：无弹层 + 问题下方折叠条渲染；no_hit（web 直达）轮零审批痕迹', async () => {
+    mockedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/models') return modelsFixture
+      if (url === '/api/v1/threads') return threadListFixture
+      if (url === `/api/v1/threads/${THREAD_ID_FAST}`) return approvalThreadDetail('running')
+      if (url === `/api/v1/turns/${TURN_ID_AWAITING}`) return turnDetailFastApproved
+      throw new Error(`unexpected GET ${url}`)
+    })
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_FAST}`)
+    await flushPromises()
+
+    // approved 形态不渲染弹层（回看态折叠条不开弹层——§3 生命周期 15 刷新恢复句）
+    expect(document.querySelector('[data-testid="hitl-sheet"]')).toBeNull()
+    // 折叠条在 TurnBlock 内（VTU 挂载为 detached DOM——组件域断言走 wrapper.find；
+    // document.querySelector 仅可达 Teleport body 内容）
+    const rail = wrapper!.find('[data-testid="approval-recall-strip"]')
+    expect(rail.exists()).toBe(true)
+    expect(rail.text()).toContain('已按『仅知识库』回答')
+    wrapper!.unmount()
+    wrapper = null
+    MockEventSource.reset()
+    await flushPromises()
+
+    // no_hit（web 直达轮）：零弹层零折叠条
+    mockedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/v1/models') return modelsFixture
+      if (url === '/api/v1/threads') return threadListFixture
+      if (url === `/api/v1/threads/${THREAD_ID_FAST}`) return approvalThreadDetail('running')
+      if (url === `/api/v1/turns/${TURN_ID_AWAITING}`) return turnDetailFastNoHit
+      throw new Error(`unexpected GET ${url}`)
+    })
+    wrapper = mount(App, { global: { plugins: [createPinia(), router, i18n] } })
+    await router.push(`/thread/${THREAD_ID_FAST}`)
+    await flushPromises()
+    expect(document.querySelector('[data-testid="hitl-sheet"]')).toBeNull()
+    expect(wrapper!.find('[data-testid="approval-recall-strip"]').exists()).toBe(false)
   })
 })

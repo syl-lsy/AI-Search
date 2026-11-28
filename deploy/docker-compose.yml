@@ -190,14 +190,11 @@ services:
         volume:
           nocopy: true
       - nacos_logs:/home/nacos/logs
-      # 预置禁 visibility 插件（{"visibility:nacos": false}）；create_host_path: false 防漏提交；
-      # 修改后重启 Nacos 生效（ADR-013）
-      - type: bind
-        source: ./deploy/nacos/plugin-states.json
-        target: /home/nacos/data/plugin/plugin-states.json
-        read_only: true
-        bind:
-          create_host_path: false
+      # plugin-states.json（禁 visibility 插件，ADR-013）已摘除单文件 bind 挂载（2026-11-28）：
+      # 只读挂载使 JRaft plugin_state 组快照恢复写回该文件必撞 Read-only file system →
+      # 「每次重启加载快照必崩」四复发（11-14/11-24/11-27/11-28 实证）——文件现由数据卷承载
+      # （/data/plugin/plugin-states.json 卷内既有副本），仓库 deploy/nacos/plugin-states.json
+      # 保留为重置备源；修改卷内文件后须 recreate 生效
     healthcheck:
       # 8848 探活（ask 口径）：优先 HTTP 健康端点，镜像无 curl 或路径形态不符时退化 bash TCP
       # （nacos 镜像含 bash——startup.sh 依赖 bash）

@@ -386,6 +386,21 @@ SPEC_CONFIG = {
             "ocr_engine": "paddleocr",
         },
     },
+    # B22 HITL 审批门（nacos-config.md §3 v1.50 逐字，与 defaults.py SPEC_CONFIG
+    # 三源 parity 锁死——TestNacosInitScriptParity）
+    "hitl": {
+        "enabled": False,
+        "deep_enabled": False,
+        "shadow": True,
+        "no_hit_action": "web",
+        "skip_query_types": ["navigational", "temporal"],
+        "preview_count": 3,
+        "preview_chars": 200,
+        "timeout_s": 120,
+        "on_timeout": "hybrid",
+        "note_max_chars": 500,
+        "noise_floor": {"enabled": False, "vector_sim_min": 0.0, "rerank_top1_min": 0.0},
+    },
     "history": {"window_turns": 6, "answer_head_chars": 200},
     "memory": {
         "inject_top_k": 5,

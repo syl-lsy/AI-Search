@@ -693,6 +693,21 @@ async def test_synthesis_connection_retry_deadline_double_gate(
     assert len(model.prompts) == 1
 
 
+# ---- 评审 F1/F4：approval_note 进 synthesis 用户角色 ----
+
+
+def test_user_content_appends_approval_note() -> None:
+    """评审 high#1/medium#4（api.md §2.13「服务端只作用户补充约束进 synthesis
+    用户角色」）：非空 approval_note 以空行接在 query 后（同一条 HumanMessage——
+    用户角色而非 system）；空串/None 速记等于 query（G3 非门轮零变化）。"""
+    from app.agent.nodes.synthesis import _user_content
+
+    assert _user_content("问题本身", None) == "问题本身"
+    assert _user_content("问题本身", "") == "问题本身"
+    assert _user_content("问题本身", "   ") == "问题本身"
+    assert _user_content("问题本身", "聚焦 RAG 检索面") == "问题本身\n\n聚焦 RAG 检索面"
+
+
 async def test_synthesis_connection_retry_exhausted_after_max_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

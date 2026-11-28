@@ -43,7 +43,7 @@ import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any, cast
@@ -68,9 +68,11 @@ from app.agent.tools.url_reader import _neutralize_content
 from app.config_center import AssetSnapshot, get_asset_center
 from app.core.logger import AgentLog
 from app.core.observability import UsageCollector, build_turn_callbacks
-from app.db.models import Source, Thread, Turn, TurnEvent, TurnFeedback
+from app.db.models import Source, Thread, Turn, TurnApproval, TurnEvent, TurnFeedback
+from app.db.models.approval import APPROVAL_CHOICES, GATE_PAYLOAD_SCHEMA_VERSION
 from app.db.session import get_session_factory
 from app.exception import (
+    ApprovalConflictException,
     BadRequestException,
     ConflictException,
     NotFoundException,
@@ -131,6 +133,114 @@ __all__ = [
 ACTIVE_STATUSES = ("pending", "running")  # 运行占用判定：pending 瞬时态并入 running（api.md §0）
 QUEUED_STATUS = "queued"
 FINAL_STATUSES = ("completed", "degraded", "failed", "canceled")
+
+# B22 HITL 审批门挂起态（data-model.md §1.3 v1.23 第 8 值，api.md §2.5 v1.37）：
+# 占线（计入 409001 未终态集——后接线批次语义）/无协程（**不在** ACTIVE_STATUSES——
+# ACTIVE 的每个消费者都假定「有协程在跑」（登记取消标志、等节点边界感知），awaiting
+# 态没有协程，混进去会让取消标志永远没人 pop；取消与打断均为直接落库收尾）/孤儿清理
+# 豁免（main.py _ORPHAN_TURN_STATUSES 不含本态——合法挂起态由审批超时扫描器收口）。
+AWAITING_APPROVAL_STATUS = "awaiting_approval"
+
+# B22 审批行超时收口缺省策略（api.md §7.4:1082「timeout 收口=缺省策略值 hybrid 对应
+# both」；on_timeout 自 collect_expired_approvals 读轮级 spec 快照解析——_resolve_on_timeout
+# hybrid 缺省/cancel/非法回落，cancel 分支=审批行 canceled(decided_by=timeout)+
+# 轮收口 canceled(cancel_reason=timeout，api.md §2.5 v1.38)+done 帧关通道）
+APPROVAL_TIMEOUT_CHOICE = "both"
+APPROVAL_TIMEOUT_DECIDED_BY = "timeout"
+
+
+def _classify_repeat_decision(
+    *,
+    recorded_status: str | None,
+    recorded_choice: str | None,
+    recorded_decided_by: str | None,
+    submitted_choice: str,
+) -> str:
+    """审批重复提交判读（api.md §2.13 幂等语义，纯函数零 IO）。
+
+    返回 `"idempotent"`（同轮同 choice 且已记录裁决为用户裁决 → 幂等 200 返回已
+    记录裁决）或 `"conflict"`（409008）。
+
+    **具体条覆盖一般条**：「同 choice 幂等 200」仅适用于 `decided_by=user` 的已
+    记录裁决；「超时后再到的人为裁决 → 409008（轮已不在 awaiting）」是契约显式
+    具体条——超时/取消/shadow/no_hit 等任何非用户裁决记录一律 conflict，即使用
+    户这次提交的 choice 与记录值相同（超时收口 choice=both 是缺省策略值，不是
+    用户的裁决表达）。
+    """
+    if (
+        recorded_status == "approved"
+        and recorded_decided_by == "user"
+        and recorded_choice == submitted_choice
+    ):
+        return "idempotent"
+    return "conflict"
+
+
+def _resolve_on_timeout(hitl_section: Mapping[str, Any] | None) -> str:
+    """hitl.on_timeout 解析（nacos-config §3 hitl.on_timeout 枚举 hybrid|cancel）。
+
+    缺省/节缺失/键缺失 → "hybrid"（答比丢弃好，hitl-OQ-13）；非法值（枚举外/
+    非字符串形态）→ 回落 "hybrid"——validator 枚举外拒收之外的运行面第二道防线
+    （与 _floor_params 同型兜底判读）。"""
+    value = (hitl_section or {}).get("on_timeout") if isinstance(hitl_section, Mapping) else None
+    return value if value in ("hybrid", "cancel") else "hybrid"
+
+
+def _merge_gate_hitl_extra(
+    ctx: _RunContext, final_state: dict[str, Any]
+) -> None:
+    """门轮 rewrite 条目 extra.hitl 补写（评审 R2：timing 面 gate_ms 观测缺口）。
+
+    背景：生产图 rewrite 节点先发自己的 stage(rewrite,done)（extra=strategy 等，
+    fast_rewrite.py:712）被 _absorb_stage 合档；门节点第二帧（extra.hitl 含
+    gate_ms，kb_gate.py）无 running 开档被 _absorb_stage 丢弃（`started is None
+    → return`）——timing.stages 的 rewrite 条目缺 hitl、2.5 门段延迟观测面缺失。
+    本函数在 TurnRunner 侧把判定面补写进 ctx.stages 已合档的 rewrite done 条目
+    （timing 为 turns 列物化副本、TurnRunner 拥有——data-model §2 口径；SSE/
+    turn_events 权威面不受影响，门节点第二帧照发〔契约 §7.2〕）。
+
+    - 非门轮（kb_gate_verdict 不在 final_state——含 hybrid 回落/竞态防御）no-op；
+    - 就地合并（setdefault extra浅合并——保留 rewrite 自身 extra.strategy/
+      decision_source 等键）；无 rewrite done 条目（防御形态）则 append 单条；
+    - gate 形态按轮级 spec 快照 shadow 判定（门节点发射面同判据）。"""
+    verdict = final_state.get("kb_gate_verdict")
+    if verdict is None:
+        return
+    hitl = (
+        ctx.spec_payload.get("hitl")
+        if isinstance(ctx.spec_payload, Mapping)
+        else None
+    )
+    hitl = hitl if isinstance(hitl, Mapping) else {}
+    hitl_extra = {
+        "gate": "shadow" if hitl.get("shadow") is True else "triggered",
+        "verdict": str(verdict),
+        "subqueries": final_state.get("kb_gate_subqueries") or [],
+        "gate_ms": final_state.get("kb_gate_ms"),
+    }
+    for entry in ctx.stages:
+        if (
+            isinstance(entry, dict)
+            and entry.get("stage_key") == "rewrite"
+            and entry.get("status") == "done"
+        ):
+            extra = entry.setdefault("extra", {})
+            extra["hitl"] = hitl_extra
+            return
+    ctx.stages.append(
+        {"stage_key": "rewrite", "status": "done", "extra": {"hitl": hitl_extra}}
+    )
+
+
+def _uuid_or_404(value: str, kind: str) -> uuid.UUID:
+    """UUID 解析守卫：非法形态按 404001 NotFoundException（不泄漏存在性——
+    cancel_turn/regenerate_turn 同款判读收敛为 helper，审批面三方法共用）。"""
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise NotFoundException(
+            f"{kind} 不存在", detail=f"非法 {kind} id：{value!r}"
+        ) from exc
 
 # regenerate 可进状态（api.md §2.12 v1.19 决策 12）：failed 且有来源同可重生成——
 # 「degraded→running(regenerate)→进程崩溃→孤儿清理置 failed」使 failed-with-sources
@@ -571,6 +681,50 @@ async def get_turn_detail(
             select(TurnFeedback.helpful).where(TurnFeedback.turn_id == turn_uuid)
         )
     ).first()
+    # B22 awaiting_ms（api.md §2.5 v1.37，REQ-069）：本轮处于 awaiting_approval 的
+    # 累计时长——挂起中（approval pending）按 now−requested_at 活计算；已收口按
+    # responded_at−requested_at；非门轮/零等待 None（键可省口径由 TurnDetail
+    # serializer 承载，非零才携带）
+    awaiting_ms: int | None = None
+    approval_row = (
+        await session.scalars(
+            select(TurnApproval).where(TurnApproval.turn_id == turn_uuid)
+        )
+    ).first()
+    if approval_row is not None and approval_row.requested_at is not None:
+        end_at = approval_row.responded_at or datetime.now(UTC)
+        awaiting_ms = max(
+            0, int((end_at - approval_row.requested_at).total_seconds() * 1000)
+        )
+    # B22 approval 四形态投影（api.md §2.5 v1.37——非门轮键整体省略不置 null）：
+    # pending=待裁决（verdict/expires_at/previews 全量——刷新恢复准源）；expired/
+    # approved 行统一投影 "approved" + decided_by 区分（存储/投影命名分歧为契约
+    # 自身定义：data-model §1.20 status 注 vs §2.5 decided 形态）；no_hit/shadow
+    # 原样；canceled 行契约四形态未列——同按省略承载（anomalies 上报）
+    approval_projection: dict[str, Any] | None = None
+    if approval_row is not None and approval_row.status != "canceled":
+        row_status = approval_row.status
+        if row_status == "pending":
+            approval_projection = {
+                "status": "pending",
+                "verdict": approval_row.verdict,
+                "expires_at": approval_row.expires_at.isoformat(),
+                "previews": approval_row.previews or [],
+            }
+        elif row_status in ("approved", "expired"):
+            approved_form: dict[str, Any] = {
+                "status": "approved",
+                "choice": approval_row.choice,
+                "decided_by": approval_row.decided_by,
+            }
+            if approval_row.note is not None:
+                approved_form["note"] = approval_row.note
+            approval_projection = approved_form
+        else:
+            approval_projection = {
+                "status": row_status,
+                "verdict": approval_row.verdict,
+            }
     status = cast(TurnStatus, turn.status)
     mode = cast(SearchMode, turn.mode)
     timing = turn.timing if isinstance(turn.timing, dict) else {}
@@ -644,6 +798,8 @@ async def get_turn_detail(
         ),
         created_at=turn.created_at,
         finished_at=turn.finished_at,
+        awaiting_ms=awaiting_ms,
+        approval=approval_projection,
     )
 
 
@@ -751,6 +907,14 @@ class _RunContext:
     # （writer 来源块 [n]=ref_no、finalize 引用核对账本）；fast 分支零消费恒空
     collected_sources: list[dict[str, Any]] = field(default_factory=list)
     search_strategy: str = "web"
+    # B22 两阶段（api.md §2.5 v1.37 awaiting_ms/duration_ms 扣除口径）：阶段 2 恢复
+    # 时由 resume_turn 按 approval 行 requested_at→responded_at 计算注入——终态落库
+    # duration=wall−awaiting（等待段不入系统时长，hitl-OQ-03）
+    awaiting_ms: int = 0
+    # B22 阶段 2 恢复标记：终态 timing.stages 走 merge（保留阶段 1 段〔rewrite+
+    # extra.hitl 判定帧〕追加阶段 2 段——回看时间线与非门轮 [rewrite,search,write]
+    # 一致；评审 medium#4(b)），duration 正常覆写（净值，awaiting_ms 扣除）
+    resumed: bool = False
     # 轮级 usage 累计（M2 批次 1 方案 A——docs/m2-usage-probe-batch0.md §3/§4）：
     # UsageCollector 随 build_turn_callbacks 并列注入 astream callbacks（fast/deep
     # 通用；随 RunnableConfig 继承传播，deepagents 子代理调用同面覆盖），
@@ -854,8 +1018,53 @@ class ThreadScheduler:
         # ——②③ 即该场景的兜底；进程重启后标记随进程消亡（BackgroundTask 不复跑、
         # 孤儿清理兜底）。
         self._preempt_turns: dict[str, str] = {}
+        # B22 awaiting 打断收口的 SSE 延发队列（评审 high#1）：interrupt/rollback
+        # 对 awaiting 轮在请求事务内直接落库收尾（先于 commit）——SSE 两帧
+        # （approval_resolved(resolved_by=conflict)+done(canceled)）必须提交后发布
+        # （「先落库后发布」不变式），故入队挂起、schedule_turn 入口（BackgroundTask
+        # =POST 响应后=事务已提交）flush；条目 {turn_id, thread_id, reason, duration_ms}
+        self._deferred_awaiting_sse: list[dict[str, Any]] = []
 
     # ---- 抢占标记维护（裁决 A：清除点见 _preempt_turns 注释）----
+
+    async def _flush_deferred_awaiting_sse(self) -> None:
+        """awaiting 打断收口的 SSE 延发 flush（评审 high#1）：逐条发布
+        approval_resolved(resolved_by=conflict，无 choice 键)+done(finish=canceled,
+        cancel_reason=reason)——单条失败不中断队列（下条继续；失败留 WARN）。
+        队列为进程内存（重启即丢）：重启后打断轮已 canceled 终态、订阅者经 2.5
+        对账收敛（与既有「进程重启孤儿清理」同级兜底）。"""
+        while self._deferred_awaiting_sse:
+            item = self._deferred_awaiting_sse.pop(0)
+            ctx_like = _RunContext(
+                turn_id=item["turn_id"], thread_id=item["thread_id"]
+            )
+            try:
+                await self._publish_and_persist(
+                    ctx_like,
+                    "approval_resolved",
+                    {"decided_by": "system", "resolved_by": "conflict"},
+                )
+                await self._publish_and_persist(
+                    ctx_like,
+                    "done",
+                    {
+                        "finish": "canceled",
+                        "degraded": False,
+                        "degraded_reason": None,
+                        "duration_ms": item["duration_ms"],
+                        "source_count": 0,
+                        "usage": {},
+                        "cancel_reason": item["reason"],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 —— 单条失败不阻塞队列
+                AgentLog(
+                    message=(
+                        f"awaiting 打断 SSE 延发失败（订阅者经 2.5 对账）："
+                        f"turn={item['turn_id']} {type(exc).__name__}"
+                    ),
+                    graph="turn_runner",
+                ).warning()
 
     def _forget_preempt(self, thread_id: str, turn_id: str) -> None:
         """清除指向 turn_id 的线程级抢占标记（幂等；失配不动——已被新登记覆盖）。
@@ -986,10 +1195,15 @@ class ThreadScheduler:
         stmt = select(Turn).where(
             Turn.thread_id == uuid.UUID(thread_id),
             Turn.id != uuid.UUID(turn_id),
-            Turn.status.in_([*ACTIVE_STATUSES, QUEUED_STATUS]),
+            # B22 awaiting 计入占线集（api.md §2.5 awaiting 语义①——同线程单
+            # in-flight 不变式；409001 未终态判定集含 awaiting）
+            Turn.status.in_([*ACTIVE_STATUSES, QUEUED_STATUS, AWAITING_APPROVAL_STATUS]),
         )
         rows = (await session.scalars(stmt)).all()
-        has_running = any(row.status in ACTIVE_STATUSES for row in rows)
+        has_running = any(
+            row.status in ACTIVE_STATUSES or row.status == AWAITING_APPROVAL_STATUS
+            for row in rows
+        )
         has_queued = any(row.status == QUEUED_STATUS for row in rows)
         decision = decide_on_submit(policy, has_running=has_running, has_queued=has_queued)
         if decision is SubmitDecision.REJECT:
@@ -1015,8 +1229,29 @@ class ThreadScheduler:
             for row in rows:
                 if row.status in ACTIVE_STATUSES:
                     self._cancel_flags[str(row.id)] = reason
+                elif row.status == AWAITING_APPROVAL_STATUS:
+                    # B22 awaiting 打断=无协程直接收尾（api.md §0 v1.37——interrupt/
+                    # rollback 对 awaiting 轮直接落库收尾非等标志）：请求事务内落
+                    # canceled（随 get_db commit）+ 审批行 canceled（helper 同事务）；
+                    # SSE 两帧（approval_resolved(resolved_by=conflict)+done
+                    # (canceled)）入延发队列——schedule_turn 入口（POST 响应后=
+                    # 事务已提交）flush，守「先落库后发布」不变式（评审 high#1）
+                    row.status = "canceled"
+                    row.cancel_reason = reason
+                    row.finished_at = datetime.now(UTC)
+                    duration_ms = await self._finalize_cancelled_approval_row(
+                        session, row.id
+                    )
+                    self._deferred_awaiting_sse.append(
+                        {
+                            "turn_id": str(row.id),
+                            "thread_id": thread_id,
+                            "reason": reason,
+                            "duration_ms": duration_ms,
+                        }
+                    )
             # 抢占登记（裁决 A）：打断后新轮插队——被打断轮 canceled 后执行槽归
-            # 新轮，既有 queued 顺延到新轮终态之后（_can_start 消费本标记）
+            # 新轮，既有 queued 轮顺延到新轮终态之后（_can_start 消费本标记）
             self._preempt_turns[thread_id] = turn_id
         return decision
 
@@ -1051,6 +1286,58 @@ class ThreadScheduler:
                 "轮次已处于终态，不可取消",
                 detail=f"turn {turn_id} status={status}",
             )
+        if status == AWAITING_APPROVAL_STATUS:
+            # B22 awaiting 分支（api.md §2.7 v1.37）：无协程不登记标志——条件 UPDATE
+            # 直接终态 canceled(user)（与 decide/timeout 共用 awaiting 行锁先到先得，
+            # R37）；落败=裁决/超时已先行（轮已 running）→ 落入下方常规标志路径由
+            # 阶段 2 事件边界感知。收口序：审批行 canceled（decided_by=system）→
+            # approval_resolved(resolved_by=cancel，无 choice 键) → done(canceled)
+            # 关通道（api.md §7.4:1083 取消形态）。
+            async with self._session_factory() as session:
+                stmt = (
+                    update(Turn)
+                    .where(
+                        # 归属已在上方 row.user_id 双条件校验（404001 面）——
+                        # 条件 UPDATE 只守 awaiting 竞态（decide/timeout 先行）
+                        Turn.id == turn_uuid,
+                        Turn.status == AWAITING_APPROVAL_STATUS,
+                    )
+                    .values(
+                        status="canceled",
+                        cancel_reason="user",
+                        finished_at=datetime.now(UTC),
+                    )
+                )
+                result = cast(Any, await session.execute(stmt))
+                if result.rowcount == 1:
+                    duration_ms = await self._finalize_cancelled_approval_row(
+                        session, turn_uuid
+                    )
+                    await session.commit()
+                else:
+                    await session.rollback()
+            if result.rowcount == 1:
+                ctx_like = _RunContext(turn_id=turn_id, thread_id=thread_id)
+                await self._publish_and_persist(
+                    ctx_like,
+                    "approval_resolved",
+                    {"decided_by": "system", "resolved_by": "cancel"},
+                )
+                await self._publish_and_persist(
+                    ctx_like,
+                    "done",
+                    {
+                        "finish": "canceled",
+                        "degraded": False,
+                        "degraded_reason": None,
+                        "duration_ms": duration_ms,
+                        "source_count": 0,
+                        "usage": {},
+                        "cancel_reason": "user",
+                    },
+                )
+                return {"turn_id": turn_id, "status": "canceling"}
+            # 竞态落败：轮已 running（裁决/超时先行）——落入常规取消路径
         if status == QUEUED_STATUS:
             # 第二道感知（评审 P1）：读 queued→出队收尾与调度 promote 存在交错窗口
             # ——登记标志后若调度已 promote 并进入执行，入口 pop 走 _finish_canceled，
@@ -1064,6 +1351,687 @@ class ThreadScheduler:
         else:
             self._cancel_flags[turn_id] = reason  # pending/running：节点边界感知
         return {"turn_id": turn_id, "status": "canceling"}
+
+    # ---- HITL 审批门（B22/REQ-069，api.md §2.13；data-model.md §1.20）----
+
+    def _sanitize_note(self, note: str | None) -> str | None:
+        """note 脱敏（api.md §2.13「过 query 同款 sanitize 管道」/R35 缓解面）。
+
+        - 门控沿 B13 口径：`load_safety_config` 返 None（safety 关/节缺失）→ 原样
+          直通（kill switch 单键热更即全链直通——不得做成无条件脱敏）；
+        - spec 快照不可用（装配缺失——单测假体调度器无快照）→ fail-open 直通 +
+          WARN（装配缺失≠safety 关，观测面留痕）；
+        - 脱敏形态与当前轮 query 同口径（detect_pii + sanitize 占位词）——note 进
+          synthesis 用户角色（阶段 2 恢复载荷），原文不入审批行。
+        """
+        if note is None:
+            return None
+        try:
+            spec = self._capture_spec_payload()
+        except Exception as exc:  # noqa: BLE001 —— 装配缺失 fail-open 直通
+            AgentLog(
+                message=f"note sanitize spec 快照不可用（fail-open 直通）：{type(exc).__name__}",
+                graph="turn_runner",
+            ).warning()
+            return note
+        safety = load_safety_config(spec)
+        if safety is None:
+            return note
+        return sanitize(note, detect_pii(note))
+
+    async def _finalize_cancelled_approval_row(
+        self, session: Any, turn_uuid: uuid.UUID
+    ) -> int:
+        """cancel awaiting 分支同事务面：审批行 canceled（decided_by=system，§7.2
+        cancel 收口口径）+ 返回扣除 awaiting 后的 duration_ms（done payload 用，
+        api.md §2.5 v1.37 扣除口径）。"""
+        now = datetime.now(UTC)
+        approval = (
+            await session.scalars(
+                select(TurnApproval).where(TurnApproval.turn_id == turn_uuid)
+            )
+        ).first()
+        if approval is not None and approval.status == "pending":
+            approval.status = "canceled"
+            approval.decided_by = "system"
+            approval.responded_at = now
+        awaiting_ms = 0
+        if approval is not None and approval.requested_at is not None:
+            awaiting_ms = max(
+                0, int((now - approval.requested_at).total_seconds() * 1000)
+            )
+        created_row = (
+            await session.execute(select(Turn.created_at).where(Turn.id == turn_uuid))
+        ).first()
+        wall_ms = (
+            max(0, int((now - created_row[0]).total_seconds() * 1000))
+            if created_row is not None and created_row[0] is not None
+            else 0
+        )
+        return max(0, wall_ms - awaiting_ms)
+    # 本段为**事务面**：开行/裁决/过期收口的 DB 状态机。阶段 2 恢复调度（resume→
+    # astream 载荷重建）与 SSE approval_requested/approval_resolved 事件面归批次 2
+    # 后续段接线——本段方法暂无生产调用方（REST 端点同批后续段暴露）。
+
+    async def open_approval(
+        self,
+        turn_id: str,
+        *,
+        user_id: str,
+        verdict: str,
+        hits_summary: list[Any],
+        previews: list[Any],
+        gate_payload: dict[str, Any] | None,
+        expires_at: datetime,
+        requested_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """开行（TurnRunner 阶段 1 门判定 has_hit 后调用）：一事务两写。
+
+        - turns.status → `awaiting_approval`（条件 UPDATE WHERE status='running'
+          ——前置=阶段 1 图执行中；violation 是内部不变式破坏，RuntimeError 不进
+          契约错误面：本方法无 REST 暴露）；
+        - turn_approvals 落 pending 行（verdict/hits_summary/previews/gate_payload
+          ——`gate_payload.schema_version` 由写入方按 GATE_PAYLOAD_SCHEMA_VERSION
+          盖章，R30 跨进程契约）；
+        - **同事务时序注**（data-model.md §1.20 :650）：turns 置 awaiting 与审批行
+          pending 写入同一事务同一 commit——异常即整体回滚，零半开态。
+        """
+        turn_uuid = _uuid_or_404(turn_id, "turn")
+        user_uuid = _uuid_or_404(user_id, "user")
+        requested = requested_at if requested_at is not None else datetime.now(UTC)
+        async with self._session_factory() as session:
+            stmt = (
+                update(Turn)
+                .where(
+                    Turn.id == turn_uuid,
+                    Turn.user_id == user_uuid,
+                    Turn.status == "running",
+                )
+                .values(status=AWAITING_APPROVAL_STATUS)
+            )
+            result = cast(Any, await session.execute(stmt))
+            if result.rowcount == 0:
+                raise RuntimeError(
+                    "open_approval 前置不满足：turn 不在 running 态"
+                    f"（turn_id={turn_id}）——门开行只能从阶段 1 图执行中进入"
+                )
+            session.add(
+                TurnApproval(
+                    turn_id=turn_uuid,
+                    status="pending",
+                    verdict=verdict,
+                    hits_summary=hits_summary,
+                    previews=previews,
+                    gate_payload=gate_payload,
+                    requested_at=requested,
+                    expires_at=expires_at,
+                )
+            )
+            await session.commit()
+        return {"turn_id": turn_id, "turn_status": AWAITING_APPROVAL_STATUS}
+
+    async def decide_approval(
+        self,
+        turn_id: str,
+        *,
+        user_id: str,
+        choice: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """用户裁决（api.md §2.13）：条件 UPDATE 先到先得 + 幂等判读。
+
+        - 归属校验（id+user 双条件 → 404001，不泄漏存在性，cancel_turn 同款）；
+        - choice 防御性校验（400001——REST 面 pydantic Literal 为第一道，本层为
+          程序化调用方的第二道）；note ≤500 字（note_max_chars 契约上限）；
+        - **条件 UPDATE**（`WHERE status='awaiting_approval'`，沿 regenerate
+          rowcount 守卫先例）：并发裁决/超时扫描共用 turns 行锁串行化（R37 先到
+          先得）——rowcount==1 即赢方，落审批行 approved + 轮置 running；
+        - rowcount==0：轮已不在 awaiting——按 `_classify_repeat_decision` 判读已
+          记录裁决：同 choice 且 decided_by=user → 幂等成功（`idempotent=true`，
+          REST 面映射 200）；其余（异 choice / 超时·取消收口后 / 无审批行）→
+          409008。
+        """
+        if choice not in APPROVAL_CHOICES:
+            raise BadRequestException(
+                "审批选项非法", detail=f"choice={choice!r} ∉ {APPROVAL_CHOICES}"
+            )
+        if note is not None and len(note) > 500:
+            raise BadRequestException(
+                "补充指令过长", detail=f"note {len(note)} 字超上限 500（note_max_chars）"
+            )
+        note = self._sanitize_note(note)
+        turn_uuid = _uuid_or_404(turn_id, "turn")
+        user_uuid = _uuid_or_404(user_id, "user")
+        async with self._session_factory() as session:
+            # 归属校验先行（id+user 双条件 → 404001，不泄漏存在性——契约 §2.13
+            # 错误面与 cancel_turn 同款；只查在先，条件 UPDATE 随后）
+            owner_row = (
+                await session.execute(
+                    select(Turn.id, Turn.thread_id).where(
+                        Turn.id == turn_uuid, Turn.user_id == user_uuid
+                    )
+                )
+            ).first()
+            if owner_row is None:
+                raise NotFoundException(
+                    "轮次不存在",
+                    detail=f"turn_id={turn_id} 不存在或不属于当前用户",
+                )
+            thread_id = str(owner_row.thread_id)
+            stmt = (
+                update(Turn)
+                .where(
+                    Turn.id == turn_uuid,
+                    Turn.user_id == user_uuid,
+                    Turn.status == AWAITING_APPROVAL_STATUS,
+                )
+                .values(status="running")
+            )
+            result = cast(Any, await session.execute(stmt))
+            if result.rowcount == 1:
+                # 审批行按 turn_id 列定位（UNIQUE(turn_id) 一轮一行；session.get 是
+                # PK=id 查找，这里手里是 turn id——不能误用）
+                approval = (
+                    await session.scalars(
+                        select(TurnApproval).where(TurnApproval.turn_id == turn_uuid)
+                    )
+                ).first()
+                if approval is None:
+                    # turns awaiting 但审批行缺失=不变式破坏（open_approval 同事务
+                    # 两写保证两行齐在）——整体回滚（未 commit 即退出 async with）
+                    raise ApprovalConflictException(
+                        "轮次不在待审批态或审批裁决冲突",
+                        detail=f"turn {turn_id} awaiting 但审批行缺失（不变式破坏）",
+                    )
+                approval.status = "approved"
+                approval.choice = choice
+                approval.note = note
+                approval.decided_by = "user"
+                approval.responded_at = datetime.now(UTC)
+                await session.commit()
+                # approval_resolved（api.md §7.2——裁决提交路径；先落库后发布不变式）
+                await self._publish_and_persist(
+                    _RunContext(turn_id=turn_id, thread_id=thread_id),
+                    "approval_resolved",
+                    {
+                        "choice": choice,
+                        "decided_by": "user",
+                        "resolved_by": "submit",
+                        "next_stage": "search",
+                    },
+                )
+                return {
+                    "turn_id": turn_id,
+                    "status": "running",
+                    "choice": choice,
+                    "idempotent": False,
+                }
+            recorded = (
+                await session.scalars(
+                    select(TurnApproval).where(TurnApproval.turn_id == turn_uuid)
+                )
+            ).first()
+            outcome = _classify_repeat_decision(
+                recorded_status=None if recorded is None else recorded.status,
+                recorded_choice=None if recorded is None else recorded.choice,
+                recorded_decided_by=None if recorded is None else recorded.decided_by,
+                submitted_choice=choice,
+            )
+            if outcome == "idempotent":
+                assert recorded is not None  # classifier 只对 approved+user 判幂等
+                return {
+                    "turn_id": turn_id,
+                    "status": "running",
+                    "choice": recorded.choice,
+                    "idempotent": True,
+                }
+            raise ApprovalConflictException(
+                "轮次不在待审批态或审批裁决冲突",
+                detail=(
+                    f"turn {turn_id} 条件推进落败（非 awaiting / 已按其他 choice 裁决"
+                    " / 已超时收口）"
+                ),
+            )
+
+    async def collect_expired_approvals(
+        self, *, now: datetime | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """惰性过期收口（hitl.on_timeout 读 spec——hybrid 缺省/cancel 双分支；
+        R32 审批死轮缓解的判定面）。
+
+        - 扫 `turn_approvals WHERE status='pending' AND expires_at < now`
+          （idx_turn_approvals_expiry 部分索引判据面）；`now` 可注入（单测/惰性
+          判定点传固定时钟）；
+        - `on_timeout` 自轮级 spec 快照解析（_resolve_on_timeout：hybrid 缺省/
+          cancel/非法回落 hybrid——快照不可用同回落，等效 hitl 键族缺省灰度态）；
+        - 逐行条件 UPDATE turns（WHERE status='awaiting_approval'）先到先得；
+          **hybrid 分支**：审批行 expired + choice=APPROVAL_TIMEOUT_CHOICE（「两者
+          都要」）+ decided_by=timeout + 轮置 running（后续 resume_turn 阶段 2）；
+          **cancel 分支**：审批行 canceled + decided_by=timeout + 轮收口 canceled
+          + done 帧关通道（cancel_reason 落 "timeout"——api.md §2.5 v1.38
+          cancel_reason 第 4 值「审批等待超时静默收口」，nacos-config.md §3 v1.50
+          `hitl.on_timeout=cancel`「静默收尾 canceled(timeout)」的执行面）；
+        - rowcount==0（并发裁决已收口/轮已非 awaiting）→ 跳过且不动审批行（赢方
+          已在同一 turns 行锁下收口该行）；
+        - 单事务批量 commit；**先落库后发布** approval_resolved（hybrid 带缺省
+          choice；cancel 无 choice 键——api.md §7.4:1083 同款）；返回收口清单
+          （含 on_timeout 标记；cancel 条目 resume_turn 自然 no-op——非 running）。
+        """
+        moment = now if now is not None else datetime.now(UTC)
+        try:
+            spec = self._capture_spec_payload()
+        except Exception as exc:  # noqa: BLE001 —— 快照不可用=缺省灰度态
+            AgentLog(
+                message=f"collect on_timeout spec 快照不可用（回落 hybrid）：{type(exc).__name__}",
+                graph="turn_runner",
+            ).warning()
+            spec = {}
+        hitl = (
+            spec.get("hitl") if isinstance(spec, Mapping) else None
+        )
+        hitl = hitl if isinstance(hitl, Mapping) else {}
+        on_timeout = _resolve_on_timeout(hitl)
+        collected: list[dict[str, Any]] = []
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(TurnApproval, Turn.created_at, Turn.thread_id)
+                    .join(Turn, Turn.id == TurnApproval.turn_id)
+                    .where(
+                        TurnApproval.status == "pending",
+                        TurnApproval.expires_at < moment,
+                    )
+                    .limit(limit)
+                )
+            ).all()
+            for approval, created_at, thread_id in rows:
+                stmt = (
+                    update(Turn)
+                    .where(
+                        Turn.id == approval.turn_id,
+                        Turn.status == AWAITING_APPROVAL_STATUS,
+                    )
+                    .values(
+                        status="canceled" if on_timeout == "cancel" else "running",
+                        **(
+                            {
+                                # cancel_reason=timeout（api.md §2.5 v1.38 第 4 值——
+                                # 审批等待超时静默收口，区别于用户取消的 "user"）
+                                "cancel_reason": "timeout",
+                                "finished_at": moment,
+                            }
+                            if on_timeout == "cancel"
+                            else {}
+                        ),
+                    )
+                )
+                result = cast(Any, await session.execute(stmt))
+                if result.rowcount == 0:
+                    continue  # 并发裁决先行赢——审批行由赢方收口，本扫描零触碰
+                if on_timeout == "cancel":
+                    approval.status = "canceled"
+                    approval.choice = None
+                    approval.decided_by = APPROVAL_TIMEOUT_DECIDED_BY
+                    approval.responded_at = moment
+                    awaiting_ms = (
+                        max(
+                            0,
+                            int(
+                                (moment - approval.requested_at).total_seconds() * 1000
+                            ),
+                        )
+                        if approval.requested_at is not None
+                        else 0
+                    )
+                    wall_ms = (
+                        max(0, int((moment - created_at).total_seconds() * 1000))
+                        if created_at is not None
+                        else 0
+                    )
+                    duration_ms = max(0, wall_ms - awaiting_ms)
+                    collected.append(
+                        {
+                            "turn_id": str(approval.turn_id),
+                            "thread_id": str(thread_id),
+                            "choice": None,
+                            "decided_by": APPROVAL_TIMEOUT_DECIDED_BY,
+                            "on_timeout": "cancel",
+                            "duration_ms": duration_ms,
+                        }
+                    )
+                else:
+                    approval.status = "expired"
+                    approval.choice = APPROVAL_TIMEOUT_CHOICE
+                    approval.decided_by = APPROVAL_TIMEOUT_DECIDED_BY
+                    approval.responded_at = moment
+                    collected.append(
+                        {
+                            "turn_id": str(approval.turn_id),
+                            "thread_id": str(thread_id),
+                            "choice": APPROVAL_TIMEOUT_CHOICE,
+                            "decided_by": APPROVAL_TIMEOUT_DECIDED_BY,
+                            "on_timeout": "hybrid",
+                        }
+                    )
+            if collected:
+                await session.commit()
+                # approval_resolved（api.md §7.2——超时收口路径；先落库后发布不变式；
+                # cancel 分支无 choice 键——api.md §7.4:1083 cancel 收口同款）
+                for item in collected:
+                    resolved_payload: dict[str, Any] = {
+                        "decided_by": item["decided_by"],
+                        "resolved_by": "timeout",
+                    }
+                    if item["choice"] is not None:
+                        resolved_payload["choice"] = item["choice"]
+                        resolved_payload["next_stage"] = "search"
+                    await self._publish_and_persist(
+                        _RunContext(
+                            turn_id=item["turn_id"], thread_id=item["thread_id"]
+                        ),
+                        "approval_resolved",
+                        resolved_payload,
+                    )
+                    if item.get("on_timeout") == "cancel":
+                        await self._publish_and_persist(
+                            _RunContext(
+                                turn_id=item["turn_id"], thread_id=item["thread_id"]
+                            ),
+                            "done",
+                            {
+                                "finish": "canceled",
+                                "degraded": False,
+                                "degraded_reason": None,
+                                "duration_ms": item["duration_ms"],
+                                "source_count": 0,
+                                "usage": {},
+                                # 同轮 cancel_reason=timeout（§2.5 v1.38 第 4 值）
+                                "cancel_reason": "timeout",
+                            },
+                        )
+        return collected
+
+    async def _persist_gate_audit_row(
+        self,
+        ctx: _RunContext,
+        final_state: dict[str, Any],
+        *,
+        row_status: str,
+    ) -> None:
+        """no_hit / shadow 审批审计行（data-model §1.20「web 直达轮亦落一行（轻量
+        无载荷）」+ 六态含 shadow；评审 high#2——no_hit=R28 最坏失效〔KB 有答案却被
+        静默跳过〕的事后追查依据；shadow 行承载 hits_summary/previews 供噪声地板
+        T 标定〔hitl-OQ-17〕与弹窗率观测）。
+
+        - 轮状态零触碰（web 直达轮照常完成/shadow 轮行为现状）——仅插审计行；
+        - gate_payload=None（无阶段 2 恢复面）；expires_at 仍按 hitl.timeout_s 填
+          （列 NOT NULL，审计行请求/过期时刻=落行时刻）；UNIQUE(turn_id) 一轮一行
+          ——门轮纠错第二趟不进门（armed 排除），结构性无重行。
+        """
+        hitl = (
+            ctx.spec_payload.get("hitl")
+            if isinstance(ctx.spec_payload, Mapping)
+            else None
+        )
+        hitl = hitl if isinstance(hitl, Mapping) else {}
+        timeout_s = hitl.get("timeout_s")
+        timeout_s = timeout_s if isinstance(timeout_s, int) and 30 <= timeout_s <= 600 else 120
+        now = datetime.now(UTC)
+        verdict = str(final_state.get("kb_gate_verdict") or "no_hit")
+        previews = final_state.get("kb_gate_previews")
+        previews = list(previews) if isinstance(previews, list) else []
+        try:
+            async with self._session_factory() as session:
+                session.add(
+                    TurnApproval(
+                        turn_id=uuid.UUID(ctx.turn_id),
+                        status=row_status,
+                        verdict=verdict,
+                        hits_summary=final_state.get("kb_gate_subqueries") or [],
+                        previews=previews,
+                        gate_payload=None,
+                        requested_at=now,
+                        expires_at=now + timedelta(seconds=timeout_s),
+                        responded_at=now,
+                    )
+                )
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 —— 审计行失败不拖垮主流程（WARN 留痕）
+            AgentLog(
+                message=(
+                    f"kb_gate 审计行落库失败（{row_status}，不拖垮主流程）："
+                    f"{type(exc).__name__}"
+                ),
+                graph="turn_runner",
+            ).warning()
+
+    async def _finish_awaiting(
+        self, ctx: _RunContext, final_state: dict[str, Any]
+    ) -> None:
+        """阶段 1 收口=awaiting 挂起（api.md §2.5 v1.37 awaiting 语义；plan §3.4）。
+
+        - 取消竞态先决（图结束→open_approval 窗口内登记的取消标志）：有标志=取消
+          已发生——直接 canceled 收尾（零审批行，尚未落库）；
+        - open_approval（一事务两写：turns→awaiting_approval + 审批行 pending，
+          data-model §1.20 :650 实施时序注）；rowcount=0（并发取消已收口）→ 零事
+          件退出；
+        - **落库后发布** approval_requested（先落库后发布不变式同 done——api.md
+          §7.2 发送时机「判定并落库后、轮置 awaiting 时」）：verdict/expires_at/
+          previews（previews 已由门节点物化 ≤preview_count×≤preview_chars）；
+        - **协程释放**：零终态落库（status=awaiting 非终态、finished_at/duration
+          不写）、零 done 零 close——SSE 连接保持仅心跳（api.md §2.5 语义③）；
+          等待窗计时走 expires_at（审批行），阶段 2 由 resume_turn 独立发起。
+        """
+        turn_id = ctx.turn_id
+        thread_id = ctx.thread_id
+        cancel_reason = self._cancel_flags.pop(turn_id, None)
+        if cancel_reason is not None:
+            await self._finish_canceled(
+                turn_id,
+                thread_id,
+                reason=cancel_reason,
+                source_count=ctx.sources_count,
+                stages=ctx.stages,
+            )
+            self._nudge_thread(thread_id)
+            return
+        hitl = (
+            ctx.spec_payload.get("hitl")
+            if isinstance(ctx.spec_payload, Mapping)
+            else None
+        )
+        hitl = hitl if isinstance(hitl, Mapping) else {}
+        timeout_s = hitl.get("timeout_s")
+        timeout_s = timeout_s if isinstance(timeout_s, int) and 30 <= timeout_s <= 600 else 120
+        verdict = str(final_state.get("kb_gate_verdict") or "has_hit")
+        previews = final_state.get("kb_gate_previews")
+        previews = list(previews) if isinstance(previews, list) else []
+        requested_at = datetime.now(UTC)
+        expires_at = requested_at + timedelta(seconds=timeout_s)
+        try:
+            await self.open_approval(
+                turn_id,
+                user_id=str(ctx.user_id) if ctx.user_id else "",
+                verdict=verdict,
+                hits_summary=final_state.get("kb_gate_subqueries") or [],
+                previews=previews,
+                gate_payload=final_state.get("kb_gate_payload"),
+                expires_at=expires_at,
+                requested_at=requested_at,
+            )
+        except RuntimeError:
+            # 并发取消已在 open_approval 前把轮收口（running 前置落败）——零事件退出
+            AgentLog(
+                message="kb_gate awaiting 开行竞态落败（轮已收口）——零事件退出",
+                graph="turn_runner",
+            ).warning()
+            return
+        # 评审 medium#3/F3：提交窗内到达的 cancel 二次 drain——首次 pop 之后、
+        # open_approval 条件 UPDATE 提交之前登记的标志（cancel 端点见 running 态走
+        # 登记路径）在 awaiting 后无人消费，会被 resume 入口 pop 误收口已裁决轮
+        # （审批行 approved 与轮 canceled 面不一致）。此处统一收口：与 §2.7 awaiting
+        # 分支同语义（审批行 canceled+轮 canceled+两帧），且**先于 usage/timing 快照
+        # 预写与 approval_requested 发布**——挂起从未对用户生效则零挂起事件。
+        late_cancel = self._cancel_flags.pop(turn_id, None)
+        if late_cancel is not None:
+            async with self._session_factory() as session:
+                stmt = (
+                    update(Turn)
+                    .where(
+                        Turn.id == uuid.UUID(turn_id),
+                        Turn.status == AWAITING_APPROVAL_STATUS,
+                    )
+                    .values(
+                        status="canceled",
+                        cancel_reason=late_cancel,
+                        finished_at=datetime.now(UTC),
+                    )
+                )
+                result = cast(Any, await session.execute(stmt))
+                if result.rowcount == 1:
+                    duration_ms = await self._finalize_cancelled_approval_row(
+                        session, uuid.UUID(turn_id)
+                    )
+                    await session.commit()
+                else:
+                    await session.rollback()
+            if result.rowcount == 1:
+                ctx_like = _RunContext(turn_id=turn_id, thread_id=thread_id)
+                await self._publish_and_persist(
+                    ctx_like,
+                    "approval_resolved",
+                    {"decided_by": "system", "resolved_by": "cancel"},
+                )
+                await self._publish_and_persist(
+                    ctx_like,
+                    "done",
+                    {
+                        "finish": "canceled",
+                        "degraded": False,
+                        "degraded_reason": None,
+                        "duration_ms": duration_ms,
+                        "source_count": ctx.sources_count,
+                        "usage": {},
+                        "cancel_reason": late_cancel,
+                    },
+                )
+                self._nudge_thread(thread_id)
+            return
+        # awaiting 快照预写（评审 medium#3/#4b）：usage=阶段 1 累计〔阶段 2
+        # restore_totals 回灌——跨阶段合计〕；timing=阶段 1 段〔含 rewrite done
+        # extra.hitl 判定帧——阶段 2 终态 merge_stages 保留追加，回看时间线一致；
+        # timing 为 turns 列物化副本，turn_events 仍为准源——data-model §2 口径〕
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    update(Turn)
+                    .where(Turn.id == uuid.UUID(turn_id))
+                    .values(
+                        usage=ctx.usage_collector.total(),
+                        timing={"stages": ctx.stages},
+                    )
+                )
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 —— 快照失败不阻断挂起（阶段 2 零回灌）
+            AgentLog(
+                message=f"awaiting usage/timing 快照预写失败（阶段 2 零回灌）：{type(exc).__name__}",
+                graph="turn_runner",
+            ).warning()
+        await self._publish_and_persist(
+            ctx,
+            "approval_requested",
+            {
+                "verdict": verdict,
+                "expires_at": expires_at.isoformat(),
+                "previews": previews,
+            },
+        )
+
+    async def resume_turn(self, turn_id: str) -> dict[str, Any] | None:
+        """阶段 2 恢复入口（plan §3.4——裁决/超时收口后由 REST 端点与超时扫描调）。
+
+        - 前置：turn running（decide/collect 条件 UPDATE 已置）+ 审批行
+          approved/expired 带 gate_payload；不满足（重复 resume/竞态）→ None 零
+          副作用退出；
+        - **R30 跨进程契约**：`gate_payload.schema_version` ≠ 当前代码版本 → 轮
+          failed + 明确 error（error 事件落库后关通道，无 done——零内容直接关闭
+          api.md §7.1 v1.10 例外条），不猜；
+        - awaiting_ms=审批行 responded_at−requested_at（终态 duration 扣除注入）；
+        - 阶段 2 = `_execute_turn(turn, resume=...)`：独立完整包络（asyncio.timeout
+          与 TurnDeadline 重建）、首 stage 归属按 api.md §7.2:845、kb_only 候选注入
+          （约束④）。
+        """
+        turn_uuid = _uuid_or_404(turn_id, "turn")
+        async with self._session_factory() as session:
+            row = await session.get(Turn, turn_uuid)
+            approval = (
+                await session.scalars(
+                    select(TurnApproval).where(TurnApproval.turn_id == turn_uuid)
+                )
+            ).first()
+            if (
+                row is None
+                or row.status != "running"
+                or approval is None
+                or approval.status not in ("approved", "expired")
+                or approval.gate_payload is None
+            ):
+                return None  # 重复 resume / 竞态收口——零副作用退出
+            payload = dict(approval.gate_payload)
+            # awaiting_ms 先于 R30 判读计算（评审 medium#2：_fail_resumed_payload
+            # 同样扣除 awaiting 时长——终态口径不限 completed）
+            awaiting_ms = 0
+            if approval.responded_at is not None and approval.requested_at is not None:
+                awaiting_ms = max(
+                    0,
+                    int(
+                        (approval.responded_at - approval.requested_at).total_seconds()
+                        * 1000
+                    ),
+                )
+            if payload.get("schema_version") != GATE_PAYLOAD_SCHEMA_VERSION:
+                await self._fail_resumed_payload(
+                    turn_id, str(row.thread_id), duration_offset_ms=awaiting_ms
+                )
+                return {"turn_id": turn_id, "status": "failed"}
+            choice = approval.choice or APPROVAL_TIMEOUT_CHOICE
+        await self._execute_turn(
+            row,
+            resume={
+                "approval_choice": choice,
+                # 评审 F1/F4（api.md §2.13）：note 进阶段 2 载荷——synthesis 用户角色
+                "note": approval.note,
+                "gate_payload": payload,
+                "awaiting_ms": awaiting_ms,
+                # 跨阶段 usage 回灌（评审 medium#3）：阶段 1 awaiting 收口预写快照
+                "usage_prior": dict(row.usage) if isinstance(row.usage, Mapping) else {},
+            },
+        )
+        return {"turn_id": turn_id, "status": "running"}
+
+    async def _fail_resumed_payload(
+        self, turn_id: str, thread_id: str, *, duration_offset_ms: int = 0
+    ) -> None:
+        """R30 收口：版本不符的轮置 failed + 明确 error（api.md §2.13「不猜」；
+        data-model §1.20/R30）——零内容形态（error 后直接关闭、无 done，§7.1
+        v1.10 例外条；failed 终态经 §2.5 对账）。duration_offset_ms=awaiting
+        时长（评审 medium#2：扣除口径不限 completed）。"""
+        message = "审批载荷版本不符，请重新提问"
+        outcome = await self._persist_terminal(
+            turn_id,
+            status="failed",
+            error={"code": "500001", "message": message, "stage_key": "search"},
+            duration_offset_ms=duration_offset_ms,
+        )
+        if outcome is None:
+            return  # 终态竞态落败：零事件退出
+        ctx_like = _RunContext(turn_id=turn_id, thread_id=thread_id)
+        await self._publish_and_persist(
+            ctx_like,
+            "error",
+            {"code": "500001", "message": message, "stage_key": "search"},
+        )
+        await self._bus.close_channel(turn_id)
 
     # ---- regenerate（api.md §2.12 v1.19 / REQ-063：degraded|failed-with-sources 仅重生成）----
 
@@ -1628,6 +2596,7 @@ class ThreadScheduler:
         merge_stages: bool = False,
         preserve_duration: bool = False,
         clear_error: bool = False,
+        duration_offset_ms: int = 0,
         usage: dict[str, Any] | None = None,
     ) -> tuple[datetime, int] | None:
         """终态落 turns（条件收口：行锁 + 终态重查，终态绝不被覆写）。
@@ -1676,8 +2645,13 @@ class ThreadScheduler:
             if row.started_at is None:  # 失败/取消路径可能未经 promote（防御）
                 row.started_at = now
             if not preserve_duration or row.duration_ms is None:
+                # duration 口径=「提交→done 减 awaiting」（api.md §2.5 v1.37
+                # hitl-OQ-03：带审批轮 duration_ms 扣除 awaiting 时长，
+                # duration_offset_ms=阶段 2 恢复注入的 awaiting_ms）
                 row.duration_ms = max(
-                    0, int((now - row.created_at).total_seconds() * 1000)
+                    0,
+                    int((now - row.created_at).total_seconds() * 1000)
+                    - duration_offset_ms,
                 )
             if error is not None:
                 row.error = error
@@ -1912,9 +2886,12 @@ class ThreadScheduler:
             rewritten_queries=rewritten,
             # regenerate 口径（§2.12 v1.19）：stages 追加、duration_ms 不覆写、
             # 成功后清旧 error/degraded_reason（旧值属上一轮失败留痕）
-            merge_stages=ctx.regenerate,
+            merge_stages=ctx.regenerate or ctx.resumed,
             preserve_duration=ctx.regenerate,
             clear_error=ctx.regenerate,
+            # B22 两阶段（api.md §2.5 v1.37）：duration 扣除 awaiting 时长
+            # （阶段 2 恢复注入；阶段 1 轮恒 0=口径不变）
+            duration_offset_ms=ctx.awaiting_ms,
             usage=usage,
         )
         if outcome is None:
@@ -2071,13 +3048,15 @@ class ThreadScheduler:
         source_count: int = 0,
         stages: list[dict[str, Any]] | None = None,
         merge_stages: bool = False,
+        duration_offset_ms: int = 0,
     ) -> None:
         """canceled 收尾：queued 轮立即出队（user）与运行中轮节点边界收尾（superseded/
         rolled_back/user）共用；保留已产出（sources 已随事件即时落库）。
 
         `merge_stages=True`（regenerate 取消路径）：保留原 stages 并追加本次段
         （§2.12「regenerate 期间可取消」——时间线不因取消丢失历史），duration_ms
-        不覆写。
+        不覆写。`duration_offset_ms`（评审 medium#2/F2）：带审批轮的 canceled 终态
+        同样扣除 awaiting 时长（api.md §2.5 扣除口径不限 completed）。
         """
         ctx_like = _RunContext(turn_id=turn_id, thread_id=thread_id)
         outcome = await self._persist_terminal(
@@ -2087,6 +3066,7 @@ class ThreadScheduler:
             stages=stages or [],
             merge_stages=merge_stages,
             preserve_duration=merge_stages,
+            duration_offset_ms=duration_offset_ms,
         )
         if outcome is None:
             return  # 终态竞态落败（图收尾已完成）：跳过 done 发布，防双终态
@@ -2147,10 +3127,12 @@ class ThreadScheduler:
             answer_md=fallback.answer_md,
             stages=ctx.stages,
             degraded_reason=None,
-            merge_stages=ctx.regenerate,
+            merge_stages=ctx.regenerate or ctx.resumed,
             preserve_duration=ctx.regenerate,
             clear_error=ctx.regenerate,
             usage=usage,
+            # 评审 medium#2/F2：兜底收束 degraded 终态同样扣除 awaiting 时长
+            duration_offset_ms=ctx.awaiting_ms,
         )
         if outcome is None:
             return  # 终态竞态落败：winner 已发布终态事件，本方零事件退出
@@ -2204,8 +3186,11 @@ class ThreadScheduler:
             degraded_reason=degraded_reason,
             # regenerate 再失败：stages 追加 / duration_ms 不覆写（§2.12 v1.25 起再失败
             # 走兜底产出收束；本分支为防御路径，stages/duration 口径不变）
-            merge_stages=ctx.regenerate,
+            merge_stages=ctx.regenerate or ctx.resumed,
             preserve_duration=ctx.regenerate,
+            # 评审 medium#2/F2：degraded 终态同样扣除 awaiting 时长（计入 P90 抽样
+            # 与 degraded 占比——口径失真面）
+            duration_offset_ms=ctx.awaiting_ms,
         )
         if outcome is None:
             return
@@ -2241,6 +3226,9 @@ class ThreadScheduler:
           终态收尾点 _persist_terminal 永不到达）或行已终态（收尾点已过期）——
           早退前清掉指向本轮的标记，避免同线程既有 queued 轮被永久阻塞。
         """
+        # B22：awaiting 打断收口的 SSE 延发 flush（本任务=POST 响应后执行=请求
+        # 事务已提交——「先落库后发布」不变式的提交后窗口，评审 high#1）
+        await self._flush_deferred_awaiting_sse()
         while True:
             row = await self._load_turn(turn_id)
             if row is None:
@@ -2423,7 +3411,8 @@ class ThreadScheduler:
         stmt = select(Turn).where(
             Turn.thread_id == row.thread_id,
             Turn.id != row.id,
-            Turn.status.in_([*ACTIVE_STATUSES, QUEUED_STATUS]),
+            # B22 awaiting 占线（api.md §2.5 语义①）——queued 轮等待 awaiting 收口
+            Turn.status.in_([*ACTIVE_STATUSES, QUEUED_STATUS, AWAITING_APPROVAL_STATUS]),
         )
         async with self._session_factory() as session:
             rows = (await session.scalars(stmt)).all()
@@ -2483,7 +3472,7 @@ class ThreadScheduler:
 
     # ---- TurnRunner：图执行 + 事件翻译（ARCH §6.1）----
 
-    async def _execute_turn(self, turn: Any) -> None:
+    async def _execute_turn(self, turn: Any, *, resume: dict[str, Any] | None = None) -> None:
         """执行单轮：astream 三流消费 → 翻译 → publish/落库 → 终态收尾。
 
         - OQ-11：运行开始一次性捕获 spec/mapping 快照存入 _RunContext——轮内全部
@@ -2495,7 +3484,16 @@ class ThreadScheduler:
           timeout 守卫 = asyncio.timeout(spec.<mode>.turn_timeout_s) 包整个 astream；
         - 组装段（快照捕获→首个 stage 发布）同在异常收口面（评审 P2）：任一异常
           复用 _fail_turn（该段恒零内容 → failed + error + close_channel，无 done），
-          异常不外泄、turn 不永卡 running、队头必被 nudge。
+          异常不外泄、turn 不永卡 running、队头必被 nudge；
+        - **B22 两阶段恢复**（plan §3.4/ADR-019，resume 面归 resume_turn 调用）：
+          resume 非空=阶段 2——query_lang 读 turns 列（阶段 1 已持久化，不重判定）、
+          初始 state 叠加门载荷（rewritten_queries/query_type/time_range）+
+          approval_choice；kb_only 注入门内 TopK 并集进 candidates（约束④，入口
+          路由直达 merge_dedupe 零 kb Send）；ctx.awaiting_ms 注入（终态 duration
+          扣除等待段）；首 stage=KB-only 由恢复入口发 stage(search,running,
+          label=检索知识库)（api.md §7.2:845——web 形态沿 web_search index-0 单对
+          不重复发）；**阶段 2 独立完整包络**（asyncio.timeout 与 TurnDeadline 均
+          重建——awaiting 不占协程不占轮预算）。
         """
         turn_id = str(turn.id)
         thread_id = str(turn.thread_id)
@@ -2521,15 +3519,35 @@ class ThreadScheduler:
             # 轮级 usage collector（M2 批次 1 方案 A，fast/deep 通用）：随 callbacks
             # 并列注入（下方 config），ctx 持引用供 _finish_completed 消费
             ctx.usage_collector = UsageCollector()
+            # awaiting_ms 前置（评审 medium#2/F2）：启动前取消收尾（下方入口 pop）
+            # 的 canceled 轮同样扣除等待段——须先于 pop 可用
+            ctx.awaiting_ms = int((resume or {}).get("awaiting_ms") or 0)
             timeout_s = self._turn_timeout_s(ctx.spec_payload, str(turn.mode))
             cancel_reason = self._cancel_flags.pop(turn_id, None)
             if cancel_reason is not None:  # 启动前已被取消/打断：零业务事件直接收尾
-                await self._finish_canceled(turn_id, thread_id, reason=cancel_reason)
+                await self._finish_canceled(
+                    turn_id,
+                    thread_id,
+                    reason=cancel_reason,
+                    duration_offset_ms=ctx.awaiting_ms,
+                )
                 self._nudge_thread(thread_id)
                 return
-            query_lang = detect_query_lang(str(turn.query))
-            ctx.query_lang = query_lang  # 图外钩子提示词的语言跟随源（与图内注入同值）
-            await self._persist_query_lang(turn_id, query_lang)
+            if resume is not None:
+                ctx.resumed = True
+                # 跨阶段 usage 回灌（评审 medium#3，plan §3.3）：阶段 1 收口预写
+                # turns.usage 快照 → 阶段 2 collector 注入，done.usage/§2.5 usage
+                # 承载两阶段合计（快照预写形态见 _finish_awaiting）
+                usage_prior = resume.get("usage_prior")
+                if isinstance(usage_prior, Mapping) and usage_prior:
+                    ctx.usage_collector.restore_totals(dict(usage_prior))
+                # 阶段 2：query_lang 阶段 1 已判定并持久化（turns 列）——直读不重判定
+                query_lang = str(turn.query_lang) if turn.query_lang else detect_query_lang(str(turn.query))
+                ctx.query_lang = query_lang
+            else:
+                query_lang = detect_query_lang(str(turn.query))
+                ctx.query_lang = query_lang  # 图外钩子提示词的语言跟随源（与图内注入同值）
+                await self._persist_query_lang(turn_id, query_lang)
             # 搜索链轮启动冻结（nacos-config §2：装载决策读熔断实时态一次，轮内中途熔断不切换）
             tools_registry = (
                 self._tools_registry
@@ -2608,14 +3626,46 @@ class ThreadScheduler:
                     initial_state["parent_turn_id"] = str(turn.parent_turn_id)
                     if parent_ctx["sources"]:
                         initial_state["parent_sources"] = parent_ctx["sources"]
+            if resume is not None:
+                # 阶段 2 叠加（plan §3.4——持久化载荷重建，不重改写）：rewritten_queries/
+                # query_type/time_range 自 gate_payload；approval_choice 驱动入口路由；
+                # kb_only 注入门内 TopK 并集（约束④——入口路由直达 merge_dedupe 零 kb Send）
+                gate_payload = resume.get("gate_payload") or {}
+                initial_state["rewritten_queries"] = list(gate_payload.get("rewritten_queries") or [])
+                initial_state["query_type"] = str(gate_payload.get("query_type") or "other")
+                initial_state["time_range"] = gate_payload.get("time_range")
+                initial_state["approval_choice"] = str(resume.get("approval_choice") or "both")
+                # 评审 F1/F4（api.md §2.13「note 进 synthesis 用户角色」）：R35 sanitize
+                # 后的 note 注入图 state（synthesis 消费；空 note 零键=非门轮逐字节）
+                if resume.get("note"):
+                    initial_state["approval_note"] = str(resume["note"])
+                if resume.get("approval_choice") == "kb_only":
+                    initial_state["candidates"] = list(gate_payload.get("kb_candidates") or [])
             # 首 stage 图前同步发布（ARCH §4.3「首个 stage ≤1s」的结构性保证：不等 LLM/
             # 图首帧——rewrite/plan 节点内不再发 running，避免重复 seq）。M2 批次 1：
             # 首 stage 按 mode——deep=plan（api.md §7.4 深度序列首事件 + §7.4 v1.4 注
             # 「首个 stage 事件即执行开始（fast=rewrite、deep=plan）」），fast 维持 rewrite。
             first_stage_key = "plan" if str(turn.mode) == "deep" else "rewrite"
-            first_stage: dict[str, Any] = {"stage_key": first_stage_key, "status": "running"}
-            await self._publish_and_persist(ctx, "stage", first_stage)
-            self._absorb_stage(ctx, first_stage)  # timing.stages 配对开档（done 帧到达时合档）
+            if resume is not None:
+                # 阶段 2 首 stage（api.md §7.2:845 归属注）：kb_only 无 web Send——
+                # stage(search,running,label=检索知识库) 由恢复入口发布（不重复发
+                # running）；web 形态（仅网络/两者都要）沿 web_search index-0 单对
+                # 帧形态不变、恢复入口零发射
+                if resume.get("approval_choice") == "kb_only":
+                    first_stage = {
+                        "stage_key": "search",
+                        "status": "running",
+                        "label": "检索知识库",
+                    }
+                    await self._publish_and_persist(ctx, "stage", first_stage)
+                    self._absorb_stage(ctx, first_stage)
+            else:
+                first_stage: dict[str, Any] = {
+                    "stage_key": first_stage_key,
+                    "status": "running",
+                }
+                await self._publish_and_persist(ctx, "stage", first_stage)
+                self._absorb_stage(ctx, first_stage)  # timing.stages 配对开档（done 帧到达时合档）
         except SearchChainUnavailable as exc:
             # 装载失败（连接指针缺失等）：与 astream 段同码（§7.2 全部搜索源不可用）
             await self._fail_turn(
@@ -2766,6 +3816,9 @@ class ThreadScheduler:
                 reason=exc.reason,
                 source_count=ctx.sources_count,
                 stages=ctx.stages,
+                # 评审第 2 轮 F2 残余：阶段 2 流内取消（带审批轮最常见取消路径）
+                # 同样扣除 awaiting 时长（api.md §2.5 扣除口径不限 completed）
+                duration_offset_ms=ctx.awaiting_ms,
             )
             self._nudge_thread(thread_id)
             return
@@ -2809,9 +3862,45 @@ class ThreadScheduler:
                 reason=cancel_reason,
                 source_count=ctx.sources_count,
                 stages=ctx.stages,
+                # 评审第 2 轮 F2 残余：事件边界 break 收尾面同样扣除 awaiting 时长
+                duration_offset_ms=ctx.awaiting_ms,
             )
             self._nudge_thread(thread_id)
             return
+        if resume is not None and resume.get("approval_choice") == "kb_only":
+            # B22 kb_only 阶段 2 search 段合档（评审 medium#4(a)）：无 web/kb Send——
+            # 恢复入口 running 帧在此配对 done（timing.stages 收口 search 条目，
+            # §2.5 回看时间线与非门轮一致）；web 形态由 web_search 副本自持 done
+            search_done: dict[str, Any] = {
+                "stage_key": "search",
+                "status": "done",
+                "detail": "KB 门内候选注入",
+            }
+            await self._publish_and_persist(ctx, "stage", search_done)
+            self._absorb_stage(ctx, search_done)
+        # B22 门轮 rewrite 条目 extra.hitl 补写（timing 面 gate_ms 观测，评审 R2）——
+        # 非门轮 no-op；awaiting 挂起快照/终态落库两路共用
+        _merge_gate_hitl_extra(ctx, final_state)
+        if final_state.get("kb_gate_action") == "await":
+            # B22 阶段 1 门判定有命中（enforce）：审批行落库→turn 置 awaiting→
+            # 协程释放（零 done 零 close——SSE 连接保持仅心跳，api.md §2.5 awaiting
+            # 语义③；两阶段执行 plan §3.4/ADR-019）
+            await self._finish_awaiting(ctx, final_state)
+            return
+        if final_state.get("kb_gate_action") == "web_only":
+            # B22 web 直达轮审计行（data-model §1.20「web 直达轮亦落一行（轻量无
+            # 载荷）」——R28 最坏失效〔KB 有答案却被静默跳过〕的事后追查依据；
+            # 图一次跑完不中断，行随终态流程并行落库，评审 high#2）
+            await self._persist_gate_audit_row(
+                ctx, final_state, row_status="no_hit"
+            )
+        elif "kb_gate_verdict" in final_state:
+            # shadow 观测态审计行（data-model §1.20 六态含 shadow——行为一律现状
+            # hybrid，行承载 hits_summary/previews 供噪声地板 T 标定〔hitl-OQ-17〕
+            # 与弹窗率观测；门 hybrid 回落〔通道失败/异常/竞态防御〕无 verdict 不落行）
+            await self._persist_gate_audit_row(
+                ctx, final_state, row_status="shadow"
+            )
         await self._finish_completed(ctx, final_state)
 
     async def _translate_custom(self, ctx: _RunContext, payload: dict[str, Any]) -> None:
@@ -2967,7 +4056,12 @@ class ThreadScheduler:
             "stage_key": stage_key,
         }
         outcome = await self._persist_terminal(
-            ctx.turn_id, status="failed", error=error_payload, stages=ctx.stages
+            ctx.turn_id,
+            status="failed",
+            error=error_payload,
+            stages=ctx.stages,
+            # 评审 medium#2/F2：failed 终态同样扣除 awaiting 时长（口径不限 completed）
+            duration_offset_ms=ctx.awaiting_ms,
         )
         if outcome is None:
             return

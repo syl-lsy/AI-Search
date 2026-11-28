@@ -11,6 +11,7 @@
 import copy
 import json
 import re
+from typing import Any
 
 import pytest
 
@@ -1960,3 +1961,139 @@ class TestKbSpecRules:
                 assert not re.search(
                     r"key|secret|token|password", field, re.IGNORECASE
                 ), field
+
+
+class TestHitlSpecRules:
+    """§3 hitl 节 v1.50 B22 校验规则（nacos-config.md §3 v1.50 校验规则条）。
+
+    形态纪律：四开关严格布尔（字符串/数字形态拒收——kill switch 防形态漂移）；
+    枚举键越界拒收（no_hit_action 单值 web / on_timeout 双值）；skip_query_types
+    为 8 值枚举子集数组（越界拒收、空数组合法）；数值域边界拒收；节缺失=合法
+    （回落 enabled=false 灰度安全，turn/followups 节缺失回落惯例）；noise_floor
+    子节缺失合法（None）。
+    """
+
+    # ---- 节缺失与缺省合法 ----
+
+    def test_hitl_section_missing_allowed(self):
+        """hitl 节整节缺失=合法（存量 spec 无此键可过校验——灰度安全）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p.pop("hitl"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_noise_floor_subsection_missing_allowed(self):
+        """noise_floor 子节缺失=合法（None——消费面回落 enabled=false）。"""
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["hitl"].pop("noise_floor"))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    def test_unknown_hitl_key_accepted_extra_allow(self):
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["hitl"].update({"future_key": 1}))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+
+    # ---- 严格布尔（四开关） ----
+
+    @pytest.mark.parametrize("field", ["enabled", "deep_enabled", "shadow"])
+    def test_switch_non_bool_rejected(self, field: str):
+        for bad in ("true", 1, None):
+            payload = _mutated(
+                SPEC_DATA_ID, lambda p, f=field, b=bad: p["hitl"].update({f: b})
+            )
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize("bad", ["true", 1, "false"])
+    def test_noise_floor_enabled_non_bool_rejected(self, bad: Any):
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, b=bad: p["hitl"]["noise_floor"].update({"enabled": b})
+        )
+        with pytest.raises(AssetValidationError):
+            validate_asset(SPEC_DATA_ID, payload)
+
+    # ---- 枚举键 ----
+
+    def test_no_hit_action_single_value_domain(self):
+        """no_hit_action 校验为单值 "web"（hitl-OQ-B 裁决：不接受 hybrid/cancel）。"""
+        for bad in ("hybrid", "cancel", "both"):
+            payload = _mutated(
+                SPEC_DATA_ID, lambda p, b=bad: p["hitl"].update({"no_hit_action": b})
+            )
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    def test_on_timeout_enum_domain(self):
+        payload = _mutated(SPEC_DATA_ID, lambda p: p["hitl"].update({"on_timeout": "cancel"}))
+        assert validate_asset(SPEC_DATA_ID, payload) == payload
+        for bad in ("both", "web", "kb_only"):
+            payload = _mutated(
+                SPEC_DATA_ID, lambda p, b=bad: p["hitl"].update({"on_timeout": b})
+            )
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    # ---- skip_query_types：8 值枚举子集数组 ----
+
+    @pytest.mark.parametrize(
+        "value, legal",
+        [
+            (["navigational"], True),
+            (["navigational", "temporal"], True),
+            ([], True),
+            (["factoid", "how_to", "other"], True),
+            (["unknown_type"], False),
+            (["factoid", "bogus"], False),
+            ([""], False),
+        ],
+    )
+    def test_skip_query_types_subset_domain(self, value: list, legal: bool):
+        """越界值拒收、空数组合法=全部进门（§3 v1.50 校验规则）。"""
+        payload = _mutated(
+            SPEC_DATA_ID, lambda p, v=value: p["hitl"].update({"skip_query_types": v})
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
+
+    # ---- 数值域边界 ----
+
+    @pytest.mark.parametrize(
+        "field, low_ok, low_bad, high_ok, high_bad",
+        [
+            ("preview_count", 1, 0, 5, 6),
+            ("preview_chars", 100, 50, 500, 600),
+            ("timeout_s", 30, 20, 600, 700),
+            ("note_max_chars", 100, 50, 1000, 2000),
+        ],
+    )
+    def test_numeric_field_bounds(
+        self, field: str, low_ok: int, low_bad: int, high_ok: int, high_bad: int
+    ):
+        for value, legal in (
+            (low_ok, True),
+            (high_ok, True),
+            (low_bad, False),
+            (high_bad, False),
+        ):
+            payload = _mutated(
+                SPEC_DATA_ID, lambda p, f=field, v=value: p["hitl"].update({f: v})
+            )
+            if legal:
+                assert validate_asset(SPEC_DATA_ID, payload) == payload
+            else:
+                with pytest.raises(AssetValidationError):
+                    validate_asset(SPEC_DATA_ID, payload)
+
+    @pytest.mark.parametrize(
+        "value, legal",
+        [(0.0, True), (1.0, True), (0.42, True), (-0.1, False), (1.5, False)],
+    )
+    def test_noise_floor_threshold_bounds(self, value: Any, legal: bool):
+        payload = _mutated(
+            SPEC_DATA_ID,
+            lambda p, v=value: p["hitl"]["noise_floor"].update({"vector_sim_min": v}),
+        )
+        if legal:
+            assert validate_asset(SPEC_DATA_ID, payload) == payload
+        else:
+            with pytest.raises(AssetValidationError):
+                validate_asset(SPEC_DATA_ID, payload)
