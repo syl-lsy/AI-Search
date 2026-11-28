@@ -200,9 +200,11 @@ def _merge_gate_hitl_extra(
     turn_events 权威面不受影响，门节点第二帧照发〔契约 §7.2〕）。
 
     - 非门轮（kb_gate_verdict 不在 final_state——含 hybrid 回落/竞态防御）no-op；
-    - 就地合并（setdefault extra浅合并——保留 rewrite 自身 extra.strategy/
-      decision_source 等键）；无 rewrite done 条目（防御形态）则 append 单条；
-    - gate 形态按轮级 spec 快照 shadow 判定（门节点发射面同判据）。"""
+    - 就地合并（setdefault extra浅合并——保留 rewrite/plan 自身 extra.strategy/
+      subtopics 等键）；无对应 done 条目（防御形态）则 append 单条；
+    - gate 形态按轮级 spec 快照 shadow 判定（门节点发射面同判据）；
+    - **mode 感知目标条目（B22 批次 4）**：fast=rewrite 条目（现状逐字节）；deep=plan
+      条目（deep 无 rewrite 面——判定帧归属门前的 planner 段，零伪 rewrite 条目）。"""
     verdict = final_state.get("kb_gate_verdict")
     if verdict is None:
         return
@@ -218,17 +220,18 @@ def _merge_gate_hitl_extra(
         "subqueries": final_state.get("kb_gate_subqueries") or [],
         "gate_ms": final_state.get("kb_gate_ms"),
     }
+    stage_key = "rewrite" if str(getattr(ctx, "mode", "") or "") != "deep" else "plan"
     for entry in ctx.stages:
         if (
             isinstance(entry, dict)
-            and entry.get("stage_key") == "rewrite"
+            and entry.get("stage_key") == stage_key
             and entry.get("status") == "done"
         ):
             extra = entry.setdefault("extra", {})
             extra["hitl"] = hitl_extra
             return
     ctx.stages.append(
-        {"stage_key": "rewrite", "status": "done", "extra": {"hitl": hitl_extra}}
+        {"stage_key": stage_key, "status": "done", "extra": {"hitl": hitl_extra}}
     )
 
 
@@ -3627,20 +3630,37 @@ class ThreadScheduler:
                     if parent_ctx["sources"]:
                         initial_state["parent_sources"] = parent_ctx["sources"]
             if resume is not None:
-                # 阶段 2 叠加（plan §3.4——持久化载荷重建，不重改写）：rewritten_queries/
-                # query_type/time_range 自 gate_payload；approval_choice 驱动入口路由；
-                # kb_only 注入门内 TopK 并集（约束④——入口路由直达 merge_dedupe 零 kb Send）
+                # 阶段 2 叠加（plan §3.4——持久化载荷重建，不重改写）。mode 分叉
+                # （B22 批次 4）：fast=rewritten_queries 自载荷 + kb_only 门内 TopK
+                # 并集注 candidates（约束④）；deep=planner 产物恢复（subtopics/
+                # outline 自 gate_payload.planner——阶段 2 跳过 planner，ARCH §4.2
+                # 分期注；deep 无 candidates 消费通道零注）。approval_choice 驱动
+                # 两图 START 条件入口；query_type/time_range 两模式同源载荷恢复
+                # （deep 侧供 research 子代理 time_range 透传）。
                 gate_payload = resume.get("gate_payload") or {}
-                initial_state["rewritten_queries"] = list(gate_payload.get("rewritten_queries") or [])
-                initial_state["query_type"] = str(gate_payload.get("query_type") or "other")
-                initial_state["time_range"] = gate_payload.get("time_range")
-                initial_state["approval_choice"] = str(resume.get("approval_choice") or "both")
-                # 评审 F1/F4（api.md §2.13「note 进 synthesis 用户角色」）：R35 sanitize
-                # 后的 note 注入图 state（synthesis 消费；空 note 零键=非门轮逐字节）
-                if resume.get("note"):
-                    initial_state["approval_note"] = str(resume["note"])
-                if resume.get("approval_choice") == "kb_only":
-                    initial_state["candidates"] = list(gate_payload.get("kb_candidates") or [])
+                if is_fast_mode:
+                    initial_state["rewritten_queries"] = list(gate_payload.get("rewritten_queries") or [])
+                    initial_state["query_type"] = str(gate_payload.get("query_type") or "other")
+                    initial_state["time_range"] = gate_payload.get("time_range")
+                    initial_state["approval_choice"] = str(resume.get("approval_choice") or "both")
+                    # 评审 F1/F4（api.md §2.13「note 进 synthesis 用户角色」）：R35 sanitize
+                    # 后的 note 注入图 state（synthesis 消费；空 note 零键=非门轮逐字节）
+                    if resume.get("note"):
+                        initial_state["approval_note"] = str(resume["note"])
+                    if resume.get("approval_choice") == "kb_only":
+                        initial_state["candidates"] = list(gate_payload.get("kb_candidates") or [])
+                else:
+                    planner_payload = gate_payload.get("planner")
+                    planner_payload = planner_payload if isinstance(planner_payload, Mapping) else {}
+                    initial_state["subtopics"] = list(planner_payload.get("subtopics") or [])
+                    initial_state["outline"] = list(planner_payload.get("outline") or [])
+                    initial_state["query_type"] = str(gate_payload.get("query_type") or "other")
+                    initial_state["time_range"] = gate_payload.get("time_range")
+                    initial_state["approval_choice"] = str(resume.get("approval_choice") or "both")
+                    # note 注入面两模式同构（deep 消费点——writer/orchestrator 用户角色，
+                    # 随批次 4 契约增量钉正；注入本身模式无关）
+                    if resume.get("note"):
+                        initial_state["approval_note"] = str(resume["note"])
             # 首 stage 图前同步发布（ARCH §4.3「首个 stage ≤1s」的结构性保证：不等 LLM/
             # 图首帧——rewrite/plan 节点内不再发 running，避免重复 seq）。M2 批次 1：
             # 首 stage 按 mode——deep=plan（api.md §7.4 深度序列首事件 + §7.4 v1.4 注
@@ -3650,8 +3670,10 @@ class ThreadScheduler:
                 # 阶段 2 首 stage（api.md §7.2:845 归属注）：kb_only 无 web Send——
                 # stage(search,running,label=检索知识库) 由恢复入口发布（不重复发
                 # running）；web 形态（仅网络/两者都要）沿 web_search index-0 单对
-                # 帧形态不变、恢复入口零发射
-                if resume.get("approval_choice") == "kb_only":
+                # 帧形态不变、恢复入口零发射。B22 批次 4：**fast 专属**——deep 阶段 2
+                # research 入口自发 stage(search,running,extra.subagents)（§7.4 深度
+                # 主干），恢复入口不重复发（api.md §7.4:1723 deep 同构注）
+                if is_fast_mode and resume.get("approval_choice") == "kb_only":
                     first_stage = {
                         "stage_key": "search",
                         "status": "running",
@@ -3870,14 +3892,19 @@ class ThreadScheduler:
         if resume is not None and resume.get("approval_choice") == "kb_only":
             # B22 kb_only 阶段 2 search 段合档（评审 medium#4(a)）：无 web/kb Send——
             # 恢复入口 running 帧在此配对 done（timing.stages 收口 search 条目，
-            # §2.5 回看时间线与非门轮一致）；web 形态由 web_search 副本自持 done
-            search_done: dict[str, Any] = {
-                "stage_key": "search",
-                "status": "done",
-                "detail": "KB 门内候选注入",
-            }
-            await self._publish_and_persist(ctx, "stage", search_done)
-            self._absorb_stage(ctx, search_done)
+            # §2.5 回看时间线与非门轮一致）；web 形态由 web_search 副本自持 done。
+            # **fast 专属（批次 4 第四段评审前置修复）**：deep kb_only 零候选注入
+            # 通道（merge_dedupe/candidates 不存在于 deep 面），该 done 帧泄入 deep
+            # 轮=无 running 配对的孤儿帧+fast 语义 detail——mode 门控与 :3654 running
+            # 发射同款；deep 侧 search 事件面归 research/supplement 节点自持
+            if is_fast_mode:
+                search_done: dict[str, Any] = {
+                    "stage_key": "search",
+                    "status": "done",
+                    "detail": "KB 门内候选注入",
+                }
+                await self._publish_and_persist(ctx, "stage", search_done)
+                self._absorb_stage(ctx, search_done)
         # B22 门轮 rewrite 条目 extra.hitl 补写（timing 面 gate_ms 观测，评审 R2）——
         # 非门轮 no-op；awaiting 挂起快照/终态落库两路共用
         _merge_gate_hitl_extra(ctx, final_state)
