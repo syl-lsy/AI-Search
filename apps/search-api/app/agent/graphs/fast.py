@@ -37,6 +37,7 @@ from langgraph.types import Send
 
 from app.agent.nodes.fast_rewrite import rewrite
 from app.agent.nodes.fuse_rerank import fuse_rerank
+from app.agent.nodes.kb_gate import approval_wait, kb_gate, route_after_gate, route_by_approval
 from app.agent.nodes.kb_route import correction_round_of, kb_supply_verdict
 from app.agent.nodes.kb_search import kb_search
 from app.agent.nodes.merge_dedupe import merge_dedupe
@@ -48,6 +49,19 @@ from app.agent.state import FastState
 #: 第五目标〔plan §2.2 B6 钉定：search_fanout_targets 加 kb_search〕——子图内扩展、
 #: 主图拓扑零改动；单测锁结构 `search_fanout_targets`）
 search_fanout_targets: list[str] = ["web_search", "merge_dedupe", "synthesis", "kb_search"]
+
+#: B22 HITL 门（v1.83 §4.1——rewrite 条件边第五目标：hitl armed 分支，plan §3.2；
+#: 子图内扩展主图零改动 ADR-012 第三例；G3 缺省关闭=分支不可达现状逐字节）
+_GATE_TARGET: str = "kb_gate"
+
+#: kb_gate 出条件边目标表（route_after_gate：await→approval_wait｜web_only→web Send×N｜
+#: hybrid→现状 web+kb 双 Send——Send 动态目标不进静态表，本表为图校验声明面）
+_GATE_OUT_TARGETS: list[str] = ["approval_wait", "web_search", "kb_search"]
+
+#: START 条件入口目标表（route_by_approval：无 approval_choice=rewrite〔阶段 1〕｜
+#: 阶段 2：kb_only→merge_dedupe 零 kb Send〔KB 候选随初始 state 注入〕｜web_only→
+#: web Send×N｜both/custom→web+kb 双 Send——plan §3.4/ARCH §4.1 :484）
+_ENTRY_TARGETS: list[str] = ["rewrite", "merge_dedupe", "web_search", "kb_search"]
 
 #: fuse_rerank 条件边目标表（B19 纠错回边——synthesis 直达｜rewrite 纠错第二趟）
 _FUSE_TARGETS: list[str] = ["synthesis", "rewrite"]
@@ -70,7 +84,8 @@ def route_after_fuse(state: Any, config: RunnableConfig | None = None) -> Send |
 
 
 def build_fast_graph() -> Any:
-    """编译 fast 子图（五节点拓扑 + B19 kb_search/纠错条件边；主图拓扑零改动）。"""
+    """编译 fast 子图（五节点拓扑 + B19 kb_search/纠错条件边 + B22 审批门两节点；
+    主图拓扑零改动）。"""
     builder = StateGraph(FastState)
     builder.add_node("rewrite", rewrite)
     builder.add_node("web_search", web_search)
@@ -78,16 +93,26 @@ def build_fast_graph() -> Any:
     builder.add_node("merge_dedupe", merge_dedupe)
     builder.add_node("fuse_rerank", fuse_rerank)
     builder.add_node("synthesis", synthesis)  # 节点名=节点语义（§6.1 messages 过滤判定面）；stage_key=write 在节点内发射
-    builder.add_edge(START, "rewrite")
+    # B22 审批门两节点（plan §3.2——G3 缺省关闭=两节点不可达现状逐字节）
+    builder.add_node(_GATE_TARGET, kb_gate)
+    builder.add_node("approval_wait", approval_wait)
+    # START 条件入口（plan §3.4 两阶段恢复）：无 approval_choice=rewrite（阶段 1，
+    # 现状 START→rewrite 边的条件化改写行为逐字节）；阶段 2 按 approval_choice 分支
+    # （kb_only 直达 merge_dedupe——KB 候选已随初始 state 注入不发 kb Send）
+    builder.add_conditional_edges(START, route_by_approval, _ENTRY_TARGETS)
     # Send 扇出：rewrite 出边按 rewritten_queries 产 Send（hybrid=web+kb 双 Send、
-    # kb_first/kb_only=单 kb Send；direct/recall 直达 synthesis——目标复用，子图内改）
-    builder.add_conditional_edges("rewrite", search_fanout, search_fanout_targets)
+    # kb_first/kb_only=单 kb Send；direct/recall 直达 synthesis——目标复用，子图内改；
+    # B22 hitl armed=kb_gate 门分支）
+    builder.add_conditional_edges("rewrite", search_fanout, [*search_fanout_targets, _GATE_TARGET])
+    # B22 门出条件边三叉（await→approval_wait｜web_only→web Send×N｜hybrid→现状双 Send）
+    builder.add_conditional_edges(_GATE_TARGET, route_after_gate, _GATE_OUT_TARGETS)
     builder.add_edge("web_search", "merge_dedupe")
     builder.add_edge("kb_search", "merge_dedupe")  # B19：merge_dedupe=唯一汇聚节点（WS→MG←KS）
     builder.add_edge("merge_dedupe", "fuse_rerank")
     # B19 纠错回边：fuse_rerank 出条件边（synthesis｜rewrite 第二趟）——零新节点
     builder.add_conditional_edges("fuse_rerank", route_after_fuse, _FUSE_TARGETS)
     builder.add_edge("synthesis", END)
+    builder.add_edge("approval_wait", END)  # 空操作终结节点——图自然 END（两阶段挂起面）
     return builder.compile()
 
 

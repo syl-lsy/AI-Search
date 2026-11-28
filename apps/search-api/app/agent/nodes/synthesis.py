@@ -461,6 +461,15 @@ def _text_of(chunk: Any) -> str:
     return ""
 
 
+def _user_content(query: str, approval_note: Any) -> str:
+    """B22 评审 F1/F4（api.md §2.13「服务端只作用户补充约束进 synthesis 用户角色」）：
+    审批补充指令（hitl.custom note，R35 sanitize 已在 decide_approval 前置）以空行
+    接在 query 后——同一条 HumanMessage（**用户角色**，非 system 角色、非提示词模板
+    键——零新 Nacos 提示词键）；空/缺省逐字节等于 query（非门轮 G3 零变化）。"""
+    note = str(approval_note or "").strip()
+    return query if not note else f"{query}\n\n{note}"
+
+
 async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """综合回答节点：stage(write) 夹流式生成；answer_md 兜底截断 + 引用越界剔除。"""
     ensure_not_canceled(config)  # 节点边界感知协作式取消（R14②：跨子图注入面）
@@ -527,7 +536,10 @@ async def synthesis(state: Any, config: RunnableConfig | None = None) -> dict[st
             "query": query,
         },
     )
-    messages = [SystemMessage(content=prompt_text), HumanMessage(content=query)]
+    messages = [
+        SystemMessage(content=prompt_text),
+        HumanMessage(content=_user_content(query, state.get("approval_note"))),
+    ]
 
     answer = ""
     last_error: Exception | None = None

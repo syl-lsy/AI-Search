@@ -31,7 +31,10 @@ class TurnEvent(Base):
     thread_id: Mapped[uuid.UUID] = mapped_column()  # 裸 uuid（无 FK，随 DDL 契约）
     turn_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("turns.id", ondelete="CASCADE"))
     seq: Mapped[int] = mapped_column(Integer)  # 线程内单调递增
-    event_type: Mapped[str] = mapped_column(String(12))  # stage|sources|images|done|error（M6 起 +memory）
+    # 0014_b22_hitl_gate 扩宽 varchar(12)→varchar(24)（§1.4 v1.23 列宽扩容注：
+    # approval_requested / approval_resolved=18 字符超旧列宽——B22 两事件入落库
+    # 子集随批次 2 SSE 段接线）；现有值域 stage|sources|images|done|error|M6 +memory
+    event_type: Mapped[str] = mapped_column(String(24))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)  # 去 envelope 冗余字段后存储
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

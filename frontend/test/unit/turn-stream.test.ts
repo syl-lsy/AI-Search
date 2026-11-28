@@ -561,15 +561,64 @@ describe('连接注册表（生命周期 11 防双连接：同一 turnId 至多�
 })
 
 describe('具名事件派发（WHATWG SSE 语义；批次 8 P0「具名事件失明」修复锁死）', () => {
-  it('openEventSource 对 api.md §7.2 全部 10 个事件名逐一 addEventListener 注册', () => {
+  it('openEventSource 对 api.md §7.2 全部 12 个事件名逐一 addEventListener 注册（v1.37 增 approval_requested/approval_resolved）', () => {
     const { es } = setup()
     const NAMED_EVENTS = [
       'stage', 'token', 'thinking', 'sources', 'images',
-      'context_compact', 'memory', 'done', 'followups', 'error',
+      'context_compact', 'memory', 'done', 'followups',
+      'approval_requested', 'approval_resolved', 'error',
     ]
     for (const name of NAMED_EVENTS) {
       expect(es.hasListener(name)).toBe(true)
     }
+  })
+
+  it('approval_requested/approval_resolved 具名帧经 addEventListener 通道交付 onEvent（B22 §7.2 v1.37：控制事件不过缓冲直交付）', () => {
+    const { es, onEvent } = setup()
+    es.open()
+    es.dispatch(frame(5, 'approval_requested', {
+      verdict: 'has_hit',
+      expires_at: '2026-11-01T08:14:06Z',
+      previews: [{ kb_doc_id: '9a77f0e1-1c3b-4e5a-9d8f-0a1b2c3d4e5f', chunk_id: '5c2e8a3b-2d4f-4a6b-8c9d-1e2f3a4b5c6d', title: 't.md', heading_path: ['a', 'b'], excerpt: 'KB 候选', query_index: 0 }],
+    }))
+    es.dispatch(frame(6, 'approval_resolved', { choice: 'kb_only', decided_by: 'user', resolved_by: 'submit', next_stage: 'search' }))
+    expect(onEvent).toHaveBeenCalledTimes(2)
+    expect(onEvent.mock.calls[0]![0].event).toBe('approval_requested')
+    expect(onEvent.mock.calls[1]![0].event).toBe('approval_resolved')
+  })
+
+  it('awaiting 等待期看门狗豁免（生命周期 15「watchdog 不触发」）：approval_requested 到达后解除武装，45s 业务静默不重连', () => {
+    const { es, onEvent, onClosed } = setup()
+    es.open()
+    es.dispatch(frame(5, 'approval_requested', {
+      verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [],
+    }))
+    expect(onEvent).toHaveBeenCalledTimes(1)
+    // awaiting 等待期 120s 无业务事件是预期（api.md §7.1 awaiting 轮事件流条）——远超 45s 看门狗阈值
+    vi.advanceTimersByTime(HEARTBEAT_WATCHDOG_MS + 5000)
+    expect(onClosed).not.toHaveBeenCalled()
+    expect(es.readyState).toBe(ES_READY_STATE.OPEN)
+  })
+
+  it('approval_resolved 到达后看门狗恢复武装（awaiting 出口帧 = 业务事件重武装既有语义）', () => {
+    const { es, onClosed } = setup()
+    es.open()
+    es.dispatch(frame(5, 'approval_requested', { verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [] }))
+    es.dispatch(frame(6, 'approval_resolved', { choice: 'kb_only', decided_by: 'user', resolved_by: 'submit', next_stage: 'search' }))
+    // resolved 后进入阶段 2——业务事件静默超阈值 → 看门狗照常 fire（close 再重连，全量重放幂等）
+    vi.advanceTimersByTime(HEARTBEAT_WATCHDOG_MS + 5000)
+    expect(onClosed).not.toHaveBeenCalled() // fire ≠ onClosed（fire 是 close 再重建，onClosed 仅终态收口）
+    expect(MockEventSource.instances.length).toBeGreaterThan(1) // 看门狗 fire → 重建连接对象
+  })
+
+  it('approval 帧重放经 seq 门幂等丢弃（Last-Event-ID 重连全量重放：已应用的帧不二次交付）', () => {
+    const { es, onEvent } = setup()
+    es.open()
+    es.dispatch(frame(5, 'approval_requested', { verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [] }))
+    es.dispatch(frame(6, 'approval_resolved', { choice: 'kb_only', decided_by: 'user', resolved_by: 'submit' }))
+    // 断线重连（Last-Event-ID 携带语义下服务端可能全量重放）→ 旧帧 seq ≤ seqGate 丢弃
+    es.dispatch(frame(5, 'approval_requested', { verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [] }))
+    expect(onEvent).toHaveBeenCalledTimes(2)
   })
 
   it('具名帧只进 addEventListener listener（onmessage 零命中）；无 event 行的 message 帧进 onmessage 且被 parseWireEvent 拒', () => {

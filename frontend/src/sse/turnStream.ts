@@ -32,6 +32,14 @@
  *       B13 拒答轮（error code=403002 内容安全拒绝）：置「等待关闭」标记——其后连接关闭/看门狗
  *       静默均按收口处理（不重连，A13 断线重连在该情形豁免）；防御：该 error 后若仍收到 done，
  *       按既有终态逻辑走（doneSeen 优先，afterError 归 false）。
+ *   L15 awaiting 态（v1.40 增，B22/REQ-069，§3 生命周期 15）：approval_requested/approval_resolved
+ *       两具名帧经 addEventListener 注册通道直交付（控制事件不过缓冲）。awaiting 等待期连接保持、
+ *       心跳照常、无业务事件是预期（api.md §7.1 awaiting 轮事件流条）——approval_requested 到达即
+ *       解除看门狗武装（等待窗 hitl.timeout_s 缺省 120s 远超 3×心跳阈值，若无豁免会在等待期误判
+ *       静默重连；契约明文「watchdog 不触发」）；approval_resolved/阶段 2 任意业务事件到达即恢复
+ *       武装（handleMessage 既有「未武装即武装」语义天然承接）。Last-Event-ID 重连的全量重放中
+ *       两帧经 seq 门幂等去重（重放不二次交付），store 层幂等门再吸收（requested 重放不重复弹、
+ *       resolved 后重放 requested 不回退已裁决形态）。
  */
 import { API_BASE_URL } from '@/api/client'
 import { CONTENT_SAFETY_ERROR_CODE } from '@/constants/errors'
@@ -226,6 +234,8 @@ const SSE_EVENT_NAMES: readonly SseEventName[] = [
   'memory',
   'done',
   'followups',
+  'approval_requested',
+  'approval_resolved',
   'error',
 ]
 
@@ -385,6 +395,12 @@ class TurnStream implements TurnStreamController {
         }
       } else if (wireEvent.event === 'followups' && this.holding) {
         this.closeInternal() // L13 收口①：followups 交付后 close
+      } else if (wireEvent.event === 'approval_requested') {
+        // L15 awaiting 等待期看门狗豁免（生命周期 15「watchdog 不触发」）：approval_requested 是
+        // awaiting 态入口帧，其后 hitl.timeout_s（缺省 120s）等待窗内无业务事件是预期——解除武装，
+        // 防等待期被 3×心跳阈值误判静默重连。approval_resolved/阶段 2 任意业务事件到达时
+        // handleMessage 既有「未武装即武装」语义天然恢复武装。
+        this.disarmWatchdog()
       }
     }
   }

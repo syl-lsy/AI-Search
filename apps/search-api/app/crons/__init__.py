@@ -21,6 +21,8 @@ CronTask = (name, interval_seconds, coroutine_factory)：
 - trace_cleanup（每日）：Langfuse 过期 trace 清理，见 trace_cleanup.py；
 - feishu_sync（每日）：飞书导入定时全量 diff（M3/B20 B 线——api.md §4.7 同步 MVP
   定时形态，24h 代码常量；撞进行中任务/零变更不建行），见 feishu_sync.py；
+- approval_timeout_sweep（30s 低频兜底）：HITL 审批超时收口（B22/REQ-069，R32——
+  惰性判定为主、本扫描兜底「无人回来」的占线窗口），见 approval_timeout_sweep.py；
 - memory_ttl_sweeper（M5 规划）：记忆 TTL 衰减清扫，参数归 Agent Spec memory 节
   （nacos-config.md §3），落地时进本注册表。
 """
@@ -28,6 +30,10 @@ CronTask = (name, interval_seconds, coroutine_factory)：
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from app.crons.approval_timeout_sweep import (
+    APPROVAL_SWEEP_INTERVAL_SECONDS,
+    sweep_expired_approvals,
+)
 from app.crons.trace_cleanup import (
     TRACE_CLEANUP_INTERVAL_SECONDS,
     cleanup_expired_traces,
@@ -53,6 +59,11 @@ async def _run_trace_cleanup() -> None:
     await cleanup_expired_traces()
 
 
+async def _run_approval_sweep() -> None:
+    """注册表契约适配：收口明细已由 sweep_expired_approvals 内部落 CronLog。"""
+    await sweep_expired_approvals()
+
+
 # 任务注册表：main.py lifespan 遍历注册为进程内 asyncio 周期任务（调度口径见模块 docstring）
 CRON_TASKS: list[CronTask] = [
     CronTask(
@@ -61,4 +72,9 @@ CRON_TASKS: list[CronTask] = [
         coroutine_factory=_run_trace_cleanup,
     ),
     FEISHU_SYNC_TASK,
+    CronTask(
+        name="approval_timeout_sweep",
+        interval_seconds=APPROVAL_SWEEP_INTERVAL_SECONDS,
+        coroutine_factory=_run_approval_sweep,
+    ),
 ]

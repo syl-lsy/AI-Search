@@ -7,8 +7,10 @@
  */
 import type { SseWireEvent } from '@/types/api'
 import {
+  approvalPreviewFixtures,
   POLITICS_REFUSAL_MESSAGE,
   THREAD_ID_FAST,
+  TURN_ID_AWAITING,
   TURN_ID_DEEP,
   TURN_ID_DIRECT,
   TURN_ID_FALLBACK_DIGEST,
@@ -166,4 +168,25 @@ export const politicsRefusalSequence: SseWireEvent[] = [
   { id: 1, event: 'stage', data: { seq: 1, turn_id: TURN_ID_POLITICS, ts: '2026-11-18T09:20:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' } },
   { id: 2, event: 'stage', data: { seq: 2, turn_id: TURN_ID_POLITICS, ts: '2026-11-18T09:20:00Z', stage_key: 'rewrite', status: 'failed', extra: { safety: 'politics', layer: 'pre_route' } } },
   { id: 3, event: 'error', data: { seq: 3, turn_id: TURN_ID_POLITICS, ts: '2026-11-18T09:20:00Z', code: '403002', message: POLITICS_REFUSAL_MESSAGE, stage_key: 'rewrite' } },
+]
+
+/* ==================== B22 HITL 审批序列（api.md §7.4 带审批形态，v1.37，批次 3 第三段） ==================== */
+
+/**
+ * 阶段 1 序列（到弹窗挂起）：stage(rewrite,done,extra.hitl) → approval_requested → 轮 awaiting、
+ * 连接保持仅心跳（等待窗内无业务事件是预期——看门狗豁免，turn-stream.test.ts 锁死）。
+ */
+export const approvalRequestedSequence: SseWireEvent[] = [
+  { id: 1, event: 'stage', data: { seq: 1, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:12:00Z', stage_key: 'rewrite', status: 'running', label: '改写意图' } },
+  { id: 2, event: 'stage', data: { seq: 2, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:12:01Z', stage_key: 'rewrite', status: 'done', extra: { hitl: { gate: 'triggered', verdict: 'has_hit', subqueries: [{ query_index: 0, top_k_count: 3 }] } } } },
+  { id: 3, event: 'approval_requested', data: { seq: 3, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:12:01Z', verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [...approvalPreviewFixtures] } },
+]
+
+/** 阶段 2 序列尾（裁决提交后续流）：approval_resolved → stage(search) → stage(write) → token → done */
+export const approvalResumeSequence: SseWireEvent[] = [
+  { id: 4, event: 'approval_resolved', data: { seq: 4, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:13:10Z', choice: 'kb_only', decided_by: 'user', resolved_by: 'submit', next_stage: 'search' } },
+  { id: 5, event: 'stage', data: { seq: 5, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:13:11Z', stage_key: 'search', status: 'running', label: '并行搜索 2 个查询', progress: { current: 1, total: 2 } } },
+  { id: 6, event: 'stage', data: { seq: 6, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:13:14Z', stage_key: 'write', status: 'running', label: '综合中' } },
+  { id: 7, event: 'token', data: { seq: 7, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:13:15Z', delta: 'KB 融合检索：RRF 以倒数排名融合两路候选。' } },
+  { id: 8, event: 'done', data: { seq: 8, turn_id: TURN_ID_AWAITING, ts: '2026-11-01T08:13:20Z', finish: 'completed', degraded: false, degraded_reason: null, duration_ms: 20000, source_count: 0, usage: { total_tokens: 500, cost_usd: 0.0005 } } },
 ]

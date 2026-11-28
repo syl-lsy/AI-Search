@@ -76,6 +76,15 @@ class MainState(TypedDict, total=False):
     search_strategy: SearchStrategy  # v1.51 四值（与 fast_rewrite.SearchStrategy 逐字一致）
     kb_route: str  # B19：kb_route 三档投影（与 FastState 同名回填——search_fanout 路由消费）
     correction_round: int  # B19：纠错轮帽标记投影（与 FastState 同名回填）
+    # B22 HITL 审批门（v1.83 §4.1——门节点产出/阶段 2 恢复输入，R14① 投影同步）：
+    approval_choice: str  # 阶段 2 输入（TurnRunner 注入）：kb_only|web_only|both|custom
+    approval_note: str  # 阶段 2 输入（评审 F1/F4）：审批补充指令（R35 sanitize 后）——synthesis 用户角色消费
+    kb_gate_action: str  # 门节点判定动作：await|web_only|hybrid（route_after_gate 消费）
+    kb_gate_verdict: str  # 门判定面：has_hit|no_hit（extra.hitl + turn_approvals 投影源）
+    kb_gate_subqueries: list[dict[str, Any]]  # hits_summary：[{query_index, top_k_count, top1_score?}]
+    kb_gate_previews: list[dict[str, Any]]  # 预览物化 ≤preview_count 条（§7.2 previews 形态）
+    kb_gate_payload: dict[str, Any] | None  # 阶段 2 恢复载荷（schema_version+kb_candidates，no_hit 轮 None）
+    kb_gate_ms: int  # 门段耗时（timing 观测面——extra.hitl.gate_ms 同源）
     time_range: TimeRange
     rewritten_queries: list[str]
     candidates: list[Candidate]
@@ -142,6 +151,15 @@ class FastState(TypedDict, total=False):
     search_strategy: SearchStrategy  # v1.44 B9② 三值 + v1.51 recall 第四值：direct/recall 条件边 + synthesis 变体消费（缺省/非法=web）
     kb_route: str  # B19：kb_route 三档（kb_only|kb_first|hybrid——缺省/非法/两兜底一律 route.default〔初值 hybrid〕，search_fanout 消费；SSE 留痕 stage(rewrite,done).extra.kb_route 键可省）
     correction_round: int  # B19 纠错轮帽标记（0=首趟；≥1=纠错第二趟——fuse_rerank 后条件边 Send 回边注入 + rewrite 落 state 持久化轮帽）
+    # B22 HITL 审批门（v1.83 §4.1——门节点产出/阶段 2 恢复输入，与 MainState 同名投影）：
+    approval_choice: str  # 阶段 2 输入（TurnRunner 注入）：kb_only|web_only|both|custom
+    approval_note: str  # 阶段 2 输入（评审 F1/F4）：审批补充指令（R35 sanitize 后）——synthesis 用户角色消费
+    kb_gate_action: str  # 门节点判定动作：await|web_only|hybrid（route_after_gate 消费）
+    kb_gate_verdict: str  # 门判定面：has_hit|no_hit
+    kb_gate_subqueries: list[dict[str, Any]]
+    kb_gate_previews: list[dict[str, Any]]
+    kb_gate_payload: dict[str, Any] | None
+    kb_gate_ms: int
     time_range: TimeRange
     rewritten_queries: list[str]
     # 检索产出（Send 扇出并行写入 → merge_dedupe 消费）

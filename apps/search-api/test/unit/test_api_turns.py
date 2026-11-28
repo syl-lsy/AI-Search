@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.db.models import Source, Turn, TurnEvent, TurnFeedback
+from app.db.models import Source, Turn, TurnApproval, TurnEvent, TurnFeedback
 from app.dependencies import get_current_user, get_db
 from app.exception import NotFoundException, TurnNotRegenerableException, TurnTerminalException
 from app.main import app
@@ -50,7 +50,8 @@ class _FakeResult:
 
 class _FakeSession:
     """按 select 实体类型分流：Turn 主行 / Source 来源行 / TurnEvent images 行 /
-    TurnFeedback 反馈现值（get_turn_detail 的四段查询——反馈读回 REQ-057 起增）。
+    TurnFeedback 反馈现值 / TurnApproval 审批行（get_turn_detail 的五段查询——
+    反馈读回 REQ-057 起增；审批行 awaiting_ms 投影 B22 v1.37 起增，非门轮零行）。
 
     expect_user_id 模拟真实 SQL 的归属过滤（WHERE user_id = <当前用户>）——行为
     同语义：行 user_id 与期望不符即查无此行（越权 404001 的假体侧依据）。
@@ -63,12 +64,14 @@ class _FakeSession:
         *,
         images_events: list[Any] | None = None,
         feedback_rows: list[Any] | None = None,
+        approval_rows: list[Any] | None = None,
         expect_user_id: uuid.UUID | None = None,
     ) -> None:
         self._turn = turn
         self._sources = sources if sources is not None else []
         self._images_events = images_events if images_events is not None else []
         self._feedback_rows = feedback_rows if feedback_rows is not None else []
+        self._approval_rows = approval_rows if approval_rows is not None else []
         self._expect_user_id = expect_user_id
 
     async def scalars(self, stmt: Any) -> _FakeResult:
@@ -88,6 +91,8 @@ class _FakeSession:
             return _FakeResult(list(self._images_events))
         if entity is TurnFeedback:
             return _FakeResult(list(self._feedback_rows))
+        if entity is TurnApproval:
+            return _FakeResult(list(self._approval_rows))
         raise AssertionError(f"未预期的查询实体：{entity}")
 
 
@@ -560,3 +565,95 @@ async def test_regenerate_not_regenerable_409006(overrides: dict) -> None:
     assert response.status_code == 409
     body = response.json()
     assert body["code"] == "409006" and body["message"] == "轮次不支持重新生成"
+
+
+# ---- §2.5 v1.37 approval 投影四形态（B22；expired→approved+decided_by=timeout 映射）----
+
+
+def _approval_row(**overrides: Any) -> SimpleNamespace:
+    base = SimpleNamespace(
+        status="expired",
+        verdict="has_hit",
+        choice="both",
+        note=None,
+        decided_by="timeout",
+        requested_at=datetime(2026, 11, 27, 8, 12, 6, tzinfo=UTC),
+        expires_at=datetime(2026, 11, 27, 8, 14, 6, tzinfo=UTC),
+        responded_at=datetime(2026, 11, 27, 8, 14, 6, tzinfo=UTC),
+        previews=[],
+    )
+    for key, value in overrides.items():
+        setattr(base, key, value)
+    return base
+
+
+async def test_get_turn_approval_expired_maps_to_approved_timeout(
+    overrides: dict,
+) -> None:
+    """expired 审批行 → 2.5 approval.status='approved' + decided_by='timeout'
+    （存储/投影命名分歧为契约自身定义：data-model §1.20 status 注 vs api.md §2.5
+    decided 形态）；note None 键省略；awaiting_ms 同帧投影。"""
+    approval = _approval_row()
+    session = _FakeSession(turn=_turn_row(status="completed"), approval_rows=[approval])
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    async with _client() as client:
+        response = await client.get(f"/api/v1/turns/{_TURN_ID}")
+    assert response.status_code == 200
+    approval_out = response.json()["data"]["approval"]
+    assert approval_out == {
+        "status": "approved",
+        "choice": "both",
+        "decided_by": "timeout",
+    }  # note None 键省略（键可省口径）
+    assert response.json()["data"]["awaiting_ms"] == 120000
+
+
+async def test_get_turn_approval_pending_form_with_previews(
+    overrides: dict,
+) -> None:
+    """pending 形态（轮 status=awaiting_approval）：verdict/expires_at/previews 全量
+    在 payload（刷新恢复以此为准源重新打开弹层——frontend-api 生命周期 15）。"""
+    previews = [
+        {
+            "kb_doc_id": "9a77",
+            "chunk_id": "5c2e",
+            "title": "检索融合",
+            "heading_path": ["KB", "RRF"],
+            "excerpt": "RRF 融合……",
+            "query_index": 0,
+        }
+    ]
+    approval = _approval_row(
+        status="pending",
+        expires_at=datetime(2026, 11, 27, 8, 14, 6, tzinfo=UTC),
+        previews=previews,
+    )
+    session = _FakeSession(
+        turn=_turn_row(status="awaiting_approval"), approval_rows=[approval]
+    )
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    async with _client() as client:
+        response = await client.get(f"/api/v1/turns/{_TURN_ID}")
+    approval_out = response.json()["data"]["approval"]
+    assert approval_out["status"] == "pending"
+    assert approval_out["verdict"] == "has_hit"
+    assert approval_out["expires_at"] == "2026-11-27T08:14:06+00:00"
+    assert approval_out["previews"] == previews
+
+
+async def test_get_turn_approval_omitted_for_non_gate_turn(
+    overrides: dict,
+) -> None:
+    """非门轮（无审批行）approval/awaiting_ms 键整体省略不置 null（api.md §2.5 键
+    可省口径 serializer 弹键；canceled 审批行契约四形态未列——同按省略承载，
+    anomalies 上报）。"""
+    session = _FakeSession(turn=_turn_row())
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[get_current_user] = lambda: _USER_ID
+    async with _client() as client:
+        response = await client.get(f"/api/v1/turns/{_TURN_ID}")
+    data = response.json()["data"]
+    assert "approval" not in data
+    assert "awaiting_ms" not in data

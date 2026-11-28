@@ -94,7 +94,7 @@ def _assert_uuid_pk(col, *, client_default_uuid4: bool) -> None:
 def test_metadata_contains_exactly_core_tables():
     """M1 五表 + M2 增量表（§1.16 turn_feedback，0010 / §1.6 snapshots、§1.9
     artifacts，0012 / §1.7 kb_documents、§1.8 kb_chunks、§1.17 kb_import_jobs，
-    0013）——不得有多余/漏登表。"""
+    0013 / §1.20 turn_approvals，0014）——不得有多余/漏登表。"""
     assert set(Base.metadata.tables) == {
         "users",
         "threads",
@@ -107,6 +107,7 @@ def test_metadata_contains_exactly_core_tables():
         "kb_documents",
         "kb_chunks",
         "kb_import_jobs",
+        "turn_approvals",
     }
 
 
@@ -245,7 +246,9 @@ def test_turns_columns():
     assert mode.nullable is False and mode.server_default is None
 
     status = _col(turns, "status")
-    assert isinstance(status.type, String) and status.type.length == 12
+    # 0014_b22_hitl_gate 扩宽 varchar(12)→varchar(24)（§1.3 v1.23 列宽扩容注：
+    # awaiting_approval=18 字符超旧列宽；varchar 扩宽为元数据级变更）
+    assert isinstance(status.type, String) and status.type.length == 24
     assert status.nullable is False
     _assert_server_default(status, "pending")
 
@@ -288,8 +291,9 @@ def test_turns_columns():
     assert isinstance(degraded_reason.type, String) and degraded_reason.type.length == 16
     assert degraded_reason.nullable is True  # 0002 起启用写入语义，列已在 0001
 
-    # cancel_reason：0008（REQ-042）——user|superseded|rolled_back，仅 status=canceled
-    # 时非空（§1.3 104 行）；无默认、取消不是 error（不复用 error 列语义）
+    # cancel_reason：0008（REQ-042）——user|superseded|rolled_back|timeout（v1.38
+    # B22 审批超时静默收口第 4 值），仅 status=canceled 时非空（§1.3 104 行）；
+    # 无默认、取消不是 error（不复用 error 列语义）；varchar(16) 无 CHECK 零 DDL
     cancel_reason = _col(turns, "cancel_reason")
     assert isinstance(cancel_reason.type, String) and cancel_reason.type.length == 16
     assert cancel_reason.nullable is True and cancel_reason.server_default is None
@@ -372,7 +376,9 @@ def test_turn_events_columns():
     assert isinstance(seq.type, Integer) and seq.nullable is False
 
     event_type = _col(events, "event_type")
-    assert isinstance(event_type.type, String) and event_type.type.length == 12
+    # 0014_b22_hitl_gate 扩宽 varchar(12)→varchar(24)（§1.4 v1.23 列宽扩容注：
+    # approval_requested/approval_resolved=18 字符超旧列宽）
+    assert isinstance(event_type.type, String) and event_type.type.length == 24
     assert event_type.nullable is False
 
     payload = _col(events, "payload")
@@ -945,3 +951,99 @@ def test_uuid_pk_client_default_is_v4_kb_tables():
     """kb 三表主键亦为应用侧 uuid4（§1.17 注「ORM 客户端 uuid4 承接，全局口径」）。"""
     for table_name in ("kb_documents", "kb_chunks", "kb_import_jobs"):
         _assert_uuid_pk(_table(table_name).columns["id"], client_default_uuid4=True)
+
+
+# ---- §1.20 turn_approvals（B22 HITL 审批门，v1.23 增，0014）----
+
+
+def test_turn_approvals_columns():
+    """§1.20 字段级 DDL 对齐：13 列序/类型/可空/server_default 逐列断言。"""
+    approvals = _table("turn_approvals")
+    assert [c.name for c in approvals.columns] == [
+        "id",
+        "turn_id",
+        "status",
+        "verdict",
+        "hits_summary",
+        "previews",
+        "gate_payload",
+        "choice",
+        "note",
+        "decided_by",
+        "requested_at",
+        "expires_at",
+        "responded_at",
+    ]
+
+    _assert_uuid_pk(_col(approvals, "id"), client_default_uuid4=True)
+
+    # turn_id：FK→turns.id ON DELETE CASCADE（线程删除级联 REQ-022 面随轮走）、
+    # not null；UNIQUE(turn_id) 一轮一行由唯一索引承载（非列级约束，§1.16 先例）
+    fk_turn = _fk(approvals, "turn_id")
+    assert fk_turn.target_fullname == "turns.id" and fk_turn.ondelete == "CASCADE"
+    assert _col(approvals, "turn_id").nullable is False
+
+    status = _col(approvals, "status")
+    assert isinstance(status.type, String) and status.type.length == 12
+    assert status.nullable is False
+    _assert_server_default(status, "'pending'")
+
+    verdict = _col(approvals, "verdict")
+    assert isinstance(verdict.type, String) and verdict.type.length == 12
+    assert verdict.nullable is False and verdict.server_default is None
+
+    for jsonb_col in ("hits_summary", "previews"):
+        col = _col(approvals, jsonb_col)
+        assert isinstance(col.type, JSONB) and col.nullable is False
+        _assert_server_default(col, "'[]'")
+
+    gate_payload = _col(approvals, "gate_payload")
+    assert isinstance(gate_payload.type, JSONB) and gate_payload.nullable is True
+    assert gate_payload.server_default is None  # no_hit 轮=null（载荷事实源）
+
+    choice = _col(approvals, "choice")
+    assert isinstance(choice.type, String) and choice.type.length == 12
+    assert choice.nullable is True and choice.server_default is None
+
+    note = _col(approvals, "note")
+    assert isinstance(note.type, Text) and note.nullable is True
+
+    decided_by = _col(approvals, "decided_by")
+    assert isinstance(decided_by.type, String) and decided_by.type.length == 8
+    assert decided_by.nullable is True and decided_by.server_default is None
+
+    requested_at = _col(approvals, "requested_at")
+    assert isinstance(requested_at.type, DateTime) and requested_at.type.timezone is True
+    assert requested_at.nullable is False
+    _assert_server_default(requested_at, "now()")
+
+    for plain_tz_col in ("expires_at", "responded_at"):
+        col = _col(approvals, plain_tz_col)
+        assert isinstance(col.type, DateTime) and col.type.timezone is True
+        assert col.server_default is None
+    assert _col(approvals, "expires_at").nullable is False
+    assert _col(approvals, "responded_at").nullable is True
+
+
+def test_turn_approvals_indexes():
+    """§1.20 索引面：UNIQUE(turn_id) + (status, expires_at) 部分索引 WHERE pending；
+    除二者外零索引（§1.20 取舍注——无历史/列表查询需求）。"""
+    approvals = _table("turn_approvals")
+
+    uq_turn = _index(approvals, "uq_turn_approvals_turn")
+    assert uq_turn.unique is True
+    assert [str(e).split(".")[-1] for e in uq_turn.expressions] == ["turn_id"]
+
+    ix_expiry = _index(approvals, "idx_turn_approvals_expiry")
+    assert ix_expiry.unique is False
+    assert [str(e).split(".")[-1] for e in ix_expiry.expressions] == [
+        "status",
+        "expires_at",
+    ]
+    where_sql = str(ix_expiry.dialect_options["postgresql"]["where"])
+    assert "pending" in where_sql, "部分索引 WHERE 条件应限定 status='pending'"
+
+    # 除 UNIQUE 与超时索引外零索引（§1.20 取舍注）
+    assert len(approvals.indexes) == 2, (
+        f"turn_approvals 应恰两索引（uq+超时部分索引），得到 {len(approvals.indexes)}"
+    )

@@ -367,6 +367,68 @@ class TestNacosInitScriptParity:
         script_spec = dict(module.DATA_IDS)[SPEC_DATA_ID]
         assert script_spec["kb"] == BUILTIN_DEFAULTS[SPEC_DATA_ID]["kb"]
 
+    def test_spec_hitl_section_parity(self):
+        """§3 v1.50（B22）：SPEC_CONFIG hitl 节双投影显式一致（kb 节同款——hitl
+        单侧漂移时给出可读性更好的失败定位）。"""
+        module = self._load_script_module()
+        script_spec = dict(module.DATA_IDS)[SPEC_DATA_ID]
+        assert script_spec["hitl"] == BUILTIN_DEFAULTS[SPEC_DATA_ID]["hitl"]
+
+
+class TestHitlSeedDefaults:
+    """§3 hitl 节 v1.50 B22 HITL 审批门种子（11 键，nacos-config.md §3 v1.50）。
+
+    判定器纯确定性零 LLM——本节无判定模型键、无判定提示词键。缺省全灰度安全：
+    enabled=false=现状逐字节（门不存在）；shadow=true（开启顺序=enabled+shadow
+    跑基线→放行数字→shadow=false）；noise_floor enabled=false+双阈值 0.0=行为
+    等价「不设」（OQ-17 缺省态；多信号形态=向量相似度腿主防线+rerank 分腿与
+    组合，阈值批次 2 shadow 复测标定后热更开启）。两个「动作」键语义区分：
+    no_hit_action=门判零命中去向（已裁决=web）；on_timeout=弹窗后用户未回应去向
+    （hybrid=按两者都要继续）。
+    """
+
+    def test_hitl_seed_keys_and_defaults_match_contract(self):
+        hitl = BUILTIN_DEFAULTS[SPEC_DATA_ID]["hitl"]
+        assert set(hitl) == {
+            "enabled",
+            "deep_enabled",
+            "shadow",
+            "no_hit_action",
+            "skip_query_types",
+            "preview_count",
+            "preview_chars",
+            "timeout_s",
+            "on_timeout",
+            "note_max_chars",
+            "noise_floor",
+        }
+        assert hitl["enabled"] is False
+        assert hitl["deep_enabled"] is False
+        assert hitl["shadow"] is True
+        assert hitl["no_hit_action"] == "web"
+        assert hitl["skip_query_types"] == ["navigational", "temporal"]
+        assert hitl["preview_count"] == 3
+        assert hitl["preview_chars"] == 200
+        assert hitl["timeout_s"] == 120
+        assert hitl["on_timeout"] == "hybrid"
+        assert hitl["note_max_chars"] == 500
+
+    def test_hitl_noise_floor_seed_is_behaviorally_unset(self):
+        """noise_floor 缺省态=行为等价「不设」（OQ-17）：enabled=false + 双阈值
+        0.0——shadow 期仍按纯「Top K 有值」口径观测。"""
+        floor = BUILTIN_DEFAULTS[SPEC_DATA_ID]["hitl"]["noise_floor"]
+        assert floor == {"enabled": False, "vector_sim_min": 0.0, "rerank_top1_min": 0.0}
+
+    def test_hitl_seed_field_names_avoid_secret_sniff(self):
+        """命名纪律（§2 嗅探联动）：hitl 节键名零敏感字段名（key/secret/token/password）。"""
+        import re
+
+        hitl = BUILTIN_DEFAULTS[SPEC_DATA_ID]["hitl"]
+        for field in hitl:
+            assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), field
+        for field in hitl["noise_floor"]:
+            assert not re.search(r"key|secret|token|password", field, re.IGNORECASE), field
+
 
 class TestKbSeedDefaults:
     """§3 kb 节 v1.43 M3 混合检索扩容种子（13 键，nacos-config.md §3 v1.43 / ADR-017）。

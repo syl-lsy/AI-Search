@@ -361,6 +361,25 @@ SPEC_CONFIG: dict[str, Any] = {
             "ocr_engine": "paddleocr",
         },
     },
+    # B22 HITL 审批门（nacos-config.md §3 v1.50 逐字；REQ-069/A54，ADR-019）——
+    # 判定器纯确定性零 LLM（本节无判定模型键、无判定提示词键）。缺省全灰度安全：
+    # enabled=false=现状逐字节；shadow=true 只观测；noise_floor enabled=false+
+    # 双阈值 0.0=行为等价「不设」（OQ-17 缺省态，多信号=向量相似度腿主防线+rerank
+    # 分腿与组合，阈值批次 2 shadow 复测标定后热更开启）。与 scripts/nacos_init.py
+    # 三源 parity（test_config_center.py::TestNacosInitScriptParity 锁死）。
+    "hitl": {
+        "enabled": False,
+        "deep_enabled": False,
+        "shadow": True,
+        "no_hit_action": "web",
+        "skip_query_types": ["navigational", "temporal"],
+        "preview_count": 3,
+        "preview_chars": 200,
+        "timeout_s": 120,
+        "on_timeout": "hybrid",
+        "note_max_chars": 500,
+        "noise_floor": {"enabled": False, "vector_sim_min": 0.0, "rerank_top1_min": 0.0},
+    },
     "history": {"window_turns": 6, "answer_head_chars": 200},
     "memory": {
         "inject_top_k": 5,

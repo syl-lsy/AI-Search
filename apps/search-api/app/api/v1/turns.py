@@ -12,13 +12,15 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import sse_settings
 from app.dependencies import get_current_user, get_db, get_event_bus
 from app.schemas import (
+    ApprovalDecisionData,
+    ApprovalDecisionRequest,
     FeedbackRequest,
     FeedbackResponse,
     TurnCancelResult,
@@ -112,6 +114,40 @@ async def regenerate_turn(
     result = await scheduler.regenerate_turn(turn_id, user_id=user_id)
     background_tasks.add_task(scheduler.execute_regenerate, turn_id)
     return TurnRegenerateResult(turn_id=result["turn_id"], status="running")
+
+
+@router.post(
+    "/turns/{turn_id}/approval",
+    response_model=ApprovalDecisionData,
+    status_code=202,
+)
+async def approve_turn(
+    turn_id: str,
+    payload: ApprovalDecisionRequest,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    user_id: Annotated[str, Depends(get_current_user)],
+    scheduler: Annotated[ThreadScheduler, Depends(get_thread_scheduler)],
+) -> ApprovalDecisionData:
+    """审批裁决（api.md §2.13 v1.37，B22/REQ-069/A54——HITL 审批门）。
+
+    路由层零业务逻辑：归属校验（404001）/ 幂等与冲突判读（同 choice 幂等 200 /
+    异 choice 或非 awaiting **409008**——§0 v1.37 定号注：计划草案 409007 已被
+    kb_import_jobs 占用顺延）/ note sanitize（R35）均在
+    `ThreadScheduler.decide_approval`；阶段 2 恢复为 BackgroundTask（条件推进已
+    commit——resume_turn 读 running 行执行，独立完整包络）。
+    HTTP 状态码区分语义：202=首次成功（阶段 2 已调度）/ 200=幂等重复（返回已记录
+    裁决，不重复触发阶段 2）；信封 code 恒 "0"。
+    """
+    result = await scheduler.decide_approval(
+        turn_id, user_id=user_id, choice=payload.choice, note=payload.note
+    )
+    if not result["idempotent"]:
+        background_tasks.add_task(scheduler.resume_turn, turn_id)
+    response.status_code = 200 if result["idempotent"] else 202
+    return ApprovalDecisionData(
+        turn_id=result["turn_id"], status="running", choice=result["choice"]
+    )
 
 
 @router.post("/turns/{turn_id}/feedback", response_model=FeedbackResponse)

@@ -38,6 +38,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 
 from app.agent.graphs.signals import emit_stage
+from app.agent.nodes.kb_gate import hitl_gate_armed
 from app.agent.nodes.kb_route import resolve_kb_route
 from app.agent.guards import ensure_not_canceled
 from app.agent.safety.content_guard import filter_candidates
@@ -72,6 +73,12 @@ def search_fanout(state: Any) -> list[Send] | str:
     queries = state.get("rewritten_queries") or []
     if not queries:
         return "merge_dedupe"
+    spec = state.get("spec")
+    # B22 HITL 门分支（v1.83 §4.1，plan §3.2——第五目标 kb_gate；零 IO 前置判定：
+    # hitl.enabled ∧ 首趟 ∧ 非跳过题型 ∧ KB 可用，hitl_gate_armed 纯函数；G3 缺省
+    # 关闭=分支不可达、现状路径逐字节——存量轮零行为变化）
+    if hitl_gate_armed(state, spec if isinstance(spec, Mapping) else None):
+        return "kb_gate"
     total = len(queries)
     spec = state.get("spec")
     web_sends = [

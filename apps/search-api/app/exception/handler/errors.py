@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from app.exception.bad_request import BadRequestException
 from app.exception.config_center import ConfigCenterException
 from app.exception.conflict import (
+    ApprovalConflictException,
     ConflictException,
     ThreadBusyException,
     TurnNotRegenerableException,
@@ -50,6 +51,10 @@ ERROR_MAP: dict[type, tuple[str, int, str]] = {
     # regenerate 前置不满足（api.md §0 v1.19 增 / §2.12：单码覆盖非 {degraded,failed}
     # 终态 / 零来源 / deep 轮 / 进行中重复点击——沿 409005 独立码先例不拆码）
     TurnNotRegenerableException: ("409006", 409, "轮次不支持重新生成"),
+    # HITL 审批裁决面（api.md §0 v1.37 增 / §2.13：单码覆盖非 awaiting_approval 轮
+    # / 同轮不同 choice 再提交 / 超时收口后再到的人为裁决；同 choice 幂等 200
+    # 不产生本码——409008 定号注：计划草案 409007 已被 kb_import_jobs 占用顺延）
+    ApprovalConflictException: ("409008", 409, "轮次不在待审批态或审批裁决冲突"),
     ConfigCenterException: ("503001", 503, "配置中心不可达且无缓存"),
     # KB 上传面（api.md §0 v1.30 M3 三码——§4.1 :527 / §4.2 :555）：
     # 413001 大小上限（KB_MAX_FILE_MB）/ 415001 类型白名单外（音视频同码，message

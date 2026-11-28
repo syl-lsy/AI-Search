@@ -23,8 +23,32 @@ from app.schemas.thread import ThreadCreate
 StageKey = Literal["rewrite", "search", "read", "reflect", "plan", "write", "code_exec"]
 StageStatus = Literal["running", "done", "failed"]
 SourceType = Literal["web", "kb"]
-CancelReason = Literal["user", "superseded", "rolled_back"]
+# v1.38 起 +timeout（B22 批次 2 契约钉正批——审批等待超时静默收口值，api.md §2.5；
+# 与 frontend/src/types/api.d.ts CancelReason 镜像同批）
+CancelReason = Literal["user", "superseded", "rolled_back", "timeout"]
 DegradedReason = Literal["timeout", "budget", "source_failure"]
+ApprovalChoice = Literal["kb_only", "web_only", "both", "custom"]
+
+
+class ApprovalDecisionRequest(BaseModel):
+    """POST /turns/{turn_id}/approval 请求体（api.md §2.13 v1.37，REQ-069/A54）。
+
+    choice 必填枚举（缺失/非法 → pydantic 400001）；note 可选 ≤500 字（note_max_chars
+    契约上限；**任意 choice 可附带**——协议面无 choice 限制，api.md §2.13 note 宽口
+    径钉正；服务端过 query 同款 sanitize 管道〔R35〕后落库，不改检索范围）。
+    """
+
+    choice: ApprovalChoice
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ApprovalDecisionData(BaseModel):
+    """§2.13 响应 data（202 首次成功 / 200 幂等重复——信封 code 恒 "0"，HTTP 状态
+    码区分语义；status 恒 "running"——阶段 2 已调度）。"""
+
+    turn_id: str
+    status: Literal["running"]
+    choice: ApprovalChoice
 
 
 class TurnCreate(ThreadCreate):
@@ -192,6 +216,23 @@ class TurnDetail(BaseModel):
             "一行），经 POST /turns/{id}/feedback 写入，本字段为回看/刷新还原的读通道"
         ),
     )
-    cancel_reason: CancelReason | None = None  # 仅 status=canceled 时非空（§2.5 v1.4）
+    cancel_reason: CancelReason | None = None  # 仅 status=canceled 时非空（§2.5 v1.4 起；v1.38 四值含 timeout）
     created_at: datetime
     finished_at: datetime | None = None
+    # §2.5 v1.37（B22/REQ-069）：awaiting_approval 累计时长（毫秒）——非零才携带
+    # （键可省口径同 images v1.12，serializer 弹 None 键；hitl-OQ-03：duration_ms
+    # 同步扣除 awaiting 时长，扣除在 TurnRunner 终态落库处）
+    awaiting_ms: int | None = None
+    # §2.5 v1.37（B22）：approval 四形态投影（pending/approved/no_hit/shadow dict——
+    # 非门轮/canceled 审批行键整体省略不置 null，serializer 弹 None 键；形态见
+    # api.md §2.5 与镜像 TurnApproval 联合）
+    approval: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_awaiting_ms_optional(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        if isinstance(data, dict):
+            for optional_key in ("awaiting_ms", "approval"):
+                if data.get(optional_key) is None:
+                    data.pop(optional_key, None)
+        return data

@@ -8,6 +8,7 @@ from app.exception.bad_request import BadRequestException
 from app.exception.base import BusinessException
 from app.exception.config_center import ConfigCenterException
 from app.exception.conflict import (
+    ApprovalConflictException,
     ConflictException,
     ThreadBusyException,
     TurnNotRegenerableException,
@@ -27,6 +28,7 @@ from app.exception.not_found import NotFoundException
 from app.exception.snapshot import SnapshotNotFoundException
 
 __all__ = [
+    "ApprovalConflictException",
     "BadRequestException",
     "BusinessException",
     "ConfigCenterException",

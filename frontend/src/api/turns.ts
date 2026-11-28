@@ -14,7 +14,7 @@
  * 服务端中文 message 直达 toast）。
  */
 import { apiPost } from './client'
-import type { Artifact, FeedbackResponse, RegenerateTurnData } from '@/types/api'
+import type { ApprovalDecisionData, ApprovalDecisionRequest, Artifact, FeedbackResponse, RegenerateTurnData } from '@/types/api'
 
 /** 轮反馈（点按钮即发；乐观 UI/静默回滚/取消语义归 turnStore.sendFeedback） */
 export function sendTurnFeedback(turnId: string, helpful: boolean | null): Promise<FeedbackResponse> {
@@ -42,4 +42,18 @@ export function regenerateTurn(turnId: string): Promise<RegenerateTurnData> {
  */
 export function exportTurnReport(turnId: string): Promise<Artifact> {
   return apiPost<Artifact>(`/api/v1/turns/${turnId}/export`)
+}
+
+/**
+ * 审批裁决（B22/REQ-069/A54；api.md §2.13 v1.37，frontend-api.md §3 生命周期 15/§4 decideApproval
+ * 行 v1.40）：POST /api/v1/turns/{turn_id}/approval——对 status=awaiting_approval 轮提交用户裁决
+ * （弹层四选一 + 可选补充指令 ≤500 字），服务端条件推进并恢复阶段 2 执行（TurnRunner 两阶段，
+ * ADR-019）。幂等：同轮同 choice 重复提交（多标签页/网络重试）→ 200 返回已记录裁决（不重复触发
+ * 阶段 2）；同轮不同 choice 或轮已不在 awaiting 态 → 409008（HTTP 409 错误信封——normalizeError
+ * 归一 ApiError.code，编排分支归 turnStore.decideApproval：409008 → toast + reconcile 多标签页
+ * 收敛；400001 choice 非法/note 超 500 字、404001 归属校验、网络错 → toast、态不动弹层保留可重试）。
+ * 响应 202=首次成功（阶段 2 已调度）/ 200=幂等重复，信封 code 恒 "0"、data.status 恒 "running"。
+ */
+export function approveTurn(turnId: string, body: ApprovalDecisionRequest): Promise<ApprovalDecisionData> {
+  return apiPost<ApprovalDecisionData>(`/api/v1/turns/${turnId}/approval`, body)
 }

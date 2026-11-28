@@ -1,8 +1,8 @@
 """integration 层：迁移链（0001_m1_core → 0008_m1_turn_scheduler → 0009_m1_turn_followups
-→ 0010_m2_turn_feedback → 0011_m2_thread_mgmt → 0012_m2_deep → 0013_m3_kb）真库验证
-（requires_db；跑在 .env.test 测试库）。
+→ 0010_m2_turn_feedback → 0011_m2_thread_mgmt → 0012_m2_deep → 0013_m3_kb
+→ 0014_b22_hitl_gate）真库验证（requires_db；跑在 .env.test 测试库）。
 
-链路：upgrade head → 断言核心表 + alembic_version=head(0013) + vector 扩展；downgrade
+链路：upgrade head → 断言核心表 + alembic_version=head(0014) + vector 扩展；downgrade
 base → 断言表与 alembic_version 清除、vector 扩展保留（0001 契约：downgrade
 不删 extension）；再 upgrade head → 全链可重复；末尾 `alembic check` 零漂移
 （迁移产物 == ORM metadata，即 autogenerate 闭环的运行时验证）。
@@ -61,7 +61,7 @@ from app.core.config import common_settings
 pytestmark = pytest.mark.requires_db
 
 #: 测试库应有的 public 表全集（M1 五表 + §1.16 turn_feedback + §1.6/§1.9 M2 deep 底座
-#: + §1.7/§1.8/§1.17 M3 KB 底座）
+#: + §1.7/§1.8/§1.17 M3 KB 底座 + §1.20 turn_approvals B22）
 CORE_TABLES = (
     "users",
     "threads",
@@ -74,11 +74,12 @@ CORE_TABLES = (
     "kb_documents",
     "kb_chunks",
     "kb_import_jobs",
+    "turn_approvals",
 )
 
-#: 链尾 revision（data-model.md §4 迁移表：0012 m2_deep → 0013 m3_kb——契约逻辑名
-#: 0003_m3_kb 的实际执行编号，M3 批次 1 落地）
-CHAIN_HEAD = "0013"
+#: 链尾 revision（data-model.md §4 迁移表：0013 m3_kb → 0014 b22_hitl_gate——契约
+#: 逻辑名占位沿 0002/0003 先例，B22 批次 2 落地）
+CHAIN_HEAD = "0014"
 
 
 def _connect(info):
@@ -758,4 +759,114 @@ def test_0013_kb_tables_upgrade_downgrade_upgrade(
             ("kb_doc_id", "uuid", "YES"),
             ("kb_chunk_ids", "jsonb", "YES"),
         ]
+    alembic(["check"])
+
+
+# ---- 0014（B22 HITL 审批门，契约逻辑名 0014_b22_hitl_gate → 实际 0014）----
+
+
+def _approval_columns(cursor) -> list[tuple]:
+    """turn_approvals 列事实（information_schema 参数化查询）。"""
+    cursor.execute(
+        "SELECT column_name, data_type, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s ORDER BY ordinal_position",
+        ("turn_approvals",),
+    )
+    return cursor.fetchall()
+
+
+def _turn_status_type(cursor) -> tuple[str, int] | None:
+    """turns.status 列宽事实（character_maximum_length）。"""
+    cursor.execute(
+        "SELECT data_type, character_maximum_length FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s AND column_name = %s",
+        ("turns", "status"),
+    )
+    row = cursor.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def _turn_events_event_type_type(cursor) -> tuple[str, int] | None:
+    """turn_events.event_type 列宽事实。"""
+    cursor.execute(
+        "SELECT data_type, character_maximum_length FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s AND column_name = %s",
+        ("turn_events", "event_type"),
+    )
+    row = cursor.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def test_0014_hitl_gate_upgrade_downgrade_upgrade(alembic, test_db, db_truncate) -> None:
+    """0014（B22/REQ-069）三段真库验证（data-model.md §1.20 + §4 0014 行）。
+
+    段 1：0013→0014 建表（13 列 + UNIQUE + 超时部分索引）+ turns.status /
+    turn_events.event_type 双列扩宽 varchar(24)；段 2：downgrade 0014→0013 全量
+    可逆（表与索引消失、两列回 varchar(12)）；段 3：再 upgrade head 可重复 +
+    `alembic check` 零漂移。
+    """
+    alembic(["upgrade", "head"])
+    alembic(["downgrade", "0013"])
+
+    # ── 段 1：upgrade 0013→0014 ──
+    alembic(["upgrade", "0014"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [("0014",)]
+
+        columns = _approval_columns(cursor)
+        assert [c[0] for c in columns] == [
+            "id",
+            "turn_id",
+            "status",
+            "verdict",
+            "hits_summary",
+            "previews",
+            "gate_payload",
+            "choice",
+            "note",
+            "decided_by",
+            "requested_at",
+            "expires_at",
+            "responded_at",
+        ]
+        by_name = {c[0]: c for c in columns}
+        assert by_name["status"][1] == "character varying"
+        assert by_name["status"][3] is not None and "pending" in by_name["status"][3]
+        assert by_name["verdict"][2] == "NO"  # verdict NOT NULL
+        assert by_name["hits_summary"][3] == "'[]'::jsonb"
+        assert by_name["gate_payload"][2] == "YES"  # 可空（no_hit 轮=null）
+        assert by_name["responded_at"][2] == "YES"
+
+        # UNIQUE + 超时部分索引
+        uq = _indexdef(cursor, "uq_turn_approvals_turn")
+        assert "UNIQUE" in uq and "turn_id" in uq
+        expiry = _indexdef(cursor, "idx_turn_approvals_expiry")
+        assert "status" in expiry and "expires_at" in expiry and "pending" in expiry
+
+        # 双列扩宽 varchar(24)
+        assert _turn_status_type(cursor) == ("character varying", 24)
+        assert _turn_events_event_type_type(cursor) == ("character varying", 24)
+
+    # ── 段 2：downgrade 0014→0013 全量可逆 ──
+    alembic(["downgrade", "0013"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        assert cursor.fetchall() == [("0013",)]
+        assert _approval_columns(cursor) == []
+        cursor.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname IN (%s, %s)",
+            ("uq_turn_approvals_turn", "idx_turn_approvals_expiry"),
+        )
+        assert cursor.fetchall() == []
+        assert _turn_status_type(cursor) == ("character varying", 12)
+        assert _turn_events_event_type_type(cursor) == ("character varying", 12)
+
+    # ── 段 3：再 upgrade head 可重复 + 零漂移 ──
+    alembic(["upgrade", "head"])
+    with _connect(test_db) as conn, conn.cursor() as cursor:
+        assert _turn_status_type(cursor) == ("character varying", 24)
+        assert _approval_columns(cursor)[0][0] == "id"
     alembic(["check"])

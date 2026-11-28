@@ -52,6 +52,10 @@ function makeTurn(partial: Partial<TurnState>): TurnState {
     memorySaved: null,
     durationMs: null,
     exportAvailable: false,
+    approval: null,
+    approvalPreviews: null,
+    awaitingMs: null,
+    rewrittenQueries: null,
     ...partial,
   }
 }
@@ -337,5 +341,28 @@ describe('TurnBlock：回答底部操作行 + followups 接线（REQ-056/REQ-046
     expect(w.find('[data-testid="followup-chips"]').exists()).toBe(false)
     const w2 = mountTurn(makeTurn({ answer_md: '答案正文', followups: [] }))
     expect(w2.find('[data-testid="followup-chips"]').exists()).toBe(false)
+  })
+})
+
+describe('TurnBlock：审批回看折叠条接线（B22 v1.40 批次 3 第三段——问题下方一行，ApprovalRecall 承载）', () => {
+  it('approved 轮：折叠条渲染于问题下方（默认收起）；no_hit（web 直达）与 approval=null 轮零审批痕迹', () => {
+    const approved = mountTurn(makeTurn({
+      approval: { status: 'approved', choice: 'kb_only', decided_by: 'user' },
+      approvalPreviews: null,
+    }))
+    const rail = approved.find('[data-testid="approval-recall-strip"]')
+    expect(rail.exists()).toBe(true)
+    expect(rail.text()).toContain('已按『仅知识库』回答')
+    // 问题下方：rail 位于问题气泡块之后、状态行之前（draft 06 补节落位）
+    expect(approved.find('[data-testid="turn-question"]').exists()).toBe(true)
+    approved.unmount()
+
+    const noHit = mountTurn(makeTurn({ approval: { status: 'no_hit', verdict: 'no_hit' } }))
+    expect(noHit.find('[data-testid="approval-recall"]').exists()).toBe(false) // web 直达轮不显示任何条
+    noHit.unmount()
+
+    const nonGate = mountTurn(makeTurn({ approval: null }))
+    expect(nonGate.find('[data-testid="approval-recall"]').exists()).toBe(false) // 非门轮零痕迹
+    nonGate.unmount()
   })
 })

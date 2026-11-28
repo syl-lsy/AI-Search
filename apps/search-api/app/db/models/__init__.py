@@ -5,8 +5,10 @@
 eval_*），并在此处同步 import。
 （§1.16 turn_feedback 已随 0010 落地——M2 增量表；§1.6 snapshots、§1.9 artifacts
 已随 0012/m2_deep 落地——M2 deep 底座；§1.7 kb_documents、§1.8 kb_chunks、
-§1.17 kb_import_jobs 已随 0013/m3_kb 落地——M3 KB 底座。）
+§1.17 kb_import_jobs 已随 0013/m3_kb 落地——M3 KB 底座；§1.20 turn_approvals
+已随 0014/b22_hitl_gate 落地——B22 HITL 审批门。）
 """
+from app.db.models.approval import TurnApproval
 from app.db.models.artifact import Artifact
 from app.db.models.kb import KbChunk, KbDocument, KbImportJob
 from app.db.models.source import Source
@@ -26,6 +28,7 @@ __all__ = [
     "Source",
     "Thread",
     "Turn",
+    "TurnApproval",
     "TurnEvent",
     "TurnFeedback",
     "User",

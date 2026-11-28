@@ -15,6 +15,7 @@ import { computed, ref } from 'vue'
 
 import UiIcon from '@/components/icons/UiIcon.vue'
 import AnswerActions from '@/components/answer/AnswerActions.vue'
+import ApprovalRecall from '@/components/answer/ApprovalRecall.vue'
 import FollowupChips from '@/components/answer/FollowupChips.vue'
 import QuestionHoverActions from '@/components/answer/QuestionHoverActions.vue'
 import AnswerRenderer from '@/components/markdown/AnswerRenderer.vue'
@@ -111,6 +112,11 @@ const qActionsVisible = ref(false)
         </button>
       </div>
     </div>
+
+    <!-- 审批回看折叠条（B22 v1.40 批次 3 第三段，OQ-04：默认收起、不进导出；web 直达/shadow/
+         canceled 轮组件内部整块不渲染——零审批痕迹；数据源 turn.approval approved 形态 +
+         approvalPreviews 流式缓存 + awaiting_ms） -->
+    <ApprovalRecall :turn="turn" />
 
     <div class="status-row" data-testid="turn-status">
       <span

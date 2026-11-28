@@ -17,3 +17,12 @@ export const THREAD_TITLE_MAX_LENGTH = 120
 
 /** 来源面板折叠胶囊圆标叠上限（Perplexity 对齐小批：跨组取前 3 个不同来源；设计说明 v1.7） */
 export const SOURCE_PILL_AVATARS_MAX = 3
+
+/**
+ * z-index 层级表扩展位（B22 批次 3 通用 HITL 弹层壳 HitlSheet——组件架构用户裁决 2026-11-28）。
+ * 既有层级：sb-backdrop/AnswerActions 菜单 30 < 抽屉 40 < **HITL 弹层壳 45** < ToastHost 50
+ * < ThreadModal 60 < CommandPalette 65——弹层在抽屉之上（覆盖输入卡形态不与抽屉冲突），
+ * 在 ToastHost 之下（409008/网络错 toast 恒浮于弹层之上可见）、ThreadModal 之下（将来
+ * 预览点入下钻弹窗可叠）。
+ */
+export const HITL_SHEET_Z_INDEX = 45

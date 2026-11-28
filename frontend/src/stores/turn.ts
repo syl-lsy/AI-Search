@@ -19,14 +19,24 @@
  *     放开 deep——api.md §2.12 前置第 3 条 v1.28，REQ-063/A47；api.md §2.12——POST → 状态置
  *     running + 清空渲染态 + SSE 重订阅，§3 生命周期 14 清空重渲约定〔deep 形态注 v1.30〕；
  *     失败 409006/404001 toast 既有链路）。
- *   - generatingThreadIds：侧边栏生成中线程集合（生命周期 12），轮生命周期事件驱动、不轮询。
- *   - closeStream()：路由切走主动断流（生命周期 11，连接注册表保证同 turnId 至多一条连接）。
+ *   - generatingThreadIds：侧边栏生成中线程集合（生命周期 12），轮生命周期事件驱动、不轮询；
+ *     v1.40 语义扩：awaiting_approval 计入生成中（审批等待期指示器不消失；占线判定面
+ *     liveTurn/canStop 不扩 awaiting——两判定面互不侵入，§4 turnStore 行 v1.40）。
+ *   - approval 状态机（B22 v1.40 增，生命周期 15）：approval_requested 置 awaiting 态 +
+ *     pending 载荷 + 预览缓存捕获；approval_resolved 四路径收口（submit/timeout → running、
+ *     cancel/conflict → canceled 终态）；decideApproval() POST §2.13（成功本地立即置 running
+ *     不等 SSE；409008 → toast + reconcile；网络错 → toast 弹层保留）；reconcile 对账 2.5
+ *     approval（刷新恢复只依赖 2.5——pending 重开弹层形态、canceled 键省略投影 null）。
+ *     批次 3 评审 M1+M2 增「已裁决重放门」：approvalDecidedTurns 会话标记集 + 2.5 approved
+ *     权威恢复 + 终态三重证据——刷新全量重放的 approval_requested 不回退已裁决轮（弹层不重开、
+ *     状态不回退、预览缓存自重放帧回填）、approval_resolved(timeout) 不重弹 toast。
  */
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { apiGet, apiPost, normalizeError } from '@/api/client'
-import { regenerateTurn, sendTurnFeedback } from '@/api/turns'
+import { approveTurn, regenerateTurn, sendTurnFeedback } from '@/api/turns'
+import { i18n } from '@/i18n'
 import { CONTENT_SAFETY_ERROR_CODE } from '@/constants/errors'
 import { toast } from '@/composables/toast'
 import { isRecord } from '@/utils/guards'
@@ -34,6 +44,8 @@ import { closeTurnStream, subscribeTurn } from '@/sse/turnStream'
 import type { TurnStreamState } from '@/sse/turnStream'
 import { usePrefsStore } from '@/stores/prefs'
 import type {
+  ApprovalChoice,
+  ApprovalPreview,
   AskMode,
   CancelReason,
   CancelTurnData,
@@ -47,6 +59,7 @@ import type {
   StageKey,
   StageStatus,
   StartTurnData,
+  TurnApproval,
   TurnDetail,
   TurnImageItem,
   TurnStatus,
@@ -68,6 +81,9 @@ function isTerminalStatus(status: TurnStatus): boolean {
   return TERMINAL_STATUSES.includes(status)
 }
 
+/** §3 生命周期 12（v1.40 语义扩）：计入生成中集合的占线状态——awaiting_approval 审批等待期侧栏指示器不消失（契约「awaiting 计入生成中」） */
+const GENERATING_STATUSES: readonly TurnStatus[] = ['running', 'queued', 'awaiting_approval']
+
 /** §4：sse 连接态三枚举（传输层五态 → 三态映射） */
 export type SseConnectionState = 'connected' | 'reconnecting' | 'idle'
 
@@ -85,6 +101,12 @@ export interface TimelineStage {
   detail?: string
   progress?: { current: number; total?: number }
   extra?: StageExtra
+}
+
+/** decideApproval 决策结果（批次 3 评审 L7：ok=false 时 message=服务端/网络错误文案，供弹层内错误条呈现） */
+export interface ApprovalDecisionResult {
+  ok: boolean
+  message: string | null
 }
 
 /** 每轮状态投影（§4 turnStore 行字段 + 派生展示字段） */
@@ -140,6 +162,34 @@ export interface TurnState {
    * 消费面 = AnswerActions 更多菜单「导出报告」门控（§5 ⑦ v1.30）。
    */
   exportAvailable: boolean
+  /**
+   * B22 HITL 审批门投影（v1.40 增，api.md §2.5 approval/§7.2 v1.37 消费面；frontend-api.md
+   * §4 turnStore 行 v1.40）：SSE approval_requested/approval_resolved 与 reconcile() 对账
+   * 双源写入——四形态 pending/approved/no_hit/shadow；非门轮键省略投影 null（§2.5「键整体
+   * 省略不置 null」的 store 面）；v1.41 钉：status=canceled 的审批行 approval 键整体省略
+   * ——canceled 轮回看面无审批折叠条。消费面 = ApprovalSheet 弹层与回看态折叠条（批次 3）。
+   */
+  approval: TurnApproval | null
+  /**
+   * approval_requested 捕获的命中预览缓存（pending 形态 previews；回看折叠条「查看当时的
+   * 知识库命中」展开数据源）。流式域字段——2.5 approved 形态无 previews 键，对账不清本地
+   * 缓存（沿 thinking_md/compactSeq「REST 无对应字段一律保留」先例）；2.5 pending 形态
+   * previews 全量在 payload（刷新恢复弹层重开数据面），对账捕获覆盖。canceled 收口清 null
+   * （取消轮不进历史、无折叠条）。
+   */
+  approvalPreviews: ApprovalPreview[] | null
+  /**
+   * awaiting_approval 累计时长毫秒（v1.37，api.md §2.5 awaiting_ms——非零才携带，键省略
+   * 投影 null；SSE 无对应事件、唯一数据源 2.5 对账回写）。消费面 = 回看折叠条等待时长行
+   * （批次 3 第三段；折叠条展开面「审批等待 N 秒」）。
+   */
+  awaitingMs: number | null
+  /**
+   * 改写子问题（api.md §2.5 rewritten_queries 顶层权威源；SSE 面无对应键——stage(rewrite,done)
+   * extra 仅 hitl 留痕，§7.4 带审批形态实测无 rewritten_queries，故唯一写入点=reconcile 对账）。
+   * 消费面 = ApprovalSheet「命中的子问题」行（query_index 对位，批次 3 第三段 AnswerView 装配）。
+   */
+  rewrittenQueries: string[] | null
 }
 
 function seedTurnState(init: {
@@ -176,6 +226,10 @@ function seedTurnState(init: {
     memorySaved: null,
     durationMs: null,
     exportAvailable: false,
+    approval: null,
+    approvalPreviews: null,
+    awaitingMs: null,
+    rewrittenQueries: null,
   }
 }
 
@@ -207,17 +261,23 @@ export const useTurnStore = defineStore('turn', () => {
 
   /* ---------- 生成中集合（生命周期 12：轮生命周期事件驱动，不轮询） ---------- */
 
+  /**
+   * v1.40 语义扩（B22）：awaiting_approval 计入生成中——审批等待期侧栏指示器不消失
+   * （frontend-api.md §4 generatingThreadIds 行 v1.40「awaiting_approval 计入生成中」）。
+   * 占线判定面与此互不侵入：AnswerView liveTurn/canStop/isStreaming 仍只认 running|queued
+   * （awaiting 不是流式、停止钮不出现——停止语义由 ApprovalSheet「取消本轮」承接，生命周期 15）。
+   */
   function markGenerating(threadId: string, status: TurnStatus): void {
-    if (status === 'running' || status === 'queued') {
+    if (GENERATING_STATUSES.includes(status)) {
       generatingThreadIds.value.add(threadId)
     } else {
       generatingThreadIds.value.delete(threadId)
     }
   }
 
-  /** 进入页面/切回时以 2.3 turns[].status 校准当前线程（生命周期 12 对账口径） */
+  /** 进入页面/切回时以 2.3 turns[].status 校准当前线程（生命周期 12 对账口径；v1.40 awaiting 同口径） */
   function calibrateThread(threadId: string, statuses: TurnStatus[]): void {
-    markGenerating(threadId, statuses.some((s) => s === 'running' || s === 'queued') ? 'running' : 'completed')
+    markGenerating(threadId, statuses.some((s) => GENERATING_STATUSES.includes(s)) ? 'running' : 'completed')
   }
 
   /* ---------- seq 游标持久化（生命周期 5 形态保留；P3 写入节流） ---------- */
@@ -433,6 +493,88 @@ export const useTurnStore = defineStore('turn', () => {
         }
         break
       }
+      case 'approval_requested': {
+        // 批次 3 评审 M1：重放门「认已裁决」——三重证据任一命中即不回退不重开弹层：
+        //   ① 本会话已见过该轮收口（approvalDecidedTurns——resolved/乐观裁决/取消/对账标记）；
+        //   ② 2.5 权威已恢复 approved 形态（刷新 reconcile 先行恢复，弹层状态派生面不开）；
+        //   ③ 轮已终态（陈旧重放帧——终态轮审批 UI 不得复活）。
+        // 命中路径仅回填预览缓存：已裁决形态且缓存为空时自重放 payload 捕获（2.5 approved 无
+        // previews 键——重放帧是刷新后回看折叠条展开数据面的唯一来源；canceled/其他形态不捕获）。
+        if (
+          approvalDecidedTurns.has(turnId) ||
+          turn.approval?.status === 'approved' ||
+          isTerminalStatus(turn.status)
+        ) {
+          if (turn.approval?.status === 'approved' && turn.approvalPreviews === null) {
+            turn.approvalPreviews = event.data.previews
+          }
+          break
+        }
+        // B22（v1.40 派发表）：置 awaiting 态 + approval=pending 载荷（verdict/expires_at/previews
+        // 全量）+ 预览缓存捕获；时间线不新增节点（rewrite 已 done、search 未开始）；生成中集合
+        // 保留（markGenerating awaiting 计入）。幂等门在 switch 前已推进 lastSeq——同连接重放
+        // （seq ≤ lastSeq）不达此处；新连接全量重放（fromSeq=0）到达时覆盖式刷新同 payload，
+        // 弹层可见性由状态派生（approval pending ∧ status awaiting）天然幂等不重复弹。
+        turn.status = 'awaiting_approval'
+        turn.approval = {
+          status: 'pending',
+          verdict: event.data.verdict,
+          expires_at: event.data.expires_at,
+          previews: event.data.previews,
+        }
+        turn.approvalPreviews = event.data.previews
+        markGenerating(turn.threadId, 'awaiting_approval')
+        break
+      }
+      case 'approval_resolved': {
+        // B22（v1.40 派发表）四路径收口，以 choice 键有无分流（api.md §7.2——「timeout 收口=缺省
+        // 策略值 hybrid 对应 both；cancel 收口无 choice——键省略」；后端 collect_expired 的
+        // on_timeout=cancel 静默收尾分支同样无 choice 键）：
+        //   choice 在（submit / timeout 续流）→ running + 已裁决形态（预览缓存保留——事件 payload
+        //     无 previews，回看折叠条展开数据源不因收口丢失）；resolved_by=timeout 时 toast 轻提示
+        //     「已按『两者都要』继续」（§3 派发表行 v1.40；submit 不 toast——乐观 UI 已即时反馈）。
+        //   choice 无（cancel 用户取消 / conflict interrupt·rollback 直接收尾）→ canceled 终态收口
+        //     （生成中集合移除；cancelReason 由随后 done(cancel,user|superseded|rolled_back) 权威
+        //     补写——§7.4 取消形态）。另一标签页同轮收敛：本端未提交过裁决时本帧即远端裁决通知
+        //     （状态派生关弹层对账）。
+        //   choice 无且 resolved_by=timeout（on_timeout=cancel 静默收尾）→ 零本地置位——本帧不置
+        //     running/裁决形态（避免「已按两者都要继续」误导与生成中集合抖动），done(finish=canceled,
+        //     cancel_reason=timeout) 紧随其后权威收口（§2.5 v1.38 第 4 cancel_reason 值）。
+        // 批次 3 评审 M2：本帧到达前的已裁决标记决定 timeout toast 是否重弹（刷新全量重放的
+        // resolved(timeout) 帧命中标记 → 不重弹）；任意分支收口后统一标记（同会话后续重放帧全部入门）。
+        const payload = event.data
+        const alreadyDecided = approvalDecidedTurns.has(turnId)
+        approvalDecidedTurns.add(turnId)
+        // 终态轮陈旧重放帧防御（批次 3 终轮评审 M，与 approval_requested 分支③对称）：
+        // reconcile 后内存 lastSeq=0 时陈旧 resolved 帧可过 seq 门——终态不得被回写复活运行/取消态。
+        const staleTerminal = isTerminalStatus(turn.status)
+        if (payload.choice === undefined) {
+          if (payload.resolved_by === 'cancel' || payload.resolved_by === 'conflict') {
+            turn.approval = null // canceled 轮 approval 键整体省略（v1.41，api.md §2.5 v1.38）
+            turn.approvalPreviews = null // 取消轮不进历史、无折叠条，预览缓存随收口清位
+            if (!staleTerminal) turn.status = 'canceled'
+            generatingThreadIds.value.delete(turn.threadId)
+          }
+        } else {
+          // alreadyDecided（重放收敛）保留既有 note（批次 3 终轮评审 M）：note 唯一权威源是 2.5
+          // （SSE resolved payload 无 note 键），无条件覆盖会把 reconcile 自 2.5 恢复的补充指令
+          // 抹掉——ApprovalRecall 指令行在 running 中刷新窗口闪没。非 alreadyDecided 首帧路径
+          // 既有形态为 pending（无 note），透传 undefined 与原行为零差异。
+          const preservedNote =
+            alreadyDecided && turn.approval?.status === 'approved' ? turn.approval.note : undefined
+          turn.approval = {
+            status: 'approved',
+            choice: payload.choice,
+            decided_by: payload.decided_by,
+            ...(preservedNote !== undefined ? { note: preservedNote } : {}),
+          }
+          if (!staleTerminal) turn.status = 'running'
+          if (payload.resolved_by === 'timeout' && !alreadyDecided) {
+            toast(i18n.global.t('answer.approvalTimeoutContinued'))
+          }
+        }
+        break
+      }
       case 'error':
         // error 非终态：保留已生成内容 + 错误条 + 节点标 failed；生成中集合不动（只认 done/对账）
         turn.errorMsg = event.data.message
@@ -629,6 +771,16 @@ export const useTurnStore = defineStore('turn', () => {
   const feedbackSeqs = new Map<string, number>()
 
   /**
+   * 已裁决标记集（批次 3 评审 M1+M2：重放门「认已裁决」）：turnId → 本会话已见过该轮审批收口。
+   * 写入点四个：applyEvent approval_resolved 任意分支收口、decideApproval 乐观成功、
+   * cancelApproval 本地收口、reconcile 对账 2.5 approved（刷新路径唯一跨刷新证据源——刷新后
+   * 内存集清零，由 2.5 权威态重建）。命中门 = 重放 approval_requested 不回退状态不重开弹层、
+   * 重放 approval_resolved(timeout) 不重弹 toast。审批门每轮至多一次（api.md §2.5），per-turn
+   * 集合无过期面。
+   */
+  const approvalDecidedTurns = new Set<string>()
+
+  /**
    * 服务端最后确认值（批次3评审-F1 失败回滚锚点）：turnId → 最后一次被服务端确认的
    * feedbackHelpful（缺省=null=从未确认）。写入点两个：sendFeedback 响应成功回写、
    * reconcile() 对账（2.5 feedback_helpful 为准源）。失败回滚目标 = 此锚点而非点击时刻
@@ -728,8 +880,93 @@ export const useTurnStore = defineStore('turn', () => {
     turn.degradedReason = detail.degraded ? detail.degraded_reason : null
     turn.durationMs = detail.duration_ms
     turn.exportAvailable = detail.export_available
+    // B22（v1.40）：approval 投影对账（2.5 为准源——刷新恢复只依赖 2.5 不依赖事件重放，§3
+    // 生命周期 15）。非门轮/canceled 轮键整体省略（v1.41）→ null；pending 形态 previews 全量
+    // 在 payload → 捕获预览缓存（弹层重开数据面）；approved 形态 2.5 无 previews → 保留本地
+    // 缓存（沿 thinking_md/compactSeq「REST 无对应字段一律保留」流式域先例——回看折叠条展开
+    // 数据源不被对账清空）；其余形态（no_hit/shadow/键省略）→ 对称清理陈旧缓存（批次 3 终轮
+    // 评审 M，与 approval=null 同步）。awaiting_ms 非零才携带（键省略投影 null）。
+    turn.approval = detail.approval ?? null
+    // 批次 3 评审 M1：2.5 approved 权威恢复 = 刷新路径的已裁决标记重建（重放门唯一跨刷新证据源）
+    if (detail.approval?.status === 'approved') approvalDecidedTurns.add(turnId)
+    // 非零才携带（api.md §2.5「零等待零键」）：键缺省与 0 值同投影 null（0 在契约面不该出现，
+    // 出现即视为无等待段——防御面与键省略同口径，s4 第四段边界用例锁死）。
+    turn.awaitingMs = detail.awaiting_ms ? detail.awaiting_ms : null
+    if (detail.approval?.status === 'pending') {
+      turn.approvalPreviews = detail.approval.previews
+    } else if (detail.approval?.status !== 'approved') {
+      turn.approvalPreviews = null
+    }
+    // B22（批次 3 第三段）：rewritten_queries 顶层权威源捕获（api.md §2.5 :218——恒出现；
+    // SSE 面无对应键〔stage(rewrite,done) extra 仅 hitl 留痕〕，故唯一写入点=对账）。
+    // 消费面 = ApprovalSheet「命中的子问题」行（query_index 对位）。
+    turn.rewrittenQueries = detail.rewritten_queries
     // lastSeq/compactSeq/thinking_md 为传输层/流式域：REST 无对应字段，一律保留
     markGenerating(turn.threadId, detail.status)
+  }
+
+  /**
+   * 审批裁决（B22 v1.40 增，REQ-069/A54；frontend-api.md §4 decideApproval 行 + §3 生命周期 15；
+   * api.md §2.13 经 api/turns.ts approveTurn 唯一出口）：POST §2.13 →
+   *   ① 成功（202 首次/200 幂等）：本地立即置 running + approval 置已裁决形态（decided_by=user）
+   *     ——乐观 UI 不等 SSE（SSE approval_resolved 与阶段 2 事件流到达时按 seq 幂等收敛）；预览
+   *     缓存保留（回看折叠条立即可展开）；生成中集合保留（running 计入）。弹层关闭由视图层
+   *     状态派生（status!=='awaiting_approval' 即关），本层零弹层耦合。
+   *   ② 409008（HTTP 409 错误信封——另一标签页已裁决/已超时收口）：toast 服务端 message +
+   *     reconcile()（以 2.5 权威态收敛——权威 status/approval 到位后弹层随状态派生自动关）。
+   *   ③ 其余失败（400001 choice 非法/note 超 500 字、404001 归属校验、网络错误）：toast、
+   *     态不动（status 保持 awaiting、approval 保持 pending）——弹层保留可重试（生命周期 15）。
+   *   批次 3 评审 L7：返回结构化结果（ok/message）——失败文案同时供弹层内错误条（errorText）
+   *   呈现，toast 语义不变（实现内部细节，契约失败语义零变更）。
+   * POST-first 模式（非乐观-first）：失败路径零本地置位，无回滚需求（对照 sendFeedback 乐观
+   * UI——反馈失败要回滚选中态，裁决失败仅 toast+权威收敛）。
+   */
+  async function decideApproval(turnId: string, choice: ApprovalChoice, note?: string): Promise<ApprovalDecisionResult> {
+    const turn = turns.value[turnId]
+    if (!turn) return { ok: false, message: null }
+    try {
+      await approveTurn(turnId, note !== undefined && note !== '' ? { choice, note } : { choice })
+    } catch (error) {
+      const normalized = normalizeError(error)
+      toast(normalized.message)
+      if (normalized.code === '409008') {
+        void safeReconcile(turnId)
+      }
+      return { ok: false, message: normalized.message }
+    }
+    turn.status = 'running'
+    turn.approval = { status: 'approved', choice, decided_by: 'user' }
+    approvalDecidedTurns.add(turnId)
+    markGenerating(turn.threadId, 'running')
+    return { ok: true, message: null }
+  }
+
+  /**
+   * 弹层「取消本轮」（B22 v1.40 增，frontend-api.md §4 cancelApproval 行：复用既有 cancel()
+   * 走 §2.7 awaiting 分支——api.md §2.7「awaiting_approval 轮可取消：直接落库终态
+   * canceled(cancel_reason=user)，无协程在跑、不经取消标志」；关闭弹层=canceled(user) 不进
+   * 历史〔G 裁决〕，审计留痕在 turn_approvals 表——v1.41 canceled 审批行 approval 键整体省略）：
+   *   ① POST /api/v1/turns/{turnId}/cancel（经既有 cancel() 出口）；
+   *   ② 成功 → 本地立即收口（契约「关弹层由 approval_resolved(resolved_by=cancel) 派发或本地
+   *     立即收口均可，实现随批次 3 定」——取本地立即）：status 置 canceled + approval/previews
+   *     清 null + 生成中集合移除；approval_resolved(resolved_by=cancel) 与 done(finish=canceled,
+   *     cancel_reason=user) 随后到达按 seq 幂等收敛（cancelReason 由 done 权威补写）；
+   *   ③ 失败（网络错等）：toast、态不动——弹层保留可重试。
+   */
+  async function cancelApproval(turnId: string): Promise<void> {
+    const turn = turns.value[turnId]
+    if (!turn) return
+    try {
+      await cancel(turnId)
+    } catch (error) {
+      toast(normalizeError(error).message)
+      return
+    }
+    turn.approval = null
+    turn.approvalPreviews = null
+    turn.status = 'canceled'
+    approvalDecidedTurns.add(turnId) // 批次 3 评审 M1：取消收口同标记已裁决门（陈旧重放帧不得复活弹层）
+    generatingThreadIds.value.delete(turn.threadId)
   }
 
   return {
@@ -744,6 +981,8 @@ export const useTurnStore = defineStore('turn', () => {
     cancel,
     sendFeedback,
     regenerate,
+    decideApproval,
+    cancelApproval,
     subscribe,
     applyEvent,
     reconcile,

@@ -27,6 +27,8 @@ from app.schemas.thread import (
     TurnSkeleton,
 )
 from app.schemas.turn import (
+    ApprovalDecisionData,
+    ApprovalDecisionRequest,
     ImageBrief,
     MemoryHits,
     SourceBrief,
@@ -40,6 +42,8 @@ from app.schemas.turn import (
 )
 
 __all__ = [
+    "ApprovalDecisionData",
+    "ApprovalDecisionRequest",
     "FeedbackRequest",
     "FeedbackResponse",
     "ImageBrief",

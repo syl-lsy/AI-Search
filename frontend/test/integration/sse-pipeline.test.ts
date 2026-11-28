@@ -13,13 +13,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { apiGet, apiPost } from '@/api/client'
 import {
+  approvalPreviewFixtures,
+  TURN_ID_AWAITING,
   TURN_ID_DIRECT,
   turnDetailDeepCompleted,
   turnDetailDirectCompleted,
   turnDetailDirectWithFollowups,
+  turnDetailFastApproved,
+  turnDetailFastAwaiting,
   turnDetailFastCompleted,
 } from '@/mocks/turnDetails'
 import {
+  approvalRequestedSequence,
+  approvalResumeSequence,
   deepSequence,
   directFollowupsEvent,
   directSequence,
@@ -513,5 +519,54 @@ describe('threadListStore 联装说明', () => {
   it('§4 第二行的 store 级联装断言归 unit/thread-list-store.test.ts（唯一出口 mock 全量）', () => {
     // 本文件聚焦 SSE 管线联装；threadListStore 的 REST/推荐池通道已在 unit 层全覆盖
     expect(true).toBe(true)
+  })
+})
+
+describe('B22 HITL 审批序列（api.md §7.4 带审批形态 v1.37：transport 全链路 + 刷新恢复直驱）', () => {
+  it('阶段 1 → 弹窗挂起（awaiting + pending 全量 + 生成中保留 + 等待期连接保持）；裁决提交 → 阶段 2 续流 → done 对账（rewrittenQueries/awaiting_ms/approved 形态 2.5 权威捕获）', async () => {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID_AWAITING, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('KB 里怎么融合检索？', 'fast')
+
+    // 阶段 1：rewrite → approval_requested → awaiting 挂起（弹层状态派生数据面就位）
+    const es = MockEventSource.instances[0]!
+    expect(es.url).toContain(`/api/v1/turns/${TURN_ID_AWAITING}/events`)
+    es.open()
+    for (const f of toFrames(approvalRequestedSequence)) es.dispatch(f)
+    const turn = store.turns[TURN_ID_AWAITING]!
+    expect(turn.status).toBe('awaiting_approval')
+    expect(turn.approval?.status).toBe('pending')
+    expect(turn.approvalPreviews?.length).toBe(2) // 预览缓存捕获（弹层数据面）
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true) // awaiting 计入生成中（侧栏指示器不消失）
+    expect(es.closedByClient).toBe(false) // 等待期连接保持（不 close 不重连——生命周期 15）
+
+    // 裁决提交（POST §2.13 → 本地立即 running 不等 SSE）→ 阶段 2 续流经同一订阅到达
+    mockedPost.mockResolvedValueOnce({ turn_id: TURN_ID_AWAITING, status: 'running', choice: 'kb_only' })
+    await store.decideApproval(TURN_ID_AWAITING, 'kb_only')
+    expect(turn.status).toBe('running')
+    mockedGet.mockResolvedValueOnce({ ...turnDetailFastApproved, status: 'completed', duration_ms: 20000 })
+    for (const f of toFrames(approvalResumeSequence)) es.dispatch(f)
+    await vi.waitFor(() => {
+      expect(store.turns[TURN_ID_AWAITING]!.approval?.status).toBe('approved') // done 对账 2.5 权威
+    })
+    // 2.5 权威捕获（刷新恢复/回看数据面）：rewritten_queries 顶层 + awaiting_ms + approved 形态
+    expect(store.turns[TURN_ID_AWAITING]!.rewrittenQueries).toEqual(['KB 融合检索怎么做？', 'RRF 融合权重怎么设？'])
+    expect(store.turns[TURN_ID_AWAITING]!.awaitingMs).toBe(9200)
+    expect(store.turns[TURN_ID_AWAITING]!.approval).toEqual({ status: 'approved', choice: 'kb_only', note: '回答时优先引用知识库的 ADR-017 结论', decided_by: 'user' })
+  })
+
+  it('刷新恢复（reconcile 直驱——loadThread 逐轮对账同款入口）：2.5 approval=pending 全量 → 弹层重开形态投影 + awaiting_ms/rewrittenQueries 捕获 + awaiting 计入生成中', async () => {
+    mockedPost.mockResolvedValueOnce({ thread_id: THREAD_ID, turn_id: TURN_ID_AWAITING, status: 'running' })
+    const store = useTurnStore()
+    await store.ask('KB 里怎么融合检索？', 'fast')
+    mockedGet.mockResolvedValueOnce(turnDetailFastAwaiting)
+    await store.reconcile(TURN_ID_AWAITING)
+    const turn = store.turns[TURN_ID_AWAITING]!
+    expect(turn.status).toBe('awaiting_approval')
+    expect(turn.approval).toEqual({ status: 'pending', verdict: 'has_hit', expires_at: '2026-11-01T08:14:06Z', previews: [...approvalPreviewFixtures] })
+    expect(turn.approvalPreviews).toEqual([...approvalPreviewFixtures]) // 弹层重开数据面（previews 全量在 payload）
+    expect(turn.awaitingMs).toBe(9200) // awaiting_ms 非零携带 → 投影
+    expect(turn.rewrittenQueries).toEqual(['KB 融合检索怎么做？', 'RRF 融合权重怎么设？']) // 2.5 顶层权威源
+    expect(store.generatingThreadIds.has(THREAD_ID)).toBe(true) // awaiting 计入生成中（刷新恢复侧栏指示器不消失）
   })
 })
