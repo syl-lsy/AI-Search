@@ -118,6 +118,67 @@ def test_approval_sweep_interval_is_low_frequency_fallback():
     assert 0 < APPROVAL_SWEEP_INTERVAL_SECONDS <= 60
 
 
+async def test_sweep_spawns_resumes_without_awaiting_completion():
+    """评审遗留③（批次 5 清偿）：扫描器并发恢复——resume_turn（阶段 2 完整
+    包络，可达百秒级）串行 await 会令一条慢恢复阻塞批内其余轮的阶段 2 启动与
+    下一扫描周期（可用性缺口）。本用例钉死：扫描在恢复任务**启动后即返回**
+    （不 await 恢复完成），两条恢复都被 spawn。"""
+    import app.crons.approval_timeout_sweep as sweep_module
+    from app.crons.approval_timeout_sweep import sweep_expired_approvals
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+    resumed: list[str] = []
+
+    class _SlowScheduler:
+        async def collect_expired_approvals(self, *, now=None):
+            return [
+                {
+                    "turn_id": "t1",
+                    "thread_id": "th",
+                    "choice": "both",
+                    "decided_by": "timeout",
+                    "on_timeout": "hybrid",
+                },
+                {
+                    "turn_id": "t2",
+                    "thread_id": "th",
+                    "choice": "both",
+                    "decided_by": "timeout",
+                    "on_timeout": "hybrid",
+                },
+            ]
+
+        async def resume_turn(self, turn_id):
+            resumed.append(turn_id)
+            started.set()
+            await release.wait()
+            return {"turn_id": turn_id, "status": "running"}
+
+    result = await asyncio.wait_for(
+        sweep_expired_approvals(scheduler=_SlowScheduler()), timeout=2.0
+    )
+    assert result.collected_count == 2
+    await asyncio.sleep(0.01)  # 让步一个循环 tick——create_task 的任务才开跑
+    assert started.is_set()  # 恢复任务已启动（扫描返回前 spawn）
+    release.set()
+    pending = [t for t in sweep_module._ACTIVE_RESUME_TASKS if not t.done()]
+    if pending:
+        await asyncio.gather(*pending)
+    assert sorted(resumed) == ["t1", "t2"]
+
+
+async def test_sweep_resume_task_failure_swallowed():
+    """单条恢复失败不中断（任务内 WARN，幂等可重入下轮自然重试——原口径保留）。"""
+    from app.crons.approval_timeout_sweep import _resume_one
+
+    class _BoomScheduler:
+        async def resume_turn(self, turn_id):
+            raise RuntimeError("boom")
+
+    await _resume_one(_BoomScheduler(), {"turn_id": "t1"})  # 不抛即过
+
+
 # ---- on_timeout 解析（补裁决尾巴：collect 读 spec 不再硬钉 hybrid）----
 
 
@@ -142,6 +203,31 @@ def test_resolve_on_timeout_three_forms(
     """on_timeout 解析三形态（nacos-config §3 hitl.on_timeout：hybrid 缺省/cancel/
     非法回落 hybrid——validator 枚举外拒收之外的运行面兜底）。"""
     assert _resolve_on_timeout(hitl_section) == expected
+
+
+@pytest.mark.parametrize(
+    "section,expected",
+    [
+        (None, 500),
+        ({}, 500),
+        ({"note_max_chars": 500}, 500),
+        ({"note_max_chars": 100}, 100),
+        ({"note_max_chars": 1000}, 1000),
+        ({"note_max_chars": 50}, 500),  # 越域下界（validator 值域 100~1000 之外回落）
+        ({"note_max_chars": 1001}, 500),  # 越域上界
+        ({"note_max_chars": True}, 500),  # bool 防御
+        ({"note_max_chars": "300"}, 500),  # 非整型
+    ],
+)
+def test_note_limit_reads_configured_key(
+    section: dict | None, expected: int
+) -> None:
+    """评审遗留④（批次 5 清偿）：hitl.note_max_chars 运行面读取——服务层真实
+    消费该键（原实现硬编码 500 键不消费）；畸形/越域回落缺省 500（validator
+    值域 ge=100 le=1000，nacos-config §3 v1.50；_resolve_on_timeout 同款兜底）。"""
+    from app.services.turn_service import _note_limit
+
+    assert _note_limit(section) == expected
 
 
 def test_usage_collector_restore_totals_cross_phase():

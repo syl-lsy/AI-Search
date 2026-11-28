@@ -586,6 +586,40 @@ async def test_resume_schema_version_mismatch_fails_turn(
     assert row["duration_ms"] < wall_ms
 
 
+async def test_resume_rejects_non_mapping_gate_payload(
+    two_phase_env: dict[str, Any],
+) -> None:
+    """评审遗留清偿②（批次 5）：gate_payload JSONB 非 Mapping 形状（手工写行/
+    脏数据 list·标量）与版本不符同族——「读不懂的载荷不猜」走轮 failed + 明确
+    error 收口面（data-model §1.20/R30），不得在 dict() 转换处裸抛绕过收口。"""
+    info = two_phase_env["info"]
+    scheduler = two_phase_env["scheduler"]
+    await _run_phase1(scheduler, info)
+    conn = _connect(info)
+    try:
+        with conn.cursor() as cursor:
+            # 合法流（decide）把轮推进 running 后，把载荷列改成 list 形状（脏数据）
+            cursor.execute(
+                "UPDATE turn_approvals SET gate_payload = %s::jsonb WHERE turn_id = %s",
+                ('["not-a-mapping"]', str(_TURN_ID)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    await scheduler.decide_approval(
+        str(_TURN_ID), user_id=_USER_ID, choice="kb_only", note=None
+    )
+    result = await scheduler.resume_turn(str(_TURN_ID))
+
+    assert result == {"turn_id": str(_TURN_ID), "status": "failed"}
+    row = _turn_row(info)
+    assert row is not None and row["status"] == "failed"
+    assert row["error"] is not None and "版本" in row["error"]["message"]
+    events = _events(info)
+    assert [p for t, p in events if t == "error"]
+    assert not [t for t, _ in events if t == "done"]
+
+
 # ---- 孤儿清理豁免 awaiting（running/queued 照清）----
 
 
@@ -798,6 +832,40 @@ async def test_interrupt_awaiting_publishes_conflict_sse(
     done = [p for t, p in events if t == "done"]
     assert done and done[0]["finish"] == "canceled"
     assert done[0]["cancel_reason"] == "superseded"
+
+
+async def test_flush_drops_ghost_frames_for_non_canceled_rows(
+    monkeypatch: pytest.MonkeyPatch, migrated_db: Any
+) -> None:
+    """评审遗留①（批次 5 清偿）：late-drain 幽灵帧防护——入队发生在请求事务内、
+    flush 在提交后窗口，两者之间事务可能整体回滚（行回 awaiting_approval）。
+    flush 前对 DB 真值复核：非 canceled 行的队列项丢弃（零发布、队列清理），
+    订阅者不被「幽灵 canceled 帧」误导（轮实际仍在等待审批）。对照组=上一用例
+    （真 canceled 行照常发布两帧）。"""
+    _seed(migrated_db)
+    recorder = _Recorder()
+    scheduler = _make_scheduler(
+        monkeypatch, recorder, _FakeRetriever(), queries=["知识库 审批门"]
+    )
+    monkeypatch.setattr("app.agent.nodes.kb_gate.rerank_via_gateway", _FakeRerank())
+    await _run_phase1(scheduler, migrated_db)
+    assert _turn_status(migrated_db) == "awaiting_approval"
+
+    # 模拟「入队后事务回滚」终态：队列有项、行未 canceled（仍在 awaiting）
+    scheduler._deferred_awaiting_sse.append(
+        {
+            "turn_id": str(_TURN_ID),
+            "thread_id": str(_THREAD_ID),
+            "reason": "superseded",
+            "duration_ms": 0,
+        }
+    )
+    await scheduler._flush_deferred_awaiting_sse()
+
+    assert scheduler._deferred_awaiting_sse == []  # 队列清理（不滞留重放）
+    events = _events(migrated_db)
+    assert not [p for t, p in events if t in ("approval_resolved", "done")]
+    assert _turn_status(migrated_db) == "awaiting_approval"  # 轮未被幽灵帧收尾
 
 
 async def test_web_direct_and_shadow_audit_rows(

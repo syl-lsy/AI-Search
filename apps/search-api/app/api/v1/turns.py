@@ -133,9 +133,12 @@ async def approve_turn(
 
     路由层零业务逻辑：归属校验（404001）/ 幂等与冲突判读（同 choice 幂等 200 /
     异 choice 或非 awaiting **409008**——§0 v1.37 定号注：计划草案 409007 已被
-    kb_import_jobs 占用顺延）/ note sanitize（R35）均在
+    kb_import_jobs 占用顺延）/ note sanitize（R35）与 note 长度判定均在
     `ThreadScheduler.decide_approval`；阶段 2 恢复为 BackgroundTask（条件推进已
     commit——resume_turn 读 running 行执行，独立完整包络）。
+    note 长度双层（批次 5 清偿④）：pydantic `max_length=1000`（validator
+    note_max_chars 值域上界）为**边界哨兵**；权威判定=服务层 `hitl.note_max_chars`
+    键消费（缺省 500）——超限同样 400001，HTTP 400/信封 code 观测面不变。
     HTTP 状态码区分语义：202=首次成功（阶段 2 已调度）/ 200=幂等重复（返回已记录
     裁决，不重复触发阶段 2）；信封 code 恒 "0"。
     """

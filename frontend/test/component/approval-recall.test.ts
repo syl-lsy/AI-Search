@@ -97,6 +97,26 @@ describe('可见性（approved 形态唯一——web 直达/shadow/pending/cance
     expect(strip().text()).toContain('两者都要')
     w.unmount()
   })
+
+  it('canceled 轮防御对称化（批次 3 残留 P3 清偿）：审批通过后轮又被取消的内存窗口（done(finish=canceled) 不触碰 approval、陈旧 approved 对象留存至 reconcile 投影 null）整块不渲染——轮级 status 与 approval.status 双维判定，与弹层可见性派生同构', () => {
+    const w = mountRecall(makeTurn({
+      status: 'canceled',
+      cancelReason: 'user',
+      approval: { status: 'approved', choice: 'both', decided_by: 'user' },
+      approvalPreviews: [...approvalPreviewFixtures],
+    }))
+    expect(w.find('[data-testid="approval-recall"]').exists()).toBe(false)
+    w.unmount()
+  })
+
+  it('防御排除仅限 canceled：completed/degraded 终态已裁决轮折叠条照常渲染（审批通过后正常答完的回看面不误伤）', () => {
+    const w1 = mountRecall(makeTurn({ status: 'completed', approval: { status: 'approved', choice: 'kb_only', decided_by: 'user' } }))
+    expect(w1.find('[data-testid="approval-recall"]').exists()).toBe(true)
+    w1.unmount()
+    const w2 = mountRecall(makeTurn({ status: 'degraded', approval: { status: 'approved', choice: 'web_only', decided_by: 'timeout' } }))
+    expect(w2.find('[data-testid="approval-recall"]').exists()).toBe(true)
+    w2.unmount()
+  })
 })
 
 describe('折叠条文案与展开（choice 复用四选项词条；预览/note/等待时长回显）', () => {

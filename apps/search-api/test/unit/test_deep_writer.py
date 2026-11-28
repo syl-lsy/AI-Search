@@ -612,3 +612,34 @@ async def test_writer_forces_thinking_off(monkeypatch: pytest.MonkeyPatch) -> No
     assert captured["thinking"] == "off"  # 强关档（忽略 spec.deep.thinking=on）
     # off 档组首键 = 百炼生效键（本裁决的核心注入键；组形态由 test_llm_factory 锁死）
     assert OFF_THINKING_EXTRA_BODY["enable_thinking"] is False
+
+
+# ==== B22 api.md §2.13 分期注（v1.39）：deep=writer 用户角色段（批次 5 接线）====
+
+
+async def test_writer_appends_approval_note_as_user_role_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审批补充指令（DeepState.approval_note——R35 sanitize 后、decide_approval
+    note_max_chars 截断前置，既有面）非空时以空行接在 writer 用户消息尾部（现
+    实现 prompt_text 整段即 writer 的用户角色消息——api.md §2.13「writer 用户
+    角色段」钉形态）；空/缺省/纯空白逐字节等于现状（G3——非门轮零变化）。
+    零新 Nacos 提示词键（消息层注入，fast synthesis _user_content 同款消息层
+    形态——deep.report_writer 模板占位符面零变更=运行态键零发布）。"""
+    # 对照组：无 note 的基线 prompt（G3 逐字节锚）
+    model_base, _ = _install(monkeypatch, [[*_REPORT_PIECES]])
+    await writer(_state_with(), _config())
+    base = model_base.prompts[0]
+    assert isinstance(base, str)
+
+    # note 非空：模板尾部空行接 note（用户角色段——fast synthesis 同构形态）
+    model_note, _ = _install(monkeypatch, [[*_REPORT_PIECES]])
+    update = await writer(_state_with(approval_note="重点对比扩展性与成本"), _config())
+    assert update["answer_md"] == _REPORT_MD
+    assert model_note.prompts[0] == base + "\n\n重点对比扩展性与成本"
+
+    # 空/None/纯空白：逐字节等于现状（G3）
+    for note in ("", None, "   "):
+        model_g3, _ = _install(monkeypatch, [[*_REPORT_PIECES]])
+        await writer(_state_with(approval_note=note), _config())
+        assert model_g3.prompts[0] == base

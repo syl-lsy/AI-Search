@@ -5,7 +5,8 @@
 - 202 {code:"0", data:{turn_id, status:"running", choice}}；幂等同 choice 重复提交
   200 与已记录裁决；非 awaiting/异 choice 冲突 **409008**（api.md §0 v1.37 定号注：
   计划草案 409007 已被 kb_import_jobs 占用顺延）；未知/越权 404001；choice 缺失或
-  非法枚举/note 超 500 → 400001（pydantic 边界）；
+  非法枚举 → 400001（pydantic 边界）；note 超限 → 400001（服务层 note_max_chars
+  键权威判定〔缺省 500〕——pydantic max_length=1000 为边界哨兵，批次 5 清偿④）；
 - note sanitize（R35）：note 过 query 同款 sanitize 管道（load_safety_config 门控 +
   detect_pii/sanitize 占位词），落库为脱敏形态；
 - 阶段 2 恢复=BackgroundTask resume_turn（POST 响应后执行——ASGITransport 在响应
@@ -316,7 +317,9 @@ async def test_approval_endpoint_error_faces(
     approval_api_env: dict[str, Any], async_client: Any
 ) -> None:
     """错误面（api.md §2.13）：未知/越权 404001；choice 非法枚举 400001（pydantic
-    边界）；note 超 500 → 400001；非 awaiting 轮（无审批行 running）→ 409008。"""
+    边界）；note 超限（501>缺省 500）→ 400001（服务层 note_max_chars 键权威判定
+    ——pydantic 边界哨兵 1000 不拦 501，批次 5 清偿④双层形态）；非 awaiting 轮
+    （无审批行 running）→ 409008。"""
     info = approval_api_env["info"]
 
     unknown = await async_client.post(

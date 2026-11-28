@@ -58,12 +58,19 @@ class _Recorder:
         self.research_calls = 0
         self.research_subtopics: list[list[str]] = []
         self.writer_outline: list[list[dict[str, Any]]] = []
+        self.writer_prompts: list[Any] = []  # §2.13 writer 用户角色段（批次 5）：真 writer 的 astream 入参捕获
 
 
-def _build_patched_deep_graph(recorder: _Recorder, subtopics: list[str]):
+def _build_patched_deep_graph(
+    recorder: _Recorder, subtopics: list[str], *, stub_writer: bool = True
+):
     """真 deep 拓扑 + LLM 节点桩（deep.py from-import + add_node 持有模块命名空间
     引用——patch 后编译即持有桩，test_deep_reflection_loop.py:149-150 先例姿势）。
-    deep 门/三路由器/approval_wait 为真实现（被测面）。"""
+    deep 门/三路由器/approval_wait 为真实现（被测面）。
+
+    stub_writer=False（批次 5 §2.13 接线用例）：writer 走**真节点**——build_chat_
+    model 模型缝由用例自 patch（astream 入参捕获）；planner/research/reflect/
+    supplement/guards/finalize 照旧桩化。"""
 
     from app.agent.graphs.signals import emit_stage
 
@@ -120,7 +127,8 @@ def _build_patched_deep_graph(recorder: _Recorder, subtopics: list[str]):
     deep_mod.reflect = _stub_reflect
     deep_mod.supplement_node = _stub_research  # 不可达（gaps 恒空）——桩防误入
     deep_mod.guards_node = _stub_guards
-    deep_mod.writer_node = _stub_writer
+    if stub_writer:
+        deep_mod.writer_node = _stub_writer
     deep_mod.finalize_node = _stub_finalize
     try:
         graph = build_deep_graph()
@@ -193,9 +201,10 @@ def _make_scheduler(
     subtopics: list[str] | None = None,
     deep_enabled: bool = True,
     hitl_overrides: dict[str, Any] | None = None,
+    stub_writer: bool = True,
 ) -> ThreadScheduler:
     subtopics = subtopics if subtopics is not None else _SUBTOPICS
-    graph = _build_patched_deep_graph(recorder, subtopics)
+    graph = _build_patched_deep_graph(recorder, subtopics, stub_writer=stub_writer)
     scheduler = ThreadScheduler(
         bus=EventBus(), session_factory=get_session_factory(), graph=graph
     )
@@ -599,3 +608,66 @@ async def test_deep_timing_merges_hitl_into_plan_stage(
     assert hitl_extra["verdict"] == "has_hit"
     assert hitl_extra["gate"] == "triggered"
     assert isinstance(hitl_extra["gate_ms"], int)
+
+
+async def test_deep_resume_note_reaches_writer_user_section(
+    monkeypatch: pytest.MonkeyPatch, migrated_db: Any
+) -> None:
+    """批次 5 mandate（api.md §2.13 分期注 v1.39「deep=writer 用户角色段」）：
+    deep 轮裁决 note 经恢复载荷（DeepState.approval_note，turn_service 注入面）
+    抵达**真 writer 节点**的用户角色消息——astream 入参=渲染模板+\n\n+note
+    （fast synthesis 同构形态）；审批行 approved 带 note 落库（R35 sanitize/
+    note_max_chars 既有面前置）。G3 对照=既有 stub 路径用例零改动绿（本用例是
+    唯一走真 writer 的用例，stub_writer=False 变体）。"""
+    from app.agent.nodes import deep_writer
+
+    class _FakeChunk:
+        def __init__(self, content: Any) -> None:
+            self.content = content
+
+    class _FakeStreamModel:
+        def __init__(self) -> None:
+            self.prompts: list[Any] = []
+
+        def astream(self, prompt: Any, config: Any = None, **kw: Any) -> Any:
+            self.prompts.append(prompt)
+
+            async def gen():
+                yield _FakeChunk("# 深度报告\n\n## 摘要\n\n核心发现[1]。\n")
+
+            return gen()
+
+    model = _FakeStreamModel()
+    monkeypatch.setattr(deep_writer, "build_chat_model", lambda alias, **kw: model)
+
+    info = migrated_db
+    _seed(info)
+    recorder = _Recorder()
+    retriever = _FakeRetriever()
+    scheduler = _make_scheduler(
+        monkeypatch, recorder, retriever, stub_writer=False  # 真 writer 节点
+    )
+    monkeypatch.setattr("app.agent.nodes.kb_gate.rerank_via_gateway", _FakeRerank())
+
+    await _run_phase1(scheduler, info)
+    assert _turn_status(info) == "awaiting_approval"
+    decision = await scheduler.decide_approval(
+        str(_TURN_ID), user_id=_USER_ID, choice="both", note="重点对比扩展性与成本"
+    )
+    assert decision["idempotent"] is False
+    await scheduler.resume_turn(str(_TURN_ID))
+
+    row = _turn_row(info)
+    assert row is not None and row["status"] == "completed"
+    approval = _approval(info)
+    assert approval is not None
+    assert approval["status"] == "approved" and approval["choice"] == "both"
+    # note 经 R35 sanitize 后落审批行（既有面）并抵达真 writer 用户角色段
+    assert approval["gate_payload"] is not None  # approved 行载荷面零触碰
+    assert model.prompts, "真 writer 恰一次 astream"
+    assert len(model.prompts) == 1
+    prompt = model.prompts[0]
+    assert isinstance(prompt, str)
+    assert prompt.endswith("\n\n重点对比扩展性与成本")
+    # note 在整段消息中恰出现一次（模板主体不含 note——用户角色段独立于材料面）
+    assert prompt.count("重点对比扩展性与成本") == 1
