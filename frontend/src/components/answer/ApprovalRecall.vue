@@ -4,7 +4,8 @@
  * 回看态句：已裁决轮在问题下方显示一行折叠条「已按『{choice}』回答 · 查看当时的知识库命中」——
  * **默认收起、不进导出**（hitl-OQ-04 裁决），展开显示预览与 note；**web 直达轮（no_hit）不显示
  * 任何条**（用户当时没被问过，事后提示只会制造困惑——判定留痕仅在 2.5 approval 对象供审计评测）；
- * shadow 形态零弹层零折叠条；canceled 轮 approval 键整体省略（v1.41）→ 无折叠条）。
+ * shadow 形态零弹层零折叠条；canceled 轮 approval 键整体省略（v1.41）→ 无折叠条，组件侧
+ * 再按轮级 status=canceled 对称排除（陈旧 approved 对象的幻影折叠条防御——见 approved 派生注）。
  *
  * 挂载点 = TurnBlock 问题下方（设计稿 06-approval-sheet.html 补节 D10 落位基准）。
  *
@@ -36,8 +37,16 @@ const props = defineProps<{ turn: TurnState }>()
 
 const { t } = useI18n()
 
-/** approved 形态唯一可见（no_hit/shadow/pending/canceled 键省略 → 整块不渲染） */
-const approved = computed(() => (props.turn.approval?.status === 'approved' ? props.turn.approval : null))
+/**
+ * approved 形态唯一可见（no_hit/shadow/pending/canceled 键省略 → 整块不渲染）。
+ * P3 防御对称化（批次 3 残留清偿）：轮级 status=canceled 一并排除——审批通过后轮又被取消的
+ * 内存窗口里（done(finish=canceled) 不触碰 approval，陈旧 approved 对象留存至 reconcile 按
+ * 2.5「canceled 键整体省略」投影 null），仅凭 approval.status 判定会渲染幻影折叠条；双维判定
+ * （轮 status ∧ approval.status）与弹层可见性派生（ApprovalSheet open）同构。
+ */
+const approved = computed(() =>
+  props.turn.status !== 'canceled' && props.turn.approval?.status === 'approved' ? props.turn.approval : null,
+)
 
 const expanded = ref(false)
 

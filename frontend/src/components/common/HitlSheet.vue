@@ -1,13 +1,13 @@
 <script setup lang="ts">
 /**
- * HitlSheet — 通用 HITL 弹层壳（B22 批次 3 第二段组件架构：通用壳+业务皮，用户裁决
- * 2026-11-28——本壳业务无关，为通用 HITL 组件；未来 HITL 场景（M5 记忆审批等）直接复用；
- * ApprovalSheet 为首个业务实例（审批门），经 preview/choices/note 三 slot 注入内容）。
+ * HitlSheet — 通用 HITL 弹层壳（通用壳+业务皮架构的通用壳侧）：壳机制全部业务无关，业务
+ * 内容（标题/文案/选项/预览/备注）一律经 props 与 preview/choices/note 三 slot 注入；业务皮
+ * 组件单独维护并在各自文件头自述业务语义，本壳零业务词（壳纯度——任意未来 HITL 场景直接复用）。
  *
  * 壳职责（全部业务无关）：
  *   - 底部 sheet 覆盖层：Teleport body（避 .app{overflow:hidden} 容器裁剪，ModelSelect
- *     v1.24 先例）+ fixed 定位：顶边紧贴 anchorEl 上沿、底部贴视口底——遮住输入卡且不改
- *     宿主布局（e2e A28 几何以 follow-bar 为基准不破坏）；anchorEl=null 退化贴视口底。
+ *     v1.24 先例）+ fixed 定位：顶边紧贴 anchorEl 上沿、底部贴视口底——遮住宿主锚点元素
+ *     且不改宿主布局；anchorEl=null 退化贴视口底。
  *   - z-index 层级表扩展位：HITL_SHEET_Z_INDEX=45（constants/ui.ts——drawer(40) 之上、
  *     ToastHost(50) 之下：toast 恒浮于弹层之上；ThreadModal(60) 之下：下钻弹窗可叠）。
  *   - 倒计时机制：expiresAt prop 为准（服务端权威），前端仅展示——timeoutHintText 仅最后
@@ -15,9 +15,9 @@
  *     等服务端收口帧，不 emit close、不倒计时计超时）。expiresAt=null 关停倒计时面。
  *   - 错误态机制：errorText prop 非空 → role=alert 区块（业务方注入文案；壳不管来源）。
  *   - 关闭确认机制：×（closeLabel 或 title 作 aria-label）与 cancelLabel 弱钮两入口统一
- *     → 确认区（closeConfirm* 四文案 prop）→「确认」emit close（业务方决定 close 语义，
- *     如取消收口）；「继续等待」撤回；确认态 Esc 仅撤回确认、非确认态 Esc
- *     零副作用（防误按丢轮——取消仅两个显式入口）；busy=true 冻结两入口（提交中防误触）。
+ *     → 确认区（closeConfirm* 四文案 prop）→「确认」emit close（close 语义归业务方）；
+ *     「继续等待」撤回；确认态 Esc 仅撤回确认、非确认态 Esc 零副作用（关闭仅两个显式
+ *     入口且均须过确认区——防误触丢内容）；busy=true 冻结两入口（提交中防误触）。
  *   - a11y：role=dialog + aria-modal=false（非模态覆盖层——用户可继续浏览正文）+ aria-label
  *     =title；open 时焦点落面板（含挂载即 open 形态——immediate watch，tabindex=-1 承接）、
  *     关闭双相位焦点返还；确认区出现焦点移入、撤回焦点回面板；内容按键可达（slot 内
@@ -25,7 +25,10 @@
  *   - busy 作用域透传：slot props { busy }——业务按钮/输入以单一来源禁用防重入。
  *
  * 壳内零业务语义：所有文案（title/确认四文案/提示文案/取消钮文案）纯 props 注入，壳内
- * 不内置任何业务词；样式全走 tokens.css 变量零裸值。
+ * 不内置任何业务词；样式以 tokens.css 变量为主，个别无对应 token 的取值按组件族既有基准
+ * 保留裸值并如实列出（面板 max-height 70vh、装饰图标/关闭钮几何 36/28px、操作钮
+ * min-height 32px、禁用态 opacity 0.55、hairline 1px 边框、padding 纵向基线 0）——收编
+ * tokens.css 归 ui-designer（设计基准镜像滞后项，不在本组件私加 token）。
  */
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 
@@ -166,13 +169,13 @@ const confirming = ref(false)
 const confirmEl = ref<HTMLElement | null>(null)
 
 function requestClose(): void {
-  if (props.busy) return // 提交中冻结关闭入口（防误触丢轮）
+  if (props.busy) return // 提交中冻结关闭入口（防误触丢内容）
   confirming.value = true
 }
 
 function confirmClose(): void {
   confirming.value = false
-  emit('close') // close 语义由业务方决定（业务实例自行定收口——如取消轮不进历史）
+  emit('close') // close 语义由业务方决定（业务实例自行定收口）
 }
 
 function stayInSheet(): void {
@@ -181,8 +184,8 @@ function stayInSheet(): void {
 }
 
 function onKeydown(ev: KeyboardEvent): void {
-  // Esc 策略：确认态仅撤回确认（焦点回面板）；非确认态零副作用——防误按丢轮，
-  // 取消仅 ×/弱取消钮两个显式入口经确认区承接
+  // Esc 策略：确认态仅撤回确认（焦点回面板）；非确认态零副作用——关闭仅 ×/弱取消钮
+  // 两个显式入口且均须过确认区承接（防误按丢内容）
   if (ev.key === 'Escape' && confirming.value) {
     ev.stopPropagation()
     stayInSheet()

@@ -186,6 +186,21 @@ def _resolve_on_timeout(hitl_section: Mapping[str, Any] | None) -> str:
     return value if value in ("hybrid", "cancel") else "hybrid"
 
 
+def _note_limit(hitl_section: Mapping[str, Any] | None) -> int:
+    """hitl.note_max_chars 运行面读取（评审遗留④批次 5 清偿——服务层真实消费该键，
+    原实现硬编码 500 键不消费）。validator 值域 ge=100 le=1000（nacos-config §3
+    v1.50）；畸形/越域回落缺省 500——validator 拒收之外的第二道防线（与
+    _resolve_on_timeout/_floor_params 同型兜底判读）。"""
+    value = (
+        (hitl_section or {}).get("note_max_chars")
+        if isinstance(hitl_section, Mapping)
+        else None
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or not (100 <= value <= 1000):
+        return 500
+    return value
+
+
 def _merge_gate_hitl_extra(
     ctx: _RunContext, final_state: dict[str, Any]
 ) -> None:
@@ -1035,9 +1050,40 @@ class ThreadScheduler:
         approval_resolved(resolved_by=conflict，无 choice 键)+done(finish=canceled,
         cancel_reason=reason)——单条失败不中断队列（下条继续；失败留 WARN）。
         队列为进程内存（重启即丢）：重启后打断轮已 canceled 终态、订阅者经 2.5
-        对账收敛（与既有「进程重启孤儿清理」同级兜底）。"""
+        对账收敛（与既有「进程重启孤儿清理」同级兜底）。
+
+        幽灵帧防护（评审遗留①批次 5 清偿）：入队在请求事务内、本 flush 在提交后
+        窗口——两者之间事务可能整体回滚（行回 awaiting_approval）。发布前对 DB
+        真值复核：非 canceled 行的队列项丢弃（队列清理、零发布、WARN 留痕），
+        订阅者不被「幽灵 canceled 帧」误导（轮实际仍在等待审批）。"""
         while self._deferred_awaiting_sse:
             item = self._deferred_awaiting_sse.pop(0)
+            try:
+                async with self._session_factory() as session:
+                    row_status = await session.scalar(
+                        select(Turn.status).where(
+                            Turn.id == uuid.UUID(item["turn_id"])
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001 —— 复核失败=丢弃不发布（宁可
+                # 漏帧走 2.5 对账，不发未经提交证实的 canceled 帧）
+                AgentLog(
+                    message=(
+                        f"awaiting 延发队列行状态复核失败（丢弃不发布）："
+                        f"turn={item['turn_id']} {type(exc).__name__}"
+                    ),
+                    graph="turn_runner",
+                ).warning()
+                continue
+            if row_status != "canceled":
+                AgentLog(
+                    message=(
+                        "awaiting 延发队列幽灵帧丢弃（行非 canceled——入队后事务"
+                        f"回滚）：turn={item['turn_id']} 行状态={row_status}"
+                    ),
+                    graph="turn_runner",
+                ).warning()
+                continue
             ctx_like = _RunContext(
                 turn_id=item["turn_id"], thread_id=item["thread_id"]
             )
@@ -1412,9 +1458,12 @@ class ThreadScheduler:
             else 0
         )
         return max(0, wall_ms - awaiting_ms)
-    # 本段为**事务面**：开行/裁决/过期收口的 DB 状态机。阶段 2 恢复调度（resume→
-    # astream 载荷重建）与 SSE approval_requested/approval_resolved 事件面归批次 2
-    # 后续段接线——本段方法暂无生产调用方（REST 端点同批后续段暴露）。
+    # 本段为**事务面**：开行/裁决/过期收口的 DB 状态机。生产调用方=批次 2 后续
+    # 段接线完成（docstring 失真清偿⑥，原「暂无生产调用方」注释已过时）：
+    # open_approval←_finish_awaiting（阶段 1 门判定 has_hit 收口）；decide_approval
+    # ←REST POST /turns/{turn_id}/approval（app/api/v1/turns.py）；collect_expired_
+    # approvals←approval_timeout_sweep cron + decide 惰性过期兜底；resume_turn←
+    # REST BackgroundTask + 扫描器（阶段 2 astream 载荷重建与 SSE 两帧事件面同在）。
 
     async def open_approval(
         self,
@@ -1485,7 +1534,9 @@ class ThreadScheduler:
 
         - 归属校验（id+user 双条件 → 404001，不泄漏存在性，cancel_turn 同款）；
         - choice 防御性校验（400001——REST 面 pydantic Literal 为第一道，本层为
-          程序化调用方的第二道）；note ≤500 字（note_max_chars 契约上限）；
+          程序化调用方的第二道）；note ≤ hitl.note_max_chars（服务层真实消费键值，
+          缺省 500、值域 100~1000——评审遗留④批次 5 清偿；pydantic 边界取值域
+          上界 1000 为宽防线）；
         - **条件 UPDATE**（`WHERE status='awaiting_approval'`，沿 regenerate
           rowcount 守卫先例）：并发裁决/超时扫描共用 turns 行锁串行化（R37 先到
           先得）——rowcount==1 即赢方，落审批行 approved + 轮置 running；
@@ -1498,9 +1549,23 @@ class ThreadScheduler:
             raise BadRequestException(
                 "审批选项非法", detail=f"choice={choice!r} ∉ {APPROVAL_CHOICES}"
             )
-        if note is not None and len(note) > 500:
+        # note 上限=hitl.note_max_chars 真实消费（评审遗留④批次 5 清偿——原实现
+        # 硬编码 500；快照不可用 fail-open 缺省 500，同 _sanitize_note 先例）
+        note_limit = 500
+        try:
+            spec = self._capture_spec_payload()
+            note_limit = _note_limit(
+                spec.get("hitl") if isinstance(spec, Mapping) else None
+            )
+        except Exception as exc:  # noqa: BLE001 —— 装配缺失=缺省灰度态
+            AgentLog(
+                message=f"note 上限 spec 快照不可用（回落缺省 500）：{type(exc).__name__}",
+                graph="turn_runner",
+            ).warning()
+        if note is not None and len(note) > note_limit:
             raise BadRequestException(
-                "补充指令过长", detail=f"note {len(note)} 字超上限 500（note_max_chars）"
+                "补充指令过长",
+                detail=f"note {len(note)} 字超上限 {note_limit}（note_max_chars）",
             )
         note = self._sanitize_note(note)
         turn_uuid = _uuid_or_404(turn_id, "turn")
@@ -1521,6 +1586,25 @@ class ThreadScheduler:
                     detail=f"turn_id={turn_id} 不存在或不属于当前用户",
                 )
             thread_id = str(owner_row.thread_id)
+            # 惰性过期兜底（评审遗留⑤批次 5 清偿）：审批行 pending 且已过
+            # expires_at 而扫描器未及（≤30s 窗口）——approval 端点本身即惰性
+            # 判定点（approval_timeout_sweep 模块口径「惰性判定为主，扫描兜底」），
+            # 按 on_timeout 语义先行收口（hybrid→轮回 running/cancel→canceled），
+            # 裁决随后经 rowcount==0 落 409008「超时后再到的人为裁决」
+            # （api.md §2.13；并发裁决先行竞态下 collect 条件 UPDATE 落败零触碰，
+            # 本端点条件 UPDATE 同样落败 → 同码，先到先得 R37 不变）
+            moment = datetime.now(UTC)
+            stale = (
+                await session.scalars(
+                    select(TurnApproval).where(
+                        TurnApproval.turn_id == turn_uuid,
+                        TurnApproval.status == "pending",
+                        TurnApproval.expires_at <= moment,
+                    )
+                )
+            ).first()
+            if stale is not None:
+                await self.collect_expired_approvals(now=moment)
             stmt = (
                 update(Turn)
                 .where(
@@ -1980,7 +2064,6 @@ class ThreadScheduler:
                 or approval.gate_payload is None
             ):
                 return None  # 重复 resume / 竞态收口——零副作用退出
-            payload = dict(approval.gate_payload)
             # awaiting_ms 先于 R30 判读计算（评审 medium#2：_fail_resumed_payload
             # 同样扣除 awaiting 时长——终态口径不限 completed）
             awaiting_ms = 0
@@ -1992,6 +2075,16 @@ class ThreadScheduler:
                         * 1000
                     ),
                 )
+            # 评审遗留②（批次 5 清偿）：JSONB 非法形状（手工写行/脏数据 list·标量
+            # ——Mapping 之外一切形状）与版本不符同族，R30「读不懂的载荷不猜」：
+            # 轮 failed + 明确 error，不在 dict() 转换处裸抛（原实现在版本判读前
+            # dict(list) 可抛 ValueError/TypeError，绕过 failed 收口面变 500 噪音）
+            if not isinstance(approval.gate_payload, Mapping):
+                await self._fail_resumed_payload(
+                    turn_id, str(row.thread_id), duration_offset_ms=awaiting_ms
+                )
+                return {"turn_id": turn_id, "status": "failed"}
+            payload = dict(approval.gate_payload)
             if payload.get("schema_version") != GATE_PAYLOAD_SCHEMA_VERSION:
                 await self._fail_resumed_payload(
                     turn_id, str(row.thread_id), duration_offset_ms=awaiting_ms

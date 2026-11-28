@@ -1,9 +1,12 @@
 """HITL 审批超时扫描（低频兜底周期任务；B22/REQ-069，R32 审批死轮缓解）。
 
 背景（data-model.md §4 v1.23 启动钩子注 / api.md §2.5 awaiting 语义注④）：审批
-超时的主判定路径是**惰性判定**（approval 端点与 2.5 读取时点按 expires_at 判读），
-本任务是**低频扫描兜底**——「用户永不回来/重启后无人触发惰性判定」的窗口里，必须
-有人把轮从 awaiting_approval 推走，否则线程被永久占线（同线程单 in-flight 不变式）。
+超时的主判定路径是**惰性判定**（approval 端点按 expires_at 惰性判读——decide_
+approval 对 pending 且已过期行先行按 on_timeout 收口再落 409008「超时后再到」，
+评审遗留⑤批次 5 清偿；2.5 投影 pending 形态原样透出 expires_at 供前端纯展示
+倒计时，服务端不因读取收口），本任务是**低频扫描兜底**——「用户永不回来/重启后
+无人触发惰性判定」的窗口里，必须有人把轮从 awaiting_approval 推走，否则线程被
+永久占线（同线程单 in-flight 不变式）。
 
 调度形态沿 crons 注册表先例（trace_cleanup.py / feishu_sync.py）：注册进 CRON_TASKS，
 main.py lifespan 建常驻周期循环（立即首轮 → sleep(interval) 循环；异常记 CronLog.error
@@ -17,8 +20,9 @@ main.py lifespan 建常驻周期循环（立即首轮 → sleep(interval) 循环
 
 收口语义（ThreadScheduler.collect_expired_approvals）：on_timeout=hybrid 缺省 →
 choice=both（缺省策略值「两者都要」）+ decided_by=timeout + 审批行 status='expired'
-+ 轮置 running（阶段 2 恢复调度归批次 2 后续段接线——恢复面就绪前本任务收口的轮
-由恢复段按清单续跑，收口本身不丢状态）。失败语义：单行条件 UPDATE 落败（并发裁决
++ 轮置 running（阶段 2 恢复调度**已接线**：sweep_expired_approvals 对收口清单
+逐条并发 spawn resume_turn——评审遗留③批次 5 清偿，串行 await 的可用性缺口
+已除；单条失败任务内 WARN 下轮重试）。失败语义：单行条件 UPDATE 落败（并发裁决
 先行）跳过不中断批内其余；DB 故障由 lifespan 循环捕获记日志、下周期重试（幂等
 可重入——重复扫描只对剩余 pending 到期行重复收口）。
 
@@ -37,6 +41,10 @@ APPROVAL_SWEEP_INTERVAL_SECONDS = 30
 
 _TASK_NAME = "approval_timeout_sweep"  # 注册表 name（CronLog task 字段同源）
 
+#: 在途恢复任务持有集（评审遗留③批次 5 清偿）：create_task 裸引用会被 GC 回收
+#: （docs 显式告警），done-callback 自摘除——进程退出/取消由 lifespan 统一收口
+_ACTIVE_RESUME_TASKS: set = set()  # set[asyncio.Task[None]]（避免运行时 import asyncio 泛型）
+
 
 @dataclass(frozen=True)
 class ApprovalSweepResult:
@@ -47,6 +55,34 @@ class ApprovalSweepResult:
     @property
     def collected_count(self) -> int:
         return len(self.collected)
+
+
+async def _resume_one(scheduler: ThreadScheduler, item: dict) -> None:
+    """单条阶段 2 恢复（评审遗留③批次 5 清偿——并发任务体）：失败任务内 WARN
+    不中断批内其余（恢复是幂等收敛型操作，残余下轮自然重试——原口径保留）。"""
+    try:
+        await scheduler.resume_turn(item["turn_id"])
+    except Exception as exc:  # noqa: BLE001 —— 单条恢复失败下轮重试
+        CronLog(
+            message=(
+                f"approval_timeout_sweep 阶段 2 恢复失败（下轮重试）："
+                f"turn={item['turn_id']} {type(exc).__name__}"
+            ),
+            task=_TASK_NAME,
+        ).warning()
+
+
+def _spawn_resume(scheduler: ThreadScheduler, item: dict) -> None:
+    """恢复任务 spawn（不 await——串行 await 会让一条慢恢复〔阶段 2 完整包络，
+    可达百秒级〕阻塞批内其余轮的阶段 2 启动与下一扫描周期）；任务入
+    _ACTIVE_RESUME_TASKS 持有集防 GC，done-callback 自摘除。"""
+    import asyncio
+
+    task = asyncio.create_task(
+        _resume_one(scheduler, item), name=f"{_TASK_NAME}:resume:{item['turn_id']}"
+    )
+    _ACTIVE_RESUME_TASKS.add(task)
+    task.add_done_callback(_ACTIVE_RESUME_TASKS.discard)
 
 
 async def sweep_expired_approvals(
@@ -62,19 +98,11 @@ async def sweep_expired_approvals(
     if scheduler is None:
         scheduler = get_thread_scheduler()
     collected = await scheduler.collect_expired_approvals(now=now)
-    # 阶段 2 恢复调度（plan §3.4——超时收口后按缺省策略续跑；单条失败不中断批内
-    # 其余——恢复是幂等收敛型操作，残余下轮自然重试）
+    # 阶段 2 恢复调度（plan §3.4——超时收口后按缺省策略续跑）：并发 spawn 不
+    # await（评审遗留③批次 5 清偿——原实现逐条 await，串行阻塞批内其余与下轮
+    # 扫描；单条失败任务内 WARN 不中断）
     for item in collected:
-        try:
-            await scheduler.resume_turn(item["turn_id"])
-        except Exception as exc:  # noqa: BLE001 —— 单条恢复失败下轮重试
-            CronLog(
-                message=(
-                    f"approval_timeout_sweep 阶段 2 恢复失败（下轮重试）："
-                    f"turn={item['turn_id']} {type(exc).__name__}"
-                ),
-                task=_TASK_NAME,
-            ).warning()
+        _spawn_resume(scheduler, item)
     result = ApprovalSweepResult(
         collected=tuple(dict(item) for item in collected)
     )

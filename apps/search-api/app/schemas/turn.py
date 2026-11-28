@@ -33,13 +33,16 @@ ApprovalChoice = Literal["kb_only", "web_only", "both", "custom"]
 class ApprovalDecisionRequest(BaseModel):
     """POST /turns/{turn_id}/approval 请求体（api.md §2.13 v1.37，REQ-069/A54）。
 
-    choice 必填枚举（缺失/非法 → pydantic 400001）；note 可选 ≤500 字（note_max_chars
-    契约上限；**任意 choice 可附带**——协议面无 choice 限制，api.md §2.13 note 宽口
-    径钉正；服务端过 query 同款 sanitize 管道〔R35〕后落库，不改检索范围）。
+    choice 必填枚举（缺失/非法 → pydantic 400001）；note 可选，长度上限=
+    `hitl.note_max_chars`（nacos 热更键，validator 值域 100~1000、缺省 500）——
+    pydantic 边界取值域上界 1000（第一道宽防线），**配置值由服务层真实消费**
+    （decide_approval，评审遗留④批次 5 清偿——原实现边界与服务层均硬编码 500、
+    键不消费）；**任意 choice 可附带**——协议面无 choice 限制，api.md §2.13 note
+    宽口径钉正；服务端过 query 同款 sanitize 管道〔R35〕后落库，不改检索范围。
     """
 
     choice: ApprovalChoice
-    note: str | None = Field(default=None, max_length=500)
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class ApprovalDecisionData(BaseModel):

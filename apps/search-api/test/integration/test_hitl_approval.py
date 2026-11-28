@@ -284,7 +284,63 @@ async def test_decide_note_over_limit_400001(awaiting_candidate: Any) -> None:
         )
 
 
+class _FakeSpecSnapshot:
+    """spec 快照假体（ThreadScheduler spec_snapshot 缝——payload 直给）。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+
+async def test_decide_honors_note_max_chars_configured_key(
+    awaiting_candidate: Any,
+) -> None:
+    """评审遗留④（批次 5 清偿）：hitl.note_max_chars 服务层真实消费——配置 100
+    时 150 字 note 拒收 400001（原实现硬编码 500 键不消费）、90 字放行；缺省
+    500 行为不变（G3——上一用例 501 字拒收即缺省面回归锚）。"""
+    _seed_open(awaiting_candidate)
+    scheduler = ThreadScheduler(
+        bus=EventBus(),
+        session_factory=get_session_factory(),
+        spec_snapshot=_FakeSpecSnapshot({"hitl": {"note_max_chars": 100}}),
+    )
+    with pytest.raises(BadRequestException):
+        await scheduler.decide_approval(
+            str(_TURN_ID), user_id=_USER_ID, choice="custom", note="长" * 150
+        )
+    row = _approval_row(awaiting_candidate)
+    assert row is not None and row["status"] == "pending"  # 拒收轮零触碰
+    await scheduler.decide_approval(
+        str(_TURN_ID), user_id=_USER_ID, choice="custom", note="短" * 90
+    )
+    row = _approval_row(awaiting_candidate)
+    assert row is not None and row["status"] == "approved"
+
+
 # ---- 裁决竞态形态二：超时收口 vs 人为裁决（先到先得）----
+
+
+async def test_decide_lazily_expires_overdue_pending_row(
+    awaiting_candidate: Any,
+) -> None:
+    """评审遗留⑤（批次 5 清偿）：decide 惰性过期——审批行 pending 且已过
+    expires_at 而扫描器未及（30s 窗口）时，人为裁决不得照常推进：approval 端点
+    即惰性判定点（approval_timeout_sweep 模块口径「惰性判定为主」），行按
+    on_timeout 缺省 hybrid 先行收口（expired/choice=both/decided_by=timeout）+
+    轮回 running，裁决落 409008「超时后再到的人为裁决」（api.md §2.13）。"""
+    _seed_open(awaiting_candidate, expires_in=-60)  # 已过期 60s（扫描器未跑）
+    scheduler = _scheduler()
+    with pytest.raises(ApprovalConflictException):
+        await scheduler.decide_approval(
+            str(_TURN_ID), user_id=_USER_ID, choice="both", note=None
+        )
+    assert _turn_status(awaiting_candidate) == "running"  # hybrid 缺省：轮续跑
+    row = _approval_row(awaiting_candidate)
+    assert row is not None
+    assert (
+        row["status"] == "expired"
+        and row["decided_by"] == "timeout"
+        and row["choice"] == "both"
+    )
 
 
 async def test_timeout_collect_then_user_decide_conflicts(

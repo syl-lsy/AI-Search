@@ -253,6 +253,20 @@ def _fallback_answer(query_lang: Any, sources: Any, partial: str) -> str:
     return "\n".join(lines)
 
 
+def _user_section(prompt_text: str, approval_note: Any) -> str:
+    """B22 审批补充指令→writer 用户角色段（api.md §2.13 分期注 v1.39「deep=writer
+    用户角色段」——批次 5 接线 mandate；DeepState.approval_note 注入面已在位
+    turn_service :3663）。approval_note 为 R35 sanitize 后文本、note_max_chars
+    截断在 decide_approval 前置（既有面，本节点零重复校验）——以空行接在用户
+    消息尾部：现实现 prompt_text 整段即 writer 的用户角色消息
+    （chain.astream(str) 单消息形态），拼接即用户角色段注入——**零新 Nacos
+    提示词键**（deep.report_writer 模板占位符面零变更=运行态键零发布；fast
+    synthesis._user_content 同款消息层形态，synthesis.py:460 先例）。空/缺省/
+    纯空白逐字节等于 prompt_text（G3——非门轮零变化）。"""
+    note = str(approval_note or "").strip()
+    return prompt_text if not note else f"{prompt_text}\n\n{note}"
+
+
 async def writer(state: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
     """writer 节点（deep 子图）：分节流式撰写 → answer_md；失败走兜底不终止。"""
     ensure_not_canceled(config)  # 取消非故障——穿透重抛（TurnRunner _finish_canceled 收尾）
@@ -263,21 +277,24 @@ async def writer(state: Any, config: RunnableConfig | None = None) -> dict[str, 
     top_n = _sources_top_n(spec)
     timeout_s = llm_timeout_s(spec, "deep")  # spec.deep.llm_timeout_s，缺省 120（§6.2）
 
-    prompt_text = render_prompt(
-        resolve_prompt("deep.report_writer"),
-        {
-            "sections_hint": _sections_hint(outline),
-            "query_lang": str(state.get("query_lang") or "en") if isinstance(state, dict) else "en",
-            "cite_rules": resolve_prompt("common.citation_rules"),
-            # M5 记忆→prompt 通道；启用前恒空（memory-api.md §2——synthesis 先例）
-            "memory_block": "",
-            "subagent_reports_block": _subagent_reports_block(
-                state.get("subagent_reports") if isinstance(state, dict) else None
-            ),
-            "sources_block": _sources_block(
-                state.get("collected_sources") if isinstance(state, dict) else None, top_n
-            ),
-        },
+    prompt_text = _user_section(
+        render_prompt(
+            resolve_prompt("deep.report_writer"),
+            {
+                "sections_hint": _sections_hint(outline),
+                "query_lang": str(state.get("query_lang") or "en") if isinstance(state, dict) else "en",
+                "cite_rules": resolve_prompt("common.citation_rules"),
+                # M5 记忆→prompt 通道；启用前恒空（memory-api.md §2——synthesis 先例）
+                "memory_block": "",
+                "subagent_reports_block": _subagent_reports_block(
+                    state.get("subagent_reports") if isinstance(state, dict) else None
+                ),
+                "sources_block": _sources_block(
+                    state.get("collected_sources") if isinstance(state, dict) else None, top_n
+                ),
+            },
+        ),
+        state.get("approval_note") if isinstance(state, dict) else None,
     )
 
     alias = resolve_chat_alias(state, config)

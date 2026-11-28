@@ -2083,6 +2083,25 @@ class TestHitlSpecRules:
                 with pytest.raises(AssetValidationError):
                     validate_asset(SPEC_DATA_ID, payload)
 
+    def test_note_limit_pydantic_sentinel_aligned_with_validator_upper_bound(self):
+        """批次 5 收口②（上界对齐锁）：pydantic note 边界哨兵（schemas
+        ApprovalDecisionRequest max_length）与 validator note_max_chars 上界对齐
+        （行为面双证=都恰 1000）。哨兵=值域上界（宽防线）、权威判定=服务层
+        hitl.note_max_chars 键消费（缺省 500，decide_approval）——两处漂移（哨兵
+        <上界会先拦合法值域请求 / 哨兵>上界放行越域值）都会使 400001 观测面错位，
+        本用例锁死对齐。"""
+        from pydantic import ValidationError
+
+        from app.config_center.validator import HitlSpec
+        from app.schemas.turn import ApprovalDecisionRequest
+
+        assert ApprovalDecisionRequest(choice="both", note="长" * 1000).note == "长" * 1000
+        with pytest.raises(ValidationError):
+            ApprovalDecisionRequest(choice="both", note="长" * 1001)
+        assert HitlSpec(note_max_chars=1000).note_max_chars == 1000
+        with pytest.raises(ValidationError):
+            HitlSpec(note_max_chars=1001)
+
     @pytest.mark.parametrize(
         "value, legal",
         [(0.0, True), (1.0, True), (0.42, True), (-0.1, False), (1.5, False)],

@@ -250,7 +250,10 @@ const CHOICES: ReadonlyArray<{ choice: ApprovalChoice; label: string; testid: st
 </template>
 
 <style scoped>
-/* 业务皮样式（壳容器/标题/确认/倒计时样式归 HitlSheet）——全 tokens.css 变量零裸值。
+/* 业务皮样式（壳容器/标题/确认/倒计时样式归 HitlSheet）——以 tokens.css 变量为主，个别
+   无对应 token 的取值按组件族既有基准保留裸值并如实列出（预览摘要/备注 line-height 1.7/1.6、
+   选项钮 min-height 36/32px、禁用态 opacity 0.55、hairline 1px 边框、padding 纵向基线 0）
+   ——收编 tokens.css 归 ui-designer（设计基准镜像滞后项，不在本组件私加 token）。
    预览卡纯展示不可点（2026-11-28 冲突裁决）：零链接零按钮、不设 hover/cursor 可点击暗示 */
 .as-previews {
   display: flex;
